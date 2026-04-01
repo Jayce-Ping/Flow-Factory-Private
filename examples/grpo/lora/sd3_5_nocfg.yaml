@@ -104,6 +104,7 @@ rewards:
     batch_size: 16
     device: "cuda"
     dtype: bfloat16
+    async_reward: true
 
 # Optional Evaluation Reward Models, default to all training reward models if not specified
 eval_rewards:
@@ -112,3 +113,4 @@ eval_rewards:
     batch_size: 32
     device: "cuda"
     dtype: bfloat16
+    async_reward: true
