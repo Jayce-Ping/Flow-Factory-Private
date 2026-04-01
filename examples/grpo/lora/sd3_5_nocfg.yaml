@@ -40,8 +40,8 @@ log:
 # Training Configuration
 train:
   # Trainer settings
-  trainer_type: 'smart_grpo' # Options: 'grpo', 'nft', 'awm'
-  advantage_aggregation: 'sum' # Options: 'sum', 'gdpo'
+  trainer_type: 'grpo' # Options: 'grpo', 'nft', 'awm'
+  advantage_aggregation: 'smart_grpo' # Options: 'sum', 'gdpo'
   # Clipping
   clip_range: 1.0e-4  # PPO/GRPO clipping range
   adv_clip_range: 5.0  # Advantage clipping range
