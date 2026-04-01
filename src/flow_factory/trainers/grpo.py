@@ -591,20 +591,28 @@ class GRPOTrainer(BaseTrainer):
         store_to_samples: bool = True
     ) -> torch.Tensor:
         """
-        Compute advantages using SMART-GRPO: Softmax-Centered, Group-Mean Temperature Advantage.
+        Compute advantages using SMART-GRPO: Softmax-Centered, Normalized Group-Mean Temperature.
 
         For each group, the advantage is:
             A_i = K * softmax((r_i - mu_G) / tau) - 1
         where:
             mu_G = group mean reward
-            tau  = |mu_G|  (group mean as temperature, data-driven)
+            tau  = |mu_G| / mean(|mu|)  (normalized group-mean temperature)
             K    = group size
 
-        Properties:
-            - Sum = 0 per group (same as standard GRPO, compatible with PG frameworks)
-            - Bounded in [-1, K - 1] (K-scaled normalization, no hyperparameters)
-            - Below-average samples get NEGATIVE advantage (proper punishment signal)
-            - Temperature = |mu_G|: harder groups -> sharper distribution
+        The temperature tau is the group's |mu_G| divided by the batch-wide
+        average |mu| across all groups. This preserves two key properties:
+            1. Harder groups (lower |mu_G|) get tau < 1 -> sharper softmax
+               -> concentrates advantage on the few good samples
+            2. Easier groups (higher |mu_G|) get tau > 1 -> flatter softmax
+               -> distributes advantage more evenly
+        while normalizing the temperature to ~1 scale regardless of the
+        absolute reward magnitude (e.g. PickScore ~20 vs [0,1] rewards).
+
+        Other properties:
+            - Sum = 0 per group (compatible with PG frameworks)
+            - Bounded in [-1, K - 1] (K-scaled, no hyperparameters)
+            - Below-average samples get NEGATIVE advantage
 
         References:
             SMART-GRPO notebook (SMART-GRPO.ipynb)
@@ -626,12 +634,20 @@ class GRPOTrainer(BaseTrainer):
         gathered_ids = self.accelerator.gather(unique_ids).cpu().numpy()
         _unique_ids, group_indices, _counts = np.unique(gathered_ids, return_inverse=True, return_counts=True)
 
-        # 4. Compute SMART-GRPO advantages: softmax-centered with group-mean temperature
+        # 4. Compute SMART-GRPO advantages: softmax-centered with normalized group-mean temperature
         from scipy.special import softmax as scipy_softmax
         advantages = np.zeros_like(aggregated_rewards, dtype=np.float64)
         eps = 1e-8
 
-        for group_id in np.unique(group_indices):
+        # Pre-compute per-group |mu_G| to derive the normalizer mean(|mu|)
+        unique_group_ids = np.unique(group_indices)
+        abs_mus = np.array([
+            np.abs(np.mean(aggregated_rewards[group_indices == gid]))
+            for gid in unique_group_ids
+        ])
+        mean_abs_mu = max(np.mean(abs_mus), eps)
+
+        for group_id in unique_group_ids:
             mask = (group_indices == group_id)
             group_rewards = aggregated_rewards[mask]
             K = len(group_rewards)
@@ -639,7 +655,7 @@ class GRPOTrainer(BaseTrainer):
                 f"Group size mismatch: expected {self.training_args.group_size}, got {K}"
 
             mu = np.mean(group_rewards, axis=0, keepdims=True)
-            tau = np.clip(np.abs(mu), eps, None)
+            tau = np.clip(np.abs(mu) / mean_abs_mu, eps, None)
             sm = scipy_softmax((group_rewards - mu) / tau)
             advantages[mask] = K * sm - 1.0
 
