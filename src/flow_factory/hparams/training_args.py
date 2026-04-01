@@ -349,9 +349,9 @@ class GRPOTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
+    advantage_aggregation: Literal['sum', 'gdpo', 'smart_grpo'] = field(
         default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."},
     )
     # Clipping / KL
     clip_range: tuple[float, float] = field(
@@ -393,9 +393,9 @@ class NFTTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
+    advantage_aggregation: Literal['sum', 'gdpo', 'smart_grpo'] = field(
         default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."},
     )
     # NFT core
     nft_beta: float = field(
@@ -467,9 +467,9 @@ class AWMTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
+    advantage_aggregation: Literal['sum', 'gdpo', 'smart_grpo'] = field(
         default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."},
     )
     # AWM core
     ema_kl_beta: float = field(
