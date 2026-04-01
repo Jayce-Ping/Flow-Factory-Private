@@ -594,7 +594,7 @@ class GRPOTrainer(BaseTrainer):
         Compute advantages using SMART-GRPO: Softmax-Centered, Group-Mean Temperature Advantage.
 
         For each group, the advantage is:
-            A_i = softmax((r_i - mu_G) / tau) - 1/K
+            A_i = K * softmax((r_i - mu_G) / tau) - 1
         where:
             mu_G = group mean reward
             tau  = |mu_G|  (group mean as temperature, data-driven)
@@ -602,7 +602,7 @@ class GRPOTrainer(BaseTrainer):
 
         Properties:
             - Sum = 0 per group (same as standard GRPO, compatible with PG frameworks)
-            - Bounded in [-1/K, 1 - 1/K] (implicit normalization, no hyperparameters)
+            - Bounded in [-1, K - 1] (K-scaled normalization, no hyperparameters)
             - Below-average samples get NEGATIVE advantage (proper punishment signal)
             - Temperature = |mu_G|: harder groups -> sharper distribution
 
@@ -641,7 +641,7 @@ class GRPOTrainer(BaseTrainer):
             mu = np.mean(group_rewards, axis=0, keepdims=True)
             tau = np.clip(np.abs(mu), eps, None)
             sm = scipy_softmax((group_rewards - mu) / tau)
-            advantages[mask] = sm - 1.0 / K
+            advantages[mask] = K * sm - 1.0
 
         # 5. Log statistics
         _log_data = {

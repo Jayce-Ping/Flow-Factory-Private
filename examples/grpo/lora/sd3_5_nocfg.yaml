@@ -44,7 +44,7 @@ train:
   advantage_aggregation: 'smart_grpo' # Options: 'sum', 'gdpo'
   # Clipping
   clip_range: 1.0e-4  # PPO/GRPO clipping range
-  adv_clip_range: 5.0  # Advantage clipping range
+  adv_clip_range: 10.0  # Advantage clipping range
   # KL div
   kl_type: 'v-based' # Options: 'x-based', 'v-based'
   kl_beta: 0 # KL divergence coefficient - 0 to disable and save memory. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
