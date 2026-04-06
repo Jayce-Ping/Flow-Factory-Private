@@ -30,7 +30,7 @@ The training loop executes: Data Preprocessing → K-Repeat Sampling → Traject
 
 ### 7. Coupled vs Decoupled Paradigm
 - **Coupled** (GRPO, GRPO-Guard): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
-- **Decoupled** (NFT, AWM): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
+- **Decoupled** (DPO, NFT, AWM): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
 
 Mixing paradigms (e.g., using `ODE` dynamics with `GRPO`) will produce incorrect gradients silently.
 
@@ -41,7 +41,7 @@ Text encoders and VAEs are loaded for Stage 1 (preprocessing), then offloaded to
 Only **trainable modules** and the **optimizer** go through `accelerator.prepare()`. The dataloader uses a custom distributed sampler (`DistributedKRepeatSampler` or `GroupContiguousSampler`) and is NOT prepared via accelerator. Breaking this causes duplicate data or incorrect gradient accumulation.
 
 ### 9a. Sampler Geometric Constraints
-Both samplers require `M * K ≡ 0 (mod W * B * G)` where M=unique_sample_num, K=group_size, W=world_size, B=per_device_batch_size, G=gradient_step_per_epoch. **GroupContiguousSampler** adds a stricter constraint: `M ≡ 0 (mod W)`. Auto-adjustment uses GCD-based rounding (DistributedKRepeatSampler) or LCM-based rounding (GroupContiguousSampler). See `.agents/knowledge/samplers.md` for full details.
+Both samplers require `M * K ≡ 0 (mod W * B * G)` where M=unique_sample_num, K=group_size, W=world_size, B=per_device_batch_size, G=gradient_step_per_epoch — **unless** `gradient_accumulation_steps` is set manually, in which case G is excluded and the constraint reduces to `M * K ≡ 0 (mod W * B)`. **GroupContiguousSampler** adds a stricter constraint in both modes: `M ≡ 0 (mod W)`. Auto-adjustment uses GCD-based rounding (DistributedKRepeatSampler) or LCM-based rounding (GroupContiguousSampler), both in `Arguments._align_batch_geometry()`. Sampler selection is in `Arguments._resolve_sampler_type()`. See `.agents/knowledge/topics/samplers.md` for full details.
 
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
 Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context manager (see `trainers/abc.py` line 119–123). Only ZeRO-1 and ZeRO-2 are safe. Document this if users ask.
@@ -51,9 +51,11 @@ Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context
 ## Base Class Interfaces (11–14)
 
 ### 11. BaseTrainer Abstract Contract
-`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. Subclasses must implement the `start()`, `optimize()`, and `evaluate()` methods. The `_initialization()` method is called in `__init__` and handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
+`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. Subclasses must implement `start()`, `prepare_feedback()`, `optimize()`, and `evaluate()`. The `_initialization()` method is called in `__init__` and handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
 
-**Trainer hierarchy**: `GRPOTrainer`, `DiffusionNFTTrainer`, and `AWMTrainer` all extend `BaseTrainer` directly. Only `GRPOGuardTrainer` extends `GRPOTrainer`. All trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`.
+**Per-epoch hook order**: `sample()` (Stages 2–3) → `prepare_feedback()` (Stages 4–5: reward buffer finalize and advantages; no policy gradients) → `optimize()` (Stage 6). `DPOTrainer` forms chosen/rejected pairs at the **start** of `optimize()` (not in `prepare_feedback()`).
+
+**Trainer hierarchy**: `GRPOTrainer`, `DPOTrainer`, `DiffusionNFTTrainer`, and `AWMTrainer` all extend `BaseTrainer` directly. Only `GRPOGuardTrainer` extends `GRPOTrainer`. All trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`. `DPOTrainer` uses advantages from `prepare_feedback()` to form chosen/rejected pairs via `_form_pairs` / `_form_pairs_from_advantages()` inside `optimize()`; if no pairs can be formed, training raises `RuntimeError` (fail-fast).
 
 ### 12. BaseAdapter Abstract Methods
 Subclasses of `BaseAdapter` MUST implement these 7 abstract methods:
@@ -94,7 +96,7 @@ All config dataclasses live in `hparams/`. The top-level `Arguments` aggregates 
 > **Why add new fields explicitly?** Pydantic dataclasses have defaults, so omitted fields don't break configs. But users copy-paste from examples — if a field isn't shown, they won't know it exists. Treat `examples/` as the user-facing API surface.
 
 ### 16. Algorithm-Specific Training Args
-`TrainingArguments` has algorithm-specific subclasses (`GRPOTrainingArguments`, `NFTTrainingArguments`, `AWMTrainingArguments`). The correct subclass is resolved by `get_training_args_class()`. Adding a new algorithm requires adding a corresponding subclass and updating the resolver.
+`TrainingArguments` has algorithm-specific subclasses (`GRPOTrainingArguments`, `DPOTrainingArguments`, `NFTTrainingArguments`, `AWMTrainingArguments`). The correct subclass is resolved by `get_training_args_class()`. Adding a new algorithm requires adding a corresponding subclass and updating the resolver.
 
 ### 17. YAML Config Structure
 Example configs follow this structure:
@@ -104,6 +106,7 @@ model:
   model_path: "..."
 train:
   trainer_type: "grpo"       # Must match registry key
+scheduler:
   dynamics_type: "Flow-SDE"  # Must be valid dynamics
 data:
   dataset: "..."
@@ -132,7 +135,7 @@ The adapter sets inference dtype for frozen components and training dtype for tr
 ### 21. Formatting Standards
 - **Black** with `line-length=100`, targeting Python 3.10–3.12
 - **isort** with `profile="black"`, `line_length=100`
-- Comments and docstrings in **English**
+- Comments and docstrings in **English** (see also Core Operating Principle #11 — applies to all persisted text in the repo)
 
 ### 22. Import Style
 - Use relative imports within `flow_factory` package (e.g., `from ..hparams import *`)
@@ -145,10 +148,54 @@ All public methods must have type annotations. Use `typing` module types (`List`
 ### 24. License Header
 All source files must include the Apache 2.0 license header with `Copyright 2026 Jayce-Ping`.
 
-### 25. Fail-Fast Error Handling
+### 25. Logger Message Style
+Logger warnings and info messages that reference configuration parameters MUST follow these rules:
+- **Use user-facing field names** (e.g., `unique_sample_num_per_epoch`, `per_device_batch_size`, `gradient_step_per_epoch`), NOT internal shorthand variables (`M`, `K`, `W`, `B`, `G`). Users read these logs to understand what changed and why — shorthand requires them to reverse-lookup definitions.
+- **Show concrete values** after each parameter name using parentheses: `unique_sample_num_per_epoch(32)`, `num_replicas(8)`.
+- **Structure multi-constraint messages** with numbered lines for readability:
+  ```
+  GroupContiguousSampler: adjusted `unique_sample_num_per_epoch` from 30 to 32 to satisfy:
+    1) unique_sample_num_per_epoch(32) % num_replicas(8) == 0
+    2) unique_sample_num_per_epoch(32) * group_size(4) % (...) == 0
+  ```
+- **Docstrings and inline comments** in source code should also prefer full field names over shorthand. Shorthand (`M`, `K`, `W`, `B`, `G`) is acceptable only in mathematical formulas within knowledge docs (e.g., `topics/samplers.md`) where brevity aids comprehension, but must be defined in a legend table.
+
+### 26. Fail-Fast Error Handling
 The codebase prefers **raising exceptions with detailed debug information** over silent auto-fallback for unexpected situations. Do not add defensive fallback code that silently recovers from invalid inputs — instead, let the error propagate with a clear message so the caller can diagnose and fix the root cause. Examples of what NOT to do:
 - Silently substituting a default range when no valid indices are found
 - Auto-swapping `start`/`end` when they are reversed
 - Clamping out-of-range values to valid bounds without reporting
 
 Auto-fallback is only acceptable when the user explicitly requests it or when documented as intentional design (e.g., `_standardize_timestep_range` coercing a scalar to a tuple is a deliberate convenience, not error recovery).
+
+### 27. Docstring Style
+All public functions and methods must have Google-style docstrings in English with the following structure:
+
+```python
+def func_name(accelerator: Accelerator, x: torch.Tensor) -> Dict[str, float]:
+    """One-line summary of main functionality.
+
+    Optional extended description providing context, algorithm details,
+    or usage guidance.  Keep it concise.
+
+    Args:
+        accelerator: Accelerator instance.
+        x: 1-D tensor (local shard on this rank).
+
+    Returns:
+        Dict[str, float]: Description of the return value, including
+            key structure if returning a dict.
+
+    Note:
+        Communication cost, edge-case behavior, implementation details,
+        or caveats that callers should be aware of.
+    """
+```
+
+**Rules:**
+- **First line**: imperative one-liner describing *what* the function does (not *how*). Must fit on one line.
+- **Args**: one entry per parameter. Type hints live in the signature, not repeated in the docstring. Description starts on the same line as the parameter name.
+- **Returns**: include the type and describe the structure (e.g., dict keys, tuple ordering, edge-case defaults).
+- **Note** (optional): communication cost, side effects, or non-obvious behavior. Use this instead of inline comments for information callers need.
+- **Do not** include `Raises:` unless the function intentionally raises a documented exception as part of its contract (fail-fast pattern).
+- Private helpers (`_func`) may use a one-liner docstring if the behavior is obvious from the name and signature.

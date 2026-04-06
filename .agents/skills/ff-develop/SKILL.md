@@ -1,6 +1,6 @@
 ---
 name: ff-develop
-description: Feature development workflow with cross-module impact analysis
+description: "Feature development with cross-module impact analysis. Covers trainer hierarchy, model adapters, reward pipeline, config system, sample dataclasses, and distributed training paths. Trigger: 'add feature', 'implement', 'refactor', 'reorganize', 'new capability'."
 ---
 
 # Feature Development Workflow
@@ -10,7 +10,8 @@ description: Feature development workflow with cross-module impact analysis
 Before implementing features or refactoring, analyze impacts across these areas:
 
 ### 1. Trainer Hierarchy
-- Changes to `BaseTrainer` affect `GRPOTrainer`, `GRPOGuardTrainer`, `DiffusionNFTTrainer`, `AWMTrainer`
+- Changes to `BaseTrainer` affect `GRPOTrainer`, `GRPOGuardTrainer`, `DPOTrainer`, `DiffusionNFTTrainer`, `AWMTrainer`
+- New or changed abstract methods on `BaseTrainer` (e.g. `prepare_feedback`) must be implemented on every concrete trainer
 - Changes to `AdvantageProcessor` affect all trainers that delegate advantage computation
 - Check: Does your change alter the `_initialization()`, `_init_reward_model()`, or `_init_dataloader()` flow?
 
@@ -64,6 +65,26 @@ Before implementing features or refactoring, analyze impacts across these areas:
    - Test with GRPO (coupled paradigm)
    - Test with NFT or AWM (decoupled paradigm)
    - Verify with at least two different model adapters
+
+## Documentation
+
+Before committing, check if the change requires documentation updates:
+
+- **New/changed API** -> update relevant `guidance/` doc
+- **New/changed config fields** -> update ALL example configs in `examples/`
+- **Architecture change** -> update `.agents/knowledge/architecture.md`
+- **New constraint discovered** -> add to `.agents/knowledge/constraints.md`
+- **Bug fix experience?** -> follow `.agents/knowledge/topics/fix_patterns.md` archival process (generate fix summary, ask user, write to appropriate location)
+
+## Common Traps
+
+- `preprocess_func()` registration: forgetting to list new encoding components in `preprocessing_modules` causes OOM
+- Config field renames **silently break** existing YAML configs — grep all YAML files first
+- `_shared_fields` in sample dataclasses: incorrect fields cause silent data corruption during collation
+- LoRA `target_module_map`: mapping wrong components means no training effect
+- Mixing coupled/decoupled paradigms: using ODE with GRPO produces incorrect gradients silently
+- `BaseAdapter` has 7 abstract methods — missing any one breaks the entire pipeline
+- Renaming config keys in `hparams/` without updating ALL `examples/` YAML causes silent default-fallback
 
 ## When to Delegate
 

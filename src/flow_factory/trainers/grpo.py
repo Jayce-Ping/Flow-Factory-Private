@@ -32,6 +32,7 @@ from ..samples import BaseSample
 from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
+from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
 
@@ -82,6 +83,7 @@ class GRPOTrainer(BaseTrainer):
                 self.evaluate()
 
             samples = self.sample()
+            self.prepare_feedback(samples)
             self.optimize(samples)
 
             self.adapter.ema_step(step=self.epoch)
@@ -118,7 +120,7 @@ class GRPOTrainer(BaseTrainer):
                 all_samples.extend(samples)
                 self.eval_reward_buffer.add_samples(samples)
             
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=False, split='pointwise')
+            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split='pointwise')
 
             # Gather and log rewards
             rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
@@ -166,14 +168,19 @@ class GRPOTrainer(BaseTrainer):
                 self.reward_buffer.add_samples(sample_batch)
 
         return samples
-    
+
+    # =========================== Reward / advantage (Stages 4--5) ============================
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """Finalize rewards from the buffer, compute advantages, and log advantage metrics."""
+        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
+        self.compute_advantages(samples, rewards, store_to_samples=True)
+        adv_metrics = self.advantage_processor.pop_advantage_metrics()
+        if adv_metrics:
+            self.log_data(adv_metrics, step=self.step)
+
     # =========================== Optimization Loop ============================
     def optimize(self, samples: List[BaseSample]) -> None:
-        """Main training loop: compute loss and update policy."""
-        # Finalize reward computation and store to samples' extra_kwargs
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
-        advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
-
+        """Policy optimization (Stage 6): PPO-style clipped loss and optional KL."""
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle samples at the beginning of each inner epoch
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
@@ -293,9 +300,6 @@ class GRPOTrainer(BaseTrainer):
 
                             # 5. Log per-timestep info
                             loss_info['ratio'].append(ratio.detach())
-                            loss_info['ratio_min'].append(ratio.min().detach())
-                            loss_info['ratio_max'].append(ratio.max().detach())
-                            loss_info['ratio_std'].append(ratio.std().detach())
                             loss_info['unclipped_loss'].append(unclipped_loss.detach())
                             loss_info['clipped_loss'].append(clipped_loss.detach())
                             loss_info['policy_loss'].append(policy_loss.detach())
@@ -316,11 +320,7 @@ class GRPOTrainer(BaseTrainer):
                                 self.optimizer.step()
                                 self.optimizer.zero_grad()
                                 # Communicate and log losses
-                                loss_info = {
-                                    k: torch.stack(v).mean() 
-                                    for k, v in loss_info.items()
-                                }
-                                loss_info = self.accelerator.reduce(loss_info, reduction="mean")
+                                loss_info = reduce_loss_info(self.accelerator, loss_info)
                                 loss_info['grad_norm'] = grad_norm
                                 self.log_data(
                                     {f'train/{k}': v for k, v in loss_info.items()},
@@ -354,7 +354,6 @@ class GRPOTrainer(BaseTrainer):
             rewards=rewards,
             store_to_samples=store_to_samples,
             aggregation_func=aggregation_func,
-            step=self.step,
         )
 
 
@@ -401,11 +400,7 @@ class GRPOGuardTrainer(GRPOTrainer):
         return samples
 
     def optimize(self, samples: List[BaseSample]) -> None:
-        """Main training loop: compute loss and update policy."""
-        # Finalize reward computation and store to samples' extra_kwargs
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
-        advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
-
+        """Policy optimization (Stage 6): GRPO-Guard reweighted loss and optional KL."""
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle samples at the beginning of each inner epoch
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
@@ -527,9 +522,6 @@ class GRPOGuardTrainer(GRPOTrainer):
 
                             # 5. Log per-timestep info
                             loss_info['ratio'].append(ratio.detach())
-                            loss_info['ratio_min'].append(ratio.min().detach())
-                            loss_info['ratio_max'].append(ratio.max().detach())
-                            loss_info['ratio_std'].append(ratio.std().detach())
                             loss_info['unclipped_loss'].append(unclipped_loss.detach())
                             loss_info['clipped_loss'].append(clipped_loss.detach())
                             loss_info['policy_loss'].append(policy_loss.detach())
@@ -550,11 +542,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                                 self.optimizer.step()
                                 self.optimizer.zero_grad()
                                 # Communicate and log losses
-                                loss_info = {
-                                    k: torch.stack(v).mean() 
-                                    for k, v in loss_info.items()
-                                }
-                                loss_info = self.accelerator.reduce(loss_info, reduction="mean")
+                                loss_info = reduce_loss_info(self.accelerator, loss_info)
                                 loss_info['grad_norm'] = grad_norm
                                 self.log_data(
                                     {f'train/{k}': v for k, v in loss_info.items()},

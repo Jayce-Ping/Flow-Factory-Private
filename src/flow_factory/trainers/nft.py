@@ -38,6 +38,7 @@ from ..rewards import RewardBuffer
 from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt, to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler, flow_match_sigma
+from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
 
@@ -98,7 +99,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
                 timestep_range=self.timestep_range,
-                shift=self.time_shift,
+                time_shift=self.time_shift,
                 device=device,
                 stratified=True,
             )
@@ -107,7 +108,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
                 timestep_range=self.timestep_range,
-                shift=self.time_shift,
+                time_shift=self.time_shift,
                 device=device,
             )
         elif time_sampling_strategy.startswith('discrete'):
@@ -161,7 +162,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                 all_samples.extend(samples)
                 self.eval_reward_buffer.add_samples(samples)
 
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=False, split='pointwise')
+            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split='pointwise')
 
             # Gather and log rewards
             rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
@@ -203,7 +204,6 @@ class DiffusionNFTTrainer(BaseTrainer):
             rewards=rewards,
             store_to_samples=store_to_samples,
             aggregation_func=aggregation_func,
-            step=self.step,
         )
 
     def start(self):
@@ -235,6 +235,7 @@ class DiffusionNFTTrainer(BaseTrainer):
             with self.sampling_context():
                 samples = self.sample()
 
+            self.prepare_feedback(samples)
             self.optimize(samples)
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
@@ -306,13 +307,16 @@ class DiffusionNFTTrainer(BaseTrainer):
             'noise_pred': output.noise_pred,
         }
 
-    def optimize(self, samples: List[BaseSample]) -> None:
-        """
-        Main optimization loop for DiffusionNFT.
-        """
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """Finalize rewards, compute advantages, and log advantage metrics."""
         rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
-        advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
+        self.compute_advantages(samples, rewards, store_to_samples=True)
+        adv_metrics = self.advantage_processor.pop_advantage_metrics()
+        if adv_metrics:
+            self.log_data(adv_metrics, step=self.step)
 
+    def optimize(self, samples: List[BaseSample]) -> None:
+        """Policy optimization (Stage 6): NFT matching loss with optional KL."""
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle samples at the beginning of each inner epoch
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
@@ -461,8 +465,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                                 self.optimizer.step()
                                 self.optimizer.zero_grad()
                                 # Log loss info
-                                loss_info = {k: torch.stack(v).mean() for k, v in loss_info.items()}
-                                loss_info = self.accelerator.reduce(loss_info, reduction="mean")
+                                loss_info = reduce_loss_info(self.accelerator, loss_info)
                                 loss_info['grad_norm'] = grad_norm
                                 self.log_data({f'train/{k}': v for k, v in loss_info.items()}, step=self.step)
                                 self.step += 1

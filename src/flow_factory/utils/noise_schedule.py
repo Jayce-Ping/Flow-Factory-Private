@@ -53,9 +53,9 @@ class TimeSampler:
         num_rows: int,
         device: torch.device,
         stratified: bool,
-        m: float,
-        s: float,
-        shift: float,
+        logit_mean: float,
+        logit_std: float,
+        time_shift: float,
     ) -> torch.Tensor:
         """Samples ``raw`` in (0, 1) with logit-normal + optional shift warp (legacy shape)."""
         if stratified:
@@ -66,9 +66,9 @@ class TimeSampler:
         else:
             u_standard = torch.randn(num_rows, device=device)
 
-        u = u_standard * s + m
+        u = u_standard * logit_std + logit_mean
         raw = torch.sigmoid(u)
-        raw = shift * raw / (1 + (shift - 1) * raw)
+        raw = time_shift * raw / (1 + (time_shift - 1) * raw)
         return torch.clamp(raw, min=0.01, max=1.0 - 1e-6)
 
     @staticmethod
@@ -76,9 +76,9 @@ class TimeSampler:
         batch_size: int,
         num_timesteps: int,
         timestep_range: Union[float, Tuple[float, float]],
-        m: float = 0.0,
-        s: float = 1.0,
-        shift: float = 3.0,
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+        time_shift: float = 3.0,
         device: torch.device = torch.device("cpu"),
         stratified: bool = True,
     ) -> torch.Tensor:
@@ -94,7 +94,7 @@ class TimeSampler:
         else:
             frac_lo, frac_hi = 0.0, float(timestep_range)
 
-        raw = TimeSampler._raw_logit_normal_unit(num_timesteps, device, stratified, m, s, shift)
+        raw = TimeSampler._raw_logit_normal_unit(num_timesteps, device, stratified, logit_mean, logit_std, time_shift)
         frac = frac_lo + raw * (frac_hi - frac_lo)
         t = TIMESTEP_MAX * (1.0 - frac)
         return t.unsqueeze(1).expand(num_timesteps, batch_size)
@@ -104,12 +104,12 @@ class TimeSampler:
         batch_size: int,
         num_timesteps: int,
         timestep_range: Union[float, Tuple[float, float]],
-        shift: float = 1.0,
+        time_shift: float = 1.0,
         device: torch.device = torch.device("cpu"),
     ) -> torch.Tensor:
         """
         Uniform sampling over fraction interval, then map to ``[0, TIMESTEP_MAX]`` scheduler times.
-        Optional ``shift`` warps the fraction before mapping (same as legacy uniform).
+        Optional ``time_shift`` warps the fraction before mapping (same as legacy uniform).
         """
         if isinstance(timestep_range, (list, tuple)):
             frac_lo, frac_hi = float(timestep_range[0]), float(timestep_range[1])
@@ -120,8 +120,8 @@ class TimeSampler:
         normalized = (torch.arange(num_timesteps, device=device) + rand_u) / num_timesteps
         f = frac_lo + normalized * (frac_hi - frac_lo)
         f = f[torch.randperm(num_timesteps, device=device)]
-        if abs(shift - 1.0) > 1e-6:
-            f = shift * f / (1 + (shift - 1) * f)
+        if abs(time_shift - 1.0) > 1e-6:
+            f = time_shift * f / (1 + (time_shift - 1) * f)
         t = TIMESTEP_MAX * (1.0 - f)
         return t.unsqueeze(1).expand(-1, batch_size)
 

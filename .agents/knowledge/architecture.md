@@ -50,9 +50,9 @@ Stage 1: Data Preprocessing (offline, cached)
   │  Result cached with hash fingerprint
   ▼
 Stage 2: K-Repeat Sampling
-  │  Two sampler strategies (see .agents/knowledge/samplers.md):
-  │  - DistributedKRepeatSampler (default): shuffles K copies across ranks
-  │  - GroupContiguousSampler (async rewards): keeps K copies on same rank
+  │  Two sampler strategies (see `.agents/knowledge/topics/samplers.md`):
+  │  - GroupContiguousSampler (preferred, auto-selected): keeps K copies on same rank
+  │  - DistributedKRepeatSampler (fallback): shuffles K copies across ranks
   │  K = training_args.group_size
   ▼
 Stage 3: Trajectory Generation
@@ -70,11 +70,19 @@ Stage 5: Advantage Computation
   ▼
 Stage 6: Policy Optimization
   │  adapter.forward() — single-step denoising for loss computation
-  │  Policy gradient (GRPO) or weighted matching (NFT/AWM)
+  │  Policy gradient (GRPO) or weighted matching (NFT/AWM) or DPO preference loss
   │  Gradient update via accelerator
   ▼
   (Repeat Stages 2–6 for next epoch)
 ```
+
+**Trainer methods vs stages** (each epoch, after Stage 1):
+
+| Method | Stages |
+|--------|--------|
+| `sample()` | 2–3 (K-repeat batches + `adapter.inference` trajectories) |
+| `prepare_feedback()` | 4–5: reward buffer finalize, `AdvantageProcessor` |
+| `optimize()` | 6: `adapter.forward` and optimizer step (DPO: form chosen/rejected pairs at entry, then loss) |
 
 ---
 
@@ -102,6 +110,7 @@ def get_class(identifier: str) -> Type:
 |-----|-------|----------|------------|
 | `grpo` | `GRPOTrainer` | Coupled | `BaseTrainer` |
 | `grpo-guard` | `GRPOGuardTrainer` | Coupled | `GRPOTrainer` |
+| `dpo` | `DPOTrainer` | Decoupled | `BaseTrainer` |
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 
@@ -183,6 +192,8 @@ Each model adapter wraps a diffusers pipeline into the `BaseAdapter` interface. 
 - `inference()` — full denoising loop (Stage 3)
 - `forward()` — single-step denoising (Stage 6)
 
+**Batch boundary convention**: All inputs to `preprocess_func()`, `encode_image()`, `encode_video()`, `inference()`, and `forward()` carry a batch dimension — tensors have shape `(B, ...)`. `condition_images` at the method level is **model-dependent**: `Tensor(B, C, H, W)` when each sample has one uniform-shape condition image (e.g. Flux1-Kontext), or `List[List[Tensor(C,H,W)]]` of length `B` when samples can have multiple or variable-shape condition images (e.g. Flux2, Qwen-Image-Edit). In both cases, `condition_images[b]` yields the per-sample value and `sample.condition_images` stored on `ImageConditionSample` is always `List[Tensor(C,H,W)]` (no batch dimension). Fields stored on `BaseSample` instances are always **per-sample** (no batch dimension).
+
 ### Component Management
 `BaseAdapter` automatically discovers pipeline components (text encoders, VAEs, transformers) and manages their lifecycle:
 - **Freezing**: Non-trainable components are frozen in `__init__`
@@ -205,7 +216,7 @@ Each model adapter wraps a diffusers pipeline into the `BaseAdapter` interface. 
 - **Communication optimization**: When `group_on_same_rank=True`, skips `accelerator.gather()` for rewards/ids and uses `all_reduce(count, sum, sum_sq)` for `global_std` computation (3 scalars instead of full tensor gather)
 - **Single-gather optimization**: When `group_on_same_rank=False`, packs all rewards + unique_ids into one tensor for a single `accelerator.gather()` call
 - **Strategies**: `"sum"` (weighted-sum GRPO) and `"gdpo"` (GDPO-style per-reward normalization)
-- All trainers (GRPO, GRPOGuard, NFT, AWM) delegate to `self.advantage_processor.compute_advantages()`
+- All trainers (GRPO, GRPOGuard, NFT, AWM, DPO) delegate to `self.advantage_processor.compute_advantages()`; `DPOTrainer` calls `_form_pairs_from_advantages()` (via `_form_pairs`) at the start of `optimize()` after advantages are on each sample
 
 ### Configuration Hierarchy
 ```
@@ -215,5 +226,24 @@ Arguments (top-level)
 ├── DataArguments       # dataset, preprocessing, resolution, sampler_type
 ├── RewardArguments     # reward_model, batch_size, dtype
 ├── LogArguments        # logger type, verbose, project name
-└── EvalArguments       # evaluation settings
+└── EvaluationArguments  # evaluation settings
 ```
+
+---
+
+## Testing
+
+### Test Commands by Change Area
+
+| Change in | How to verify |
+|-----------|--------------|
+| `trainers/` | Run training for >= 2 epochs with GRPO (coupled) and NFT or AWM (decoupled) |
+| `models/` | Verify with at least 2 model adapters (e.g., Flux + SD3.5 for T2I, Wan for T2V) |
+| `rewards/` | Verify with both pointwise (PickScore) and groupwise (PickScore_rank) reward models |
+| `hparams/` | Check ALL `examples/` YAML configs parse correctly; run `pytest` |
+| `data_utils/` | Verify sampler constraints with different M/K/W/B combinations; test both sampler types |
+| `scheduler/` | Verify with SDE dynamics (Flow-SDE) and ODE dynamics |
+| `samples/` | Verify `_shared_fields` and collation across affected sample types |
+| `advantage/` | Test advantage computation with both `group_contiguous` and `distributed_k_repeat` samplers |
+| `ema/` | Verify EMA step/save/load cycle |
+| Full regression | `pytest` |
