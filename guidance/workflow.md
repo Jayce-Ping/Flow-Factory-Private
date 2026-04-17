@@ -65,15 +65,16 @@ Each model adapter exposes a `preprocess_func` that encodes raw inputs into tens
 
 ```python
 # src/flow_factory/data_utils/dataset.py — GeneralDataset._preprocess_batch()
-def _preprocess_batch(self, batch, image_dir, video_dir):
+def _preprocess_batch(self, batch, image_dir, video_dir, audio_dir):
     # 1. Prepare text prompts
     prompt = batch["prompt"]
     # 2. Load images from disk (if applicable)
     # 3. Load videos from disk (if applicable)
-    # 4. Call model-specific preprocess function
+    # 4. Load audio files from disk (if applicable, via utils.audio.load_audio)
+    # 5. Call model-specific preprocess function
     preprocess_res = self._preprocess_func(**filtered_args)
-    # 5. Move tensors to CPU for caching
-    # 6. Return batch dict with encoded tensors + metadata
+    # 6. Move tensors to CPU for caching
+    # 7. Return batch dict with encoded tensors + metadata
 ```
 
 The preprocess function is model-specific. For example, Flux.2 encodes prompts via its text encoder and images via its VAE:
@@ -89,8 +90,10 @@ def preprocess_func(self, prompt, images, ...):
 
 ### Key Points
 
-- **Distributed preprocessing**: When running on multiple GPUs, each rank processes a shard of the dataset independently, then merges results. Controlled by `enable_preprocess` in data config.
-- **Intelligent caching**: A hash fingerprint of `(dataset, model_type, model_path, preprocess_kwargs)` determines the cache path. Subsequent runs skip preprocessing if the cache is valid.
+- **Distributed preprocessing**: When running on multiple GPUs, each rank processes a shard of the dataset independently. The orchestrator (`loader._create_or_load_dataset`) routes each rank's `Dataset.map` output directly to its final per-rank Arrow file via `cache_file_name=`, so a shard is written to disk exactly once. After all ranks finish, the consolidator (local-main for `preprocess_parallelism="local"`, global rank 0 for `"global"`) writes only `state.json` and `dataset_info.json` referencing the existing per-rank files and atomically renames `.tmp` → final cache directory — no row data is re-serialized.
+- **Cache layout**: The merged cache directory looks like `{cache_dir}/{fingerprint}/_parts/rank_{i:05d}_of_{N:05d}/cache-{fingerprint}_shard{i}of{N-1}.arrow`, plus the top-level `state.json` and `dataset_info.json`. While preprocessing is in flight, the same content lives under `{cache_dir}/{fingerprint}.tmp/`, with a `_build_meta.json` sentinel that records `num_shards` so a subsequent run with the same `num_shards` can resume from any per-rank Arrow files that were already written before a crash, while a different `num_shards` triggers a clean wipe.
+- **No HF default-cache copy**: Because each `map()` call sets `cache_file_name`, HuggingFace does **not** also write a duplicate `cache-*.arrow` under `~/.cache/huggingface/datasets/...`.
+- **Intelligent caching**: A hash fingerprint of `(dataset, split, max_dataset_size, preprocess_func source, preprocess_kwargs, extra_hash_strs)` (the last includes `model_type` and `model_name_or_path`) determines the cache path. Subsequent runs that match the fingerprint take the fast path without any `Dataset.map` invocation.
 - **Component offloading**: Text encoders and VAEs are loaded for preprocessing, then offloaded before the training loop to free VRAM for the denoising model.
 
 ### Configuration
@@ -102,6 +105,7 @@ data:
   force_reprocess: false           # Force re-encoding even if cache exists; essential if code is modified without changing config
   preprocessing_batch_size: 16     # Batch size for encoding
   cache_dir: "~/.cache/flow_factory/datasets"
+  preprocess_parallelism: "local"  # "local" = per-node parallelism (no shared FS required); "global" = cross-node (shared FS required)
 ```
 
 
