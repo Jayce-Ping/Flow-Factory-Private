@@ -721,7 +721,7 @@ For a detailed walkthrough of how `inference()` and `forward()` fit into the six
 
 **Critical convention — batch boundary:**
 
-> All inputs to `preprocess_func()`, `encode_image()`, `encode_video()`, `inference()`, and `forward()` carry a **batch dimension**. Tensors have shape `(B, ...)` and condition collections use `List[...]` with length `B`.
+> All inputs to `preprocess_func()`, `encode_image()`, `encode_video()`, `encode_audio()`, `inference()`, and `forward()` carry a **batch dimension**. Tensors have shape `(B, ...)` and condition collections use `List[...]` with length `B`.
 >
 > `condition_images` at the method level is **model-dependent** — there is no single canonical batch type:
 > - Single condition image per sample with uniform shape (e.g. Flux1-Kontext): batched `Tensor(B, C, H, W)`. `condition_images[b]` yields `Tensor(C,H,W)`, which `ImageConditionSample.__post_init__` unbinds to `[Tensor(C,H,W)]`.
@@ -757,6 +757,16 @@ All encoding methods and `inference()`/`forward()` receive **batched** inputs. H
 |---|---|---|
 | `videos` | `List[List[List[Image.Image]]]` | **Multi-video batch**: `videos[i]` is a list of condition videos, each video is a list of frames. |
 | `condition_videos` | `List[List[Tensor(T,C,H,W)]]` | Preprocessed version |
+
+### Audio
+
+| Parameter | Format | Description |
+|---|---|---|
+| `audios` | `MultiAudioBatch` (= `List[List[Tensor(samples,)]]` mono or `List[List[Tensor(channels, samples)]]` stereo) | **Multi-audio batch**: `audios[i]` is a list of audio tensors for sample `i`. Tensors are loaded by `flow_factory.utils.audio.load_audio`. Empty samples contribute `[]`. |
+| `condition_audios` | `List[List[Tensor]]` | Preprocessed/resampled version stored on `BaseSample` subclasses. |
+| `audio_features` | `List[Tensor(seq, D)]` or `Tensor(B, seq, D)` | Encoder output. Use `List` for variable-length sequences, `Tensor` when all samples share the same sequence length. |
+
+> Type aliases live in `flow_factory/utils/audio.py`. `MultiAudioBatch` mirrors `MultiImageBatch` / `MultiVideoBatch`: nested per-sample list with one Tensor per condition audio. Override `encode_audio()` only if your model consumes audio — text/image/video-only adapters inherit `BaseAdapter`'s no-op default.
 
 ### Sample Fields (no batch dimension)
 

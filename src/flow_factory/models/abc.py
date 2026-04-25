@@ -280,6 +280,16 @@ class BaseAdapter(ABC):
     def vae(self, module: torch.nn.Module):
         self.set_component('vae', module)
 
+    # ------------------------------------ Audio VAE ------------------------------------
+    @property
+    def audio_vae(self) -> Optional[torch.nn.Module]:
+        """Get audio VAE if available in pipeline, preferring prepared version."""
+        return self._components.get('audio_vae') or getattr(self.pipeline, 'audio_vae', None)
+
+    @audio_vae.setter
+    def audio_vae(self, module: torch.nn.Module):
+        self.set_component('audio_vae', module)
+
     # ---------------------------------- Transformers ----------------------------------
     @property
     def transformer_names(self) -> List[str]:
@@ -1668,9 +1678,12 @@ class BaseAdapter(ABC):
             encoder.eval()
 
     def _freeze_vae(self):
-        """Freeze VAE."""
+        """Freeze video VAE and audio VAE (if present)."""
         self.vae.requires_grad_(False)
         self.vae.eval()
+        if self.audio_vae is not None:
+            self.audio_vae.requires_grad_(False)
+            self.audio_vae.eval()
 
     def _freeze_transformers(self):
         """Freeze transformer components (e.g., UNet, ControlNets)."""
@@ -1686,7 +1699,7 @@ class BaseAdapter(ABC):
         self._freeze_text_encoders()
         self._freeze_vae()
         self._freeze_transformers()
-        
+
         # Selectively unfreeze target components
         for comp_name in self.model_args.target_components:
             if not hasattr(self, comp_name):
@@ -1802,7 +1815,11 @@ class BaseAdapter(ABC):
         and passes through concrete names ('text_encoder', 'vae', 'transformer_2') as-is.
         """
         if components is None:
-            return self.text_encoder_names + ['vae'] + self.transformer_names
+            return [
+                name
+                for name, comp in self.pipeline.components.items()
+                if isinstance(comp, torch.nn.Module)
+            ]
         
         if isinstance(components, str):
             components = [components]
@@ -1903,11 +1920,11 @@ class BaseAdapter(ABC):
         Always process a batch of inputs.
         Args:
             prompt: List of text prompts. A batch of text inputs.
-            images: 
+            images:
                 - None: no image input.
                 - List[Image.Image]: list of images (a batch of single images)
                 - List[List[Image.Image]]: list of list of images (a batch of a list images, each image list can be empty)
-            videos: 
+            videos:
                 - None: no video input.
                 - List[Video]: list of videos (a batch of single videos)
                 - List[List[Video]]: list of list of videos (a batch of a list videos, each video list can be empty)
@@ -1919,7 +1936,7 @@ class BaseAdapter(ABC):
 
         """
         results = {}
-        
+
         for input, encoder_method in [
             (prompt, self.encode_prompt),
             (images, self.encode_image),
