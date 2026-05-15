@@ -458,21 +458,13 @@ class OPDTrainer(GRPOTrainer):
                                 std_dev_t = std_dev_t.expand(kl_reward.shape[0])
                             kl_reward = kl_reward / (2 * std_dev_t.detach() ** 2 + 1e-8)
 
-                            # Always-normalize across the micro-batch (Flow-OPD's
-                            # per_sample / per_timestep / global branches all
-                            # collapse to this single global mean/std normalization).
-                            kl_reward_raw = kl_reward.detach()
-                            kl_reward_normalized = (
-                                (kl_reward - kl_reward.mean()) / (kl_reward.std() + 1e-4)
-                            )
-
                             # Negate so high distance → discourage. See module
                             # docstring for the sign-convention rationale.
-                            adv = -self.training_args.kl_scale * kl_reward_normalized
+                            adv = -self.training_args.kl_scale * kl_reward
                             adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                             # Detach: gradient flows through `output.log_prob`
                             # (the policy ratio), not through the advantage.
-                            adv = adv.detach()
+                            # adv = adv.detach() # Flow-OPD's official implementation does not detach the advantage
 
                             # ---- 5. PPO-style clipped policy loss (mirrors GRPOTrainer) ----
                             ratio = torch.exp(output.log_prob - old_log_prob)
@@ -538,8 +530,8 @@ class OPDTrainer(GRPOTrainer):
                                 loss_info["kl_loss"].append(kl_loss.detach())
 
                             # ---- 7. Per-timestep logging ----
-                            loss_info["kl_reward_mean"].append(kl_reward_raw.mean().detach())
-                            loss_info["kl_reward_std"].append(kl_reward_raw.std().detach())
+                            loss_info["kl_reward_mean"].append(kl_reward.mean().detach())
+                            loss_info["kl_reward_std"].append(kl_reward.std().detach())
                             loss_info["adv_mean"].append(adv.mean().detach())
                             loss_info["adv_abs_mean"].append(adv.abs().mean().detach())
                             loss_info["ratio"].append(ratio.detach())
