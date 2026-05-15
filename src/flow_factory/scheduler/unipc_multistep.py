@@ -399,7 +399,8 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
                 next_latents = next_latents.to(_input_dtype).float()
 
             if compute_log_prob:
-                log_prob = -((next_latents.detach() - next_latents_mean) ** 2)
+                # log_prob = -((next_latents.detach() - next_latents_mean) ** 2)
+                log_prob = -((next_latents.detach() - next_latents_mean) ** 2) / (2 * std_dev_t**2)
                 log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
 
