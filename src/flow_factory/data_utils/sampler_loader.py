@@ -16,8 +16,18 @@
 from torch.utils.data import Sampler, Dataset
 from accelerate import Accelerator
 
-from .sampler import DistributedKRepeatSampler, GroupContiguousSampler
+from .sampler import (
+    DistributedKRepeatSampler,
+    GroupContiguousSampler,
+    GroupDistributedSampler,
+)
 from ..hparams import Arguments
+
+SAMPLER_REGISTRY = {
+    "distributed_k_repeat": DistributedKRepeatSampler,
+    "group_contiguous": GroupContiguousSampler,
+    "group_distributed": GroupDistributedSampler,
+}
 
 
 def get_data_sampler(
@@ -28,17 +38,25 @@ def get_data_sampler(
     """
     Factory function to create the appropriate distributed sampler.
 
+    The sampler strategy is determined by ``config.data_args.sampler_type``,
+    which is resolved in ``Arguments._resolve_sampler_type()`` and aligned in
+    ``Arguments._align_batch_geometry()`` during ``__post_init__``.
+
     Returns:
-        - GroupContiguousSampler when any reward model uses async_reward
+        - GroupContiguousSampler when resolved type is ``"group_contiguous"``
           (keeps each group's samples on the same rank)
-        - DistributedKRepeatSampler otherwise (default behavior)
+        - GroupDistributedSampler when resolved type is ``"group_distributed"``
+          (split each group evenly across ranks)
+        - DistributedKRepeatSampler when resolved type is ``"distributed_k_repeat"``
+          (default behavior)
     """
     training_args = config.training_args
-    sampler_cls = (
-        GroupContiguousSampler
-        if config._has_async_rewards
-        else DistributedKRepeatSampler
-    )
+    sampler_type = config.data_args.sampler_type
+    sampler_cls = SAMPLER_REGISTRY.get(sampler_type)
+    if sampler_cls is None:
+        raise ValueError(
+            f"Unknown sampler_type={sampler_type!r}. Expected one of {sorted(SAMPLER_REGISTRY)}."
+        )
     return sampler_cls(
         dataset=dataset,
         batch_size=training_args.per_device_batch_size,

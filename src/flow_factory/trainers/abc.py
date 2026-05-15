@@ -32,7 +32,9 @@ from ..hparams import *
 from ..models.abc import BaseAdapter
 from ..data_utils.loader import get_dataloader
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
+from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
+from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -133,11 +135,13 @@ class BaseTrainer(ABC):
         train_reward_configs = self.reward_loader.get_reward_configs('train')
         eval_reward_configs = self.reward_loader.get_reward_configs('eval')
         # Initialize reward processor
+        group_on_same_rank = self.config.data_args.sampler_type == "group_contiguous"
         self.reward_processor = RewardProcessor(
             accelerator=self.accelerator,
             reward_models=self.reward_models,
             reward_configs=train_reward_configs,
             tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding,
+            group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
         self.eval_reward_processor = RewardProcessor(
@@ -145,6 +149,7 @@ class BaseTrainer(ABC):
             reward_models=self.eval_reward_models,
             reward_configs=eval_reward_configs,
             tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding
+            group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
         # Initialize reward buffers
@@ -154,7 +159,20 @@ class BaseTrainer(ABC):
         self.eval_reward_buffer = RewardBuffer(
             self.eval_reward_processor, self.training_args.group_size,
         )
-            
+
+        # Initialize advantage processor
+        self.advantage_processor = AdvantageProcessor(
+            accelerator=self.accelerator,
+            reward_weights={
+                name: cfg.weight
+                for name, cfg in train_reward_configs.items()
+            },
+            group_size=self.training_args.group_size,
+            global_std=getattr(self.training_args, 'global_std', True),
+            sampler_type=self.config.data_args.sampler_type,
+            verbose=self.log_args.verbose,
+        )
+
         return self.reward_models, self.eval_reward_models
 
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
@@ -326,6 +344,15 @@ class BaseTrainer(ABC):
         pass
 
     @abstractmethod
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """Stages 4--5: finalize rewards, compute advantages, and log metrics (no policy gradients).
+
+        Algorithms that need extra batching before the loss (e.g. DPO chosen/rejected pairs) may
+        perform that work in :meth:`optimize` after advantages are on each sample.
+        """
+        pass
+
+    @abstractmethod
     def optimize(self, *args, **kwargs):
         """Update policy model"""
         pass
@@ -334,6 +361,31 @@ class BaseTrainer(ABC):
     def evaluate(self):
         """Evaluation for one epoch."""
         pass
+
+    def _maybe_offload_samples_to_cpu(self, samples: List[BaseSample]) -> None:
+        """Move every sample's tensor fields to CPU when ``offload_samples_to_cpu`` is enabled.
+
+        Producer-side half of the CPU-offload + lazy-reload pipeline: samples
+        leave ``sample()`` already on CPU so that the GPU peak from the rollout
+        buffer is bounded by a single batch worth of inference activations.
+
+        Must be called BEFORE ``self.reward_buffer.add_samples(...)`` so that
+        the buffer's recorded ``sync_event`` captures "D2H complete + data
+        ready on CPU"; downstream reward workers (sync or async) then see a
+        deterministic CPU-resident state and trigger their own H2D inside
+        ``RewardProcessor`` (see ``move_tensors_to_device`` in
+        ``utils/base.py``).
+
+        No-op when ``training_args.offload_samples_to_cpu`` is False
+        (default), preserving the legacy GPU-resident behaviour.
+
+        Args:
+            samples: Newly generated samples for the current sample loop iteration.
+        """
+        if not self.training_args.offload_samples_to_cpu:
+            return
+        for sample in samples:
+            sample.to('cpu')
 
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
         """Save trainer state to a specific path."""
@@ -359,3 +411,18 @@ class BaseTrainer(ABC):
             resume_type=resume_type,
         )
         self.accelerator.wait_for_everyone()
+
+    def cleanup(self) -> None:
+        """Initiate non-blocking shutdown of async reward workers.
+
+        Called on KeyboardInterrupt to cancel pending futures and signal
+        executor threads to stop. This does NOT wait for threads to finish;
+        the caller is expected to follow with os._exit() which will forcefully
+        reclaim all resources including GPU memory.
+        """
+        for buf in (
+            getattr(self, 'reward_buffer', None),
+            getattr(self, 'eval_reward_buffer', None),
+        ):
+            if buf is not None:
+                buf.shutdown(wait=False, cancel_futures=True)
