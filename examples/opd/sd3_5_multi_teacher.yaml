@@ -1,0 +1,119 @@
+# Multi-teacher OPD on SD-3.5 medium ("alternate" mode in Flow-OPD).
+#
+# Each sample in the JSONL must carry a `teacher_name` field that names which
+# loaded teacher to distill against, e.g.:
+#
+#   {"prompt": "Photo of a sign saying HELLO", "teacher_name": "ocr_teacher"}
+#   {"prompt": "Two red cubes on a blue mat",  "teacher_name": "geneval_teacher"}
+#
+# Alternatively, tag rows with `dataset_id` and let `teacher_dataset_map`
+# translate, e.g.:
+#
+#   {"prompt": "...", "dataset_id": "ocr"}        ->  ocr_teacher
+#   {"prompt": "...", "dataset_id": "geneval"}    ->  geneval_teacher
+#
+# OPDTrainer enforces that every sample inside a per-device micro-batch shares
+# one teacher (raises ValueError otherwise). The K-repeat sampler produces
+# homogeneous batches as long as a single prompt always maps to a single
+# teacher.
+
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  # Concatenated JSONL of OCR + GenEval prompts, each tagged with its teacher.
+  dataset_dir: "dataset/opd_mix"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null  # set to your cold-start LoRA (model-merge / SFT)
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+train:
+  trainer_type: 'opd'
+
+  # ---- OPD-specific ----
+  teacher_loras:
+    ocr_teacher: "/path/to/ocr_teacher_lora"
+    geneval_teacher: "/path/to/geneval_teacher_lora"
+  # Optional: dataset_id -> teacher_name routing. Skip if dataset rows already
+  # carry `teacher_name` directly.
+  teacher_dataset_map:
+    ocr: ocr_teacher
+    geneval: geneval_teacher
+  kl_scale: 1.0
+
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+
+  kl_type: 'x-based'
+  kl_beta: 0
+  ref_param_device: 'cuda'
+
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.5
+
+  per_device_batch_size: 8
+  group_size: 24
+  global_std: true
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 2
+
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  seed: 42
+
+scheduler:
+  dynamics_type: "Flow-SDE"
+  noise_level: 0.8
+  num_sde_steps: 2
+  sde_steps: [1, 2, 3, 4, 5]
+  seed: 42
+
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 4.5
+  num_inference_steps: 40
+  eval_freq: 20
+  seed: 42
+
+# OPD does not consume task rewards at training time.
+rewards: []
+
+eval_rewards:
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 32
+    device: "cuda"
+    dtype: bfloat16

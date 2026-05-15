@@ -24,6 +24,7 @@ from .training_args import (
     GRPOTrainingArguments,
     NFTTrainingArguments,
     AWMTrainingArguments,
+    OPDTrainingArguments,
     get_training_args_class,
 )
 from .reward_args import RewardArguments, MultiRewardArguments
@@ -39,6 +40,7 @@ __all__ = [
     "GRPOTrainingArguments",
     "NFTTrainingArguments",
     "AWMTrainingArguments",
+    "OPDTrainingArguments",
     "get_training_args_class",
     "RewardArguments",
     "MultiRewardArguments",

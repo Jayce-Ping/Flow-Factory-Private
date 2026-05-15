@@ -368,6 +368,12 @@ class GeneralDataset(Dataset):
                 final_res[k] = v
 
         # 6. Prepare final results
+        # NOTE: `**batch` passes through every JSONL column unchanged (e.g. `teacher_name`,
+        # `dataset_id`, or any future per-row metadata). String columns are left as Python
+        # strings by HF's TorchFormatter (see `set_format` call above), so adding non-numeric
+        # columns to the JSONL is safe. Trainers that need such fields (e.g. OPDTrainer's
+        # per-batch teacher routing) can read them directly from `batch['<column_name>']`
+        # (List[str] / list of values per sample) or from `batch['metadata'][i]`.
         batch_dict = {**batch, **final_res}
         # Add the rest info to `metadata` key, dict[list] -> list[dict]
         batch_dict['metadata'] = [

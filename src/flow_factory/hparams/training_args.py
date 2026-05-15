@@ -545,6 +545,116 @@ class AWMTrainingArguments(TrainingArguments):
         return self.num_train_timesteps
 
 
+@dataclass
+class OPDTrainingArguments(GRPOTrainingArguments):
+    r"""Training arguments for On-Policy Distillation (OPD).
+
+    OPD replaces the GRPO task-reward advantage with a per-step teacher KL signal:
+    each timestep, the student's predicted next-latents-mean is compared against
+    one or more frozen LoRA teacher(s) to produce a dense vector-field signal.
+
+    Hardcoded design choices (see Flow-OPD reference):
+    - Always runs the ``kl_only`` advantage path (no ``reward_mode`` switch).
+    - Always normalizes ``kl_reward`` across the micro-batch
+      (Flow-OPD's ``per_sample`` / ``per_timestep`` / ``global`` branches all
+      collapse to the same global mean/std normalization).
+
+    References:
+    [1] Flow-OPD: On-Policy Distillation for Flow Matching Models
+        - https://github.com/CostaliyA/Flow-OPD
+    """
+
+    teacher_loras: Dict[str, str] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Mapping ``{teacher_name: ckpt_path}`` of frozen LoRA teachers to load "
+                "alongside the student LoRA. Single-teacher = exactly one entry. Each "
+                "path must point to a directory containing either a PEFT-saved adapter "
+                "(``adapter_config.json`` + ``adapter_model.safetensors``) or a raw "
+                "LoRA safetensors export."
+            )
+        },
+    )
+
+    teacher_dataset_map: Optional[Dict[str, str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional mapping ``{dataset_id: teacher_name}`` for multi-teacher "
+                "(``alternate``) routing. When set, each sample's ``teacher_name`` / "
+                "``dataset_id`` field decides which teacher's vector field is used. "
+                "Leave ``None`` for single-teacher mode (uses the only key in "
+                "``teacher_loras``)."
+            )
+        },
+    )
+
+    kl_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Positive scalar that scales the (already micro-batch normalized) "
+                "teacher KL signal before it is used as the per-timestep advantage."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        if not isinstance(self.teacher_loras, dict):
+            raise TypeError(
+                f"expected dict for `teacher_loras`, got {type(self.teacher_loras).__name__}: "
+                f"{self.teacher_loras!r}"
+            )
+        if not self.teacher_loras:
+            raise ValueError(
+                f"OPDTrainingArguments requires at least one teacher LoRA in "
+                f"`teacher_loras`, got {self.teacher_loras!r}. Configure as e.g. "
+                f"`{{teacher_name: /path/to/lora_dir}}`."
+            )
+        for name, path in self.teacher_loras.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"`teacher_loras` keys must be non-empty strings, got {name!r}"
+                )
+            if not isinstance(path, str) or not path:
+                raise ValueError(
+                    f"`teacher_loras[{name!r}]` must be a non-empty string path, "
+                    f"got {path!r}"
+                )
+
+        if self.teacher_dataset_map is not None:
+            if not isinstance(self.teacher_dataset_map, dict):
+                raise TypeError(
+                    f"expected dict for `teacher_dataset_map`, got "
+                    f"{type(self.teacher_dataset_map).__name__}: {self.teacher_dataset_map!r}"
+                )
+            unknown = {
+                ds_id: tname
+                for ds_id, tname in self.teacher_dataset_map.items()
+                if tname not in self.teacher_loras
+            }
+            if unknown:
+                raise ValueError(
+                    f"`teacher_dataset_map` references teacher(s) not present in "
+                    f"`teacher_loras`. unknown entries: {unknown!r}; "
+                    f"available teachers: {sorted(self.teacher_loras.keys())!r}"
+                )
+
+        if not isinstance(self.kl_scale, (int, float)):
+            raise TypeError(
+                f"expected float/int for `kl_scale`, got {type(self.kl_scale).__name__}: "
+                f"{self.kl_scale!r}"
+            )
+        if self.kl_scale <= 0:
+            raise ValueError(
+                f"`kl_scale` must be > 0 for OPD distillation to provide a non-trivial "
+                f"signal, got {self.kl_scale!r}"
+            )
+
+
 # ============================================================================
 # Training Arguments Registry
 # ============================================================================
@@ -554,6 +664,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     'grpo-guard': GRPOTrainingArguments,
     'nft': NFTTrainingArguments,
     'awm': AWMTrainingArguments,
+    'opd': OPDTrainingArguments,
 }
 
 
