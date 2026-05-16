@@ -808,6 +808,86 @@ class DGPOTrainingArguments(GRPOTrainingArguments):
 
 
 @dataclass
+class OPDTrainingArguments(TrainingArguments):
+    r"""Training arguments for On-Policy Distillation (OPD), SDE regime.
+
+    Implements the REINFORCE form of the trajectory-level reverse KL
+    (Eq. 11 in the Flow-OPD paper). One or more frozen LoRA teachers are
+    distilled into the student along the student's on-policy trajectory
+    using a closed-form per-step Gaussian KL as the dense reward and the
+    score-function gradient for the trajectory term.
+    """
+
+    # OPD core
+    teacher_paths: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of teacher LoRA checkpoint paths, each written by "
+                "`BaseAdapter.save_checkpoint()`. Must contain at least one entry; "
+                "every teacher must share the student's LoRA rank/alpha so its "
+                "weights can be loaded into the same adapter slot."
+            )
+        },
+    )
+    teacher_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={
+            "help": (
+                "Storage device for the teacher LoRA snapshots. 'cuda' keeps "
+                "snapshots on-device for fast swaps; 'cpu' minimizes VRAM at the "
+                "cost of an H2D copy each time a teacher is swapped in."
+            )
+        },
+    )
+    teacher_aggregation: Literal["round_robin", "average"] = field(
+        default="round_robin",
+        metadata={
+            "help": (
+                "How to combine multiple teachers per training batch. "
+                "'round_robin': cycle through teachers per micro-batch "
+                "(cheapest, matches paper's outer m-loop in expectation). "
+                "'average': forward every teacher and average the velocity "
+                "prediction per timestep (M x teacher forward cost)."
+            )
+        },
+    )
+    reinforce_coef: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k). "
+                "Set to 0 to drop the trajectory term entirely (equivalent to "
+                "stop-gradient on the trajectory; cheapest estimator from §3.2)."
+            )
+        },
+    )
+
+    # Reuse the GRPO-style global_std knob so AdvantageProcessor instantiation
+    # in BaseTrainer._init_reward_model() picks a sensible default; OPD itself
+    # never calls AdvantageProcessor.compute_advantages.
+    global_std: bool = field(
+        default=True,
+        metadata={"help": "Forwarded to AdvantageProcessor; unused by OPD's loss."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.teacher_paths:
+            raise ValueError(
+                "OPDTrainingArguments requires `teacher_paths` to contain at least "
+                f"one teacher LoRA checkpoint, got teacher_paths={self.teacher_paths!r}."
+            )
+        if self.reinforce_coef < 0:
+            raise ValueError(
+                f"`reinforce_coef` must be >= 0, got reinforce_coef={self.reinforce_coef!r}."
+            )
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        return args.scheduler_args.num_sde_steps
+
+
+@dataclass
 class CRDTrainingArguments(TrainingArguments):
     r"""Training arguments for Centered Reward Distillation (CRD).
 
@@ -946,6 +1026,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     'dgpo': DGPOTrainingArguments,
     'dpo': DPOTrainingArguments,
     'crd': CRDTrainingArguments,
+    'opd': OPDTrainingArguments,
 }
 
 
