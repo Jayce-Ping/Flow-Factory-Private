@@ -58,7 +58,7 @@ from ..utils.checkpoint import (
     mapping_lora_state_dict,
     infer_lora_config,
     infer_target_modules,
-    resolve_lora_dir,
+    resolve_checkpoint_path,
 )
 from ..samples import BaseSample
 from ..ema import EMAModuleWrapper
@@ -1477,13 +1477,13 @@ class BaseAdapter(ABC):
     def _load_lora(self, path: str) -> None:
         """Load LoRA adapters for target components with auto-format detection.
 
-        Accepts either a local directory written by :meth:`save_checkpoint` or a
-        Hugging Face Hub repo id (``owner/repo`` / ``owner/repo@revision``,
-        optionally with an ``hf://`` URL prefix). Hub repos are downloaded once
-        on the local main process and reused by other ranks via the accelerator
-        barrier; see :func:`flow_factory.utils.checkpoint.resolve_lora_dir`.
+        Expects ``path`` to be a local directory. Hugging Face Hub specs
+        (``owner/repo[/subfolder][@revision]`` or ``hf://...``) are resolved
+        upstream by :meth:`load_checkpoint` and
+        :func:`load_lora_as_named_parameters` via
+        :func:`flow_factory.utils.checkpoint.resolve_checkpoint_path` before
+        this method is called.
         """
-        path = resolve_lora_dir(path, accelerator=self.accelerator)
         for comp_name in self.model_args.target_components:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
@@ -1683,8 +1683,11 @@ class BaseAdapter(ABC):
                 - None: Auto-detect based on checkpoint directory contents
         """
         path = os.path.expanduser(path)
+        path = resolve_checkpoint_path(path, accelerator=self.accelerator)
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint path not found: {path}")
+            raise FileNotFoundError(
+                f"Checkpoint path not found locally or on Hugging Face Hub: {path!r}"
+            )
 
         # Auto-detect if not specified
         if resume_type is None:

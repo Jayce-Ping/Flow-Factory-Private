@@ -24,6 +24,8 @@ import torch
 from typing import Dict, Optional, List, Tuple, Literal, TYPE_CHECKING
 
 from safetensors.torch import save_file, load_file
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
@@ -143,50 +145,146 @@ def infer_target_modules(
     return sorted(target_modules)
 
 
-# ============================ LoRA Path Resolution ============================
-# `owner/repo` or `owner/repo@revision` (with optional `hf://` URL prefix).
-# - owner: word chars + `-`
-# - repo:  word chars + `.` `-` (HF allows dots in repo names, e.g. SD3.5M-Flow)
-# - revision (optional): word chars + `.` `-` `/` (branches, tags, commits)
-_HF_REPO_RE = re.compile(r"^(?:hf://)?([\w\-]+/[\w.\-]+)(?:@([\w.\-/]+))?$")
+# ================================ Hugging Face Hub ================================
+HF_PATH_PREFIX = "hf://"
 
 
-def resolve_lora_dir(
-    path: str,
-    *,
-    accelerator: Optional["Accelerator"] = None,
-) -> str:
-    """Resolve a LoRA path to a local directory, downloading from HF Hub if needed.
+def parse_hf_checkpoint_path(path: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Parse a Hugging Face checkpoint path spec into ``(repo_id, subfolder, revision)``.
 
-    Accepted forms:
-      - **Existing local directory** (after ``os.path.expanduser``): returned
-        as-is. This is the legacy form and is checked first, so a local path
-        always wins over a same-named Hub repo.
-      - **Hugging Face Hub repo id** matching ``owner/repo`` or
-        ``owner/repo@revision`` (optionally with an ``hf://`` URL prefix):
-        downloaded via :func:`huggingface_hub.snapshot_download` and the
-        snapshot directory is returned. The HF cache dir is used as-is
-        (respects ``HF_HOME`` / ``HUGGINGFACE_HUB_CACHE``).
-
-    Distributed safety:
-        When ``accelerator`` is supplied, only ``accelerator.is_local_main_process``
-        performs the download, then all ranks ``wait_for_everyone()`` and call
-        ``snapshot_download`` again to obtain the local path from cache. This
-        avoids N concurrent downloads writing to the same cache directory.
+    Accepts both bare and ``hf://``-prefixed specs:
+      - ``owner/repo``                          -> (``owner/repo``,  None,           None)
+      - ``hf://owner/repo``                     -> (``owner/repo``,  None,           None)
+      - ``owner/repo/sub/dir``                  -> (``owner/repo``,  ``sub/dir``,    None)
+      - ``owner/repo@v1.0``                     -> (``owner/repo``,  None,           ``v1.0``)
+      - ``hf://owner/repo/sub/dir@v1.0``        -> (``owner/repo``,  ``sub/dir``,    ``v1.0``)
 
     Args:
-        path: A local directory path OR a Hub repo id (with optional revision).
-        accelerator: Optional :class:`accelerate.Accelerator`. When set, the
-            download is gated to the local main process and synchronized.
+        path: A bare or ``hf://``-prefixed checkpoint spec.
 
     Returns:
-        Absolute local directory path that exists on disk.
+        Tuple of (repo_id, subfolder, revision); subfolder and revision are ``None`` when absent.
+
+    Raises:
+        ValueError: If the spec lacks the ``owner/repo`` form (at minimum two path segments).
+    """
+    if not isinstance(path, str):
+        raise TypeError(
+            f"expected str for path, got {type(path).__name__}: {path!r}"
+        )
+
+    spec = path[len(HF_PATH_PREFIX):] if path.startswith(HF_PATH_PREFIX) else path
+
+    # Split off optional @revision (revision token cannot contain '/' or '@').
+    revision: Optional[str] = None
+    if "@" in spec:
+        spec, revision = spec.rsplit("@", 1)
+        if not revision or "/" in revision:
+            raise ValueError(
+                f"invalid revision in HF checkpoint path: {path!r} "
+                f"(expected 'owner/repo[/subfolder][@revision]', got revision={revision!r})"
+            )
+
+    parts = [p for p in spec.split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(
+            f"invalid HF checkpoint path: {path!r} "
+            f"(expected at least 'owner/repo', got {len(parts)} non-empty segments)"
+        )
+
+    repo_id = "/".join(parts[:2])
+    subfolder = "/".join(parts[2:]) if len(parts) > 2 else None
+    return repo_id, subfolder, revision
+
+
+def download_hf_checkpoint(
+    repo_id: str,
+    subfolder: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> str:
+    """
+    Download a Hugging Face checkpoint snapshot and return the local directory path.
+
+    Thin wrapper over ``huggingface_hub.snapshot_download``. When ``subfolder`` is
+    provided, restricts the download to that subtree via ``allow_patterns`` and
+    returns the path joined with the subfolder so the caller receives the directory
+    layout that the existing local-checkpoint loaders expect.
+
+    Authentication is taken from the standard ``HF_TOKEN`` / ``HUGGING_FACE_HUB_TOKEN``
+    environment variables (and the local ``~/.cache/huggingface/token`` cache). For
+    multi-node training the token must be available on every node.
+
+    Args:
+        repo_id: HF repository identifier in ``owner/repo`` form.
+        subfolder: Optional subdirectory within the repo to fetch.
+        revision: Optional git revision (branch, tag, or commit SHA).
+
+    Returns:
+        Absolute local directory path containing the snapshot (with ``subfolder`` appended when set).
+    """
+    if not isinstance(repo_id, str) or "/" not in repo_id:
+        raise ValueError(
+            f"expected 'owner/repo' for repo_id, got {repo_id!r}"
+        )
+
+    allow_patterns: Optional[List[str]] = None
+    if subfolder:
+        # Match the subfolder itself plus everything beneath it.
+        allow_patterns = [f"{subfolder}/*", f"{subfolder}/**"]
+
+    local_root = snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        allow_patterns=allow_patterns,
+    )
+
+    if subfolder:
+        local_path = os.path.join(local_root, subfolder)
+        if not os.path.isdir(local_path):
+            raise FileNotFoundError(
+                f"HF snapshot for repo_id={repo_id!r} (revision={revision!r}) did not "
+                f"contain expected subfolder {subfolder!r}; downloaded root={local_root!r}"
+            )
+        return local_path
+
+    return local_root
+
+
+def resolve_checkpoint_path(
+    path: str,
+    accelerator: Optional["Accelerator"] = None,
+) -> str:
+    """
+    Resolve a checkpoint path to a local directory, downloading from HF Hub if needed.
+
+    Resolution order:
+        1. If ``path`` starts with ``hf://``, strip the prefix and force HF download
+           (lets users override a colliding local directory).
+        2. Otherwise, if the expanded local path exists on disk, return it as-is.
+        3. Otherwise, parse as ``owner/repo[/subfolder][@revision]`` and download
+           via Hugging Face Hub.
+
+    Multi-node-safe: when ``accelerator`` is supplied, the download is gated on
+    ``accelerator.is_local_main_process`` (one process per node), then synchronized
+    via ``wait_for_everyone``. On non-shared filesystems each node populates its
+    own HF cache exactly once; on shared filesystems ``huggingface_hub``'s per-blob
+    ``WeakFileLock`` dedupes the concurrent calls so only one node transfers bytes.
+
+    Args:
+        path: Local filesystem path or HF spec (with or without ``hf://`` prefix).
+        accelerator: Optional :class:`accelerate.Accelerator`. When set, gates the
+            download to the per-node main process and synchronizes ranks.
+
+    Returns:
+        Absolute local directory path ready for the existing checkpoint loaders
+        (or upstream loaders such as :func:`load_lora_as_named_parameters`).
 
     Raises:
         TypeError: ``path`` is not a string.
         ValueError: ``path`` is empty.
-        FileNotFoundError: ``path`` is neither an existing local directory nor
-            a well-formed HF Hub repo id (the message names both attempted
+        FileNotFoundError: ``path`` is neither an existing local path nor a
+            reachable Hugging Face Hub repo (the message names both attempted
             interpretations so the user can debug).
     """
     if not isinstance(path, str):
@@ -196,47 +294,40 @@ def resolve_lora_dir(
     if not path:
         raise ValueError("`path` must be a non-empty string, got ''.")
 
-    # 1. Local path always wins (covers both legacy local checkpoints and the
-    # case where a user happens to have a directory literally named `owner/repo`).
-    expanded = os.path.expanduser(path)
-    if os.path.isdir(expanded):
+    force_hf = path.startswith(HF_PATH_PREFIX)
+    spec = path[len(HF_PATH_PREFIX):] if force_hf else path
+    expanded = os.path.expanduser(spec)
+
+    if not force_hf and os.path.exists(expanded):
         return expanded
 
-    # 2. Try Hub repo id.
-    match = _HF_REPO_RE.match(path)
-    if match is None:
-        raise FileNotFoundError(
-            f"could not resolve LoRA path {path!r}: it is neither an existing "
-            f"local directory (looked at {expanded!r}) nor a well-formed Hugging "
-            f"Face Hub repo id (expected `owner/repo` or `owner/repo@revision`, "
-            f"optionally with an `hf://` prefix)."
-        )
-    repo_id, revision = match.group(1), match.group(2)
-
     try:
-        from huggingface_hub import snapshot_download
-    except ImportError as e:
-        raise ImportError(
-            f"resolving HF Hub LoRA {path!r} requires `huggingface_hub`; "
-            f"install it via `pip install huggingface_hub`."
+        repo_id, subfolder, revision = parse_hf_checkpoint_path(spec)
+    except ValueError as e:
+        raise FileNotFoundError(
+            f"could not resolve checkpoint path {path!r}: it is neither an existing "
+            f"local path (looked at {expanded!r}) nor a well-formed Hugging Face Hub "
+            f"repo spec (expected 'owner/repo[/subfolder][@revision]', optionally "
+            f"with an 'hf://' prefix)."
         ) from e
 
     is_local_main = (
         accelerator is None or getattr(accelerator, "is_local_main_process", True)
     )
-
     if is_local_main:
-        snapshot_download(repo_id=repo_id, revision=revision)
+        download_hf_checkpoint(repo_id, subfolder, revision)
     if accelerator is not None:
         accelerator.wait_for_everyone()
-    # All ranks resolve to the cached snapshot dir (download is already complete,
-    # so this is a cheap cache lookup that returns the local path).
-    local_dir = snapshot_download(repo_id=repo_id, revision=revision)
 
-    if not os.path.isdir(local_dir):
+    # Re-call on all ranks; on the populated cache this is a metadata-only lookup.
+    # Narrow re-raise for HF-Hub failure modes so users see a single actionable
+    # message instead of a raw HTTPError.
+    try:
+        return download_hf_checkpoint(repo_id, subfolder, revision)
+    except (RepositoryNotFoundError, HfHubHTTPError) as e:
         raise FileNotFoundError(
-            f"HF Hub snapshot for {path!r} resolved to {local_dir!r}, but that "
-            f"directory does not exist. The download may have been interrupted; "
-            f"check your HF cache (HF_HOME / HUGGINGFACE_HUB_CACHE) and retry."
-        )
-    return local_dir
+            f"checkpoint {path!r} not found locally and could not be fetched from "
+            f"Hugging Face Hub (repo={repo_id!r}, subfolder={subfolder!r}, "
+            f"revision={revision!r}). For private repos, ensure HF_TOKEN is set on "
+            f"ALL nodes."
+        ) from e
