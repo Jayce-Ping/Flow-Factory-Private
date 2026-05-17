@@ -38,6 +38,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from peft import get_peft_model, LoraConfig, PeftModel
 
 from huggingface_hub import split_torch_state_dict_into_shards
+from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from accelerate import Accelerator, DistributedType
 from accelerate.state import PartialState
 from accelerate.utils.modeling import (
@@ -1484,8 +1485,6 @@ class BaseAdapter(ABC):
         Raises:
             FileNotFoundError: When the spec is neither a local path nor a reachable HF repo.
         """
-        from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
-
         force_hf = path.startswith(HF_PATH_PREFIX)
         spec = path[len(HF_PATH_PREFIX):] if force_hf else path
 
