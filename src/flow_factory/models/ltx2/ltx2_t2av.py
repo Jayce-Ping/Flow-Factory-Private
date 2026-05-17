@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Literal, Any, ClassVar, Dict, List, Optional, Union
 
 import torch
 from accelerate import Accelerator
@@ -671,6 +671,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         # SDE control
         noise_level: Optional[float] = None,
         compute_log_prob: bool = True,
+        log_prob_reduction: Literal["mean", "sum"] = "mean",
         return_kwargs: List[str] = ["next_latents", "log_prob", "noise_pred"],
         # LTX-2.3 compatibility
         use_cross_timestep: bool = False,
@@ -726,7 +727,9 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         audio_modality_scale = audio_modality_scale or modality_scale
         audio_guidance_rescale = audio_guidance_rescale or guidance_rescale
 
-        if (guidance_scale > 1.0 or audio_guidance_scale > 1.0) and negative_connector_prompt_embeds is None:
+        if (
+            guidance_scale > 1.0 or audio_guidance_scale > 1.0
+        ) and negative_connector_prompt_embeds is None:
             logger.warning(
                 "Passed `guidance_scale` > 1.0, but no `negative_connector_prompt_embeds` provided. "
                 "Classifier-free guidance will be disabled."
@@ -923,6 +926,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             timestep_next=t_next,
             next_latents=video_next,
             compute_log_prob=compute_log_prob,
+            log_prob_reduction=log_prob_reduction,
             return_dict=True,
             return_kwargs=return_kwargs,
             noise_level=noise_level,

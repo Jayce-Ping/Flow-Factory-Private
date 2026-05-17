@@ -61,6 +61,7 @@ class EvaluationArguments(ArgABC):
         default=10,
         metadata={"help": "Evaluation frequency (in epochs). 0 for no evaluation."},
     )
+
     def __post_init__(self):
         if not self.resolution:
             logger.warning("`resolution` is not set, using default (512, 512).")
@@ -69,26 +70,28 @@ class EvaluationArguments(ArgABC):
             if len(self.resolution) == 1:
                 self.resolution = (self.resolution[0], self.resolution[0])
             elif len(self.resolution) > 2:
-                logger.warning(f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]}).")
+                logger.warning(
+                    f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]})."
+                )
                 self.resolution = (self.resolution[0], self.resolution[1])
             else:  # len == 2
                 self.resolution = (self.resolution[0], self.resolution[1])
         else:  # int
             self.resolution = (self.resolution, self.resolution)
-        
+
         # height/width override
         if self.height is not None and self.resolution[0] != self.height:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
-                    f"Using height to override: ({self.height}, {self.resolution[1]})."
-                )
-                self.resolution = (self.height, self.resolution[1])
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
+                f"Using height to override: ({self.height}, {self.resolution[1]})."
+            )
+            self.resolution = (self.height, self.resolution[1])
         if self.width is not None and self.resolution[1] != self.width:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
-                    f"Using width to override: ({self.resolution[0]}, {self.width})."
-                )
-        
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
+                f"Using width to override: ({self.resolution[0]}, {self.width})."
+            )
+
         # Final assignment
         self.height, self.width = self.resolution
 
@@ -99,6 +102,7 @@ class EvaluationArguments(ArgABC):
 # ============================================================================
 # Training Arguments Base Class
 # ============================================================================
+
 
 @dataclass
 class TrainingArguments(ArgABC):
@@ -117,11 +121,15 @@ class TrainingArguments(ArgABC):
     )
     height: Optional[int] = field(
         default=None,
-        metadata={"help": "Height for sampling and training. If None, use the first element of `resolution`."},
+        metadata={
+            "help": "Height for sampling and training. If None, use the first element of `resolution`."
+        },
     )
     width: Optional[int] = field(
         default=None,
-        metadata={"help": "Width for sampling and training. If None, use the second element of `resolution`."},
+        metadata={
+            "help": "Width for sampling and training. If None, use the second element of `resolution`."
+        },
     )
 
     # --- Sampling and training ---
@@ -236,19 +244,23 @@ class TrainingArguments(ArgABC):
         default="cuda",
         metadata={"help": "Device to store EMA model."},
     )
-    ema_decay_schedule: Literal["constant", "power", "linear", "piecewise_linear", "cosine", "warmup_cosine"] = field(
+    ema_decay_schedule: Literal[
+        "constant", "power", "linear", "piecewise_linear", "cosine", "warmup_cosine"
+    ] = field(
         default="power",
         metadata={"help": "Decay schedule for EMA."},
     )
 
     # --- Latent storage precision ---
-    latent_storage_dtype: Optional[Literal['bf16', 'fp16', 'fp32']] = field(
-        default='fp16',
-        metadata={"help": (
-            "Dtype for storing latents in trajectory. "
-            "Default fp16 uses `float16`. It's recommended to use fp16 for both precision and memory efficiency. "
-            "Options: bf16, fp16, fp32, None (use model-native dtype)."
-        )},
+    latent_storage_dtype: Optional[Literal["bf16", "fp16", "fp32"]] = field(
+        default="fp16",
+        metadata={
+            "help": (
+                "Dtype for storing latents in trajectory. "
+                "Default fp16 uses `float16`. It's recommended to use fp16 for both precision and memory efficiency. "
+                "Options: bf16, fp16, fp32, None (use model-native dtype)."
+            )
+        },
     )
 
     def __post_init__(self):
@@ -260,7 +272,9 @@ class TrainingArguments(ArgABC):
             if len(self.resolution) == 1:
                 self.resolution = (self.resolution[0], self.resolution[0])
             elif len(self.resolution) > 2:
-                logger.warning(f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]}).")
+                logger.warning(
+                    f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]})."
+                )
                 self.resolution = (self.resolution[0], self.resolution[1])
             else:
                 self.resolution = (self.resolution[0], self.resolution[1])
@@ -268,16 +282,16 @@ class TrainingArguments(ArgABC):
             self.resolution = (self.resolution, self.resolution)
 
         if self.height is not None and self.resolution[0] != self.height:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
-                    f"Using height to override: ({self.height}, {self.resolution[1]})."
-                )
-                self.resolution = (self.height, self.resolution[1])
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
+                f"Using height to override: ({self.height}, {self.resolution[1]})."
+            )
+            self.resolution = (self.height, self.resolution[1])
         if self.width is not None and self.resolution[1] != self.width:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
-                    f"Using width to override: ({self.resolution[0]}, {self.width})."
-                )
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
+                f"Using width to override: ({self.resolution[0]}, {self.width})."
+            )
 
         self.height, self.width = self.resolution
 
@@ -293,9 +307,8 @@ class TrainingArguments(ArgABC):
         logger.info("World Size:" + str(world_size))
 
         sample_num_per_iteration = world_size * self.per_device_batch_size
-        self.num_batches_per_epoch = (
-            (self.unique_sample_num_per_epoch * self.group_size)
-            // max(1, sample_num_per_iteration)
+        self.num_batches_per_epoch = (self.unique_sample_num_per_epoch * self.group_size) // max(
+            1, sample_num_per_iteration
         )
         if self.gradient_accumulation_steps == "auto":
             self._manual_gradient_accumulation_steps = False
@@ -315,14 +328,17 @@ class TrainingArguments(ArgABC):
         self.adam_betas = (self.adam_betas[0], self.adam_betas[1])
 
         if self.learning_rate is None:
-            if 'lora' in self.trainer_type.lower():
+            if "lora" in self.trainer_type.lower():
                 self.learning_rate = 1e-4
             else:
                 self.learning_rate = 1e-5
-            logger.info(f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training.")
+            logger.info(
+                f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training."
+            )
 
     def compute_gradient_accumulation_steps(
-        self, num_batches_per_epoch: int,
+        self,
+        num_batches_per_epoch: int,
     ) -> int:
         """Compute gradient accumulation steps (before ×num_train_timesteps).
 
@@ -347,13 +363,13 @@ class TrainingArguments(ArgABC):
     @property
     def requires_ref_model(self) -> bool:
         """Whether the algorithm requires maintaining reference model parameters.
-        
+
         Defaults to True when ``kl_beta`` exists and is positive.
         Subclasses may override for custom semantics (e.g. always False for
         algorithms that never use a reference model, or always True for
         algorithms that need one regardless of KL).
         """
-        return getattr(self, 'kl_beta', 0) > 0.0
+        return getattr(self, "kl_beta", 0) > 0.0
 
     def get_preprocess_guidance_scale(self) -> float:
         """Return the guidance_scale for data preprocessing.
@@ -372,7 +388,7 @@ class TrainingArguments(ArgABC):
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
         return yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False, indent=2)
-    
+
     def __repr__(self) -> str:
         """Same as __str__ for consistency."""
         return self.__str__()
@@ -381,6 +397,7 @@ class TrainingArguments(ArgABC):
 # ============================================================================
 # Algorithm-Specific Subclasses
 # ============================================================================
+
 
 def _standardize_clip_range(value, name: str) -> tuple[float, float]:
     """Convert a scalar or sequence to a symmetric (lo, hi) tuple."""
@@ -400,9 +417,9 @@ def _standardize_timestep_range(value: Union[float, Tuple[float, float]]) -> Tup
         result = (0.0, float(value))
     else:
         result = (float(value[0]), float(value[1]))
-    assert 0 <= result[0] < result[1] <= 1.0, (
-        f"`timestep_range` must satisfy 0 <= start < end <= 1, got {result}"
-    )
+    assert (
+        0 <= result[0] < result[1] <= 1.0
+    ), f"`timestep_range` must satisfy 0 <= start < end <= 1, got {result}"
     return result
 
 
@@ -415,9 +432,11 @@ class GRPOTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo', 'smart_grpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."},
+    advantage_aggregation: Literal["sum", "gdpo", "smart_grpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."
+        },
     )
     # Clipping / KL
     clip_range: tuple[float, float] = field(
@@ -428,9 +447,11 @@ class GRPOTrainingArguments(TrainingArguments):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based', 'x-based'] = field(
-        default='x-based',
-        metadata={"help": "Type of KL divergence. 'v-based': velocity space, 'x-based': latent space."},
+    kl_type: Literal["v-based", "x-based"] = field(
+        default="x-based",
+        metadata={
+            "help": "Type of KL divergence. 'v-based': velocity space, 'x-based': latent space."
+        },
     )
     kl_beta: float = field(
         default=0,
@@ -443,10 +464,12 @@ class GRPOTrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
-        self.clip_range = _standardize_clip_range(self.clip_range, 'clip_range')
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
-        if self.kl_type not in ['v-based', 'x-based']:
-            raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based'].")
+        self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ["v-based", "x-based"]:
+            raise ValueError(
+                f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based']."
+            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         return args.scheduler_args.num_sde_steps
@@ -461,9 +484,11 @@ class NFTTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo', 'smart_grpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."},
+    advantage_aggregation: Literal["sum", "gdpo", "smart_grpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."
+        },
     )
     # NFT core
     nft_beta: float = field(
@@ -480,8 +505,8 @@ class NFTTrainingArguments(TrainingArguments):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based'] = field(
-        default='v-based',
+    kl_type: Literal["v-based"] = field(
+        default="v-based",
         metadata={"help": "Type of KL divergence. NFT defaults to 'v-based'."},
     )
     kl_beta: float = field(
@@ -496,10 +521,14 @@ class NFTTrainingArguments(TrainingArguments):
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
-        metadata={"help": "Total number of training timesteps. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."},
+        metadata={
+            "help": "Total number of training timesteps. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."
+        },
     )
-    time_sampling_strategy: Literal['uniform', 'logit_normal', 'discrete', 'discrete_with_init', 'discrete_wo_init'] = field(
-        default='discrete',
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
         metadata={"help": "Time sampling strategy for training."},
     )
     time_shift: float = field(
@@ -520,10 +549,12 @@ class NFTTrainingArguments(TrainingArguments):
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
 
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])))
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
 
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
-        if self.kl_type not in ['v-based']:
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ["v-based"]:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
 
     def get_num_train_timesteps(self, args: Any) -> int:
@@ -540,9 +571,11 @@ class AWMTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo', 'smart_grpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."},
+    advantage_aggregation: Literal["sum", "gdpo", "smart_grpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."
+        },
     )
     # AWM core
     ema_kl_beta: float = field(
@@ -550,7 +583,7 @@ class AWMTrainingArguments(TrainingArguments):
         metadata={"help": "EMA KL penalty beta for AWM trainer."},
     )
     awm_weighting: str = field(
-        default='Uniform',
+        default="Uniform",
         metadata={"help": "Weighting strategy for AWM."},
     )
     ghuber_power: float = field(
@@ -571,8 +604,8 @@ class AWMTrainingArguments(TrainingArguments):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based'] = field(
-        default='v-based',
+    kl_type: Literal["v-based"] = field(
+        default="v-based",
         metadata={"help": "Type of KL divergence. AWM defaults to 'v-based'."},
     )
     kl_beta: float = field(
@@ -587,10 +620,14 @@ class AWMTrainingArguments(TrainingArguments):
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
-        metadata={"help": "Total number of training timesteps. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."},
+        metadata={
+            "help": "Total number of training timesteps. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."
+        },
     )
-    time_sampling_strategy: Literal['uniform', 'logit_normal', 'discrete', 'discrete_with_init', 'discrete_wo_init'] = field(
-        default='discrete',
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
         metadata={"help": "Time sampling strategy for training."},
     )
     time_shift: float = field(
@@ -611,11 +648,13 @@ class AWMTrainingArguments(TrainingArguments):
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
 
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])))
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
 
-        self.clip_range = _standardize_clip_range(self.clip_range, 'clip_range')
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
-        if self.kl_type not in ['v-based']:
+        self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ["v-based"]:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
 
     def get_num_train_timesteps(self, args: Any) -> int:
@@ -647,14 +686,16 @@ class DPOTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
+        },
     )
 
     # Timestep sampling
-    weighting_scheme: Literal['logit_normal', 'uniform'] = field(
-        default='logit_normal',
+    weighting_scheme: Literal["logit_normal", "uniform"] = field(
+        default="logit_normal",
         metadata={"help": "Timestep sampling distribution for DPO training."},
     )
     logit_mean: float = field(
@@ -669,7 +710,9 @@ class DPOTrainingArguments(TrainingArguments):
     # Timestep control (multi-timestep training)
     num_train_timesteps: int = field(
         default=1,
-        metadata={"help": "Total number of training timesteps per pair. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."},
+        metadata={
+            "help": "Total number of training timesteps per pair. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."
+        },
     )
     time_shift: float = field(
         default=1.0,
@@ -677,16 +720,18 @@ class DPOTrainingArguments(TrainingArguments):
     )
     timestep_range: Union[float, Tuple[float, float]] = field(
         default=0.99,
-        metadata={"help": "Timestep range for training. Float for [0, value], tuple for [start, end]."},
+        metadata={
+            "help": "Timestep range for training. Float for [0, value], tuple for [start, end]."
+        },
     )
 
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(
-                self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])
-            ))
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
 
     @property
     def requires_ref_model(self) -> bool:
@@ -694,7 +739,8 @@ class DPOTrainingArguments(TrainingArguments):
         return True
 
     def compute_gradient_accumulation_steps(
-        self, num_batches_per_epoch: int,
+        self,
+        num_batches_per_epoch: int,
     ) -> int:
         """DPO forms M pairs from M×K samples, distributed evenly across ranks.
 
@@ -732,50 +778,70 @@ class DGPOTrainingArguments(GRPOTrainingArguments):
     )
     clip_dsm: bool = field(
         default=True,
-        metadata={"help": "Whether to apply PPO-style DSM clipping using EMA old-policy predictions."},
+        metadata={
+            "help": "Whether to apply PPO-style DSM clipping using EMA old-policy predictions."
+        },
     )
     clip_kl: bool = field(
         default=False,
-        metadata={"help": "Whether to apply PPO-style clipping to the KL loss using the same ratio-based mask."},
+        metadata={
+            "help": "Whether to apply PPO-style clipping to the KL loss using the same ratio-based mask."
+        },
     )
     switch_ema_ref: int = field(
         default=200,
-        metadata={"help": "After this many optimizer steps, use EMA parameters for sampling instead of current params."},
+        metadata={
+            "help": "After this many optimizer steps, use EMA parameters for sampling instead of current params."
+        },
     )
     off_policy: bool = field(
         default=False,
-        metadata={"help": "Whether to use EMA parameters for sampling from the start (off-policy)."},
+        metadata={
+            "help": "Whether to use EMA parameters for sampling from the start (off-policy)."
+        },
     )
     kl_cfg: float = field(
         default=1.0,
-        metadata={"help": "CFG scale for reference model predictions. >1.0 enables CFG on the frozen ref model."},
+        metadata={
+            "help": "CFG scale for reference model predictions. >1.0 enables CFG on the frozen ref model."
+        },
     )
     use_ema_ref: bool = field(
         default=False,
-        metadata={"help": "Use EMA (old policy) as DGPO loss reference instead of frozen pretrained. Dynamic ref from TDM-R1."},
+        metadata={
+            "help": "Use EMA (old policy) as DGPO loss reference instead of frozen pretrained. Dynamic ref from TDM-R1."
+        },
     )
 
     # Old-policy EMA ref (ema_ref) — a fast-tracking EMA separate from the sampling EMA
     ema_ref_max_decay: float = field(
         default=0.3,
-        metadata={"help": "Maximum decay for old-policy EMA ref. Actual decay is min(ema_ref_max_decay, ema_ref_ramp_rate * step)."},
+        metadata={
+            "help": "Maximum decay for old-policy EMA ref. Actual decay is min(ema_ref_max_decay, ema_ref_ramp_rate * step)."
+        },
     )
     ema_ref_ramp_rate: float = field(
         default=0.001,
-        metadata={"help": "Linear ramp rate for old-policy EMA ref decay. decay(step) = min(max_decay, ramp_rate * step)."},
+        metadata={
+            "help": "Linear ramp rate for old-policy EMA ref decay. decay(step) = min(max_decay, ramp_rate * step)."
+        },
     )
     ema_ref_device: Literal["cpu", "cuda"] = field(
-        default='cuda',
+        default="cuda",
         metadata={"help": "Device for old-policy EMA ref parameters ('cuda' or 'cpu')."},
     )
 
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
-        metadata={"help": "Number of training timesteps per sample. 0 defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."},
+        metadata={
+            "help": "Number of training timesteps per sample. 0 defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."
+        },
     )
-    time_sampling_strategy: Literal['uniform', 'logit_normal', 'discrete', 'discrete_with_init', 'discrete_wo_init'] = field(
-        default='discrete',
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
         metadata={"help": "Strategy for sampling training timesteps."},
     )
     time_shift: float = field(
@@ -784,14 +850,18 @@ class DGPOTrainingArguments(GRPOTrainingArguments):
     )
     timestep_range: Union[float, Tuple[float, float]] = field(
         default=0.6,
-        metadata={"help": "Timestep range for discrete sampling. Float for [0, value], tuple for [start, end]."},
+        metadata={
+            "help": "Timestep range for discrete sampling. Float for [0, value], tuple for [start, end]."
+        },
     )
 
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])))
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         assert self.num_train_timesteps is not None
@@ -876,38 +946,14 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    reinforce_scale_factor: Union[float, Literal["auto"]] = field(
-        default=1.0,
-        metadata={
-            "help": (
-                "Multiplier on `reinforce_loss` applied AFTER `reinforce_coef` to "
-                "compensate for the spatial-mean reduction asymmetry vs paper. "
-                "Background: the scheduler's `log_prob` reduces "
-                "(x-mu)^2 / (2 * sigma^2) via `mean` over spatial dims, "
-                "downweighting the REINFORCE gradient by 1/d (d = per-sample "
-                "latent spatial dim, e.g. C*H*W). `D_k` and `R_bar_{k+1}` also "
-                "use `mean` and inherit the same 1/d. Net result: code's "
-                "pathwise gradient is 1/d * paper, REINFORCE gradient is "
-                "1/d^2 * paper, so the relative pathwise/REINFORCE balance "
-                "differs from paper Eq. 11 by a factor of d (which can be "
-                "tens of thousands for typical image latents). "
-                "1.0 (default): keep current behavior (no compensation). "
-                "'auto': detect d from `next_latents_mean.shape[1:]` on the "
-                "first optimize() call and multiply `reinforce_loss` by d, "
-                "restoring paper's intended pathwise/REINFORCE ratio. "
-                "float >= 0: manual override for partial compensation or "
-                "ablations."
-            )
-        },
-    )
 
     # KL regularization against the pre-trained base model (LoRA-off for LoRA
     # mode; pre-finetune EMA snapshot for full fine-tuning). Disabled by default
     # since OPD's primary signal is the teacher KL D_k, not anchor-to-base
     # regularization; opt in by setting kl_beta > 0 when teachers drift the
     # student far from the base model and you want a leash.
-    kl_type: Literal['v-based', 'x-based'] = field(
-        default='x-based',
+    kl_type: Literal["v-based", "x-based"] = field(
+        default="x-based",
         metadata={
             "help": (
                 "KL space against the pre-trained base. "
@@ -960,24 +1006,9 @@ class OPDTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"`reinforce_coef` must be >= 0, got reinforce_coef={self.reinforce_coef!r}."
             )
-        if isinstance(self.reinforce_scale_factor, (int, float)) and not isinstance(
-            self.reinforce_scale_factor, bool
-        ):
-            if self.reinforce_scale_factor < 0:
-                raise ValueError(
-                    "`reinforce_scale_factor` must be >= 0 (or 'auto'), got "
-                    f"reinforce_scale_factor={self.reinforce_scale_factor!r}."
-                )
-        elif self.reinforce_scale_factor != "auto":
-            raise ValueError(
-                "`reinforce_scale_factor` must be a non-negative float or 'auto', "
-                f"got reinforce_scale_factor={self.reinforce_scale_factor!r}."
-            )
         if self.kl_beta < 0:
-            raise ValueError(
-                f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}."
-            )
-        if self.kl_type not in ['v-based', 'x-based']:
+            raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")
+        if self.kl_type not in ["v-based", "x-based"]:
             raise ValueError(
                 f"Invalid kl_type for OPD: {self.kl_type!r}. "
                 "Valid options are: ['v-based', 'x-based']."
@@ -1169,23 +1200,31 @@ class CRDTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
+        },
     )
 
     # CRD core
     crd_beta: float = field(
         default=1.0,
-        metadata={"help": "Beta scaling for CRD reward matching loss. Controls implicit vs external reward balance."},
+        metadata={
+            "help": "Beta scaling for CRD reward matching loss. Controls implicit vs external reward balance."
+        },
     )
-    crd_loss_type: Literal['mse', 'bce'] = field(
-        default='mse',
-        metadata={"help": "Loss type for CRD reward distillation. 'mse': squared error, 'bce': binary cross-entropy."},
+    crd_loss_type: Literal["mse", "bce"] = field(
+        default="mse",
+        metadata={
+            "help": "Loss type for CRD reward distillation. 'mse': squared error, 'bce': binary cross-entropy."
+        },
     )
     use_old_for_loss: bool = field(
         default=True,
-        metadata={"help": "Use 'old' model snapshot (instead of ref) for implicit reward estimation."},
+        metadata={
+            "help": "Use 'old' model snapshot (instead of ref) for implicit reward estimation."
+        },
     )
     adaptive_logp: bool = field(
         default=True,
@@ -1193,16 +1232,22 @@ class CRDTrainingArguments(TrainingArguments):
     )
     weight_temp: float = field(
         default=-1.0,
-        metadata={"help": "Temperature for softmax weighting of advantages in CRD. Negative means uniform (inf temp)."},
+        metadata={
+            "help": "Temperature for softmax weighting of advantages in CRD. Negative means uniform (inf temp)."
+        },
     )
     # Decay schedules for model snapshots
     old_model_decay: str = field(
         default="0-0.25-0.005-0.999",
-        metadata={"help": "Decay schedule for old model blending: 'start_step-start_value-slope-end_value' or preset name."},
+        metadata={
+            "help": "Decay schedule for old model blending: 'start_step-start_value-slope-end_value' or preset name."
+        },
     )
     sampling_model_decay: Union[str, int] = field(
         default="75-0.0-0.0075-0.999",
-        metadata={"help": "Decay schedule for sampling model blending. Same format as old_model_decay, or int preset."},
+        metadata={
+            "help": "Decay schedule for sampling model blending. Same format as old_model_decay, or int preset."
+        },
     )
 
     # Clipping / KL
@@ -1210,8 +1255,8 @@ class CRDTrainingArguments(TrainingArguments):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based'] = field(
-        default='v-based',
+    kl_type: Literal["v-based"] = field(
+        default="v-based",
         metadata={"help": "Type of KL divergence. CRD uses 'v-based' (velocity space)."},
     )
     kl_beta: float = field(
@@ -1241,10 +1286,14 @@ class CRDTrainingArguments(TrainingArguments):
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
-        metadata={"help": "Number of training timesteps. 0 = auto from num_inference_steps * timestep_range."},
+        metadata={
+            "help": "Number of training timesteps. 0 = auto from num_inference_steps * timestep_range."
+        },
     )
-    time_sampling_strategy: Literal['uniform', 'logit_normal', 'discrete', 'discrete_with_init', 'discrete_wo_init'] = field(
-        default='discrete',
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
         metadata={"help": "Time sampling strategy for training."},
     )
     time_shift: float = field(
@@ -1262,11 +1311,11 @@ class CRDTrainingArguments(TrainingArguments):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(
-                self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])
-            ))
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
-        if self.kl_type not in ['v-based']:
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ["v-based"]:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
 
     @property
@@ -1282,31 +1331,32 @@ class CRDTrainingArguments(TrainingArguments):
         """Account for kl_cfg: ref model may need CFG even when sampling does not."""
         return max(self.guidance_scale, self.kl_cfg)
 
+
 # ============================================================================
 # Training Arguments Registry
 # ============================================================================
 
 _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
-    'grpo': GRPOTrainingArguments,
-    'grpo-guard': GRPOTrainingArguments,
-    'nft': NFTTrainingArguments,
-    'awm': AWMTrainingArguments,
-    'dgpo': DGPOTrainingArguments,
-    'dpo': DPOTrainingArguments,
-    'crd': CRDTrainingArguments,
-    'opd': OPDTrainingArguments,
-    'opd-ode': OPDODETrainingArguments,
+    "grpo": GRPOTrainingArguments,
+    "grpo-guard": GRPOTrainingArguments,
+    "nft": NFTTrainingArguments,
+    "awm": AWMTrainingArguments,
+    "dgpo": DGPOTrainingArguments,
+    "dpo": DPOTrainingArguments,
+    "crd": CRDTrainingArguments,
+    "opd": OPDTrainingArguments,
+    "opd-ode": OPDODETrainingArguments,
 }
 
 
 def get_training_args_class(identifier: str) -> Type[TrainingArguments]:
     """
     Resolve the TrainingArguments subclass for a given trainer type.
-    
+
     Supports:
     1. Registry lookup: 'grpo' -> GRPOTrainingArguments
     2. Direct python path: 'my_package.hparams.CustomTrainingArgs' -> CustomTrainingArgs
-    
+
     Falls back to base TrainingArguments if lookup fails.
     """
     identifier_lower = identifier.lower()
@@ -1316,7 +1366,7 @@ def get_training_args_class(identifier: str) -> Type[TrainingArguments]:
 
     # Try dynamic import (python path like 'my_package.args.CustomArgs')
     try:
-        module_path, class_name = identifier.rsplit('.', 1)
+        module_path, class_name = identifier.rsplit(".", 1)
         module = importlib.import_module(module_path)
         cls = getattr(module, class_name)
         if isinstance(cls, type) and issubclass(cls, TrainingArguments):

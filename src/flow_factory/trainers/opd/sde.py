@@ -92,15 +92,6 @@ class OPDTrainer(BaseTrainer):
         self.num_train_timesteps = self.adapter.scheduler.num_sde_steps
         self.pathwise_coef = self.training_args.pathwise_coef
         self.reinforce_coef = self.training_args.reinforce_coef
-        # `reinforce_scale_factor` compensates for the spatial-mean reduction's
-        # asymmetric downweighting of the REINFORCE term vs the paper's
-        # `||.||^2` (sum) convention. 1.0 (default) keeps current behavior;
-        # 'auto' detects `d = prod(latent_shape[1:])` on first optimize() use
-        # and multiplies `reinforce_loss` by `d` to restore paper's
-        # pathwise/REINFORCE relative balance. See the field's metadata in
-        # `OPDTrainingArguments` for the full derivation.
-        self.reinforce_scale_factor = self.training_args.reinforce_scale_factor
-        self._resolved_reinforce_scale: Optional[float] = None
         self.teacher_aggregation = self.training_args.teacher_aggregation
 
         # Sanity check: warn (do not hard-error) when the configured loss
@@ -326,45 +317,6 @@ class OPDTrainer(BaseTrainer):
             self.log_data(log_data, step=self.step)
 
     # =========================== Optimization ============================
-    def _resolve_reinforce_scale(self, mu_student: torch.Tensor) -> float:
-        """Resolve `reinforce_scale_factor` on first use, then cache.
-
-        - ``'auto'`` -> ``prod(mu_student.shape[1:])`` (per-sample latent
-          spatial dim ``d``). Restores paper Eq. 11's pathwise/REINFORCE
-          relative balance under the spatial-mean reduction used in
-          :meth:`_compute_per_step_kl` and ``scheduler.step``'s ``log_prob``
-          (which downweight code's REINFORCE gradient by ``1/d^2`` and
-          pathwise gradient by ``1/d`` vs the paper's ``||.||^2`` sum
-          convention).
-        - ``float`` -> returned as-is.
-
-        Idempotent: cached in ``self._resolved_reinforce_scale`` after the
-        first call so subsequent timesteps pay zero cost.
-        """
-        if self._resolved_reinforce_scale is not None:
-            return self._resolved_reinforce_scale
-
-        if self.reinforce_scale_factor == "auto":
-            spatial_shape = tuple(int(s) for s in mu_student.shape[1:])
-            scale = 1.0
-            for s in spatial_shape:
-                scale *= float(s)
-            logger.info(
-                f"OPDTrainer: reinforce_scale_factor='auto' resolved to d={scale!r} "
-                f"from next_latents_mean.shape[1:]={spatial_shape} "
-                "(restores paper's pathwise/REINFORCE relative balance)."
-            )
-        else:
-            scale = float(self.reinforce_scale_factor)
-            if scale != 1.0:
-                logger.info(
-                    f"OPDTrainer: reinforce_scale_factor={scale!r} (manual override; "
-                    "default 1.0 corresponds to the codebase's spatial-mean convention)."
-                )
-
-        self._resolved_reinforce_scale = scale
-        return scale
-
     def _build_forward_kwargs(
         self,
         batch: Dict[str, Any],
@@ -399,6 +351,8 @@ class OPDTrainer(BaseTrainer):
             self._forward_accepts_var_kwargs,
         )
         forward_kwargs["return_kwargs"] = return_kwargs
+        if compute_log_prob:
+            forward_kwargs["log_prob_reduction"] = "sum"
         return forward_kwargs
 
     def _teacher_next_latents_mean(
@@ -436,18 +390,13 @@ class OPDTrainer(BaseTrainer):
         std_dev_t: torch.Tensor,
         dt: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute ``D_k = mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` per batch sample.
+        """Compute ``D_k = sum(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` per batch sample.
 
         ``sigma_bar^2 = std_dev_t^2 * (-dt)`` follows the Flow-SDE
         discretisation (see Appendix B of the Flow-OPD paper).
 
-        The spatial reduction of ``(mu_s - mu_t)^2`` uses ``mean`` over the
-        non-batch dimensions (matching GRPO's reduction convention in
-        ``kl_div`` -- see ``trainers/grpo.py``); the OPD-specific
-        ``sigma_bar^2`` divisor has no GRPO analogue. The resulting
-        per-sample scalar is proportional to the analytical ``D_k`` up to a
-        fixed ``(spatial_dims)`` factor that is absorbed into the learning
-        rate.
+        Spatial reduction uses ``sum`` over non-batch dimensions (Frobenius
+        norm squared / factorized Gaussian KL convention in Flow-OPD Eq. 11).
         """
         if mu_student.shape != mu_teacher.shape:
             raise ValueError(
@@ -457,7 +406,7 @@ class OPDTrainer(BaseTrainer):
             )
 
         diff_sq = (mu_student.float() - mu_teacher.float()) ** 2
-        diff_sq = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
+        diff_sq = diff_sq.sum(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
 
         # `std_dev_t` and `dt` are produced by the Flow-SDE scheduler in shape
         # `(B, 1, 1)` (per-sample scalars broadcast across spatial dims), so a
@@ -791,11 +740,7 @@ class OPDTrainer(BaseTrainer):
 
                     pathwise_loss = d_k_grad.mean()
                     reinforce_loss = (r_kp1 * log_prob_new).mean()
-                    reinforce_scale = self._resolve_reinforce_scale(student_out.next_latents_mean)
-                    loss = (
-                        self.pathwise_coef * pathwise_loss
-                        + self.reinforce_coef * reinforce_scale * reinforce_loss
-                    )
+                    loss = self.pathwise_coef * pathwise_loss + self.reinforce_coef * reinforce_loss
 
                     if self.enable_kl_loss:
                         kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
@@ -807,9 +752,6 @@ class OPDTrainer(BaseTrainer):
                     loss_info["r_bar"].append(r_kp1.mean().detach())
                     loss_info["log_prob"].append(log_prob_new.mean().detach())
                     loss_info["reinforce_loss"].append(reinforce_loss.detach())
-                    loss_info["reinforce_scale"].append(
-                        torch.as_tensor(reinforce_scale, device=loss.device)
-                    )
                     loss_info["loss"].append(loss.detach())
 
                     self.accelerator.backward(loss)
