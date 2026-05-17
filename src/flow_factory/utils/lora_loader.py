@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, List, Union
 
 import torch
 
+from .checkpoint import resolve_lora_dir
 from .logger_utils import setup_logger
 
 if TYPE_CHECKING:
@@ -59,10 +60,15 @@ def load_lora_as_named_parameters(
         name: Identifier for the resulting snapshot. Reused as the key for
             :meth:`BaseAdapter.use_named_parameters`. Overwrites any existing
             entry with the same name.
-        lora_path: Filesystem path to the teacher LoRA checkpoint, in the
-            exact layout produced by :meth:`BaseAdapter.save_checkpoint`
-            (a single component directory, or one subdirectory per component
-            when ``len(target_components) > 1``).
+        lora_path: Where to load the teacher LoRA from. Either:
+            - A local filesystem path in the exact layout produced by
+              :meth:`BaseAdapter.save_checkpoint` (a single component directory,
+              or one subdirectory per component when
+              ``len(target_components) > 1``); OR
+            - A Hugging Face Hub repo id of the form ``owner/repo`` or
+              ``owner/repo@revision`` (optionally with an ``hf://`` URL
+              prefix), which is downloaded transparently via
+              :func:`~flow_factory.utils.checkpoint.resolve_lora_dir`.
         device: Storage device for the snapshot tensors. ``"cpu"`` minimizes
             VRAM at the cost of an H2D copy on every swap; ``"cuda"`` keeps
             the snapshot on-device and is faster but uses LoRA-sized VRAM
@@ -71,8 +77,9 @@ def load_lora_as_named_parameters(
     Raises:
         ValueError: The adapter is not in LoRA mode, or no trainable LoRA
             parameters were found after loading.
-        FileNotFoundError: ``lora_path`` (or any per-component subpath) does
-            not exist.
+        FileNotFoundError: ``lora_path`` is neither an existing local directory
+            nor a well-formed Hugging Face Hub repo id, or any per-component
+            subpath under the resolved local directory does not exist.
     """
     if adapter.model_args.finetune_type != "lora":
         raise ValueError(
@@ -89,11 +96,11 @@ def load_lora_as_named_parameters(
             f"with non-empty modules in target_module_map={adapter.target_module_map!r}."
         )
 
-    if not os.path.exists(lora_path):
-        raise FileNotFoundError(
-            f"Teacher LoRA path does not exist: {lora_path!r} "
-            f"(expected layout: directory written by BaseAdapter.save_checkpoint)."
-        )
+    # Accepts either a local directory written by BaseAdapter.save_checkpoint OR
+    # a Hugging Face Hub repo id (`owner/repo[@revision]`, optional `hf://` prefix).
+    # Downloads from the Hub are gated to the local main process and synchronized
+    # across ranks via the accelerator barrier.
+    lora_path = resolve_lora_dir(lora_path, accelerator=adapter.accelerator)
     if len(target_components) > 1:
         for comp in target_components:
             sub = os.path.join(lora_path, comp)

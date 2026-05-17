@@ -58,6 +58,7 @@ from ..utils.checkpoint import (
     mapping_lora_state_dict,
     infer_lora_config,
     infer_target_modules,
+    resolve_lora_dir,
 )
 from ..samples import BaseSample
 from ..ema import EMAModuleWrapper
@@ -1474,7 +1475,15 @@ class BaseAdapter(ABC):
         return state_dict
 
     def _load_lora(self, path: str) -> None:
-        """Load LoRA adapters for target components with auto-format detection."""
+        """Load LoRA adapters for target components with auto-format detection.
+
+        Accepts either a local directory written by :meth:`save_checkpoint` or a
+        Hugging Face Hub repo id (``owner/repo`` / ``owner/repo@revision``,
+        optionally with an ``hf://`` URL prefix). Hub repos are downloaded once
+        on the local main process and reused by other ranks via the accelerator
+        barrier; see :func:`flow_factory.utils.checkpoint.resolve_lora_dir`.
+        """
+        path = resolve_lora_dir(path, accelerator=self.accelerator)
         for comp_name in self.model_args.target_components:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")

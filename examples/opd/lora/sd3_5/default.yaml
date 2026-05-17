@@ -10,6 +10,10 @@
 #     (i.e. by any prior Flow-Factory LoRA run on the same base model). All
 #     teachers MUST share the student's LoRA rank/alpha so their weights can
 #     load into the student's adapter slot.
+#   - Each `teacher_paths` entry can be either a local directory or a Hugging
+#     Face Hub repo id (`owner/repo` or `owner/repo@revision`, optionally with
+#     an `hf://` URL prefix). Hub repos are downloaded once on the local main
+#     process via `huggingface_hub.snapshot_download` and reused by other ranks.
 #
 # OPD does not consume external reward models; `rewards: []` keeps the
 # reward / advantage stages as a no-op.
@@ -56,10 +60,15 @@ train:
   trainer_type: 'opd'
 
   # ---- OPD-specific ----
-  # Paths to teacher LoRA checkpoints (saved by `BaseAdapter.save_checkpoint`).
+  # Paths to teacher LoRA checkpoints. Accepts either:
+  #   - Local directories written by `BaseAdapter.save_checkpoint()`, OR
+  #   - Hugging Face Hub repo ids: "owner/repo" / "owner/repo@revision"
+  #     (auto-downloaded; local paths are checked first when both could match).
   # Each entry is one teacher; with >1 entry, OPD distills the entire set.
   teacher_paths:
-    - "jieliu/SD3.5M-FlowGRPO-Text"
+    - "jieliu/SD3.5M-FlowGRPO-Text"      # HF Hub repo id (auto-downloaded)
+    # - "/path/to/local/lora_dir"          # local directory
+    # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).

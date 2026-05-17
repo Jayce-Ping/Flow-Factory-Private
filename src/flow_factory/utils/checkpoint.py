@@ -21,9 +21,12 @@ import re
 import glob
 import json
 import torch
-from typing import Dict, Optional, List, Tuple, Literal
+from typing import Dict, Optional, List, Tuple, Literal, TYPE_CHECKING
 
 from safetensors.torch import save_file, load_file
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
 
 def mapping_lora_state_dict(
         state_dict: Dict[str, torch.Tensor],
@@ -138,3 +141,102 @@ def infer_target_modules(
             target_modules.add(match.group(1))
     
     return sorted(target_modules)
+
+
+# ============================ LoRA Path Resolution ============================
+# `owner/repo` or `owner/repo@revision` (with optional `hf://` URL prefix).
+# - owner: word chars + `-`
+# - repo:  word chars + `.` `-` (HF allows dots in repo names, e.g. SD3.5M-Flow)
+# - revision (optional): word chars + `.` `-` `/` (branches, tags, commits)
+_HF_REPO_RE = re.compile(r"^(?:hf://)?([\w\-]+/[\w.\-]+)(?:@([\w.\-/]+))?$")
+
+
+def resolve_lora_dir(
+    path: str,
+    *,
+    accelerator: Optional["Accelerator"] = None,
+) -> str:
+    """Resolve a LoRA path to a local directory, downloading from HF Hub if needed.
+
+    Accepted forms:
+      - **Existing local directory** (after ``os.path.expanduser``): returned
+        as-is. This is the legacy form and is checked first, so a local path
+        always wins over a same-named Hub repo.
+      - **Hugging Face Hub repo id** matching ``owner/repo`` or
+        ``owner/repo@revision`` (optionally with an ``hf://`` URL prefix):
+        downloaded via :func:`huggingface_hub.snapshot_download` and the
+        snapshot directory is returned. The HF cache dir is used as-is
+        (respects ``HF_HOME`` / ``HUGGINGFACE_HUB_CACHE``).
+
+    Distributed safety:
+        When ``accelerator`` is supplied, only ``accelerator.is_local_main_process``
+        performs the download, then all ranks ``wait_for_everyone()`` and call
+        ``snapshot_download`` again to obtain the local path from cache. This
+        avoids N concurrent downloads writing to the same cache directory.
+
+    Args:
+        path: A local directory path OR a Hub repo id (with optional revision).
+        accelerator: Optional :class:`accelerate.Accelerator`. When set, the
+            download is gated to the local main process and synchronized.
+
+    Returns:
+        Absolute local directory path that exists on disk.
+
+    Raises:
+        TypeError: ``path`` is not a string.
+        ValueError: ``path`` is empty.
+        FileNotFoundError: ``path`` is neither an existing local directory nor
+            a well-formed HF Hub repo id (the message names both attempted
+            interpretations so the user can debug).
+    """
+    if not isinstance(path, str):
+        raise TypeError(
+            f"expected str for `path`, got {type(path).__name__}: {path!r}"
+        )
+    if not path:
+        raise ValueError("`path` must be a non-empty string, got ''.")
+
+    # 1. Local path always wins (covers both legacy local checkpoints and the
+    # case where a user happens to have a directory literally named `owner/repo`).
+    expanded = os.path.expanduser(path)
+    if os.path.isdir(expanded):
+        return expanded
+
+    # 2. Try Hub repo id.
+    match = _HF_REPO_RE.match(path)
+    if match is None:
+        raise FileNotFoundError(
+            f"could not resolve LoRA path {path!r}: it is neither an existing "
+            f"local directory (looked at {expanded!r}) nor a well-formed Hugging "
+            f"Face Hub repo id (expected `owner/repo` or `owner/repo@revision`, "
+            f"optionally with an `hf://` prefix)."
+        )
+    repo_id, revision = match.group(1), match.group(2)
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise ImportError(
+            f"resolving HF Hub LoRA {path!r} requires `huggingface_hub`; "
+            f"install it via `pip install huggingface_hub`."
+        ) from e
+
+    is_local_main = (
+        accelerator is None or getattr(accelerator, "is_local_main_process", True)
+    )
+
+    if is_local_main:
+        snapshot_download(repo_id=repo_id, revision=revision)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    # All ranks resolve to the cached snapshot dir (download is already complete,
+    # so this is a cheap cache lookup that returns the local path).
+    local_dir = snapshot_download(repo_id=repo_id, revision=revision)
+
+    if not os.path.isdir(local_dir):
+        raise FileNotFoundError(
+            f"HF Hub snapshot for {path!r} resolved to {local_dir!r}, but that "
+            f"directory does not exist. The download may have been interrupted; "
+            f"check your HF cache (HF_HOME / HUGGINGFACE_HUB_CACHE) and retry."
+        )
+    return local_dir
