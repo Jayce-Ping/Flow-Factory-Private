@@ -608,7 +608,7 @@ class OPDODETrainer(BaseTrainer):
                             # Teacher: noise_pred at the SAME x (frozen params, input-grad on).
                             v_teacher = self._teacher_velocity(x, t, t_next, batch, teacher_indices)
 
-                            # D_j = (dt^2 / 2) * mean((v_s - v_t)^2) per sample.
+                            # D_j = (dt^2 / 2) * sum((v_s - v_t)^2) per sample (Frobenius norm).
                             dt_sq = dt_scalar.float().pow(2)
                             d_j = (
                                 0.5
@@ -616,7 +616,7 @@ class OPDODETrainer(BaseTrainer):
                                 * (v_student.float() - v_teacher.float())
                                 .pow(2)
                                 .flatten(1)
-                                .mean(dim=1)
+                                .sum(dim=1)
                             )
                             loss = loss + self.pathwise_coef * d_j.mean()
                             loss_info["d_j"].append(d_j.mean().detach())
