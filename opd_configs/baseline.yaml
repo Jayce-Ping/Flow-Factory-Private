@@ -1,0 +1,160 @@
+# On-Policy Distillation (OPD) — SD3.5 LoRA example.
+# Implements the SDE-regime REINFORCE form (Eq. 11) of the Flow-OPD paper:
+#   grad L = E_tau[ sum_k grad D_k + sum_k R_bar_{k+1} grad log p_theta ]
+# where D_k is the per-step Gaussian KL between student and a frozen LoRA
+# teacher, and R_bar_{k+1} = sum_{j>k} D_j is the closed-form cumulative
+# future KL (treated as a stop-gradient constant in the REINFORCE term).
+#
+# Required prerequisites (see `train.teacher_paths` below):
+#   - One or more LoRA checkpoints produced by `BaseAdapter.save_checkpoint()`
+#     (i.e. by any prior Flow-Factory LoRA run on the same base model). All
+#     teachers MUST share the student's LoRA rank/alpha so their weights can
+#     load into the student's adapter slot.
+#
+# OPD does not consume external reward models; `rewards: []` keeps the
+# reward / advantage stages as a no-op.
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+num_processes: 8  # Number of processes to launch (overrides config file)
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/ocr"  # Path to dataset folder
+  preprocessing_batch_size: 8  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset
+  cache_dir: "~/.cache/flow_factory/datasets"  # Cache directory for preprocessed datasets
+  max_dataset_size: 1024  # Limit the maximum number of samples in the dataset
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+
+# Model Configuration
+model:
+  finetune_type: 'lora'  # OPD requires LoRA for the multi-teacher swap mechanism.
+  lora_rank: 32           # Must match the rank of every teacher in `teacher_paths`.
+  lora_alpha: 64          # Must match the alpha of every teacher in `teacher_paths`.
+  target_modules: "default"  # Options: all, default, or list of module names
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory-OPD"
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+# Training Configuration
+train:
+  # ---- Trainer selection ----
+  trainer_type: 'opd'
+
+  # ---- OPD-specific ----
+  # Paths to teacher LoRA checkpoints. Accepts either:
+  #   - Local directories written by `BaseAdapter.save_checkpoint()`, OR
+  #   - Hugging Face Hub repo ids: "owner/repo" / "owner/repo@revision"
+  #     (auto-downloaded; local paths are checked first when both could match).
+  # Each entry is one teacher; with >1 entry, OPD distills the entire set.
+  teacher_paths:
+    - "jieliu/SD3.5M-FlowGRPO-Text"      # HF Hub repo id (auto-downloaded)
+    # - "/path/to/local/lora_dir"          # local directory
+    # - "owner/repo@v1.0.0"                # pinned revision
+  teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
+  teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
+  reinforce_coef: 0.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).
+
+  # ---- KL anchor to the pre-trained base model ----
+  # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
+  # active LoRA adapter (exposing the base); for full fine-tuning it uses an
+  # EMA snapshot of original weights. 0 disables the KL term.
+  kl_beta: 0.0                           # KL penalty against pre-trained base. x-based: typical ~1; v-based: typical 1e-4..1e-2.
+  kl_type: 'x-based'                     # Options: x-based (same-variance Gaussian KL on next_latents_mean; same scale as D_k), v-based (MSE on noise_pred; GRPO-style)
+
+  # ---- Sampling settings ----
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.5
+
+  # ---- Batch / sampling geometry ----
+  per_device_batch_size: 8
+  group_size: 1                          # OPD does not group by prompt; reward/advantage stages are no-ops.
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  num_inner_epochs: 1                    # Recommended for on-policy correctness (no IS ratio in this PR).
+
+  # ---- Optimization ----
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # ---- EMA ----
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # ---- Misc ----
+  enable_gradient_checkpointing: false
+  seed: 42
+
+# Scheduler Configuration
+# OPD-SDE requires SDE dynamics; training timesteps come from the SDE step pool.
+# To match the paper's "sum over all N transitions" exactly, leave `sde_steps`
+# null (== arange(0, N-1)) and set `num_sde_steps` equal to `num_inference_steps - 1`.
+scheduler:
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS. (ODE not supported by OPD-SDE.)
+  noise_level: 0.8
+  num_sde_steps: null        # null -> use the full sde_steps pool (paper-faithful)
+  sde_steps: null            # null -> arange(0, num_inference_steps - 1)
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 4.5
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+
+# Reward Model Configuration
+# OPD derives its dense reward signal from the teacher KL (D_k); no external
+# reward model is required. Adding entries here only logs auxiliary rewards
+# (see `OPDTrainer.prepare_feedback`); they are NOT consumed by `optimize()`.
+rewards:
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+
+# Optional Evaluation Reward Models — same note as above. Add a PickScore /
+# CLIP entry here if you want to track downstream metrics during evaluation.
+eval_rewards:
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
