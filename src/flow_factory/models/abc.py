@@ -1491,6 +1491,10 @@ class BaseAdapter(ABC):
         Raises:
             FileNotFoundError: When the spec is neither a local path nor a reachable HF repo.
         """
+        # Normalize leading ``~`` for local-path inputs; no-op for HF specs since
+        # ``expanduser`` only acts on a leading ``~``.
+        path = os.path.expanduser(path)
+
         force_hf = path.startswith(HF_PATH_PREFIX)
         spec = path[len(HF_PATH_PREFIX):] if force_hf else path
 
@@ -1741,7 +1745,6 @@ class BaseAdapter(ABC):
                 - 'state': Load full training state (model + optimizer + scheduler + RNG)
                 - None: Auto-detect based on checkpoint directory contents
         """
-        path = os.path.expanduser(path)
         path = self._resolve_checkpoint_path(path)
         if not os.path.exists(path):
             raise FileNotFoundError(
