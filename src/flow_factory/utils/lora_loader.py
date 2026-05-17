@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, List, Union
 
 import torch
 
-from .checkpoint import resolve_checkpoint_path
 from .logger_utils import setup_logger
 
 if TYPE_CHECKING:
@@ -68,7 +67,7 @@ def load_lora_as_named_parameters(
             - A Hugging Face Hub spec of the form
               ``owner/repo[/subfolder][@revision]`` (optionally with an
               ``hf://`` URL prefix), which is downloaded transparently via
-              :func:`~flow_factory.utils.checkpoint.resolve_checkpoint_path`.
+              :meth:`~flow_factory.models.abc.BaseAdapter._resolve_checkpoint_path`.
         device: Storage device for the snapshot tensors. ``"cpu"`` minimizes
             VRAM at the cost of an H2D copy on every swap; ``"cuda"`` keeps
             the snapshot on-device and is faster but uses LoRA-sized VRAM
@@ -98,9 +97,9 @@ def load_lora_as_named_parameters(
 
     # Accepts either a local directory written by BaseAdapter.save_checkpoint OR
     # a Hugging Face Hub spec ('owner/repo[/subfolder][@revision]', optional
-    # 'hf://' prefix). Downloads from the Hub are gated to the local main process
-    # and synchronized across ranks via the accelerator barrier.
-    lora_path = resolve_checkpoint_path(lora_path, accelerator=adapter.accelerator)
+    # 'hf://' prefix). Multi-node download dedup is handled by HF Hub's per-blob
+    # WeakFileLock (see BaseAdapter._resolve_checkpoint_path docstring).
+    lora_path = adapter._resolve_checkpoint_path(lora_path)
     if len(target_components) > 1:
         for comp in target_components:
             sub = os.path.join(lora_path, comp)
