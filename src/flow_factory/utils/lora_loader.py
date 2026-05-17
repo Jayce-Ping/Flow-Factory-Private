@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, List, Union
 
 import torch
 
-from .checkpoint import resolve_lora_dir
+from .checkpoint import resolve_checkpoint_path
 from .logger_utils import setup_logger
 
 if TYPE_CHECKING:
@@ -65,10 +65,10 @@ def load_lora_as_named_parameters(
               :meth:`BaseAdapter.save_checkpoint` (a single component directory,
               or one subdirectory per component when
               ``len(target_components) > 1``); OR
-            - A Hugging Face Hub repo id of the form ``owner/repo`` or
-              ``owner/repo@revision`` (optionally with an ``hf://`` URL
-              prefix), which is downloaded transparently via
-              :func:`~flow_factory.utils.checkpoint.resolve_lora_dir`.
+            - A Hugging Face Hub spec of the form
+              ``owner/repo[/subfolder][@revision]`` (optionally with an
+              ``hf://`` URL prefix), which is downloaded transparently via
+              :func:`~flow_factory.utils.checkpoint.resolve_checkpoint_path`.
         device: Storage device for the snapshot tensors. ``"cpu"`` minimizes
             VRAM at the cost of an H2D copy on every swap; ``"cuda"`` keeps
             the snapshot on-device and is faster but uses LoRA-sized VRAM
@@ -97,10 +97,10 @@ def load_lora_as_named_parameters(
         )
 
     # Accepts either a local directory written by BaseAdapter.save_checkpoint OR
-    # a Hugging Face Hub repo id (`owner/repo[@revision]`, optional `hf://` prefix).
-    # Downloads from the Hub are gated to the local main process and synchronized
-    # across ranks via the accelerator barrier.
-    lora_path = resolve_lora_dir(lora_path, accelerator=adapter.accelerator)
+    # a Hugging Face Hub spec ('owner/repo[/subfolder][@revision]', optional
+    # 'hf://' prefix). Downloads from the Hub are gated to the local main process
+    # and synchronized across ranks via the accelerator barrier.
+    lora_path = resolve_checkpoint_path(lora_path, accelerator=adapter.accelerator)
     if len(target_components) > 1:
         for comp in target_components:
             sub = os.path.join(lora_path, comp)
