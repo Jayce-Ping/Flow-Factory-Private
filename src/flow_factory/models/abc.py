@@ -38,6 +38,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from peft import get_peft_model, LoraConfig, PeftModel
 
 from huggingface_hub import split_torch_state_dict_into_shards
+from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from accelerate import Accelerator, DistributedType
 from accelerate.state import PartialState
 from accelerate.utils.modeling import (
@@ -58,7 +59,9 @@ from ..utils.checkpoint import (
     mapping_lora_state_dict,
     infer_lora_config,
     infer_target_modules,
-    resolve_checkpoint_path,
+    parse_hf_checkpoint_path,
+    download_hf_checkpoint,
+    HF_PATH_PREFIX,
 )
 from ..samples import BaseSample
 from ..ema import EMAModuleWrapper
@@ -1456,6 +1459,74 @@ class BaseAdapter(ABC):
             logger.info(f"Checkpoint saved successfully to {save_directory}")
 
     # -------------------------------------------- Load -------------------------------------------
+    def _resolve_checkpoint_path(self, path: str) -> str:
+        """
+        Resolve `path` to a local directory, downloading from Hugging Face Hub when needed.
+
+        Resolution order:
+            1. If `path` starts with ``hf://``, strip the prefix and force HF download
+               (lets users override a colliding local directory).
+            2. Otherwise, if `path` exists locally, return it as-is.
+            3. Otherwise, parse as ``owner/repo[/subfolder][@revision]`` and download
+               via Hugging Face Hub.
+
+        Multi-node-safe: all ranks call ``snapshot_download`` directly. Hugging
+        Face Hub's per-blob ``WeakFileLock`` serializes concurrent calls within
+        each filesystem domain (cross-node on POSIX-locking shared FS, per-node
+        on non-shared FS), so exactly one rank per filesystem domain actually
+        transfers bytes. Un-gated (rather than ``is_local_main_process`` plus a
+        barrier) so a failed download raises uniformly on every affected rank
+        instead of leaving siblings deadlocked at a barrier the failing rank
+        never reaches. Residual hazard: a rare single-rank transient failure
+        (e.g. one node's network blip) can produce asymmetric progress, in
+        which case the surviving ranks will eventually trip the NCCL watchdog
+        on the final barrier below.
+
+        Args:
+            path: Local filesystem path or HF spec (with or without ``hf://`` prefix).
+
+        Returns:
+            Absolute local directory path ready for the existing checkpoint loaders.
+
+        Raises:
+            FileNotFoundError: When the spec is neither a local path nor a reachable HF repo.
+        """
+        # Normalize leading ``~`` for local-path inputs; no-op for HF specs since
+        # ``expanduser`` only acts on a leading ``~``.
+        path = os.path.expanduser(path)
+        force_hf = path.startswith(HF_PATH_PREFIX)
+
+        # Local path wins unless an explicit ``hf://`` prefix forces remote.
+        if not force_hf and os.path.exists(path):
+            return path
+
+        # ``parse_hf_checkpoint_path`` handles the ``hf://`` prefix internally.
+        repo_id, subfolder, revision = parse_hf_checkpoint_path(path)
+
+        try:
+            local_path = download_hf_checkpoint(repo_id, subfolder, revision)
+        except (RepositoryNotFoundError, HfHubHTTPError) as e:
+            raise FileNotFoundError(
+                f"Checkpoint {path!r} not found locally and could not be fetched "
+                f"from Hugging Face Hub (repo={repo_id!r}, subfolder={subfolder!r}, "
+                f"revision={revision!r}). For private repos, ensure HF_TOKEN is set "
+                f"on ALL nodes."
+            ) from e
+
+        # Sync after download so downstream loaders enter the lockstep dispatch
+        # together. On symmetric failure every rank raises above before this
+        # barrier is reached, so no deadlock; the residual asymmetric-failure
+        # case is documented in the docstring.
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_local_main_process:
+            logger.info(
+                f"[local rank 0 / global rank {self.accelerator.process_index}] "
+                f"resolved checkpoint '{path}' -> {local_path}"
+            )
+
+        return local_path
+
     @staticmethod
     def load_sharded_checkpoint(checkpoint_dir: str, index_file: str) -> Dict[str, torch.Tensor]:
         """Load sharded safetensors checkpoint."""
@@ -1481,8 +1552,7 @@ class BaseAdapter(ABC):
         (``owner/repo[/subfolder][@revision]`` or ``hf://...``) are resolved
         upstream by :meth:`load_checkpoint` and
         :func:`load_lora_as_named_parameters` via
-        :func:`flow_factory.utils.checkpoint.resolve_checkpoint_path` before
-        this method is called.
+        :meth:`_resolve_checkpoint_path` before this method is called.
         """
         for comp_name in self.model_args.target_components:
             if not hasattr(self, comp_name):
@@ -1682,12 +1752,7 @@ class BaseAdapter(ABC):
                 - 'state': Load full training state (model + optimizer + scheduler + RNG)
                 - None: Auto-detect based on checkpoint directory contents
         """
-        path = os.path.expanduser(path)
-        path = resolve_checkpoint_path(path, accelerator=self.accelerator)
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Checkpoint path not found locally or on Hugging Face Hub: {path!r}"
-            )
+        path = self._resolve_checkpoint_path(path)
 
         # Auto-detect if not specified
         if resume_type is None:
