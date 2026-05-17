@@ -24,6 +24,7 @@ import torch
 from typing import Dict, Optional, List, Tuple, Literal
 
 from safetensors.torch import save_file, load_file
+from huggingface_hub import snapshot_download
 
 def mapping_lora_state_dict(
         state_dict: Dict[str, torch.Tensor],
@@ -222,8 +223,6 @@ def download_hf_checkpoint(
         raise ValueError(
             f"expected 'owner/repo' for repo_id, got {repo_id!r}"
         )
-
-    from huggingface_hub import snapshot_download
 
     allow_patterns: Optional[List[str]] = None
     if subfolder:
