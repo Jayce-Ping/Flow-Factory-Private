@@ -35,6 +35,7 @@ _TRAINER_REGISTRY: Dict[str, str] = {
     'dpo': 'flow_factory.trainers.dpo.DPOTrainer',
     'crd': 'flow_factory.trainers.crd.CRDTrainer',
     'opd': 'flow_factory.trainers.opd.sde.OPDTrainer',
+    'opd-ode': 'flow_factory.trainers.opd.ode.OPDODETrainer',
 }
 
 

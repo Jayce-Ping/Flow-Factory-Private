@@ -13,14 +13,14 @@
 # limitations under the License.
 
 # src/flow_factory/trainers/opd/common.py
-"""Shared helpers for the OPD trainer family.
+"""Shared helpers for the OPD trainer family (``sde.py`` and ``ode.py``).
 
-Module-level pure functions kept here so that the per-regime OPD trainers
-(currently :class:`flow_factory.trainers.opd.sde.OPDTrainer`; future regime
-variants land as sibling files) stay DRY without introducing class-inheritance
-coupling (constraint #11 -- flat trainer hierarchy). Each trainer owns its
-own algorithm-specific machinery and only delegates teacher administration
-and ``adapter.forward`` kwarg plumbing here.
+These are module-level pure functions to keep the two trainers DRY without
+introducing class-inheritance coupling (constraint #11 -- flat trainer
+hierarchy). Both :class:`flow_factory.trainers.opd.sde.OPDTrainer` (SDE) and
+:class:`flow_factory.trainers.opd.ode.OPDODETrainer` (ODE) own their own
+algorithm-specific machinery and only delegate teacher administration and
+``adapter.forward`` kwarg plumbing here.
 """
 
 from __future__ import annotations

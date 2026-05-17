@@ -1,0 +1,150 @@
+# OPD-ODE - SD3.5 LoRA baseline: differentiable Euler rollout, pure pathwise loss.
+# Implements Algorithm 2 of the Flow-OPD paper (Eq. 13):
+#   grad L = sum_j d D_j / d theta,
+#   D_j = (dt_j^2 / 2) * mean(||v_theta(x_{t_j}, t_j) - v_phi(x_{t_j}, t_j)||^2),
+#   x_{t_{j+1}} = x_{t_j} + v_theta(x_{t_j}, t_j) * dt_j   (Euler step, WITH grad)
+# i.e. the full N-step rollout is a deterministic function of theta and the
+# gradient is computed by backpropagating through the ODE solver. No REINFORCE
+# term, no stochastic-trajectory log-probability.
+#
+# Companion configs:
+#   - opd_configs/with_reinforce.yaml : OPD-SDE Algorithm 1 (REINFORCE + pathwise)
+#   - opd_configs/reinforce_only.yaml : OPD-SDE ablation (REINFORCE only)
+#
+# Required prerequisites (see `train.teacher_paths` below):
+#   - One or more LoRA checkpoints produced by `BaseAdapter.save_checkpoint()`
+#     (i.e. by any prior Flow-Factory LoRA run on the same base model). All
+#     teachers MUST share the student's LoRA rank/alpha so their weights can
+#     load into the student's adapter slot.
+#
+# OPD-ODE does not consume external reward models; `rewards: []` keeps the
+# reward / advantage stages as a no-op.
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+num_processes: 8  # Number of processes to launch (overrides config file)
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/ocr"  # Path to dataset folder
+  preprocessing_batch_size: 8  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 1024
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'  # OPD-ODE requires LoRA for the multi-teacher swap mechanism.
+  lora_rank: 32           # Must match the rank of every teacher in `teacher_paths`.
+  lora_alpha: 64          # Must match the alpha of every teacher in `teacher_paths`.
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null  # auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp}
+  project: "Flow-Factory-OPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+# Training Configuration
+train:
+  # ---- Trainer selection ----
+  trainer_type: 'opd-ode'
+
+  # ---- OPD-shared teacher administration ----
+  # Paths to teacher LoRA checkpoints. Accepts either:
+  #   - Local directories written by `BaseAdapter.save_checkpoint()`, OR
+  #   - Hugging Face Hub repo ids: "owner/repo" / "owner/repo@revision".
+  teacher_paths:
+    - "jieliu/SD3.5M-FlowGRPO-Text"      # HF Hub repo id (auto-downloaded)
+    # - "/path/to/local/lora_dir"          # local directory
+  teacher_param_device: 'cuda'           # Options: cpu, cuda.
+  teacher_aggregation: 'round_robin'     # Options: 'round_robin' / 'average'
+
+  # ---- OPD-ODE-specific ----
+  pathwise_coef: 1.0                     # Coefficient on the per-step pathwise term D_j.
+  solver_checkpointing: false            # OFF by default. Set true for FLUX / Qwen-Image or
+                                         # when num_inference_steps >= 16 to avoid OOM on the
+                                         # BPTT backward (~2x forward compute, O(1) solver-depth memory).
+  bptt_steps: null                       # Null = full BPTT through all `num_inference_steps` (paper-exact).
+                                         # Set to an int (e.g., 2, 3) to cap the autograd graph to that
+                                         # many consecutive Euler steps, dropping solver-depth memory
+                                         # from O(N) to O(K) at the cost of a biased gradient. `1` = no
+                                         # cross-step BPTT (cheapest estimator, paper section 3.2).
+                                         # Orthogonal to `solver_checkpointing` -- the latter trades
+                                         # memory for compute without biasing the gradient.
+
+  # ---- KL anchor to the pre-trained base model (optional) ----
+  # 0 disables. x-based KL is on the same scale as D_j; v-based matches GRPO/NFT.
+  kl_beta: 0.0
+  kl_type: 'x-based'                     # Options: x-based, v-based
+
+  # ---- Sampling settings ----
+  resolution: 512
+  # NOTE: keep `num_inference_steps` modest -- BPTT through ALL steps means N transformer
+  # forwards + backwards per micro-batch. With SD3.5 LoRA at 512^2 and bs=4, N=6 fits in
+  # ~24 GB; for larger N or larger models, set `solver_checkpointing: true` above.
+  num_inference_steps: 6
+  guidance_scale: 4.5
+
+  # ---- Batch / sampling geometry ----
+  per_device_batch_size: 4
+  group_size: 1                          # OPD does not group by prompt.
+  unique_sample_num_per_epoch: 32
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  num_inner_epochs: 1
+
+  # ---- Optimization ----
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # ---- EMA ----
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # ---- Misc ----
+  enable_gradient_checkpointing: false   # Transformer-internal checkpointing (orthogonal to `solver_checkpointing`).
+  seed: 42
+
+# Scheduler Configuration
+# OPD-ODE REQUIRES deterministic ODE Euler dynamics; the trainer asserts both at __init__.
+scheduler:
+  dynamics_type: "ODE"   # Required: must be ODE for OPD-ODE.
+  noise_level: 0         # Required: must be 0 for deterministic Euler rollout.
+  num_sde_steps: null    # Irrelevant under ODE; kept for schema compatibility.
+  sde_steps: null
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 4.5
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+
+# Reward Model Configuration
+# OPD-ODE derives its signal from the teacher KL D_j; no external reward model
+# is required. Adding entries here would only affect the eval loop's reward
+# logging (`OPDODETrainer.prepare_feedback` is fully no-op).
+rewards: []
+
+# Optional Evaluation Reward Models -- add a PickScore / OCR entry here if you
+# want to track downstream metrics during the standard eval loop.
+eval_rewards: []
