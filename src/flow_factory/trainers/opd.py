@@ -275,19 +275,46 @@ class OPDTrainer(BaseTrainer):
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """OPD has no external advantage stage; teacher KL is the dense reward.
 
-        Drains any pending async reward workers (when the user configured
-        auxiliary reward models purely for logging); the returned rewards
-        are intentionally not consumed by :meth:`optimize`.
+        Three responsibilities, all optional / main-process-only:
+          1. Drain any pending async reward workers (when the user configured
+             auxiliary reward models purely for logging); the returned rewards
+             are intentionally not consumed by :meth:`optimize`.
+          2. Log ``train_samples[:30]`` for qualitative inspection on
+             wandb / swanlab (matches GRPO's convention so cross-trainer
+             panels group cleanly).
+          3. Log epoch-level teacher metadata so the cycling teacher slate
+             (``round_robin``) or the all-teachers regime (``average``) is
+             traceable in the wandb time-series.
         """
-        if not self.reward_models:
-            return
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
-        if rewards and self.accelerator.is_main_process:
-            log_data: Dict[str, Any] = {}
-            for key, value in rewards.items():
-                value_np = torch.as_tensor(value).cpu().numpy()
-                log_data[f"train/aux_reward_{key}_mean"] = float(np.mean(value_np))
-                log_data[f"train/aux_reward_{key}_std"] = float(np.std(value_np))
+        log_data: Dict[str, Any] = {}
+
+        # 1. Aux reward stats (only when reward_models are attached; calling
+        # `reward_buffer.finalize` on an empty buffer is a wasted no-op + async-drain).
+        if self.reward_models:
+            rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
+            if rewards and self.accelerator.is_main_process:
+                for key, value in rewards.items():
+                    value_np = torch.as_tensor(value).cpu().numpy()
+                    log_data[f"train/aux_reward_{key}_mean"] = float(np.mean(value_np))
+                    log_data[f"train/aux_reward_{key}_std"] = float(np.std(value_np))
+
+        # 2-3. Rollout-sample images + teacher metadata (main process only;
+        # samples are rank-local, matching GRPO's `_log_data['train_samples'] = samples[:30]`
+        # pattern).
+        if self.accelerator.is_main_process:
+            log_data["train_samples"] = samples[:30]
+
+            teacher_indices_first_batch = self._teacher_indices_for_batch(
+                batch_idx=0, inner_epoch=0
+            )
+            log_data["train/teacher_index_first_batch"] = float(
+                teacher_indices_first_batch[0]
+            )
+            log_data["train/num_active_teachers_per_batch"] = float(
+                len(teacher_indices_first_batch)
+            )
+
+        if log_data:
             self.log_data(log_data, step=self.step)
 
     # =========================== Optimization ============================
