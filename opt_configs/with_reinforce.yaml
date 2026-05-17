@@ -69,6 +69,13 @@ train:
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).
 
+  # ---- KL anchor to the pre-trained base model ----
+  # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
+  # active LoRA adapter (exposing the base); for full fine-tuning it uses an
+  # EMA snapshot of original weights. 0 disables the KL term.
+  kl_beta: 0.0                           # KL penalty against pre-trained base. x-based: typical ~1; v-based: typical 1e-4..1e-2.
+  kl_type: 'x-based'                     # Options: x-based (same-variance Gaussian KL on next_latents_mean; same scale as D_k), v-based (MSE on noise_pred; GRPO-style)
+
   # ---- Sampling settings ----
   resolution: 512
   num_inference_steps: 10

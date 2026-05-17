@@ -105,6 +105,26 @@ class OPDTrainer(BaseTrainer):
         self._teacher_names: List[str] = []
         self._init_teachers()
 
+    @property
+    def enable_kl_loss(self) -> bool:
+        """KL anchor to pre-trained base is enabled when ``kl_beta > 0``.
+
+        Mirrors :attr:`GRPOTrainer.enable_kl_loss`. When True, every gradient
+        step runs an additional reference forward inside
+        :meth:`BaseAdapter.use_ref_parameters` (which for LoRA mode disables
+        the active LoRA adapter, exposing the underlying base model) and adds
+        ``kl_beta * kl_div`` to the per-step loss. Two ``kl_type`` modes are
+        supported (see :class:`OPDTrainingArguments.kl_type`):
+
+        - ``'x-based'`` (default): same-variance Gaussian KL on the SDE
+          transition mean, ``mean(||mu_s - mu_ref||^2) / (2 * sigma_bar^2)``;
+          identical formula to the teacher-vs-student ``D_k`` so the two
+          KL terms live on the same scale.
+        - ``'v-based'``: unscaled MSE on the velocity prediction,
+          ``mean((noise_pred_s - noise_pred_ref)^2)``; matches GRPO.
+        """
+        return self.training_args.kl_beta > 0.0
+
     # =========================== Initialization ============================
     def _init_teachers(self) -> None:
         """Load each teacher LoRA checkpoint into a named-parameter snapshot."""
@@ -419,6 +439,94 @@ class OPDTrainer(BaseTrainer):
 
         return diff_sq / (2.0 * sigma_bar_sq)
 
+    def _student_return_kwargs_for_train(self) -> List[str]:
+        """Per-step student-forward return keys for the gradient pass.
+
+        Base keys (always needed): ``log_prob`` (REINFORCE), ``next_latents_mean``
+        (pathwise D_k + x-based KL), ``std_dev_t`` and ``dt`` (sigma_bar^2).
+        Adds ``noise_pred`` only when v-based KL is active; x-based KL reuses
+        the already-requested ``next_latents_mean``.
+        """
+        keys = list(_STUDENT_RETURN_KWARGS)
+        if self.enable_kl_loss and self.training_args.kl_type == "v-based":
+            keys.append("noise_pred")
+        return keys
+
+    def _compute_kl_anchor(
+        self,
+        student_out: Any,
+        forward_kwargs: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the KL anchor to the pre-trained base model.
+
+        Runs one reference forward inside ``torch.no_grad() + use_ref_parameters()``
+        (LoRA-disable for LoRA mode; EMA snapshot for full fine-tuning) and
+        returns ``(kl_div, kl_loss)`` where ``kl_loss = kl_beta * kl_div``.
+
+        Two regimes, selected by ``self.training_args.kl_type``:
+
+        - ``'x-based'``: same-variance Gaussian-KL on the SDE transition mean,
+          identical to the teacher-vs-student ``D_k`` formula. Reuses
+          :meth:`_compute_per_step_kl`, sharing the
+          ``sigma_bar^2 = std_dev_t^2 * (-dt)`` divisor so this term lives on
+          the same scale as the teacher pathwise loss.
+        - ``'v-based'``: unscaled MSE on the velocity prediction, matching
+          GRPO's ``noise_pred`` KL.
+
+        Gradient flow: the reference forward is no-grad (base weights are
+        frozen); KL is computed OUTSIDE the no-grad block so autograd records
+        the dependency on the student tensor only.
+        """
+        kl_type = self.training_args.kl_type
+        if kl_type == "v-based":
+            ref_return_kwargs = ["noise_pred"]
+        elif kl_type == "x-based":
+            ref_return_kwargs = ["next_latents_mean"]
+        else:
+            raise ValueError(
+                f"Unknown kl_type={kl_type!r}; expected 'v-based' or 'x-based'."
+            )
+
+        with torch.no_grad(), self.adapter.use_ref_parameters():
+            ref_kwargs = forward_kwargs.copy()
+            ref_kwargs["compute_log_prob"] = False
+            ref_kwargs["return_kwargs"] = ref_return_kwargs
+            ref_out = self.adapter.forward(**ref_kwargs)
+
+        if kl_type == "v-based":
+            if student_out.noise_pred is None or ref_out.noise_pred is None:
+                raise RuntimeError(
+                    "v-based KL requires `noise_pred` from both student and "
+                    "reference; got "
+                    f"student_noise_pred={'set' if student_out.noise_pred is not None else 'None'}, "
+                    f"ref_noise_pred={'set' if ref_out.noise_pred is not None else 'None'}."
+                )
+            kl_div_per_sample = torch.mean(
+                (student_out.noise_pred - ref_out.noise_pred) ** 2,
+                dim=tuple(range(1, student_out.noise_pred.ndim)),
+            )
+            kl_div = kl_div_per_sample.mean()
+        else:  # x-based
+            if student_out.next_latents_mean is None or ref_out.next_latents_mean is None:
+                raise RuntimeError(
+                    "x-based KL requires `next_latents_mean` from both student "
+                    "and reference; got "
+                    f"student_next_latents_mean={'set' if student_out.next_latents_mean is not None else 'None'}, "
+                    f"ref_next_latents_mean={'set' if ref_out.next_latents_mean is not None else 'None'}."
+                )
+            # Same Gaussian-KL formula as the teacher-vs-student D_k:
+            # mean(||mu_s - mu_ref||^2) / (2 * sigma_bar^2), sigma_bar from the student's scheduler outputs.
+            kl_div_per_sample = self._compute_per_step_kl(
+                mu_student=student_out.next_latents_mean,
+                mu_teacher=ref_out.next_latents_mean,
+                std_dev_t=student_out.std_dev_t,
+                dt=student_out.dt,
+            )
+            kl_div = kl_div_per_sample.mean()
+
+        kl_loss = self.training_args.kl_beta * kl_div
+        return kl_div, kl_loss
+
     @staticmethod
     def _reverse_cumulative(
         d_list: List[torch.Tensor],
@@ -629,7 +737,7 @@ class OPDTrainer(BaseTrainer):
                         latents=latents,
                         next_latents=next_latents,
                         compute_log_prob=True,
-                        return_kwargs=_STUDENT_RETURN_KWARGS,
+                        return_kwargs=self._student_return_kwargs_for_train(),
                     )
 
                     student_out = self.adapter.forward(**forward_kwargs)
@@ -656,6 +764,12 @@ class OPDTrainer(BaseTrainer):
                     pathwise_loss = d_k_grad.mean()
                     reinforce_loss = (r_kp1 * log_prob_new).mean()
                     loss = pathwise_loss + self.reinforce_coef * reinforce_loss
+
+                    if self.enable_kl_loss:
+                        kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
+                        loss = loss + kl_loss
+                        loss_info["kl_div"].append(kl_div.detach())
+                        loss_info["kl_loss"].append(kl_loss.detach())
 
                     loss_info["d_k"].append(pathwise_loss.detach())
                     loss_info["r_bar"].append(r_kp1.mean().detach())
