@@ -72,7 +72,7 @@ class OCRRewardModel(PointwiseRewardModel):
         self.ocr = PaddleOCR(
             use_angle_cls=False,
             lang="en",
-            use_gpu=config.get('use_gpu', False),
+            use_gpu=getattr(config, 'use_gpu', False),
             show_log=False  # Disable unnecessary log output
         )
 
