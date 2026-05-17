@@ -876,6 +876,30 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    reinforce_scale_factor: Union[float, Literal["auto"]] = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Multiplier on `reinforce_loss` applied AFTER `reinforce_coef` to "
+                "compensate for the spatial-mean reduction asymmetry vs paper. "
+                "Background: the scheduler's `log_prob` reduces "
+                "(x-mu)^2 / (2 * sigma^2) via `mean` over spatial dims, "
+                "downweighting the REINFORCE gradient by 1/d (d = per-sample "
+                "latent spatial dim, e.g. C*H*W). `D_k` and `R_bar_{k+1}` also "
+                "use `mean` and inherit the same 1/d. Net result: code's "
+                "pathwise gradient is 1/d * paper, REINFORCE gradient is "
+                "1/d^2 * paper, so the relative pathwise/REINFORCE balance "
+                "differs from paper Eq. 11 by a factor of d (which can be "
+                "tens of thousands for typical image latents). "
+                "1.0 (default): keep current behavior (no compensation). "
+                "'auto': detect d from `next_latents_mean.shape[1:]` on the "
+                "first optimize() call and multiply `reinforce_loss` by d, "
+                "restoring paper's intended pathwise/REINFORCE ratio. "
+                "float >= 0: manual override for partial compensation or "
+                "ablations."
+            )
+        },
+    )
 
     # KL regularization against the pre-trained base model (LoRA-off for LoRA
     # mode; pre-finetune EMA snapshot for full fine-tuning). Disabled by default
@@ -935,6 +959,19 @@ class OPDTrainingArguments(TrainingArguments):
         if self.reinforce_coef < 0:
             raise ValueError(
                 f"`reinforce_coef` must be >= 0, got reinforce_coef={self.reinforce_coef!r}."
+            )
+        if isinstance(self.reinforce_scale_factor, (int, float)) and not isinstance(
+            self.reinforce_scale_factor, bool
+        ):
+            if self.reinforce_scale_factor < 0:
+                raise ValueError(
+                    "`reinforce_scale_factor` must be >= 0 (or 'auto'), got "
+                    f"reinforce_scale_factor={self.reinforce_scale_factor!r}."
+                )
+        elif self.reinforce_scale_factor != "auto":
+            raise ValueError(
+                "`reinforce_scale_factor` must be a non-negative float or 'auto', "
+                f"got reinforce_scale_factor={self.reinforce_scale_factor!r}."
             )
         if self.kl_beta < 0:
             raise ValueError(
