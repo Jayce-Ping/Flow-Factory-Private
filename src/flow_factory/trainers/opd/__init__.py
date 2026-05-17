@@ -13,21 +13,27 @@
 # limitations under the License.
 
 # src/flow_factory/trainers/opd/__init__.py
-"""On-Policy Distillation (OPD) trainers.
+"""On-Policy Distillation (OPD) trainers -- SDE and ODE regimes.
 
-- :class:`OPDTrainer` (``sde.py``): Algorithm 1 of the Flow-OPD paper,
-  REINFORCE-form SDE regime (Eq. 11). Couples a no-grad SDE trajectory
-  rollout with a per-timestep pathwise + REINFORCE loss.
+Two algorithm variants from the Flow-OPD paper:
 
-Teacher LoRA loading and per-batch teacher selection are shared via
-:mod:`flow_factory.trainers.opd.common` so future regime additions can
-reuse them without subclassing.
+- :class:`OPDTrainer` (``sde.py``): Algorithm 1, REINFORCE-form SDE regime
+  (Eq. 11). Couples a no-grad SDE trajectory rollout with a per-timestep
+  pathwise + REINFORCE loss.
+- :class:`OPDODETrainer` (``ode.py``): Algorithm 2, fully pathwise ODE regime
+  (Eq. 13). Differentiable Euler rollout with BPTT through the ODE solver;
+  optional truncated BPTT via the ``bptt_steps`` knob.
 
-Registry key (resolved via :func:`flow_factory.trainers.registry.get_trainer_class`):
+The two trainers share teacher LoRA loading and per-batch teacher selection
+via :mod:`flow_factory.trainers.opd.common`.
 
-- ``'opd'`` -> :class:`OPDTrainer`
+Registry keys (resolved via :func:`flow_factory.trainers.registry.get_trainer_class`):
+
+- ``'opd'``     -> :class:`OPDTrainer`
+- ``'opd-ode'`` -> :class:`OPDODETrainer`
 """
 
+from .ode import OPDODETrainer
 from .sde import OPDTrainer
 
-__all__ = ["OPDTrainer"]
+__all__ = ["OPDTrainer", "OPDODETrainer"]

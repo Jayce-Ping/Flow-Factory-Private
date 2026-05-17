@@ -28,6 +28,7 @@ from .training_args import (
     DPOTrainingArguments,
     CRDTrainingArguments,
     OPDTrainingArguments,
+    OPDODETrainingArguments,
     get_training_args_class,
 )
 from .reward_args import RewardArguments, MultiRewardArguments
@@ -47,6 +48,7 @@ __all__ = [
     "DPOTrainingArguments",
     "CRDTrainingArguments",
     "OPDTrainingArguments",
+    "OPDODETrainingArguments",
     "get_training_args_class",
     "RewardArguments",
     "MultiRewardArguments",
