@@ -1,6 +1,11 @@
-# On-Policy Distillation (OPD) — SD3.5 LoRA example.
+# OPD - SD3.5 LoRA baseline: pathwise D_k + REINFORCE (both coefs = 1.0).
+# Full OPD loss with both terms enabled. Companion ablation file
+# `reinforce_only.yaml` zeros out `pathwise_coef` to isolate the
+# REINFORCE-only signal for comparison.
+#
 # Implements the SDE-regime REINFORCE form (Eq. 11) of the Flow-OPD paper:
-#   grad L = E_tau[ sum_k grad D_k + sum_k R_bar_{k+1} grad log p_theta ]
+#   grad L = E_tau[ pathwise_coef * sum_k grad D_k
+#                 + reinforce_coef * sum_k R_bar_{k+1} grad log p_theta ]
 # where D_k is the per-step Gaussian KL between student and a frozen LoRA
 # teacher, and R_bar_{k+1} = sum_{j>k} D_j is the closed-form cumulative
 # future KL (treated as a stop-gradient constant in the REINFORCE term).
@@ -43,7 +48,7 @@ model:
   resume_type: null
 
 log:
-  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  run_name: "sd3-5_lora_opd_pathwise_reinforce"  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
   project: "Flow-Factory-OPD"
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"
@@ -67,7 +72,13 @@ train:
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
-  reinforce_coef: 0.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).
+  pathwise_coef: 1.0                     # Coefficient on the pathwise term D_k(theta); 0 disables per-step distillation (see reinforce_only.yaml).
+  reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k); 0 drops the trajectory term.
+  reinforce_scale_factor: 'auto'         # 'auto' = multiply reinforce_loss by per-sample latent dim d (C*H*W),
+                                         # restoring paper's pathwise/REINFORCE relative balance under the
+                                         # spatial-mean reduction used in `_compute_per_step_kl` and
+                                         # `scheduler.step`'s `log_prob`. Set to 1.0 to keep the pre-fix
+                                         # behavior, or any float for manual / partial compensation.
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
