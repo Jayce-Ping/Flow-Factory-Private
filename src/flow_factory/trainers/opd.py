@@ -91,8 +91,23 @@ class OPDTrainer(BaseTrainer):
         self.training_args: OPDTrainingArguments
 
         self.num_train_timesteps = self.adapter.scheduler.num_sde_steps
+        self.pathwise_coef = self.training_args.pathwise_coef
         self.reinforce_coef = self.training_args.reinforce_coef
         self.teacher_aggregation = self.training_args.teacher_aggregation
+
+        # Sanity check: warn (do not hard-error) when the configured loss
+        # carries no learning signal at all -- e.g. an accidental ablation
+        # config. Users may still intentionally hit this path for plumbing
+        # tests, so we only emit a warning.
+        if self.pathwise_coef == 0 and self.reinforce_coef == 0 and self.training_args.kl_beta == 0:
+            logger.warning(
+                "OPDTrainer received zero-signal loss config: "
+                f"pathwise_coef={self.pathwise_coef}, "
+                f"reinforce_coef={self.reinforce_coef}, "
+                f"kl_beta={self.training_args.kl_beta}. "
+                "All three terms contribute zero gradient; the student "
+                "will not move. Set at least one to a positive value."
+            )
 
         # Cache adapter.forward signature once so `_build_forward_kwargs`
         # avoids `inspect.signature` introspection on every per-timestep call.
@@ -327,9 +342,7 @@ class OPDTrainer(BaseTrainer):
             teacher_indices_first_batch = self._teacher_indices_for_batch(
                 batch_idx=0, inner_epoch=0
             )
-            log_data["train/teacher_index_first_batch"] = float(
-                teacher_indices_first_batch[0]
-            )
+            log_data["train/teacher_index_first_batch"] = float(teacher_indices_first_batch[0])
             log_data["train/num_active_teachers_per_batch"] = float(
                 len(teacher_indices_first_batch)
             )
@@ -483,9 +496,7 @@ class OPDTrainer(BaseTrainer):
         elif kl_type == "x-based":
             ref_return_kwargs = ["next_latents_mean"]
         else:
-            raise ValueError(
-                f"Unknown kl_type={kl_type!r}; expected 'v-based' or 'x-based'."
-            )
+            raise ValueError(f"Unknown kl_type={kl_type!r}; expected 'v-based' or 'x-based'.")
 
         with torch.no_grad(), self.adapter.use_ref_parameters():
             ref_kwargs = forward_kwargs.copy()
@@ -560,9 +571,11 @@ class OPDTrainer(BaseTrainer):
            frozen teacher's ``mu_phi`` for reuse in the main pass.
         2. Main pass (with grad): per training timestep, run the student
            forward (gradient-flowing), reuse the cached teacher mean,
-           assemble ``loss = D_k + reinforce_coef * R_bar_{k+1}.detach() * log_p``
-           and backprop. Matches the GRPO per-timestep ``accumulate``
-           pattern so ``gradient_accumulation_steps *= num_train_timesteps``
+           assemble ``loss = pathwise_coef * D_k +
+           reinforce_coef * R_bar_{k+1}.detach() * log_p`` (plus
+           ``kl_beta * KL_anchor`` when ``kl_beta > 0``) and backprop.
+           Matches the GRPO per-timestep ``accumulate`` pattern so
+           ``gradient_accumulation_steps *= num_train_timesteps``
            (see ``Arguments._adjust_gradient_accumulation``) stays consistent.
 
         Both passes run in ``self.adapter.train()`` mode (set once below) so
@@ -763,7 +776,7 @@ class OPDTrainer(BaseTrainer):
 
                     pathwise_loss = d_k_grad.mean()
                     reinforce_loss = (r_kp1 * log_prob_new).mean()
-                    loss = pathwise_loss + self.reinforce_coef * reinforce_loss
+                    loss = self.pathwise_coef * pathwise_loss + self.reinforce_coef * reinforce_loss
 
                     if self.enable_kl_loss:
                         kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)

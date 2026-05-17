@@ -1,7 +1,11 @@
-# OPD - SD3.5 LoRA baseline: pathwise D_k + REINFORCE (both coefs = 1.0).
-# Full OPD loss with both terms enabled. Companion ablation file
-# `reinforce_only.yaml` zeros out `pathwise_coef` to isolate the
-# REINFORCE-only signal for comparison.
+# OPD - SD3.5 LoRA ablation: REINFORCE-only (pathwise_coef=0).
+# Disables the per-step distillation term D_k(theta) so the student is
+# updated *only* by the REINFORCE term R_bar_{k+1} * grad log p_theta.
+# The Rao-Blackwellised reward R_bar_{k+1} is still computed from the
+# no-grad D_k values in the pre-pass, so the trajectory-level signal is
+# preserved -- only the per-step v-matching gradient is removed.
+#
+# Companion baseline (full OPD loss with both terms): with_reinforce.yaml.
 #
 # Implements the SDE-regime REINFORCE form (Eq. 11) of the Flow-OPD paper:
 #   grad L = E_tau[ pathwise_coef * sum_k grad D_k
@@ -72,8 +76,8 @@ train:
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
-  pathwise_coef: 1.0                     # Coefficient on the pathwise term D_k(theta); 0 disables per-step distillation (see reinforce_only.yaml).
-  reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k); 0 drops the trajectory term.
+  pathwise_coef: 0.0                     # ABLATION: disable D_k(theta); train under the REINFORCE term only. Default 1.0.
+  reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k). 0 drops the trajectory term entirely.
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
