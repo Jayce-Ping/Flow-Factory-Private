@@ -863,6 +863,42 @@ class OPDTrainingArguments(TrainingArguments):
         },
     )
 
+    # KL regularization against the pre-trained base model (LoRA-off for LoRA
+    # mode; pre-finetune EMA snapshot for full fine-tuning). Disabled by default
+    # since OPD's primary signal is the teacher KL D_k, not anchor-to-base
+    # regularization; opt in by setting kl_beta > 0 when teachers drift the
+    # student far from the base model and you want a leash.
+    kl_type: Literal['v-based', 'x-based'] = field(
+        default='x-based',
+        metadata={
+            "help": (
+                "KL space against the pre-trained base. "
+                "'x-based' (default): same-variance Gaussian KL on the SDE "
+                "transition mean, i.e. mean(||mu_student - mu_ref||^2) / "
+                "(2 * sigma_bar^2). Identical formula to the teacher-vs-student "
+                "D_k, so the two KL terms live on the same scale and are "
+                "directly comparable. "
+                "'v-based': unscaled MSE on the velocity prediction "
+                "mean((noise_pred_student - noise_pred_ref)^2). Matches the "
+                "GRPO/NFT/DPO/CRD convention."
+            )
+        },
+    )
+    kl_beta: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "KL penalty coefficient against the pre-trained base model. "
+                "0 (default) disables the KL term, which keeps OPD on its "
+                "pure teacher-distillation objective. Set > 0 to anchor the "
+                "student to the base. Note: x-based KL is on the same scale "
+                "as D_k (the teacher pathwise loss), so a kl_beta near 1 is a "
+                "natural starting point in x-based; v-based KL is larger in "
+                "magnitude and typically needs kl_beta in 1e-4..1e-2."
+            )
+        },
+    )
+
     # Reuse the GRPO-style global_std knob so AdvantageProcessor instantiation
     # in BaseTrainer._init_reward_model() picks a sensible default; OPD itself
     # never calls AdvantageProcessor.compute_advantages.
@@ -881,6 +917,15 @@ class OPDTrainingArguments(TrainingArguments):
         if self.reinforce_coef < 0:
             raise ValueError(
                 f"`reinforce_coef` must be >= 0, got reinforce_coef={self.reinforce_coef!r}."
+            )
+        if self.kl_beta < 0:
+            raise ValueError(
+                f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}."
+            )
+        if self.kl_type not in ['v-based', 'x-based']:
+            raise ValueError(
+                f"Invalid kl_type for OPD: {self.kl_type!r}. "
+                "Valid options are: ['v-based', 'x-based']."
             )
 
     def get_num_train_timesteps(self, args: Any) -> int:
