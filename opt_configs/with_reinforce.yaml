@@ -85,7 +85,7 @@ train:
   per_device_batch_size: 8
   group_size: 1                          # OPD does not group by prompt; reward/advantage stages are no-ops.
   unique_sample_num_per_epoch: 64
-  gradient_step_per_epoch: 2
+  gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
   num_inner_epochs: 1                    # Recommended for on-policy correctness (no IS ratio in this PR).
 
