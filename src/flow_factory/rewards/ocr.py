@@ -17,13 +17,19 @@
 OCR Reward Model using PP-OCRv5.
 Some instructions for installation on CUDA 12.9:
 ```bash
-pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
-pip install paddleocr
+pip install paddlepaddle-gpu==2.6.2
+pip install paddleocr==2.9.1
 pip install python-Levenshtein
 # Install torch2.8.0 and it will update nvcc toolkits automatically
 pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu129
 # Maybe you will need this:
 yum install -y mesa-libGL glib2
+
+# Pre-download weights
+<<<python
+from paddleocr import PaddleOCR
+ocr = PaddleOCR(use_angle_cls=False, lang="en", use_gpu=False, show_log=False)
+<<<
 ```
 For other versions of CUDA, please refer to the official documentation of PaddleOCR.
 """
@@ -57,11 +63,17 @@ class OCRRewardModel(PointwiseRewardModel):
         device_index = self.accelerator.local_process_index
 
         # Initialize PP-OCRv5 reader with new API
-        self.model = PaddleOCR(
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            device=f"gpu:{device_index}" if "cuda" in str(self.device) else "cpu"
+        # self.model = PaddleOCR(
+        #     use_doc_orientation_classify=False,
+        #     use_doc_unwarping=False,
+        #     use_textline_orientation=False,
+        #     device=f"gpu:{device_index}" if "cuda" in str(self.device) else "cpu"
+        # )
+        self.ocr = PaddleOCR(
+            use_angle_cls=False,
+            lang="en",
+            use_gpu=config.get('use_gpu', False),
+            show_log=False  # Disable unnecessary log output
         )
 
     def _compute_scores_batch(
@@ -81,12 +93,15 @@ class OCRRewardModel(PointwiseRewardModel):
             target_text = parts[1] if len(parts) >= 2 else p
 
             try:
-                # OCR recognition using PP-OCRv5 predict API
-                result = self.model.predict(img)
-                # Extract recognized text from PP-OCRv5 result
-                recognized_text = ''
-                for res in result:
-                    recognized_text += ''.join(res['rec_texts'])
+                # # OCR recognition using PP-OCRv5 predict API
+                # result = self.model.predict(img)
+                # # Extract recognized text from PP-OCRv5 result
+                # recognized_text = ''
+                # for res in result:
+                #     recognized_text += ''.join(res['rec_texts'])
+                result = self.ocr.ocr(img, cls=False)
+                # Extract recognized text (handle possible multi-line results)
+                recognized_text = ''.join([res[1][0] if res[1][1] > 0 else '' for res in result[0]]) if result[0] else ''
 
                 recognized_text = recognized_text.replace(' ', '').lower()
                 target_text = target_text.replace(' ', '').lower()
