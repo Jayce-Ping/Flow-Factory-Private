@@ -68,6 +68,7 @@ train:
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
   reinforce_coef: 0.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).
+  reinforce_scale_factor: 1.0         # 'auto' = multiply reinforce_loss by per-sample latent dim d (C*H*W),
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
