@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/opd.py
-"""
-On-Policy Distillation (OPD) Trainer for Flow Matching, SDE regime.
+# src/flow_factory/trainers/opd/sde.py
+"""On-Policy Distillation (OPD) Trainer for Flow Matching, SDE regime.
 
 Implements the REINFORCE form of the trajectory-level reverse KL
 (Eq. 11 in the Flow-OPD paper):
@@ -32,7 +31,6 @@ attached via ``OPDTrainingArguments.teacher_paths`` and combined either by
 per-batch round-robin or per-timestep averaging.
 """
 
-import inspect
 import os
 from collections import defaultdict
 from functools import partial
@@ -44,18 +42,19 @@ import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ..hparams import OPDTrainingArguments
-from ..samples import BaseSample
-from ..utils.base import (
-    create_generator,
-    create_generator_by_prompt,
-    filter_kwargs,
+from ...hparams import OPDTrainingArguments
+from ...samples import BaseSample
+from ...utils.base import create_generator, create_generator_by_prompt, filter_kwargs
+from ...utils.dist import reduce_loss_info
+from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import compute_trajectory_indices
+from ..abc import BaseTrainer
+from .common import (
+    cache_forward_signature,
+    filter_forward_kwargs,
+    load_teachers,
+    teacher_indices_for_batch,
 )
-from ..utils.dist import reduce_loss_info
-from ..utils.logger_utils import setup_logger
-from ..utils.lora_loader import load_lora_as_named_parameters
-from ..utils.trajectory_collector import compute_trajectory_indices
-from .abc import BaseTrainer
 
 logger = setup_logger(__name__)
 
@@ -68,14 +67,14 @@ _TEACHER_RETURN_KWARGS = ["next_latents_mean", "std_dev_t", "dt"]
 class OPDTrainer(BaseTrainer):
     """On-Policy Distillation trainer (SDE regime, Eq. 11).
 
-    Reuses GRPO's coupled / Flow-SDE training topology — full-trajectory
+    Reuses GRPO's coupled / Flow-SDE training topology -- full-trajectory
     rollout with on-policy log-probabilities, then a per-timestep
     forward/backward inside ``optimize()``. Differs from GRPO in three
     ways:
 
-    1. No external reward model — the per-step Gaussian KL ``D_k`` between
+    1. No external reward model -- the per-step Gaussian KL ``D_k`` between
        student and teacher serves as the dense reward signal.
-    2. No advantage / aggregation step — ``R_bar_{k+1}`` is computed as a
+    2. No advantage / aggregation step -- ``R_bar_{k+1}`` is computed as a
        reverse cumulative sum over ``D_j`` per trajectory inside
        ``optimize()``.
     3. One or more teacher LoRAs are pre-loaded into named-parameter
@@ -111,14 +110,15 @@ class OPDTrainer(BaseTrainer):
 
         # Cache adapter.forward signature once so `_build_forward_kwargs`
         # avoids `inspect.signature` introspection on every per-timestep call.
-        sig = inspect.signature(self.adapter.forward)
-        self._forward_param_names: frozenset = frozenset(sig.parameters.keys())
-        self._forward_accepts_var_kwargs: bool = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        self._forward_param_names, self._forward_accepts_var_kwargs = cache_forward_signature(
+            self.adapter.forward
         )
 
-        self._teacher_names: List[str] = []
-        self._init_teachers()
+        self._teacher_names: List[str] = load_teachers(
+            self.adapter,
+            list(self.training_args.teacher_paths),
+            self.training_args.teacher_param_device,
+        )
 
     @property
     def enable_kl_loss(self) -> bool:
@@ -140,52 +140,18 @@ class OPDTrainer(BaseTrainer):
         """
         return self.training_args.kl_beta > 0.0
 
-    # =========================== Initialization ============================
-    def _init_teachers(self) -> None:
-        """Load each teacher LoRA checkpoint into a named-parameter snapshot."""
-        teacher_paths: List[str] = list(self.training_args.teacher_paths)
-        if not teacher_paths:
-            raise ValueError(
-                "OPDTrainer requires at least one teacher LoRA path; "
-                f"got teacher_paths={teacher_paths!r}."
-            )
-
-        device = self.training_args.teacher_param_device
-        for i, path in enumerate(teacher_paths):
-            name = f"opd_teacher_{i}"
-            load_lora_as_named_parameters(
-                adapter=self.adapter,
-                name=name,
-                lora_path=path,
-                device=device,
-            )
-            self._teacher_names.append(name)
-        logger.info(
-            f"OPDTrainer initialised with {len(self._teacher_names)} teacher(s): "
-            f"{self._teacher_names} (aggregation={self.teacher_aggregation!r}, "
-            f"device={device!r})."
-        )
-
+    # =========================== Helper Shims ============================
     def _teacher_indices_for_batch(self, batch_idx: int, inner_epoch: int) -> List[int]:
-        """Return teacher indices used for one micro-batch.
-
-        ``round_robin`` -> single teacher cycling across micro-batches, inner
-        epochs, and outer epochs (so different inner epochs of the same outer
-        epoch use different teachers; otherwise inner-epoch 0 and inner-epoch 1
-        would always pick the same teacher for the same ``batch_idx``).
-        ``average`` -> all teachers (forward each, average the velocity).
-        """
-        num_teachers = len(self._teacher_names)
-        if self.teacher_aggregation == "round_robin":
-            num_batches = self.training_args.num_batches_per_epoch
-            num_inner = self.training_args.num_inner_epochs
-            global_batch = (self.epoch * num_inner + inner_epoch) * num_batches + batch_idx
-            return [global_batch % num_teachers]
-        if self.teacher_aggregation == "average":
-            return list(range(num_teachers))
-        raise ValueError(
-            f"Unknown teacher_aggregation={self.teacher_aggregation!r}; "
-            f"expected 'round_robin' or 'average'."
+        """Thin shim around :func:`common.teacher_indices_for_batch` capturing
+        the trainer's stateful fields (``self.epoch``, ``training_args``)."""
+        return teacher_indices_for_batch(
+            teacher_aggregation=self.teacher_aggregation,
+            num_teachers=len(self._teacher_names),
+            epoch=self.epoch,
+            inner_epoch=inner_epoch,
+            batch_idx=batch_idx,
+            num_inner=self.training_args.num_inner_epochs,
+            num_batches=self.training_args.num_batches_per_epoch,
         )
 
     # =========================== Main Loop ============================
@@ -363,7 +329,8 @@ class OPDTrainer(BaseTrainer):
     ) -> Dict[str, Any]:
         """Assemble the per-timestep ``adapter.forward`` kwargs (shared by student / teacher).
 
-        Uses the parameter names cached in ``__init__`` to avoid the
+        Uses the parameter names cached in ``__init__`` via
+        :func:`common.cache_forward_signature` to avoid the
         ``inspect.signature`` introspection that ``filter_kwargs`` would do
         on every call (this helper runs O(num_train_timesteps * num_batches)
         times per inner epoch).
@@ -378,11 +345,11 @@ class OPDTrainer(BaseTrainer):
             "noise_level": self.adapter.scheduler.noise_level,
             **batch,
         }
-        if self._forward_accepts_var_kwargs:
-            forward_kwargs = full_kwargs
-        else:
-            allowed = self._forward_param_names
-            forward_kwargs = {k: v for k, v in full_kwargs.items() if k in allowed}
+        forward_kwargs = filter_forward_kwargs(
+            full_kwargs,
+            self._forward_param_names,
+            self._forward_accepts_var_kwargs,
+        )
         forward_kwargs["return_kwargs"] = return_kwargs
         return forward_kwargs
 
