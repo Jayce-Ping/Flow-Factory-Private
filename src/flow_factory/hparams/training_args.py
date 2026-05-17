@@ -852,6 +852,20 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    pathwise_coef: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Coefficient on the pathwise term D_k(theta) = "
+                "||mu_student - mu_teacher||^2 / (2 * sigma_bar^2). "
+                "Set to 0 to disable per-step distillation and run a "
+                "REINFORCE-only ablation (the trajectory signal still uses "
+                "R_bar_{k+1}, which is built from the no-grad D_k values "
+                "in the pre-pass, so the closed-form Rao-Blackwell reward "
+                "is preserved)."
+            )
+        },
+    )
     reinforce_coef: float = field(
         default=1.0,
         metadata={
@@ -913,6 +927,10 @@ class OPDTrainingArguments(TrainingArguments):
             raise ValueError(
                 "OPDTrainingArguments requires `teacher_paths` to contain at least "
                 f"one teacher LoRA checkpoint, got teacher_paths={self.teacher_paths!r}."
+            )
+        if self.pathwise_coef < 0:
+            raise ValueError(
+                f"`pathwise_coef` must be >= 0, got pathwise_coef={self.pathwise_coef!r}."
             )
         if self.reinforce_coef < 0:
             raise ValueError(
