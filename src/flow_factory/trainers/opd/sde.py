@@ -351,8 +351,6 @@ class OPDTrainer(BaseTrainer):
             self._forward_accepts_var_kwargs,
         )
         forward_kwargs["return_kwargs"] = return_kwargs
-        if compute_log_prob:
-            forward_kwargs["log_prob_reduction"] = "sum"
         return forward_kwargs
 
     def _teacher_next_latents_mean(
@@ -390,13 +388,13 @@ class OPDTrainer(BaseTrainer):
         std_dev_t: torch.Tensor,
         dt: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute ``D_k = sum(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` per batch sample.
+        """Compute ``D_k = mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` per batch sample.
 
         ``sigma_bar^2 = std_dev_t^2 * (-dt)`` follows the Flow-SDE
         discretisation (see Appendix B of the Flow-OPD paper).
 
-        Spatial reduction uses ``sum`` over non-batch dimensions (Frobenius
-        norm squared / factorized Gaussian KL convention in Flow-OPD Eq. 11).
+        Spatial reduction uses ``mean`` over non-batch dimensions (matching
+        GRPO's ``kl_div`` convention in ``trainers/grpo.py``).
         """
         if mu_student.shape != mu_teacher.shape:
             raise ValueError(
@@ -406,7 +404,7 @@ class OPDTrainer(BaseTrainer):
             )
 
         diff_sq = (mu_student.float() - mu_teacher.float()) ** 2
-        diff_sq = diff_sq.sum(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
+        diff_sq = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
 
         # `std_dev_t` and `dt` are produced by the Flow-SDE scheduler in shape
         # `(B, 1, 1)` (per-sample scalars broadcast across spatial dims), so a
