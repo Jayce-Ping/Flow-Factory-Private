@@ -74,6 +74,11 @@ train:
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
   pathwise_coef: 1.0                     # Coefficient on the pathwise term D_k(theta); 0 disables per-step distillation (see reinforce_only.yaml).
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k); 0 drops the trajectory term.
+  reinforce_scale_factor: 'auto'         # 'auto' = multiply reinforce_loss by per-sample latent dim d (C*H*W),
+                                         # restoring paper's pathwise/REINFORCE relative balance under the
+                                         # spatial-mean reduction used in `_compute_per_step_kl` and
+                                         # `scheduler.step`'s `log_prob`. Set to 1.0 to keep the pre-fix
+                                         # behavior, or any float for manual / partial compensation.
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the

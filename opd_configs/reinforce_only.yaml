@@ -78,6 +78,12 @@ train:
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
   pathwise_coef: 0.0                     # ABLATION: disable D_k(theta); train under the REINFORCE term only. Default 1.0.
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k). 0 drops the trajectory term entirely.
+  reinforce_scale_factor: 'auto'         # 'auto' is especially important for the REINFORCE-only ablation:
+                                         # pathwise_coef=0 means the REINFORCE term IS the entire gradient signal,
+                                         # so leaving the legacy 1.0 would scale it 1/d^2 vs paper. 'auto'
+                                         # multiplies reinforce_loss by per-sample latent dim d (C*H*W) to
+                                         # restore paper Eq. 11 fidelity. Set to 1.0 to exactly reproduce
+                                         # the pre-fix behavior.
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
