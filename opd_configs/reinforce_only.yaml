@@ -52,7 +52,7 @@ model:
   resume_type: null
 
 log:
-  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  run_name: "sd3-5_lora_opd_reinforce_only"  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
   project: "Flow-Factory-OPD"
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"
