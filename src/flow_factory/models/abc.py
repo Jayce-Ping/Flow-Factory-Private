@@ -1494,14 +1494,14 @@ class BaseAdapter(ABC):
         # Normalize leading ``~`` for local-path inputs; no-op for HF specs since
         # ``expanduser`` only acts on a leading ``~``.
         path = os.path.expanduser(path)
-
         force_hf = path.startswith(HF_PATH_PREFIX)
-        spec = path[len(HF_PATH_PREFIX):] if force_hf else path
 
-        if not force_hf and os.path.exists(spec):
-            return spec
+        # Local path wins unless an explicit ``hf://`` prefix forces remote.
+        if not force_hf and os.path.exists(path):
+            return path
 
-        repo_id, subfolder, revision = parse_hf_checkpoint_path(spec)
+        # ``parse_hf_checkpoint_path`` handles the ``hf://`` prefix internally.
+        repo_id, subfolder, revision = parse_hf_checkpoint_path(path)
 
         try:
             local_path = download_hf_checkpoint(repo_id, subfolder, revision)
@@ -1746,10 +1746,6 @@ class BaseAdapter(ABC):
                 - None: Auto-detect based on checkpoint directory contents
         """
         path = self._resolve_checkpoint_path(path)
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Checkpoint path not found locally or on Hugging Face Hub: {path!r}"
-            )
 
         # Auto-detect if not specified
         if resume_type is None:
