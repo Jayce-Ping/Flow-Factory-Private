@@ -78,6 +78,8 @@ train:
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
   pathwise_coef: 0.0                     # ABLATION: disable D_k(theta); train under the REINFORCE term only. Default 1.0.
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k). 0 drops the trajectory term entirely.
+  # reinforce_horizon: null              # default: all future D_j in R_bar_{k+1} (paper Eq. 11)
+  # reinforce_horizon: 3                 # REINFORCE uses at most the next 3 steps of D_j
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
