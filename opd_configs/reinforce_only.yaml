@@ -73,10 +73,11 @@ train:
   # Each entry is one teacher; with >1 entry, OPD distills the entire set.
   teacher_paths:
     - "jieliu/SD3.5M-FlowGRPO-Text"      # HF Hub repo id (auto-downloaded)
+    - "jieliu/SD3.5M-FlowGRPO-PickScore"
     # - "/path/to/local/lora_dir"          # local directory
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
-  teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
+  teacher_aggregation: 'average'         # Options: 'average' (forward every teacher per timestep), 'round_robin' (1 teacher per batch, cycling)
   pathwise_coef: 0.0                     # ABLATION: disable D_k(theta); train under the REINFORCE term only. Default 1.0.
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k). 0 drops the trajectory term entirely.
   normalize_d_k: true                    # If false: D_k = mean(||Δμ||²) without / (2*sigma_bar^2) (feeds R_bar pre-pass).

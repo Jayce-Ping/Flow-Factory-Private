@@ -52,8 +52,9 @@ train:
 
   teacher_paths:
     - "jieliu/SD3.5M-FlowGRPO-Text"
+    - "jieliu/SD3.5M-FlowGRPO-PickScore"
   teacher_param_device: 'cuda'
-  teacher_aggregation: 'round_robin'
+  teacher_aggregation: 'average'
   pathwise_coef: 1.0
   reinforce_coef: 1.0
   normalize_d_k: true
