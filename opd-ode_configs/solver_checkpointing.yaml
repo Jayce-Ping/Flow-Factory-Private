@@ -101,13 +101,13 @@ eval:
 rewards:
   - name: "ocr"
     reward_model: "ocr"
-    batch_size: 16
+    batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
   - name: "pick_score"
     reward_model: "PickScore"
-    batch_size: 16
+    batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
@@ -115,13 +115,13 @@ rewards:
 eval_rewards:
   - name: "ocr"
     reward_model: "ocr"
-    batch_size: 16
+    batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
   - name: "pick_score"
     reward_model: "PickScore"
-    batch_size: 16
+    batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
