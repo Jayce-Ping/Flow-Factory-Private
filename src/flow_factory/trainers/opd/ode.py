@@ -45,6 +45,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ...hparams import OPDODETrainingArguments
+from ...scheduler import set_scheduler_timesteps
 from ...utils.base import create_generator, create_generator_by_prompt, filter_kwargs
 from ...utils.dist import reduce_loss_info
 from ...utils.logger_utils import setup_logger
@@ -57,6 +58,32 @@ from .common import (
 )
 
 logger = setup_logger(__name__)
+
+
+def prepare_train_timesteps(
+    scheduler,
+    *,
+    num_inference_steps: int,
+    height: int,
+    width: int,
+    patch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """SD3.5-compatible noise schedule for OPD-ODE Euler training.
+
+    Mirrors ``SD3_5Adapter.inference`` step 5: ``image_seq_len`` from latent
+    spatial size, then ``set_scheduler_timesteps`` (shift + retrieve_timesteps).
+    Returns scheduler-scale timesteps in inference order (noisy → clean).
+    """
+    latent_h = height // 8
+    latent_w = width // 8
+    image_seq_len = (latent_h // patch_size) * (latent_w // patch_size)
+    return set_scheduler_timesteps(
+        scheduler=scheduler,
+        num_inference_steps=num_inference_steps,
+        seq_len=image_seq_len,
+        device=device,
+    )
 
 
 class OPDODETrainer(BaseTrainer):
@@ -536,8 +563,33 @@ class OPDODETrainer(BaseTrainer):
            (see :meth:`OPDODETrainingArguments.get_num_train_timesteps`).
         """
         device = self.accelerator.device
-        timesteps = self.adapter.scheduler.timesteps
+        height = self.training_args.height
+        width = self.training_args.width
+        if height is None or width is None:
+            raise ValueError(
+                "OPD-ODE requires training height and width for scheduler timesteps, "
+                f"got height={height!r}, width={width!r}. "
+                "Set `training.resolution` or `training.height` / `training.width` in the config."
+            )
+        patch_size = self.adapter.pipeline.transformer.config.patch_size
+        timesteps = prepare_train_timesteps(
+            self.adapter.scheduler,
+            num_inference_steps=self.training_args.num_inference_steps,
+            height=height,
+            width=width,
+            patch_size=patch_size,
+            device=device,
+        )
         num_steps = len(timesteps)
+        if num_steps != self.training_args.num_inference_steps:
+            raise ValueError(
+                f"OPD-ODE train timestep count mismatch after set_scheduler_timesteps: "
+                f"len(timesteps)={num_steps}, "
+                f"expected training.num_inference_steps="
+                f"{self.training_args.num_inference_steps}. "
+                f"image_seq_len derived from height={height}, "
+                f"width={width}, patch_size={patch_size}."
+            )
 
         self.adapter.train()
 
