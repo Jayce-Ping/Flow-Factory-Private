@@ -13,6 +13,8 @@
 #
 # OPD does not consume external reward models; `rewards: []` keeps the
 # reward / advantage stages as a no-op.
+#
+# Group experiment (K=16 sampling): group_pathwise_only.yaml.
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
@@ -67,7 +69,11 @@ train:
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
+  pathwise_coef: 1.0                     # Pathwise D_k only; reinforce_coef=0 disables REINFORCE.
   reinforce_coef: 0.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).
+  normalize_d_k: true                    # If false: D_k = mean(||Δμ||²) without / (2*sigma_bar^2).
+  reinforce_future_reduction: "sum"      # Unused when reinforce_coef=0; kept for config parity.
+  reinforce_group_center: false          # Unused when reinforce_coef=0.
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
@@ -83,7 +89,7 @@ train:
 
   # ---- Batch / sampling geometry ----
   per_device_batch_size: 8
-  group_size: 1                          # OPD does not group by prompt; reward/advantage stages are no-ops.
+  group_size: 1
   unique_sample_num_per_epoch: 64
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto

@@ -23,11 +23,12 @@ Implements the REINFORCE form of the trajectory-level reverse KL
         + sum_k R_bar_{k+1} * grad_theta log p_theta(x_{k+1} | x_k)
     ]
 
-where ``D_k = || mu_theta^k - mu_phi^k ||^2 / (2 * sigma_bar_k^2)`` is the
-per-step Gaussian KL between the student and a frozen LoRA teacher
-``v_phi``, and ``R_bar_{k+1} = sum_{j>k} D_j`` is the closed-form
-cumulative-future KL (treated as a constant). Optionally truncate to the
-next ``reinforce_horizon`` steps via ``OPDTrainingArguments.reinforce_horizon``.
+where ``D_k`` is the per-step Gaussian KL between the student and a frozen
+LoRA teacher (optionally divided by ``2 * sigma_bar_k^2`` via
+``normalize_d_k``), and ``R_bar_{k+1}`` aggregates future ``D_j`` by sum
+(paper Eq. 11) or mean (``reinforce_future_reduction``). Optionally truncate
+to the next ``reinforce_horizon`` steps. REINFORCE may use group-centered
+coefficients (``reinforce_group_center``).
 One or more teachers can be
 attached via ``OPDTrainingArguments.teacher_paths`` and combined either by
 per-batch round-robin or per-timestep averaging.
@@ -36,7 +37,7 @@ per-batch round-robin or per-timestep averaging.
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -76,9 +77,9 @@ class OPDTrainer(BaseTrainer):
 
     1. No external reward model -- the per-step Gaussian KL ``D_k`` between
        student and teacher serves as the dense reward signal.
-    2. No advantage / aggregation step -- ``R_bar_{k+1}`` is computed as a
-       reverse cumulative sum over ``D_j`` per trajectory inside
-       ``optimize()``.
+    2. No external reward advantage -- ``R_bar_{k+1}`` is computed from
+       future ``D_j`` per trajectory inside ``optimize()`` (sum or mean,
+       optional group centering for REINFORCE).
     3. One or more teacher LoRAs are pre-loaded into named-parameter
        snapshots; ``optimize()`` swaps them in via
        ``adapter.use_named_parameters`` to compute ``v_phi``.
@@ -95,7 +96,19 @@ class OPDTrainer(BaseTrainer):
         self.pathwise_coef = self.training_args.pathwise_coef
         self.reinforce_coef = self.training_args.reinforce_coef
         self.reinforce_horizon = self.training_args.reinforce_horizon
+        self.reinforce_future_reduction = self.training_args.reinforce_future_reduction
+        self.reinforce_group_center = self.training_args.reinforce_group_center
+        self.normalize_d_k = self.training_args.normalize_d_k
         self.teacher_aggregation = self.training_args.teacher_aggregation
+
+        if self.reinforce_group_center and self.reinforce_coef > 0:
+            if self.config.data_args.sampler_type != "group_contiguous":
+                logger.warning(
+                    "reinforce_group_center=True but data.sampler_type is not "
+                    f"'group_contiguous' (got {self.config.data_args.sampler_type!r}). "
+                    "Group means may be wrong unless samples are group-contiguous "
+                    "on this rank."
+                )
 
         # Sanity check: warn (do not hard-error) when the configured loss
         # carries no learning signal at all -- e.g. an accidental ablation
@@ -135,9 +148,8 @@ class OPDTrainer(BaseTrainer):
         supported (see :class:`OPDTrainingArguments.kl_type`):
 
         - ``'x-based'`` (default): same-variance Gaussian KL on the SDE
-          transition mean, ``mean(||mu_s - mu_ref||^2) / (2 * sigma_bar^2)``;
-          identical formula to the teacher-vs-student ``D_k`` so the two
-          KL terms live on the same scale.
+          transition mean via :meth:`_compute_per_step_kl` (respects
+          ``normalize_d_k``); identical scale to teacher-vs-student ``D_k``.
         - ``'v-based'``: unscaled MSE on the velocity prediction,
           ``mean((noise_pred_s - noise_pred_ref)^2)``; matches GRPO.
         """
@@ -390,11 +402,15 @@ class OPDTrainer(BaseTrainer):
         mu_teacher: torch.Tensor,
         std_dev_t: torch.Tensor,
         dt: torch.Tensor,
+        *,
+        normalize: bool,
     ) -> torch.Tensor:
-        """Compute ``D_k = mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` per batch sample.
+        """Per-sample Gaussian transition KL ``D_k`` with optional normalization.
 
-        ``sigma_bar^2 = std_dev_t^2 * (-dt)`` follows the Flow-SDE
-        discretisation (see Appendix B of the Flow-OPD paper).
+        When ``normalize`` is True: ``mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)``
+        with ``sigma_bar^2 = std_dev_t^2 * (-dt)`` (Flow-SDE, Appendix B).
+
+        When False: ``mean(||mu_s - mu_t||^2)`` only.
 
         Spatial reduction uses ``mean`` over non-batch dimensions (matching
         GRPO's ``kl_div`` convention in ``trainers/grpo.py``).
@@ -408,6 +424,9 @@ class OPDTrainer(BaseTrainer):
 
         diff_sq = (mu_student.float() - mu_teacher.float()) ** 2
         diff_sq = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
+
+        if not normalize:
+            return diff_sq
 
         # `std_dev_t` and `dt` are produced by the Flow-SDE scheduler in shape
         # `(B, 1, 1)` (per-sample scalars broadcast across spatial dims), so a
@@ -497,6 +516,7 @@ class OPDTrainer(BaseTrainer):
                 mu_teacher=ref_out.next_latents_mean,
                 std_dev_t=student_out.std_dev_t,
                 dt=student_out.dt,
+                normalize=self.normalize_d_k,
             )
             kl_div = kl_div_per_sample.mean()
 
@@ -507,48 +527,127 @@ class OPDTrainer(BaseTrainer):
     def _reverse_cumulative(
         d_list: List[torch.Tensor],
         max_future_steps: Optional[int] = None,
+        *,
+        reduction: Literal["sum", "mean"] = "sum",
     ) -> List[torch.Tensor]:
-        """Return per-timestep future KL sums for the REINFORCE coefficient.
+        """Return per-timestep future KL aggregates for the REINFORCE coefficient.
 
-        Indexed so ``r_per_k[k] == bar_R_{k+1}`` of the paper: KL accumulated
-        over timesteps strictly after ``k``.
+        Indexed so ``r_per_k[k] == bar_R_{k+1}``: statistics over timesteps
+        strictly after ``k``.
 
-        - ``max_future_steps is None``: ``bar_R_{k+1} = sum_{j=k+1}^{K-1} D_j``
-          (full future horizon, paper Eq. 11).
-        - ``max_future_steps == n``: ``bar_R_{k+1} = sum_{j=k+1}^{min(k+n, K-1)} D_j``.
-          The last training timestep has ``bar_R = 0``.
+        - ``reduction='sum'``: ``bar_R_{k+1} = sum_{j>k} D_j`` (paper Eq. 11).
+        - ``reduction='mean'``: ``bar_R_{k+1} = mean_{j>k} D_j``.
+
+        - ``max_future_steps is None``: all future timesteps after ``k``.
+        - ``max_future_steps == n``: only ``j in k+1 .. min(k+n, K-1)``.
         """
+        if reduction not in ("sum", "mean"):
+            raise ValueError(f"expected reduction 'sum' or 'mean', got reduction={reduction!r}.")
         if not d_list:
             return []
 
         k_len = len(d_list)
-        if max_future_steps is None:
-            device = d_list[0].device
-            dtype = d_list[0].dtype
-            shape = d_list[0].shape
-            running = torch.zeros(shape, device=device, dtype=dtype)
-            r_per_k: List[torch.Tensor] = [None] * k_len  # type: ignore[list-item]
-            for k in range(k_len - 1, -1, -1):
-                r_per_k[k] = running.clone()
-                running = running + d_list[k]
-            return r_per_k
-
-        if max_future_steps < 1:
+        if max_future_steps is not None and max_future_steps < 1:
             raise ValueError(
                 f"expected max_future_steps None or >= 1, got max_future_steps={max_future_steps!r}."
             )
 
-        r_per_k = []
+        if max_future_steps is None:
+            device = d_list[0].device
+            dtype = d_list[0].dtype
+            shape = d_list[0].shape
+            if reduction == "sum":
+                running = torch.zeros(shape, device=device, dtype=dtype)
+                r_per_k: List[torch.Tensor] = [None] * k_len  # type: ignore[list-item]
+                for k in range(k_len - 1, -1, -1):
+                    r_per_k[k] = running.clone()
+                    running = running + d_list[k]
+                return r_per_k
+
+            running_sum = torch.zeros(shape, device=device, dtype=dtype)
+            running_count = 0
+            r_per_k_mean: List[torch.Tensor] = [None] * k_len  # type: ignore[list-item]
+            for k in range(k_len - 1, -1, -1):
+                if running_count > 0:
+                    r_per_k_mean[k] = running_sum / float(running_count)
+                else:
+                    r_per_k_mean[k] = torch.zeros(shape, device=device, dtype=dtype)
+                running_sum = running_sum + d_list[k]
+                running_count += 1
+            return r_per_k_mean
+
+        r_per_k: List[torch.Tensor] = []
         for k in range(k_len):
             j_end = min(k + 1 + max_future_steps, k_len)
             if j_end <= k + 1:
                 r_per_k.append(torch.zeros_like(d_list[0]))
             else:
-                total = d_list[k + 1].clone()
-                for j in range(k + 2, j_end):
-                    total = total + d_list[j]
-                r_per_k.append(total)
+                future = torch.stack(d_list[k + 1 : j_end], dim=0)
+                if reduction == "sum":
+                    r_per_k.append(future.sum(dim=0))
+                else:
+                    r_per_k.append(future.mean(dim=0))
         return r_per_k
+
+    @staticmethod
+    def _group_center(
+        values: torch.Tensor,
+        group_ids: torch.Tensor,
+        group_size: int,
+    ) -> torch.Tensor:
+        """Subtract per-group mean from ``values`` (shape ``(B,)``)."""
+        if values.ndim != 1:
+            raise ValueError(
+                f"expected values.ndim == 1 for group centering, got values.shape={tuple(values.shape)}."
+            )
+        if group_ids.shape != values.shape:
+            raise ValueError(
+                f"group_ids and values must have the same shape, got "
+                f"group_ids.shape={tuple(group_ids.shape)} vs values.shape={tuple(values.shape)}."
+            )
+        if group_size < 2:
+            raise ValueError(
+                f"expected group_size >= 2 for group centering, got group_size={group_size!r}."
+            )
+
+        unique_ids = torch.unique(group_ids)
+        centered = values.clone()
+        for uid in unique_ids:
+            mask = group_ids == uid
+            count = int(mask.sum().item())
+            if count != group_size:
+                raise ValueError(
+                    f"expected {group_size} samples for unique_id={uid.item()}, got count={count} "
+                    f"in micro-batch of size {values.shape[0]}."
+                )
+            centered[mask] = values[mask] - values[mask].mean()
+        return centered
+
+    @staticmethod
+    def _shuffle_samples_for_optimize(
+        samples: List[BaseSample],
+        group_size: int,
+        group_center: bool,
+        generator: torch.Generator,
+    ) -> List[BaseSample]:
+        """Shuffle samples for ``optimize()``, optionally permuting whole groups."""
+        n = len(samples)
+        if not group_center:
+            perm = torch.randperm(n, generator=generator)
+            return [samples[i] for i in perm]
+
+        if n % group_size != 0:
+            raise ValueError(
+                f"expected len(samples) divisible by group_size for reinforce_group_center, "
+                f"got len(samples)={n}, group_size={group_size}."
+            )
+        num_groups = n // group_size
+        group_perm = torch.randperm(num_groups, generator=generator)
+        shuffled: List[BaseSample] = []
+        for g in group_perm:
+            start = int(g.item()) * group_size
+            shuffled.extend(samples[start : start + group_size])
+        return shuffled
 
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimisation (Stage 6): two-pass per-batch loss.
@@ -577,6 +676,21 @@ class OPDTrainer(BaseTrainer):
         """
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
+        group_size = self.training_args.group_size
+
+        if self.reinforce_group_center:
+            if len(samples) % group_size != 0:
+                raise ValueError(
+                    f"expected len(samples) divisible by group_size for reinforce_group_center, "
+                    f"got len(samples)={len(samples)}, group_size={group_size}."
+                )
+            if per_device_batch_size % group_size != 0:
+                raise ValueError(
+                    f"expected per_device_batch_size divisible by group_size for "
+                    f"reinforce_group_center, got per_device_batch_size={per_device_batch_size}, "
+                    f"group_size={group_size}."
+                )
+
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
 
         # Single mode swap for the whole optimize() -- mirrors GRPO's pattern.
@@ -584,8 +698,12 @@ class OPDTrainer(BaseTrainer):
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
+            shuffled_samples = self._shuffle_samples_for_optimize(
+                samples,
+                group_size=group_size,
+                group_center=self.reinforce_group_center,
+                generator=perm_gen,
+            )
 
             loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
@@ -601,6 +719,11 @@ class OPDTrainer(BaseTrainer):
                     sample.to(device)
                     for sample in shuffled_samples[start : start + per_device_batch_size]
                 ]
+                group_ids = torch.tensor(
+                    [sample.unique_id for sample in batch_samples],
+                    device=device,
+                    dtype=torch.int64,
+                )
                 batch = BaseSample.stack(batch_samples)
                 latents_index_map = batch["latent_index_map"]  # (T+1,) LongTensor
                 num_timesteps = batch["timesteps"].shape[1]
@@ -617,7 +740,11 @@ class OPDTrainer(BaseTrainer):
                     num_timesteps=num_timesteps,
                     teacher_indices=teacher_indices,
                 )
-                r_per_k = self._reverse_cumulative(d_list, self.reinforce_horizon)
+                r_per_k = self._reverse_cumulative(
+                    d_list,
+                    self.reinforce_horizon,
+                    reduction=self.reinforce_future_reduction,
+                )
 
                 # 2. Main pass: per-timestep loss + backward.
                 loss_info = self._optimize_train_pass(
@@ -626,6 +753,7 @@ class OPDTrainer(BaseTrainer):
                     num_timesteps=num_timesteps,
                     mu_teacher_list=mu_teacher_list,
                     r_per_k=r_per_k,
+                    group_ids=group_ids,
                     loss_info=loss_info,
                 )
 
@@ -687,6 +815,7 @@ class OPDTrainer(BaseTrainer):
                     mu_teacher=mu_teacher,
                     std_dev_t=student_out.std_dev_t,
                     dt=student_out.dt,
+                    normalize=self.normalize_d_k,
                 )
                 d_list.append(d_k.detach())
                 mu_teacher_list.append(mu_teacher.detach())
@@ -700,6 +829,7 @@ class OPDTrainer(BaseTrainer):
         num_timesteps: int,
         mu_teacher_list: List[torch.Tensor],
         r_per_k: List[torch.Tensor],
+        group_ids: torch.Tensor,
         loss_info: Dict[str, List[torch.Tensor]],
     ) -> Dict[str, List[torch.Tensor]]:
         """Main pass: per-timestep student forward + loss + backward.
@@ -759,9 +889,16 @@ class OPDTrainer(BaseTrainer):
                         mu_teacher=mu_teacher,
                         std_dev_t=student_out.std_dev_t,
                         dt=student_out.dt,
+                        normalize=self.normalize_d_k,
                     )
 
                     r_kp1 = r_per_k[k_idx].detach()
+                    if self.reinforce_group_center:
+                        r_kp1 = self._group_center(
+                            r_kp1,
+                            group_ids,
+                            self.training_args.group_size,
+                        )
                     log_prob_new = student_out.log_prob
 
                     pathwise_loss = d_k_grad.mean()
@@ -775,7 +912,9 @@ class OPDTrainer(BaseTrainer):
                         loss_info["kl_loss"].append(kl_loss.detach())
 
                     loss_info["d_k"].append(pathwise_loss.detach())
-                    loss_info["r_bar"].append(r_kp1.mean().detach())
+                    loss_info["r_bar"].append(r_per_k[k_idx].detach().mean())
+                    if self.reinforce_group_center:
+                        loss_info["r_bar_adv"].append(r_kp1.mean().detach())
                     loss_info["log_prob"].append(log_prob_new.mean().detach())
                     loss_info["reinforce_loss"].append(reinforce_loss.detach())
                     loss_info["loss"].append(loss.detach())
