@@ -1190,13 +1190,8 @@ class OPDODETrainingArguments(TrainingArguments):
             )
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        # OPD-ODE issues ONE `accelerator.backward()` per micro-batch -- the
-        # entire N-step Euler rollout lives in a single autograd graph and is
-        # backward'd as one unit. So the per-micro-batch multiplier on
-        # `gradient_accumulation_steps` is 1, NOT `num_inference_steps`. (For
-        # SDE-OPD / GRPO the multiplier is the per-timestep accumulate count
-        # because they call backward inside the timestep loop.)
-        return 1
+        """One ``accumulate`` + ``backward`` per Euler step per micro-batch."""
+        return self.num_inference_steps
 
     @property
     def requires_ref_model(self) -> bool:

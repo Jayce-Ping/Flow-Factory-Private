@@ -1,5 +1,7 @@
 # OPD-ODE ablation baseline: full BPTT through all Euler steps (Algorithm 2 / Eq. 13).
 # Differentiable ODE rollout with pathwise_coef=1.0, bptt_steps=null, solver_checkpointing=false.
+# Full BPTT retains O(N) peak autograd memory (retain_graph across steps); use
+# solver_checkpointing.yaml or tbptt_steps_3.yaml if OOM.
 # Closest ODE counterpart to SDE `opd_configs/pathwise_reinforce.yaml` (pure pathwise; no REINFORCE).
 #
 #   grad L = sum_j d D_j / d theta,

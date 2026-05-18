@@ -91,9 +91,10 @@ train:
 
   # ---- Sampling settings ----
   resolution: 512
-  # NOTE: keep `num_inference_steps` modest -- BPTT through ALL steps means N transformer
-  # forwards + backwards per micro-batch. With SD3.5 LoRA at 512^2 and bs=4, N=6 fits in
-  # ~24 GB; for larger N or larger models, set `solver_checkpointing: true` above.
+  # NOTE: keep `num_inference_steps` modest -- each Euler step is one forward + backward.
+  # With `gradient_accumulation_steps: auto`, GAS is multiplied by N (same as GRPO/SDE-OPD).
+  # Full BPTT (`bptt_steps: null`) still needs O(N) autograd memory; use `solver_checkpointing`
+  # or smaller `bptt_steps` (e.g. 1) to cap memory. SD3.5 LoRA 512^2 bs=4, N=6 ~24 GB.
   num_inference_steps: 6
   guidance_scale: 4.5
 
@@ -102,7 +103,7 @@ train:
   group_size: 1                          # OPD does not group by prompt.
   unique_sample_num_per_epoch: 32
   gradient_step_per_epoch: 1
-  gradient_accumulation_steps: auto
+  gradient_accumulation_steps: auto   # auto: base GAS * num_inference_steps (per-step backward).
   num_inner_epochs: 1
 
   # ---- Optimization ----
