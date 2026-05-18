@@ -78,8 +78,8 @@ class OPDTrainer(BaseTrainer):
     1. No external reward model -- the per-step Gaussian KL ``D_k`` between
        student and teacher serves as the dense reward signal.
     2. No external reward advantage -- ``R_bar_{k+1}`` is computed from
-       future ``D_j`` per trajectory inside ``optimize()`` (sum or mean,
-       optional group centering for REINFORCE).
+       future ``D_j`` on the full rank inside ``optimize()`` (sum or mean,
+       optional rank-local group centering for REINFORCE).
     3. One or more teacher LoRAs are pre-loaded into named-parameter
        snapshots; ``optimize()`` swaps them in via
        ``adapter.use_named_parameters`` to compute ``v_phi``.
@@ -103,11 +103,9 @@ class OPDTrainer(BaseTrainer):
 
         if self.reinforce_group_center and self.reinforce_coef > 0:
             if self.config.data_args.sampler_type != "group_contiguous":
-                logger.warning(
-                    "reinforce_group_center=True but data.sampler_type is not "
-                    f"'group_contiguous' (got {self.config.data_args.sampler_type!r}). "
-                    "Group means may be wrong unless samples are group-contiguous "
-                    "on this rank."
+                raise ValueError(
+                    "reinforce_group_center=True requires data.sampler_type "
+                    f"'group_contiguous', got {self.config.data_args.sampler_type!r}."
                 )
 
         # Sanity check: warn (do not hard-error) when the configured loss
@@ -594,8 +592,14 @@ class OPDTrainer(BaseTrainer):
         values: torch.Tensor,
         group_ids: torch.Tensor,
         group_size: int,
+        *,
+        rank_index: Optional[int] = None,
     ) -> torch.Tensor:
-        """Subtract per-group mean from ``values`` (shape ``(B,)``)."""
+        """Subtract per-group mean from rank-local ``values`` (shape ``(N,)``).
+
+        Expects each ``unique_id`` to appear exactly ``group_size`` times
+        (``group_contiguous`` sampling on this rank).
+        """
         if values.ndim != 1:
             raise ValueError(
                 f"expected values.ndim == 1 for group centering, got values.shape={tuple(values.shape)}."
@@ -610,6 +614,7 @@ class OPDTrainer(BaseTrainer):
                 f"expected group_size >= 2 for group centering, got group_size={group_size!r}."
             )
 
+        rank_suffix = f" on rank {rank_index}" if rank_index is not None else ""
         unique_ids = torch.unique(group_ids)
         centered = values.clone()
         for uid in unique_ids:
@@ -617,11 +622,26 @@ class OPDTrainer(BaseTrainer):
             count = int(mask.sum().item())
             if count != group_size:
                 raise ValueError(
-                    f"expected {group_size} samples for unique_id={uid.item()}, got count={count} "
-                    f"in micro-batch of size {values.shape[0]}."
+                    f"expected {group_size} samples for unique_id={uid.item()}, got count={count}"
+                    f"{rank_suffix}, num_samples={values.shape[0]}."
                 )
             centered[mask] = values[mask] - values[mask].mean()
         return centered
+
+    def _validate_rank_group_layout(
+        self,
+        group_ids: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        """Fail-fast when this rank's samples do not form complete prompt groups."""
+        unique_ids, counts = torch.unique(group_ids, return_counts=True)
+        for uid, count in zip(unique_ids, counts):
+            if int(count.item()) != group_size:
+                raise ValueError(
+                    f"expected {group_size} samples for unique_id={uid.item()} on rank "
+                    f"{self.accelerator.process_index}, got count={int(count.item())}, "
+                    f"num_samples={group_ids.shape[0]}."
+                )
 
     @staticmethod
     def _shuffle_samples_for_optimize(
@@ -648,6 +668,103 @@ class OPDTrainer(BaseTrainer):
             start = int(g.item()) * group_size
             shuffled.extend(samples[start : start + group_size])
         return shuffled
+
+    def _precompute_rank_reinforce_and_teacher(
+        self,
+        shuffled_samples: List[BaseSample],
+        per_device_batch_size: int,
+        inner_epoch: int,
+        num_batches: int,
+    ) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]], List[List[torch.Tensor]]]:
+        """Rank-wide no-grad pre-pass: ``D_k`` buffer, ``R_bar``, optional group center.
+
+        Micro-batches are used only for forward memory; per-timestep ``D_k`` are
+        stitched into length-``N`` tensors before reverse-cumulative aggregation
+        and rank-local group centering.
+
+        Returns:
+            ``(r_per_k, r_per_k_raw, mu_teacher_by_batch)`` where
+
+            - ``r_per_k[k]`` is the REINFORCE coefficient used in the main pass
+              (group-centered when ``reinforce_group_center``).
+            - ``r_per_k_raw[k]`` is the pre-center ``R_bar`` (``None`` when not
+              group-centering).
+            - ``mu_teacher_by_batch[batch_idx]`` is the per-timestep teacher
+              mean list for that micro-batch's main pass.
+        """
+        device = self.accelerator.device
+        num_samples = len(shuffled_samples)
+        group_size = self.training_args.group_size
+
+        rank_group_ids = torch.tensor(
+            [sample.unique_id for sample in shuffled_samples],
+            device=device,
+            dtype=torch.int64,
+        )
+        if self.reinforce_group_center:
+            self._validate_rank_group_layout(rank_group_ids, group_size)
+
+        d_accum: Optional[List[torch.Tensor]] = None
+        mu_teacher_by_batch: List[List[torch.Tensor]] = []
+
+        for batch_idx in range(num_batches):
+            start = batch_idx * per_device_batch_size
+            end = min(start + per_device_batch_size, num_samples)
+            batch_size = end - start
+            batch_samples = [shuffled_samples[i].to(device) for i in range(start, end)]
+            batch = BaseSample.stack(batch_samples)
+            latents_index_map = batch["latent_index_map"]
+            num_timesteps = batch["timesteps"].shape[1]
+
+            teacher_indices = self._teacher_indices_for_batch(batch_idx, inner_epoch)
+            d_list, mu_teacher_list = self._precompute_d_per_timestep(
+                batch=batch,
+                latents_index_map=latents_index_map,
+                num_timesteps=num_timesteps,
+                teacher_indices=teacher_indices,
+            )
+            mu_teacher_by_batch.append(mu_teacher_list)
+
+            if d_accum is None:
+                d_accum = [
+                    torch.empty(num_samples, device=device, dtype=d_list[0].dtype)
+                    for _ in range(len(d_list))
+                ]
+
+            for k_idx, d_k in enumerate(d_list):
+                if d_k.shape != (batch_size,):
+                    raise ValueError(
+                        f"expected d_k.shape=({batch_size},) for micro-batch {batch_idx}, "
+                        f"got d_k.shape={tuple(d_k.shape)}."
+                    )
+                d_accum[k_idx][start:end] = d_k.detach()
+
+        if d_accum is None:
+            raise RuntimeError(
+                "rank pre-pass produced no D_k tensors; expected num_batches >= 1, "
+                f"got num_batches={num_batches}, num_samples={num_samples}."
+            )
+
+        r_per_k_raw = self._reverse_cumulative(
+            d_accum,
+            self.reinforce_horizon,
+            reduction=self.reinforce_future_reduction,
+        )
+
+        if self.reinforce_group_center:
+            rank_index = self.accelerator.process_index
+            r_per_k = [
+                self._group_center(
+                    r_k,
+                    rank_group_ids,
+                    group_size,
+                    rank_index=rank_index,
+                )
+                for r_k in r_per_k_raw
+            ]
+            return r_per_k, r_per_k_raw, mu_teacher_by_batch
+
+        return r_per_k_raw, None, mu_teacher_by_batch
 
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimisation (Stage 6): two-pass per-batch loss.
@@ -684,12 +801,6 @@ class OPDTrainer(BaseTrainer):
                     f"expected len(samples) divisible by group_size for reinforce_group_center, "
                     f"got len(samples)={len(samples)}, group_size={group_size}."
                 )
-            if per_device_batch_size % group_size != 0:
-                raise ValueError(
-                    f"expected per_device_batch_size divisible by group_size for "
-                    f"reinforce_group_center, got per_device_batch_size={per_device_batch_size}, "
-                    f"group_size={group_size}."
-                )
 
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
 
@@ -707,6 +818,15 @@ class OPDTrainer(BaseTrainer):
 
             loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
+            r_per_k_rank, r_per_k_raw_rank, mu_teacher_by_batch = (
+                self._precompute_rank_reinforce_and_teacher(
+                    shuffled_samples=shuffled_samples,
+                    per_device_batch_size=per_device_batch_size,
+                    inner_epoch=inner_epoch,
+                    num_batches=num_batches,
+                )
+            )
+
             for batch_idx in tqdm(
                 range(num_batches),
                 total=num_batches,
@@ -715,15 +835,8 @@ class OPDTrainer(BaseTrainer):
                 disable=not self.show_progress_bar,
             ):
                 start = batch_idx * per_device_batch_size
-                batch_samples = [
-                    sample.to(device)
-                    for sample in shuffled_samples[start : start + per_device_batch_size]
-                ]
-                group_ids = torch.tensor(
-                    [sample.unique_id for sample in batch_samples],
-                    device=device,
-                    dtype=torch.int64,
-                )
+                end = min(start + per_device_batch_size, len(shuffled_samples))
+                batch_samples = [shuffled_samples[i].to(device) for i in range(start, end)]
                 batch = BaseSample.stack(batch_samples)
                 latents_index_map = batch["latent_index_map"]  # (T+1,) LongTensor
                 num_timesteps = batch["timesteps"].shape[1]
@@ -733,27 +846,20 @@ class OPDTrainer(BaseTrainer):
                     torch.as_tensor(float(teacher_indices[0]), device=device)
                 )
 
-                # 1. Pre-pass: compute D_k and cache mu_teacher per timestep.
-                d_list, mu_teacher_list = self._precompute_d_per_timestep(
-                    batch=batch,
-                    latents_index_map=latents_index_map,
-                    num_timesteps=num_timesteps,
-                    teacher_indices=teacher_indices,
-                )
-                r_per_k = self._reverse_cumulative(
-                    d_list,
-                    self.reinforce_horizon,
-                    reduction=self.reinforce_future_reduction,
+                r_per_k_mb = [r_k[start:end] for r_k in r_per_k_rank]
+                r_per_k_raw_mb = (
+                    [r_k[start:end] for r_k in r_per_k_raw_rank]
+                    if r_per_k_raw_rank is not None
+                    else None
                 )
 
-                # 2. Main pass: per-timestep loss + backward.
                 loss_info = self._optimize_train_pass(
                     batch=batch,
                     latents_index_map=latents_index_map,
                     num_timesteps=num_timesteps,
-                    mu_teacher_list=mu_teacher_list,
-                    r_per_k=r_per_k,
-                    group_ids=group_ids,
+                    mu_teacher_list=mu_teacher_by_batch[batch_idx],
+                    r_per_k=r_per_k_mb,
+                    r_per_k_raw=r_per_k_raw_mb,
                     loss_info=loss_info,
                 )
 
@@ -829,7 +935,7 @@ class OPDTrainer(BaseTrainer):
         num_timesteps: int,
         mu_teacher_list: List[torch.Tensor],
         r_per_k: List[torch.Tensor],
-        group_ids: torch.Tensor,
+        r_per_k_raw: Optional[List[torch.Tensor]],
         loss_info: Dict[str, List[torch.Tensor]],
     ) -> Dict[str, List[torch.Tensor]]:
         """Main pass: per-timestep student forward + loss + backward.
@@ -893,12 +999,6 @@ class OPDTrainer(BaseTrainer):
                     )
 
                     r_kp1 = r_per_k[k_idx].detach()
-                    if self.reinforce_group_center:
-                        r_kp1 = self._group_center(
-                            r_kp1,
-                            group_ids,
-                            self.training_args.group_size,
-                        )
                     log_prob_new = student_out.log_prob
 
                     pathwise_loss = d_k_grad.mean()
@@ -912,9 +1012,11 @@ class OPDTrainer(BaseTrainer):
                         loss_info["kl_loss"].append(kl_loss.detach())
 
                     loss_info["d_k"].append(pathwise_loss.detach())
-                    loss_info["r_bar"].append(r_per_k[k_idx].detach().mean())
-                    if self.reinforce_group_center:
+                    if r_per_k_raw is not None:
+                        loss_info["r_bar"].append(r_per_k_raw[k_idx].detach().mean())
                         loss_info["r_bar_adv"].append(r_kp1.mean().detach())
+                    else:
+                        loss_info["r_bar"].append(r_kp1.mean().detach())
                     loss_info["log_prob"].append(log_prob_new.mean().detach())
                     loss_info["reinforce_loss"].append(reinforce_loss.detach())
                     loss_info["loss"].append(loss.detach())
