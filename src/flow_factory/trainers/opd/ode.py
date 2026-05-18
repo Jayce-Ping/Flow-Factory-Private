@@ -66,9 +66,9 @@ class OPDODETrainer(BaseTrainer):
     from a no-grad rollout. The full N-step Euler rollout is run inside
     :meth:`optimize` with ``requires_grad=True`` on the student so the
     pathwise loss can backprop through every step (BPTT through the ODE
-    solver). Memory cost is therefore O(N) transformer activations per
-    micro-batch; enable :attr:`solver_checkpointing` to trade O(1)
-    solver-depth memory for ~2x forward compute.
+    solver). Each Euler step calls ``accelerator.backward`` (GRPO / SDE-OPD
+    pattern) so truncated BPTT (``bptt_steps``) caps peak autograd memory;
+    full BPTT remains O(N) unless :attr:`solver_checkpointing` is enabled.
 
     Teacher administration (LoRA snapshot loading and per-batch
     round-robin / average selection) is shared with :class:`OPDTrainer` via
@@ -525,18 +525,15 @@ class OPDODETrainer(BaseTrainer):
 
         1. Sample initial Gaussian noise ``x_{t_0}`` (deterministic per
            ``(epoch, inner_epoch)``).
-        2. Run an N-step Euler rollout WITH gradient, accumulating the
-           per-step pathwise loss ``D_j = (dt_j^2 / 2) * mean(||v_s - v_t||^2)``
-           into a scalar. When ``bptt_steps`` is set, the trajectory state
-           ``x`` is detached every ``bptt_steps`` Euler steps so the autograd
-           graph spans at most ``bptt_steps`` consecutive student forwards
-           (truncated BPTT; see
-           :attr:`OPDODETrainingArguments.bptt_steps`).
-        3. Optionally add ``kl_beta * KL_anchor`` per step.
-        4. Single ``accelerator.backward(loss)`` -- BPTT through the entire
-           solver (or each segment, when ``bptt_steps`` is set).
-           ``optimizer.step()`` fires every ``gradient_accumulation_steps``
-           micro-batches as configured.
+        2. Run an N-step Euler rollout WITH gradient; per Euler step compute
+           ``D_j`` (and optional KL anchor) and call
+           ``accelerator.backward`` immediately (GRPO / SDE-OPD pattern).
+           When ``bptt_steps`` is set, ``x`` is detached every
+           ``bptt_steps`` steps so autograd spans at most that many consecutive
+           student forwards (truncated BPTT).
+        3. ``gradient_accumulation_steps`` is multiplied by
+           ``num_inference_steps`` in ``Arguments._adjust_gradient_accumulation``
+           (see :meth:`OPDODETrainingArguments.get_num_train_timesteps`).
         """
         device = self.accelerator.device
         timesteps = self.adapter.scheduler.timesteps
@@ -560,7 +557,6 @@ class OPDODETrainer(BaseTrainer):
                     disable=not self.show_progress_bar,
                 )
             ):
-                # Move tensor fields to device (lazy reload; mirrors SDE pattern).
                 batch = {
                     k: (v.to(device) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
@@ -571,90 +567,95 @@ class OPDODETrainer(BaseTrainer):
                     torch.as_tensor(float(teacher_indices[0]), device=device)
                 )
 
-                with self.accelerator.accumulate(*self.adapter.trainable_components):
-                    with self.autocast():
-                        x = self._sample_initial_latents(batch, seed_offset=inner_epoch)
-                        # Keep latents in float for BPTT precision; transformer
-                        # forward will autocast its activations as configured.
-                        x = x.float()
-                        loss = x.new_zeros(())
+                x = self._sample_initial_latents(batch, seed_offset=inner_epoch).float()
+                loss_info = self._optimize_train_pass(
+                    batch=batch,
+                    x=x,
+                    timesteps=timesteps,
+                    num_steps=num_steps,
+                    teacher_indices=teacher_indices,
+                    loss_info=loss_info,
+                )
 
-                        for j in range(num_steps):
-                            # Truncated BPTT: detach the trajectory state every
-                            # `bptt_steps` Euler steps. j == 0 is already
-                            # gradient-free (x_0 is fresh noise from
-                            # `_sample_initial_latents`), so the first detach
-                            # lands at j == bptt_steps and caps the first
-                            # gradient-carrying segment to `bptt_steps`
-                            # consecutive student forwards. Within each
-                            # segment the deepest backprop path covers
-                            # `bptt_steps` steps and the shallowest covers 1.
-                            if self.bptt_steps is not None and j > 0 and j % self.bptt_steps == 0:
-                                x = x.detach()
+    def _optimize_train_pass(
+        self,
+        batch: Dict[str, Any],
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        num_steps: int,
+        teacher_indices: List[int],
+        loss_info: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, List[torch.Tensor]]:
+        """Differentiable Euler rollout: per-step loss + backward + accumulate.
 
-                            t = timesteps[j].to(device)
-                            t_next = (
-                                timesteps[j + 1].to(device)
-                                if j + 1 < num_steps
-                                else torch.zeros_like(t)
-                            )
-                            # dt = (sigma_next - sigma) under the scheduler convention;
-                            # sigma = t / 1000.
-                            dt_scalar = (t_next - t) / 1000.0
+        Matches the GRPO / SDE-OPD per-timestep ``accumulate`` pattern so
+        activations from earlier Euler steps can be freed before later steps
+        when ``bptt_steps`` caps the segment length. Full BPTT
+        (``bptt_steps is None``) uses ``retain_graph=True`` within each
+        segment of length ``num_steps``; peak memory remains O(N) unless
+        ``solver_checkpointing`` is enabled.
+        """
+        device = self.accelerator.device
+        segment_len = self.bptt_steps if self.bptt_steps is not None else num_steps
 
-                            # Student: noise_pred (== v_theta) + next_latents_mean (== x_next).
-                            v_student, x_next = self._student_step(x, t, t_next, batch)
+        for j in range(num_steps):
+            if self.bptt_steps is not None and j > 0 and j % self.bptt_steps == 0:
+                x = x.detach()
 
-                            # Teacher: noise_pred at the SAME x (frozen params, input-grad on).
-                            v_teacher = self._teacher_velocity(x, t, t_next, batch, teacher_indices)
+            t = timesteps[j].to(device)
+            t_next = timesteps[j + 1].to(device) if j + 1 < num_steps else torch.zeros_like(t)
+            dt_scalar = (t_next - t) / 1000.0
 
-                            # D_j = (dt^2 / 2) * mean((v_s - v_t)^2) per sample.
-                            dt_sq = dt_scalar.float().pow(2)
-                            d_j = (
-                                0.5
-                                * dt_sq
-                                * (v_student.float() - v_teacher.float())
-                                .pow(2)
-                                .flatten(1)
-                                .mean(dim=1)
-                            )
-                            loss = loss + self.pathwise_coef * d_j.mean()
-                            loss_info["d_j"].append(d_j.mean().detach())
+            with self.accelerator.accumulate(*self.adapter.trainable_components):
+                with self.autocast():
+                    v_student, x_next = self._student_step(x, t, t_next, batch)
+                    v_teacher = self._teacher_velocity(x, t, t_next, batch, teacher_indices)
 
-                            if self.enable_kl_loss:
-                                kl_div, kl_loss = self._compute_kl_anchor_ode(
-                                    student_noise_pred=v_student,
-                                    student_next_mean=x_next,
-                                    x=x,
-                                    t=t,
-                                    t_next=t_next,
-                                    dt_scalar=dt_scalar,
-                                    batch=batch,
-                                )
-                                loss = loss + kl_loss
-                                loss_info["kl_div"].append(kl_div.detach())
-                                loss_info["kl_loss"].append(kl_loss.detach())
+                    dt_sq = dt_scalar.float().pow(2)
+                    d_j = (
+                        0.5
+                        * dt_sq
+                        * (v_student.float() - v_teacher.float()).pow(2).flatten(1).mean(dim=1)
+                    )
+                    loss_j = self.pathwise_coef * d_j.mean()
+                    loss_info["d_j"].append(d_j.mean().detach())
 
-                            # Advance the trajectory. `x_next` carries grad
-                            # through `v_student` -> `theta`, so BPTT chain stays intact.
-                            x = x_next
-
-                        loss_info["loss"].append(loss.detach())
-
-                    # Single backward through the entire N-step rollout graph.
-                    self.accelerator.backward(loss)
-                    if self.accelerator.sync_gradients:
-                        grad_norm = self.accelerator.clip_grad_norm_(
-                            self.adapter.get_trainable_parameters(),
-                            self.training_args.max_grad_norm,
+                    if self.enable_kl_loss:
+                        kl_div, kl_loss = self._compute_kl_anchor_ode(
+                            student_noise_pred=v_student,
+                            student_next_mean=x_next,
+                            x=x,
+                            t=t,
+                            t_next=t_next,
+                            dt_scalar=dt_scalar,
+                            batch=batch,
                         )
-                        self.optimizer.step()
-                        self.optimizer.zero_grad()
-                        loss_info = reduce_loss_info(self.accelerator, loss_info)
-                        loss_info["grad_norm"] = grad_norm
-                        self.log_data(
-                            {f"train/{k}": v for k, v in loss_info.items()},
-                            step=self.step,
-                        )
-                        self.step += 1
-                        loss_info = defaultdict(list)
+                        loss_j = loss_j + kl_loss
+                        loss_info["kl_div"].append(kl_div.detach())
+                        loss_info["kl_loss"].append(kl_loss.detach())
+
+                    loss_info["loss"].append(loss_j.detach())
+
+                at_segment_end = (j + 1) % segment_len == 0 or j == num_steps - 1
+                retain_graph = not at_segment_end
+
+                self.accelerator.backward(loss_j, retain_graph=retain_graph)
+                if self.accelerator.sync_gradients:
+                    grad_norm = self.accelerator.clip_grad_norm_(
+                        self.adapter.get_trainable_parameters(),
+                        self.training_args.max_grad_norm,
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    loss_info = reduce_loss_info(self.accelerator, loss_info)
+                    loss_info["grad_norm"] = grad_norm
+                    self.log_data(
+                        {f"train/{k}": v for k, v in loss_info.items()},
+                        step=self.step,
+                    )
+                    self.step += 1
+                    loss_info = defaultdict(list)
+
+            x = x_next.float()
+
+        return loss_info
