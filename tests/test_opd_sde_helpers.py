@@ -66,6 +66,55 @@ class TestOPDGroupCenter(unittest.TestCase):
         torch.testing.assert_close(centered[0], torch.tensor(-1.0))
         torch.testing.assert_close(centered[1], torch.tensor(1.0))
 
+    def test_rank_scale_two_groups(self) -> None:
+        """Simulate N=32 rank with two prompt groups (K=16 each)."""
+        group_a = 100
+        group_b = 200
+        group_ids = torch.tensor([group_a] * 16 + [group_b] * 16, dtype=torch.int64)
+        values = torch.arange(32, dtype=torch.float32)
+        centered = OPDTrainer._group_center(
+            values,
+            group_ids,
+            group_size=16,
+            rank_index=0,
+        )
+        self.assertAlmostEqual(centered[:16].sum().item(), 0.0, places=4)
+        self.assertAlmostEqual(centered[16:].sum().item(), 0.0, places=4)
+        torch.testing.assert_close(
+            centered[:16],
+            values[:16] - values[:16].mean(),
+        )
+
+    def test_incomplete_group_raises(self) -> None:
+        values = torch.tensor([1.0, 2.0, 3.0])
+        group_ids = torch.tensor([1, 1, 1])
+        with self.assertRaises(ValueError):
+            OPDTrainer._group_center(values, group_ids, group_size=16, rank_index=3)
+
+
+class TestOPDRankReinforcePipeline(unittest.TestCase):
+    def test_stitch_reverse_center(self) -> None:
+        """Micro-batch stitch (N=4, B=2) then rank-level R_bar and center."""
+        d0 = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        d1 = torch.tensor([4.0, 3.0, 2.0, 1.0])
+        r_raw = OPDTrainer._reverse_cumulative(
+            [d0, d1],
+            max_future_steps=None,
+            reduction="sum",
+        )
+        group_ids = torch.tensor([10, 10, 20, 20])
+        r_centered = OPDTrainer._group_center(
+            r_raw[0],
+            group_ids,
+            group_size=2,
+        )
+        # r_raw[0][i] = d1[i]; group 10: d1[0],d1[1] -> mean 3.5
+        torch.testing.assert_close(r_raw[0], d1)
+        torch.testing.assert_close(r_centered[0], torch.tensor(-2.5))
+        torch.testing.assert_close(r_centered[1], torch.tensor(-0.5))
+        torch.testing.assert_close(r_centered[2], torch.tensor(0.5))
+        torch.testing.assert_close(r_centered[3], torch.tensor(2.5))
+
 
 if __name__ == "__main__":
     unittest.main()

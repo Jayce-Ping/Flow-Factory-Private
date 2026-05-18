@@ -989,8 +989,9 @@ class OPDTrainingArguments(TrainingArguments):
             "help": (
                 "If True, REINFORCE uses group-centered coefficients "
                 "r_i - mean_{i' in group}(r_{i'}) instead of raw r_i. "
-                "Requires group_size >= 2, group_contiguous sampling, and "
-                "per_device_batch_size divisible by group_size."
+                "R_bar is aggregated on the full rank (after micro-batch "
+                "D_k pre-pass), then centered once per timestep. Requires "
+                "group_size >= 2 and data.sampler_type=group_contiguous."
             )
         },
     )
