@@ -26,7 +26,9 @@ Implements the REINFORCE form of the trajectory-level reverse KL
 where ``D_k = || mu_theta^k - mu_phi^k ||^2 / (2 * sigma_bar_k^2)`` is the
 per-step Gaussian KL between the student and a frozen LoRA teacher
 ``v_phi``, and ``R_bar_{k+1} = sum_{j>k} D_j`` is the closed-form
-cumulative-future KL (treated as a constant). One or more teachers can be
+cumulative-future KL (treated as a constant). Optionally truncate to the
+next ``reinforce_horizon`` steps via ``OPDTrainingArguments.reinforce_horizon``.
+One or more teachers can be
 attached via ``OPDTrainingArguments.teacher_paths`` and combined either by
 per-batch round-robin or per-timestep averaging.
 """
@@ -92,6 +94,7 @@ class OPDTrainer(BaseTrainer):
         self.num_train_timesteps = self.adapter.scheduler.num_sde_steps
         self.pathwise_coef = self.training_args.pathwise_coef
         self.reinforce_coef = self.training_args.reinforce_coef
+        self.reinforce_horizon = self.training_args.reinforce_horizon
         self.teacher_aggregation = self.training_args.teacher_aggregation
 
         # Sanity check: warn (do not hard-error) when the configured loss
@@ -503,23 +506,48 @@ class OPDTrainer(BaseTrainer):
     @staticmethod
     def _reverse_cumulative(
         d_list: List[torch.Tensor],
+        max_future_steps: Optional[int] = None,
     ) -> List[torch.Tensor]:
-        """Return ``[R_1, R_2, ..., R_K]`` with ``R_k = sum_{j > k-1, j in [k, K-1]} D_j``.
+        """Return per-timestep future KL sums for the REINFORCE coefficient.
 
-        Indexed so ``R_per_k[k] == bar_R_{k+1}`` of the paper: the future KL
-        starting AFTER timestep ``k``. The last entry is therefore a
-        zero tensor.
+        Indexed so ``r_per_k[k] == bar_R_{k+1}`` of the paper: KL accumulated
+        over timesteps strictly after ``k``.
+
+        - ``max_future_steps is None``: ``bar_R_{k+1} = sum_{j=k+1}^{K-1} D_j``
+          (full future horizon, paper Eq. 11).
+        - ``max_future_steps == n``: ``bar_R_{k+1} = sum_{j=k+1}^{min(k+n, K-1)} D_j``.
+          The last training timestep has ``bar_R = 0``.
         """
         if not d_list:
             return []
-        device = d_list[0].device
-        dtype = d_list[0].dtype
-        shape = d_list[0].shape
-        running = torch.zeros(shape, device=device, dtype=dtype)
-        r_per_k: List[torch.Tensor] = [None] * len(d_list)  # type: ignore[list-item]
-        for k in range(len(d_list) - 1, -1, -1):
-            r_per_k[k] = running.clone()
-            running = running + d_list[k]
+
+        k_len = len(d_list)
+        if max_future_steps is None:
+            device = d_list[0].device
+            dtype = d_list[0].dtype
+            shape = d_list[0].shape
+            running = torch.zeros(shape, device=device, dtype=dtype)
+            r_per_k: List[torch.Tensor] = [None] * k_len  # type: ignore[list-item]
+            for k in range(k_len - 1, -1, -1):
+                r_per_k[k] = running.clone()
+                running = running + d_list[k]
+            return r_per_k
+
+        if max_future_steps < 1:
+            raise ValueError(
+                f"expected max_future_steps None or >= 1, got max_future_steps={max_future_steps!r}."
+            )
+
+        r_per_k = []
+        for k in range(k_len):
+            j_end = min(k + 1 + max_future_steps, k_len)
+            if j_end <= k + 1:
+                r_per_k.append(torch.zeros_like(d_list[0]))
+            else:
+                total = d_list[k + 1].clone()
+                for j in range(k + 2, j_end):
+                    total = total + d_list[j]
+                r_per_k.append(total)
         return r_per_k
 
     def optimize(self, samples: List[BaseSample]) -> None:
@@ -589,7 +617,7 @@ class OPDTrainer(BaseTrainer):
                     num_timesteps=num_timesteps,
                     teacher_indices=teacher_indices,
                 )
-                r_per_k = self._reverse_cumulative(d_list)
+                r_per_k = self._reverse_cumulative(d_list, self.reinforce_horizon)
 
                 # 2. Main pass: per-timestep loss + backward.
                 loss_info = self._optimize_train_pass(

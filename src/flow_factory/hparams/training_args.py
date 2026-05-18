@@ -946,6 +946,18 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    reinforce_horizon: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Max number of future training timesteps included in "
+                "R_bar_{k+1} = sum of D_j for the REINFORCE term. "
+                "None (default): sum all j > k (paper Eq. 11). "
+                "Integer n >= 1: only D_{k+1} .. D_{k+n} (clipped at trajectory end). "
+                "Does not affect pathwise D_k or pre-pass D_j storage."
+            )
+        },
+    )
 
     # KL regularization against the pre-trained base model (LoRA-off for LoRA
     # mode; pre-finetune EMA snapshot for full fine-tuning). Disabled by default
@@ -1005,6 +1017,11 @@ class OPDTrainingArguments(TrainingArguments):
         if self.reinforce_coef < 0:
             raise ValueError(
                 f"`reinforce_coef` must be >= 0, got reinforce_coef={self.reinforce_coef!r}."
+            )
+        if self.reinforce_horizon is not None and self.reinforce_horizon < 1:
+            raise ValueError(
+                f"`reinforce_horizon` must be None or >= 1, got "
+                f"reinforce_horizon={self.reinforce_horizon!r}."
             )
         if self.kl_beta < 0:
             raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")
