@@ -15,14 +15,15 @@
 # src/flow_factory/hparams/training_args.py
 from __future__ import annotations
 
-import yaml
 import importlib
 from dataclasses import dataclass, field
-from typing import Any, Type, Literal, Union, Optional, Tuple, Dict
+from typing import Any, Dict, Literal, Optional, Tuple, Type, Union
 
-from .abc import ArgABC
+import yaml
+
 from ..utils.dist import get_world_size
 from ..utils.logger_utils import setup_logger
+from .abc import ArgABC
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -926,13 +927,26 @@ class OPDTrainingArguments(TrainingArguments):
         default=1.0,
         metadata={
             "help": (
-                "Coefficient on the pathwise term D_k(theta) = "
-                "||mu_student - mu_teacher||^2 / (2 * sigma_bar^2). "
+                "Coefficient on the pathwise per-step Gaussian KL D_k(theta). "
+                "When normalize_d_k is True (default), D_k = "
+                "mean(||mu_student - mu_teacher||^2) / (2 * sigma_bar^2); "
+                "when False, D_k = mean(||mu_student - mu_teacher||^2) only. "
                 "Set to 0 to disable per-step distillation and run a "
                 "REINFORCE-only ablation (the trajectory signal still uses "
                 "R_bar_{k+1}, which is built from the no-grad D_k values "
                 "in the pre-pass, so the closed-form Rao-Blackwell reward "
                 "is preserved)."
+            )
+        },
+    )
+    normalize_d_k: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True, all x-based Gaussian KL / D_k terms divide by "
+                "(2 * sigma_bar^2) with sigma_bar^2 = std_dev_t^2 * (-dt). "
+                "Applies to teacher pathwise D_k, REINFORCE pre-pass D_k, and "
+                "x-based KL anchor; v-based KL anchor is unaffected."
             )
         },
     )
@@ -951,10 +965,32 @@ class OPDTrainingArguments(TrainingArguments):
         metadata={
             "help": (
                 "Max number of future training timesteps included in "
-                "R_bar_{k+1} = sum of D_j for the REINFORCE term. "
-                "None (default): sum all j > k (paper Eq. 11). "
+                "R_bar_{k+1} for the REINFORCE term (sum or mean per "
+                "reinforce_future_reduction). "
+                "None (default): all j > k (paper Eq. 11 when reduction=sum). "
                 "Integer n >= 1: only D_{k+1} .. D_{k+n} (clipped at trajectory end). "
                 "Does not affect pathwise D_k or pre-pass D_j storage."
+            )
+        },
+    )
+    reinforce_future_reduction: Literal["sum", "mean"] = field(
+        default="sum",
+        metadata={
+            "help": (
+                "How to aggregate future D_j into R_bar_{k+1} for REINFORCE. "
+                "'sum': R_bar_{k+1} = sum_{j>k} D_j (paper Eq. 11). "
+                "'mean': R_bar_{k+1} = mean_{j>k} D_j."
+            )
+        },
+    )
+    reinforce_group_center: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, REINFORCE uses group-centered coefficients "
+                "r_i - mean_{i' in group}(r_{i'}) instead of raw r_i. "
+                "Requires group_size >= 2, group_contiguous sampling, and "
+                "per_device_batch_size divisible by group_size."
             )
         },
     )
@@ -970,10 +1006,8 @@ class OPDTrainingArguments(TrainingArguments):
             "help": (
                 "KL space against the pre-trained base. "
                 "'x-based' (default): same-variance Gaussian KL on the SDE "
-                "transition mean, i.e. mean(||mu_student - mu_ref||^2) / "
-                "(2 * sigma_bar^2). Identical formula to the teacher-vs-student "
-                "D_k, so the two KL terms live on the same scale and are "
-                "directly comparable. "
+                "transition mean; uses the same formula as teacher-vs-student "
+                "D_k (including normalize_d_k), so the two KL terms are comparable. "
                 "'v-based': unscaled MSE on the velocity prediction "
                 "mean((noise_pred_student - noise_pred_ref)^2). Matches the "
                 "GRPO/NFT/DPO/CRD convention."
@@ -1022,6 +1056,16 @@ class OPDTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"`reinforce_horizon` must be None or >= 1, got "
                 f"reinforce_horizon={self.reinforce_horizon!r}."
+            )
+        if self.reinforce_future_reduction not in ("sum", "mean"):
+            raise ValueError(
+                f"`reinforce_future_reduction` must be 'sum' or 'mean', got "
+                f"reinforce_future_reduction={self.reinforce_future_reduction!r}."
+            )
+        if self.reinforce_group_center and self.reinforce_coef > 0 and self.group_size < 2:
+            raise ValueError(
+                f"`reinforce_group_center` requires group_size >= 2 when "
+                f"reinforce_coef > 0, got group_size={self.group_size!r}."
             )
         if self.kl_beta < 0:
             raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")

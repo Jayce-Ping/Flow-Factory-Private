@@ -34,7 +34,7 @@ data:
   force_reprocess: false  # Force reprocessing of the dataset
   cache_dir: "~/.cache/flow_factory/datasets"  # Cache directory for preprocessed datasets
   max_dataset_size: 1024  # Limit the maximum number of samples in the dataset
-  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+  sampler_type: "auto"  # For reinforce_group_center: use "group_contiguous"
 
 # Model Configuration
 model:
@@ -74,6 +74,9 @@ train:
   teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
   pathwise_coef: 1.0                     # Coefficient on the pathwise term D_k(theta); 0 disables per-step distillation (see reinforce_only.yaml).
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k); 0 drops the trajectory term.
+  normalize_d_k: true                    # If false: D_k = mean(||Δμ||²) without / (2*sigma_bar^2) (teacher D_k, R_bar, x-based KL anchor).
+  reinforce_future_reduction: "sum"      # Options: sum (paper Eq.11 R_bar), mean (average future D_j).
+  reinforce_group_center: false          # If true: see group_reinforce_pathwise.yaml / group_reinforce_only.yaml.
 
   # ---- KL anchor to the pre-trained base model ----
   # Mirrors GRPO's `kl_beta`. For LoRA mode the reference forward disables the
@@ -89,7 +92,7 @@ train:
 
   # ---- Batch / sampling geometry ----
   per_device_batch_size: 8
-  group_size: 1                          # OPD does not group by prompt; reward/advantage stages are no-ops.
+  group_size: 1                          # Paper-style single trajectory per prompt; use group_reinforce.yaml for group_size=16.
   unique_sample_num_per_epoch: 64
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
