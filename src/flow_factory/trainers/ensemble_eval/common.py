@@ -316,32 +316,21 @@ def ensemble_forward_step(
     noise_only_kwargs = dict(forward_kwargs)
     noise_only_kwargs["return_kwargs"] = ["noise_pred"]
 
-    raw_preds: List[torch.Tensor] = []
     scaled_preds: List[torch.Tensor] = []
     for name, weight in zip(checkpoint_names, weights, strict=True):
         with adapter.use_named_parameters(name):
+            # Clear the autocast weight cache after parameter swap.  Autocast
+            # caches fp32→bf16 casts keyed by tensor data_ptr; .data.copy_()
+            # does not change data_ptr, so stale cached values would be used
+            # for subsequent checkpoints without this invalidation.
+            torch.clear_autocast_cache()
             out = base_forward(**noise_only_kwargs)
         if out.noise_pred is None:
             raise RuntimeError(
                 f"Checkpoint '{name}' forward did not return `noise_pred`; "
                 "check that the adapter supports return_kwargs=['noise_pred']."
             )
-        raw_preds.append(out.noise_pred)
         scaled_preds.append(out.noise_pred * weight)
-
-    # Sanity check: if all raw noise_preds are identical, the parameter swap
-    # is likely not taking effect (common cause: load_adapter silently failed
-    # or parameter objects diverged from model forward path).
-    if len(raw_preds) > 1:
-        ref = raw_preds[0]
-        all_same = all(torch.equal(ref, p) for p in raw_preds[1:])
-        if all_same:
-            logger.warning(
-                "ensemble_forward_step: ALL checkpoint noise_preds are numerically "
-                "identical! This means use_named_parameters is NOT effectively "
-                "swapping model weights. Check that load_lora_as_named_parameters "
-                "actually loaded distinct weights for each checkpoint."
-            )
 
     if blend_mode == "weighted":
         combined_noise_pred = torch.stack(scaled_preds, dim=0).sum(dim=0)
