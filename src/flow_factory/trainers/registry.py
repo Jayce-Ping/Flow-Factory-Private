@@ -30,6 +30,7 @@ _TRAINER_REGISTRY: Dict[str, str] = {
     'grpo': 'flow_factory.trainers.grpo.GRPOTrainer',
     'grpo-guard': 'flow_factory.trainers.grpo.GRPOGuardTrainer',
     'nft': 'flow_factory.trainers.nft.DiffusionNFTTrainer',
+    'mnft': 'flow_factory.trainers.mnft.MNFTTrainer',
     'awm': 'flow_factory.trainers.awm.AWMTrainer',
     'dgpo': 'flow_factory.trainers.dgpo.DGPOTrainer',
     'dpo': 'flow_factory.trainers.dpo.DPOTrainer',
