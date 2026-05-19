@@ -72,7 +72,7 @@ train:
   teacher_aggregation: 'average'         # Options: 'average' (forward every teacher per timestep), 'round_robin' (1 teacher per batch, cycling)
   pathwise_coef: 1.0                     # Pathwise D_k only; reinforce_coef=0 disables REINFORCE.
   reinforce_coef: 0.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).
-  normalize_d_k: true                    # If false: D_k = mean(||Δμ||²) without / (2*sigma_bar^2).
+  normalize_d_k: false                    # If false: D_k = mean(||Δμ||²) without / (2*sigma_bar^2).
   reinforce_future_reduction: "sum"      # Unused when reinforce_coef=0; kept for config parity.
   reinforce_group_center: false          # Unused when reinforce_coef=0.
 
