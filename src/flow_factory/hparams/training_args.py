@@ -990,8 +990,21 @@ class OPDTrainingArguments(TrainingArguments):
                 "If True, REINFORCE uses group-centered coefficients "
                 "r_i - mean_{i' in group}(r_{i'}) instead of raw r_i. "
                 "R_bar is aggregated on the full rank (after micro-batch "
-                "D_k pre-pass), then centered once per timestep. Requires "
-                "group_size >= 2 and data.sampler_type=group_contiguous."
+                "D_k pre-pass), then centered once per timestep. Optional "
+                "per-group std division is controlled by reinforce_group_std. "
+                "Requires group_size >= 2 and data.sampler_type=group_contiguous "
+                "when reinforce_coef > 0."
+            )
+        },
+    )
+    reinforce_group_std: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True (requires reinforce_group_center), divide rank-local "
+                "group-centered R_bar by per-group std with epsilon clamp "
+                "(GRPO-style when global_std=False). Applied once per timestep "
+                "after rank-wide reverse-cumulative aggregation."
             )
         },
     )
@@ -1063,10 +1076,20 @@ class OPDTrainingArguments(TrainingArguments):
                 f"`reinforce_future_reduction` must be 'sum' or 'mean', got "
                 f"reinforce_future_reduction={self.reinforce_future_reduction!r}."
             )
-        if self.reinforce_group_center and self.reinforce_coef > 0 and self.group_size < 2:
+        if self.reinforce_group_std and not self.reinforce_group_center:
             raise ValueError(
-                f"`reinforce_group_center` requires group_size >= 2 when "
-                f"reinforce_coef > 0, got group_size={self.group_size!r}."
+                "`reinforce_group_std` requires `reinforce_group_center=True`, "
+                f"got reinforce_group_center={self.reinforce_group_center!r}."
+            )
+        if (
+            (self.reinforce_group_center or self.reinforce_group_std)
+            and self.reinforce_coef > 0
+            and self.group_size < 2
+        ):
+            raise ValueError(
+                f"`reinforce_group_center` / `reinforce_group_std` require "
+                f"group_size >= 2 when reinforce_coef > 0, got "
+                f"group_size={self.group_size!r}."
             )
         if self.kl_beta < 0:
             raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")

@@ -28,7 +28,8 @@ LoRA teacher (optionally divided by ``2 * sigma_bar_k^2`` via
 ``normalize_d_k``), and ``R_bar_{k+1}`` aggregates future ``D_j`` by sum
 (paper Eq. 11) or mean (``reinforce_future_reduction``). Optionally truncate
 to the next ``reinforce_horizon`` steps. REINFORCE may use group-centered
-coefficients (``reinforce_group_center``).
+and optionally std-normalized coefficients (``reinforce_group_center``,
+``reinforce_group_std``).
 One or more teachers can be
 attached via ``OPDTrainingArguments.teacher_paths`` and combined either by
 per-batch round-robin or per-timestep averaging.
@@ -98,14 +99,16 @@ class OPDTrainer(BaseTrainer):
         self.reinforce_horizon = self.training_args.reinforce_horizon
         self.reinforce_future_reduction = self.training_args.reinforce_future_reduction
         self.reinforce_group_center = self.training_args.reinforce_group_center
+        self.reinforce_group_std = self.training_args.reinforce_group_std
         self.normalize_d_k = self.training_args.normalize_d_k
         self.teacher_aggregation = self.training_args.teacher_aggregation
 
-        if self.reinforce_group_center and self.reinforce_coef > 0:
+        if (self.reinforce_group_center or self.reinforce_group_std) and self.reinforce_coef > 0:
             if self.config.data_args.sampler_type != "group_contiguous":
                 raise ValueError(
-                    "reinforce_group_center=True requires data.sampler_type "
-                    f"'group_contiguous', got {self.config.data_args.sampler_type!r}."
+                    "reinforce_group_center=True and/or reinforce_group_std=True "
+                    "require data.sampler_type 'group_contiguous', got "
+                    f"{self.config.data_args.sampler_type!r}."
                 )
 
         # Sanity check: warn (do not hard-error) when the configured loss
@@ -588,21 +591,24 @@ class OPDTrainer(BaseTrainer):
         return r_per_k
 
     @staticmethod
-    def _group_center(
+    def _group_normalize(
         values: torch.Tensor,
         group_ids: torch.Tensor,
         group_size: int,
         *,
+        center: bool = True,
+        divide_by_std: bool = False,
+        std_eps: float = 1e-6,
         rank_index: Optional[int] = None,
     ) -> torch.Tensor:
-        """Subtract per-group mean from rank-local ``values`` (shape ``(N,)``).
+        """Per-group mean center and/or std normalization on rank-local ``values``.
 
         Expects each ``unique_id`` to appear exactly ``group_size`` times
         (``group_contiguous`` sampling on this rank).
         """
         if values.ndim != 1:
             raise ValueError(
-                f"expected values.ndim == 1 for group centering, got values.shape={tuple(values.shape)}."
+                f"expected values.ndim == 1 for group normalization, got values.shape={tuple(values.shape)}."
             )
         if group_ids.shape != values.shape:
             raise ValueError(
@@ -611,12 +617,16 @@ class OPDTrainer(BaseTrainer):
             )
         if group_size < 2:
             raise ValueError(
-                f"expected group_size >= 2 for group centering, got group_size={group_size!r}."
+                f"expected group_size >= 2 for group normalization, got group_size={group_size!r}."
+            )
+        if not center and not divide_by_std:
+            raise ValueError(
+                "expected at least one of center=True or divide_by_std=True for group normalization."
             )
 
         rank_suffix = f" on rank {rank_index}" if rank_index is not None else ""
         unique_ids = torch.unique(group_ids)
-        centered = values.clone()
+        normalized = values.clone()
         for uid in unique_ids:
             mask = group_ids == uid
             count = int(mask.sum().item())
@@ -625,8 +635,34 @@ class OPDTrainer(BaseTrainer):
                     f"expected {group_size} samples for unique_id={uid.item()}, got count={count}"
                     f"{rank_suffix}, num_samples={values.shape[0]}."
                 )
-            centered[mask] = values[mask] - values[mask].mean()
-        return centered
+            group_vals = values[mask]
+            out_vals = group_vals
+            if center:
+                out_vals = group_vals - group_vals.mean()
+            if divide_by_std:
+                std = torch.std(group_vals, unbiased=False)
+                std = max(float(std.item()), std_eps)
+                out_vals = out_vals / std
+            normalized[mask] = out_vals
+        return normalized
+
+    @staticmethod
+    def _group_center(
+        values: torch.Tensor,
+        group_ids: torch.Tensor,
+        group_size: int,
+        *,
+        rank_index: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Subtract per-group mean from rank-local ``values`` (shape ``(N,)``)."""
+        return OPDTrainer._group_normalize(
+            values,
+            group_ids,
+            group_size,
+            center=True,
+            divide_by_std=False,
+            rank_index=rank_index,
+        )
 
     def _validate_rank_group_layout(
         self,
@@ -754,10 +790,12 @@ class OPDTrainer(BaseTrainer):
         if self.reinforce_group_center:
             rank_index = self.accelerator.process_index
             r_per_k = [
-                self._group_center(
+                self._group_normalize(
                     r_k,
                     rank_group_ids,
                     group_size,
+                    center=True,
+                    divide_by_std=self.reinforce_group_std,
                     rank_index=rank_index,
                 )
                 for r_k in r_per_k_raw
