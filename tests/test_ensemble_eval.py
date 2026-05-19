@@ -28,6 +28,7 @@ from flow_factory.trainers.ensemble_eval.common import (
     ensemble_forward_step,
     load_checkpoints,
     normalize_checkpoint_weights,
+    pcgrad_blend_noise_preds,
 )
 from flow_factory.trainers.registry import get_trainer_class
 
@@ -86,6 +87,61 @@ class TestEnsembleEvalTrainingArgumentsPostInit(unittest.TestCase):
                 group_size=1,
                 per_device_batch_size=1,
             )
+
+    def test_rejects_invalid_blend_mode(self) -> None:
+        with self.assertRaises(ValueError):
+            EnsembleEvalTrainingArguments(
+                checkpoint_paths=["/tmp/a"],
+                ensemble_blend_mode="invalid",  # type: ignore[arg-type]
+                unique_sample_num_per_epoch=1,
+                group_size=1,
+                per_device_batch_size=1,
+            )
+
+    def test_rejects_non_positive_pcgrad_eps(self) -> None:
+        with self.assertRaises(ValueError):
+            EnsembleEvalTrainingArguments(
+                checkpoint_paths=["/tmp/a"],
+                pcgrad_eps=0.0,
+                unique_sample_num_per_epoch=1,
+                group_size=1,
+                per_device_batch_size=1,
+            )
+
+
+class TestPcgradBlendNoisePreds(unittest.TestCase):
+    def test_single_checkpoint_returns_input(self) -> None:
+        pred = torch.tensor([1.0, 2.0])
+        out = pcgrad_blend_noise_preds([pred])
+        torch.testing.assert_close(out, pred)
+
+    def test_two_conflict_cancels(self) -> None:
+        out = pcgrad_blend_noise_preds(
+            [torch.tensor([2.0]), torch.tensor([-2.0])],
+        )
+        torch.testing.assert_close(out, torch.tensor([0.0]))
+
+    def test_two_non_conflict_sums(self) -> None:
+        out = pcgrad_blend_noise_preds(
+            [torch.tensor([2.0]), torch.tensor([1.0])],
+        )
+        torch.testing.assert_close(out, torch.tensor([3.0]))
+
+    def test_batchwise_conflict_per_sample(self) -> None:
+        preds = [
+            torch.tensor([[2.0], [-1.0]]),
+            torch.tensor([[-2.0], [1.0]]),
+        ]
+        out = pcgrad_blend_noise_preds(preds)
+        torch.testing.assert_close(out, torch.tensor([[0.0], [0.0]]))
+
+    def test_rejects_empty_sequence(self) -> None:
+        with self.assertRaises(ValueError):
+            pcgrad_blend_noise_preds([])
+
+    def test_rejects_non_positive_eps(self) -> None:
+        with self.assertRaises(ValueError):
+            pcgrad_blend_noise_preds([torch.tensor([1.0])], eps=0.0)
 
 
 class TestLoadCheckpoints(unittest.TestCase):
@@ -170,6 +226,52 @@ class TestEnsembleForwardStep(unittest.TestCase):
         adapter.scheduler.step.assert_called_once()
         call_kwargs = adapter.scheduler.step.call_args.kwargs
         torch.testing.assert_close(call_kwargs["noise_pred"], torch.tensor([2.5]))
+
+    def test_pcgrad_blend_before_scheduler(self) -> None:
+        preds = {
+            "eval_ckpt_0": torch.tensor([2.0]),
+            "eval_ckpt_1": torch.tensor([-2.0]),
+        }
+        adapter = _MockAdapter(preds)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.tensor([0.0]),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad",
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([0.0]))
+        call_kwargs = adapter.scheduler.step.call_args.kwargs
+        torch.testing.assert_close(call_kwargs["noise_pred"], torch.tensor([0.0]))
+
+    def test_rejects_invalid_blend_mode(self) -> None:
+        preds = {
+            "eval_ckpt_0": torch.tensor([1.0]),
+            "eval_ckpt_1": torch.tensor([3.0]),
+        }
+        adapter = _MockAdapter(preds)
+        with self.assertRaises(ValueError):
+            ensemble_forward_step(
+                adapter,
+                ["eval_ckpt_0", "eval_ckpt_1"],
+                [0.5, 0.5],
+                {
+                    "t": torch.tensor(500),
+                    "latents": torch.tensor([0.0]),
+                    "compute_log_prob": False,
+                },
+                adapter._sched_cache,
+                base_forward=adapter.forward,
+                blend_mode="invalid",  # type: ignore[arg-type]
+            )
 
 
 class TestEnsembleForwardStepWithPatchedForward(unittest.TestCase):

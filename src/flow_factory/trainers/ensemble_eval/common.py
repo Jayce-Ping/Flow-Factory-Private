@@ -17,7 +17,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
+import random
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Literal, Optional, Sequence, Tuple, get_args
 
 import torch
 
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 SchedulerStepCache = Tuple[FrozenSet[str], bool]
+
+EnsembleBlendMode = Literal["weighted", "pcgrad"]
+ENSEMBLE_BLEND_MODES: Tuple[str, ...] = get_args(EnsembleBlendMode)
 
 
 def load_checkpoints(
@@ -158,6 +162,107 @@ def _build_scheduler_step_kwargs(
     return filter_forward_kwargs(full_scheduler_kwargs, param_names, accepts_var_kwargs)
 
 
+def _batchwise_broadcast_shape(tensor: torch.Tensor) -> Tuple[int, ...]:
+    """Shape ``(B, 1, 1, ...)`` for per-batch scalars broadcast over ``tensor``."""
+    return (tensor.shape[0],) + (1,) * (tensor.ndim - 1)
+
+
+def _shuffled_other_indices(
+    num_checkpoints: int,
+    exclude: int,
+    generator: Optional[torch.Generator],
+) -> List[int]:
+    """Return checkpoint indices ``j != exclude``, in random order."""
+    indices = [j for j in range(num_checkpoints) if j != exclude]
+    if len(indices) <= 1:
+        return indices
+    if generator is not None:
+        perm = torch.randperm(len(indices), generator=generator).tolist()
+        return [indices[p] for p in perm]
+    random.shuffle(indices)
+    return indices
+
+
+def pcgrad_blend_noise_preds(
+    scaled_preds: Sequence[torch.Tensor],
+    *,
+    eps: float = 1e-8,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Blend checkpoint ``noise_pred`` tensors with PCGrad conflict projection.
+
+    Each entry in ``scaled_preds`` is typically ``weight_k * noise_pred_k`` with
+    weights normalized to sum to 1. For each pair ``(i, j)`` with negative
+    per-batch dot product, the component of ``pc[i]`` along ``scaled_preds[j]``
+    is removed (using the **original** ``scaled_preds[j]``, per the PCGrad paper).
+    The result is ``sum_k pc[k]``.
+
+    Args:
+        scaled_preds: Per-checkpoint velocity tensors, same shape.
+        eps: Minimum value for ``||v_j||^2`` when dividing.
+        generator: Optional RNG for shuffling inner-loop task order.
+
+    Returns:
+        Combined ``noise_pred`` tensor.
+
+    Raises:
+        ValueError: Empty sequence, shape mismatch, or invalid ``eps``.
+        TypeError: Non-tensor entries in ``scaled_preds``.
+    """
+    if not scaled_preds:
+        raise ValueError(
+            "pcgrad_blend_noise_preds requires at least one tensor, got empty sequence."
+        )
+    if eps <= 0:
+        raise ValueError(f"pcgrad_eps must be > 0, got {eps}.")
+
+    ref = scaled_preds[0]
+    if not isinstance(ref, torch.Tensor):
+        raise TypeError(
+            f"pcgrad_blend_noise_preds expected torch.Tensor, got {type(ref).__name__}."
+        )
+    if ref.ndim < 1:
+        raise ValueError(
+            f"pcgrad_blend_noise_preds expected batch dimension (ndim >= 1), got ndim={ref.ndim}."
+        )
+    ref_shape = ref.shape
+    for idx, pred in enumerate(scaled_preds):
+        if not isinstance(pred, torch.Tensor):
+            raise TypeError(
+                f"pcgrad_blend_noise_preds expected torch.Tensor at index {idx}, "
+                f"got {type(pred).__name__}."
+            )
+        if pred.shape != ref_shape:
+            raise ValueError(
+                f"pcgrad_blend_noise_preds expected all tensors to share shape {tuple(ref_shape)}, "
+                f"got index {idx} shape {tuple(pred.shape)}."
+            )
+
+    if len(scaled_preds) == 1:
+        return ref
+
+    batch = ref_shape[0]
+    broadcast_shape = _batchwise_broadcast_shape(ref)
+    flat_orig = [pred.reshape(batch, -1) for pred in scaled_preds]
+    norm_sq_orig = [
+        (flat_j * flat_j).sum(dim=1).clamp_min(eps).view(broadcast_shape)
+        for flat_j in flat_orig
+    ]
+
+    num_checkpoints = len(scaled_preds)
+    pc = [pred.clone() for pred in scaled_preds]
+
+    for i in range(num_checkpoints):
+        for j in _shuffled_other_indices(num_checkpoints, i, generator):
+            flat_pc_i = pc[i].reshape(batch, -1)
+            dot = (flat_pc_i * flat_orig[j]).sum(dim=1).view(broadcast_shape)
+            coeff = dot / norm_sq_orig[j]
+            proj = coeff * scaled_preds[j]
+            pc[i] = torch.where(dot < 0, pc[i] - proj, pc[i])
+
+    return torch.stack(pc, dim=0).sum(dim=0)
+
+
 def ensemble_forward_step(
     adapter: "BaseAdapter",
     checkpoint_names: Sequence[str],
@@ -165,6 +270,9 @@ def ensemble_forward_step(
     forward_kwargs: Dict[str, Any],
     sched_cache: SchedulerStepCache,
     base_forward: Callable[..., Any],
+    blend_mode: EnsembleBlendMode = "weighted",
+    pcgrad_eps: float = 1e-8,
+    pcgrad_generator: Optional[torch.Generator] = None,
 ) -> Any:
     """Blend per-checkpoint ``noise_pred`` tensors, then run one scheduler step.
 
@@ -181,14 +289,22 @@ def ensemble_forward_step(
         sched_cache: Cached signature from :func:`cache_scheduler_step_signature`.
         base_forward: Original ``adapter.forward`` before any ensemble patch; must
             not re-enter :func:`ensemble_forward_step`.
+        blend_mode: ``'weighted'`` for linear blend, ``'pcgrad'`` for PCGrad fusion.
+        pcgrad_eps: Epsilon for PCGrad denominator when ``blend_mode='pcgrad'``.
+        pcgrad_generator: Optional RNG for PCGrad inner-loop shuffle.
 
     Returns:
         Scheduler step output (same type as ``adapter.forward``).
 
     Raises:
-        ValueError: Mismatched ``checkpoint_names`` / ``weights`` lengths.
+        ValueError: Mismatched lengths, invalid ``blend_mode``, or empty checkpoints.
         RuntimeError: A checkpoint forward did not return ``noise_pred``.
     """
+    if blend_mode not in ENSEMBLE_BLEND_MODES:
+        raise ValueError(
+            f"ensemble_forward_step expected blend_mode in {ENSEMBLE_BLEND_MODES}, "
+            f"got blend_mode={blend_mode!r}."
+        )
     if len(checkpoint_names) != len(weights):
         raise ValueError(
             f"checkpoint_names and weights must have the same length, got "
@@ -200,7 +316,7 @@ def ensemble_forward_step(
     noise_only_kwargs = dict(forward_kwargs)
     noise_only_kwargs["return_kwargs"] = ["noise_pred"]
 
-    combined_noise_pred: Optional[torch.Tensor] = None
+    scaled_preds: List[torch.Tensor] = []
     for name, weight in zip(checkpoint_names, weights, strict=True):
         with adapter.use_named_parameters(name):
             out = base_forward(**noise_only_kwargs)
@@ -209,11 +325,16 @@ def ensemble_forward_step(
                 f"Checkpoint '{name}' forward did not return `noise_pred`; "
                 "check that the adapter supports return_kwargs=['noise_pred']."
             )
-        term = out.noise_pred * weight
-        combined_noise_pred = term if combined_noise_pred is None else combined_noise_pred + term
+        scaled_preds.append(out.noise_pred * weight)
 
-    if combined_noise_pred is None:
-        raise RuntimeError("ensemble_forward_step produced no blended noise_pred.")
+    if blend_mode == "weighted":
+        combined_noise_pred = torch.stack(scaled_preds, dim=0).sum(dim=0)
+    else:
+        combined_noise_pred = pcgrad_blend_noise_preds(
+            scaled_preds,
+            eps=pcgrad_eps,
+            generator=pcgrad_generator,
+        )
 
     scheduler_kwargs = _build_scheduler_step_kwargs(
         forward_kwargs, combined_noise_pred, sched_cache
