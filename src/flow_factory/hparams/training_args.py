@@ -1535,8 +1535,9 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
 
     Loads multiple LoRA checkpoints as named-parameter snapshots (same mechanism
     as OPD multi-teacher) and runs a single pass over the dataset ``test`` split.
-    At each denoising step, ``noise_pred`` is a weighted sum of per-checkpoint
-    predictions, followed by one ``scheduler.step`` call.
+    When ``checkpoint_paths`` is non-empty, each denoising step blends per-checkpoint
+    ``noise_pred`` values, then runs one ``scheduler.step``. When empty, evaluates
+    with the current adapter weights via standard ``forward`` (no ensemble).
     """
 
     checkpoint_paths: List[str] = field(
@@ -1544,8 +1545,9 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         metadata={
             "help": (
                 "List of LoRA checkpoint paths (local or Hugging Face Hub ids), "
-                "each written by `BaseAdapter.save_checkpoint()`. Must contain "
-                "at least one entry; every checkpoint must share the student's "
+                "each written by `BaseAdapter.save_checkpoint()`. Use an empty list "
+                "to evaluate the current adapter without loading ensemble snapshots. "
+                "Non-empty lists require every checkpoint to share the student's "
                 "LoRA rank/alpha."
             )
         },
@@ -1573,13 +1575,14 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if not self.checkpoint_paths:
-            raise ValueError(
-                "EnsembleEvalTrainingArguments requires `checkpoint_paths` to "
-                f"contain at least one LoRA checkpoint, got "
-                f"checkpoint_paths={self.checkpoint_paths!r}."
-            )
         n_ckpt = len(self.checkpoint_paths)
+        if n_ckpt == 0:
+            if self.checkpoint_weights is not None:
+                raise ValueError(
+                    "checkpoint_weights cannot be set when checkpoint_paths is empty; "
+                    f"got checkpoint_weights={self.checkpoint_weights!r}."
+                )
+            return
         if self.checkpoint_weights is not None:
             if len(self.checkpoint_weights) != n_ckpt:
                 raise ValueError(
