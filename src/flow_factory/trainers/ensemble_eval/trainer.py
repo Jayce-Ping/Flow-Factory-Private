@@ -66,7 +66,7 @@ class EnsembleEvalTrainer(BaseTrainer):
                 len(self._checkpoint_names),
             )
             blend_mode = self.training_args.ensemble_blend_mode
-            if blend_mode == "pcgrad" and len(self._checkpoint_names) == 1:
+            if blend_mode.startswith("pcgrad") and len(self._checkpoint_names) == 1:
                 logger.info(
                     "Ensemble eval: pcgrad blend with one checkpoint is equivalent to "
                     "weighted blend (no conflict pairs)."
@@ -85,7 +85,7 @@ class EnsembleEvalTrainer(BaseTrainer):
         self._pcgrad_generator: Optional[torch.Generator] = None
         if (
             self._checkpoint_names
-            and self.training_args.ensemble_blend_mode == "pcgrad"
+            and self.training_args.ensemble_blend_mode.startswith("pcgrad")
         ):
             self._pcgrad_generator = torch.Generator().manual_seed(
                 int(self.training_args.seed)

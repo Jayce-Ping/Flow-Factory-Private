@@ -1572,14 +1572,23 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
             )
         },
     )
-    ensemble_blend_mode: Literal["weighted", "pcgrad"] = field(
+    ensemble_blend_mode: Literal[
+        "weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"
+    ] = field(
         default="weighted",
         metadata={
             "help": (
                 "How to fuse per-checkpoint noise_pred at each denoising step. "
                 "'weighted': linear blend sum_i w_i * noise_pred_i. "
-                "'pcgrad': PCGrad conflict projection on w_i * noise_pred_i, "
-                "then sum projected vectors."
+                "'pcgrad': PCGrad conflict projection on w_i * noise_pred_i with "
+                "a single global dot product per batch element (original algorithm; "
+                "may never detect conflicts for similar LoRA checkpoints). "
+                "'pcgrad_residual': compute delta from pretrained model, apply "
+                "PCGrad on the task-specific deltas (adds one extra forward pass "
+                "per denoising step; recommended for checkpoints trained on "
+                "different objectives). "
+                "'pcgrad_channelwise': per-channel (4D) or per-token (3D) "
+                "dot products for finer-grained conflict detection."
             )
         },
     )
@@ -1588,16 +1597,20 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         metadata={
             "help": (
                 "Minimum squared norm per batch element when dividing in PCGrad "
-                "projection (only used when ensemble_blend_mode='pcgrad')."
+                "projection (only used when ensemble_blend_mode starts with "
+                "'pcgrad')."
             )
         },
     )
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.ensemble_blend_mode not in ("weighted", "pcgrad"):
+        _valid_blend_modes = (
+            "weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"
+        )
+        if self.ensemble_blend_mode not in _valid_blend_modes:
             raise ValueError(
-                "ensemble_blend_mode must be 'weighted' or 'pcgrad', "
+                f"ensemble_blend_mode must be one of {_valid_blend_modes}, "
                 f"got ensemble_blend_mode={self.ensemble_blend_mode!r}."
             )
         if self.pcgrad_eps <= 0:

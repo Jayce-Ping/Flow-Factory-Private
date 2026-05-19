@@ -29,6 +29,7 @@ from flow_factory.trainers.ensemble_eval.common import (
     load_checkpoints,
     normalize_checkpoint_weights,
     pcgrad_blend_noise_preds,
+    pcgrad_blend_noise_preds_channelwise,
 )
 from flow_factory.trainers.registry import get_trainer_class
 
@@ -303,6 +304,244 @@ class TestEnsembleForwardStepWithPatchedForward(unittest.TestCase):
             base_forward=real_forward,
         )
         torch.testing.assert_close(out.noise_pred, torch.tensor([2.0]))
+
+
+# ---------------------------------------------------------------------------
+# PCGrad Channelwise Tests
+# ---------------------------------------------------------------------------
+
+
+class TestPcgradBlendChannelwise(unittest.TestCase):
+    """Tests for pcgrad_blend_noise_preds_channelwise."""
+
+    def test_single_checkpoint_returns_input(self) -> None:
+        pred = torch.randn(2, 3, 4, 4)
+        out = pcgrad_blend_noise_preds_channelwise([pred])
+        torch.testing.assert_close(out, pred)
+
+    def test_4d_per_channel_conflict(self) -> None:
+        """4D tensor: channel 0 conflicts, channel 1 does not."""
+        # Shape (B=1, C=2, H=1, W=1)
+        # Channel 0: pred0=+2, pred1=-2 → conflict (dot<0) → project to 0
+        # Channel 1: pred0=+1, pred1=+3 → no conflict → sum = 4
+        pred0 = torch.tensor([[[[2.0]], [[1.0]]]])  # (1, 2, 1, 1)
+        pred1 = torch.tensor([[[[-2.0]], [[3.0]]]])  # (1, 2, 1, 1)
+        out = pcgrad_blend_noise_preds_channelwise([pred0, pred1])
+        # Channel 0: conflicting → both projected to 0, sum=0
+        # Channel 1: non-conflicting → sum = 1 + 3 = 4
+        torch.testing.assert_close(out, torch.tensor([[[[0.0]], [[4.0]]]]))
+
+    def test_3d_per_token_conflict(self) -> None:
+        """3D tensor: token 0 conflicts, token 1 does not."""
+        # Shape (B=1, seq_len=2, feat=2)
+        # Token 0: pred0=[2, 1], pred1=[-2, -1] → dot = -4 - 1 = -5 < 0 → conflict
+        # Token 1: pred0=[1, 1], pred1=[1, 1] → dot = 1 + 1 = 2 > 0 → no conflict
+        pred0 = torch.tensor([[[2.0, 1.0], [1.0, 1.0]]])  # (1, 2, 2)
+        pred1 = torch.tensor([[[-2.0, -1.0], [1.0, 1.0]]])  # (1, 2, 2)
+        out = pcgrad_blend_noise_preds_channelwise([pred0, pred1])
+        # Token 0: full conflict (opposite directions) → both project to 0
+        # Token 1: no conflict → sum = [2, 2]
+        torch.testing.assert_close(out, torch.tensor([[[0.0, 0.0], [2.0, 2.0]]]))
+
+    def test_non_conflict_equals_sum(self) -> None:
+        """When all channels align, result equals simple sum (same as weighted)."""
+        pred0 = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]])
+        pred1 = torch.tensor([[[[0.5, 1.0], [1.5, 2.0]], [[2.5, 3.0], [3.5, 4.0]]]])
+        out = pcgrad_blend_noise_preds_channelwise([pred0, pred1])
+        expected = pred0 + pred1
+        torch.testing.assert_close(out, expected)
+
+    def test_rejects_2d_tensor(self) -> None:
+        """ndim < 3 should raise ValueError."""
+        with self.assertRaises(ValueError):
+            pcgrad_blend_noise_preds_channelwise(
+                [torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 4.0]])]
+            )
+
+    def test_rejects_empty_sequence(self) -> None:
+        with self.assertRaises(ValueError):
+            pcgrad_blend_noise_preds_channelwise([])
+
+
+# ---------------------------------------------------------------------------
+# PCGrad Residual Mode Tests (via ensemble_forward_step)
+# ---------------------------------------------------------------------------
+
+
+class _MockAdapterWithRef(_MockAdapter):
+    """Mock adapter that also supports use_ref_parameters for residual mode."""
+
+    def __init__(
+        self,
+        preds_by_name: Dict[str, torch.Tensor],
+        ref_pred: torch.Tensor,
+    ) -> None:
+        super().__init__(preds_by_name)
+        self._ref_pred = ref_pred
+
+    @contextmanager
+    def use_ref_parameters(self):
+        """Temporarily set active prediction to the reference (pretrained) pred."""
+        prev = getattr(self, "_active_name", None)
+        self._active_name = "__ref__"
+        yield
+        self._active_name = prev
+
+    def forward(self, **kwargs: Any) -> _MockSchedulerOutput:
+        del kwargs
+        if self._active_name == "__ref__":
+            pred = self._ref_pred
+        else:
+            pred = self._preds_by_name[self._active_name]
+        return _MockSchedulerOutput(noise_pred=pred, next_latents=pred)
+
+
+class TestEnsembleForwardStepResidualMode(unittest.TestCase):
+    """Tests for blend_mode='pcgrad_residual' via ensemble_forward_step."""
+
+    def test_residual_conflicting_deltas(self) -> None:
+        """When checkpoint deltas conflict, PCGrad projects them."""
+        # ref_pred = [10.0], ckpt_0 = [12.0], ckpt_1 = [8.0]
+        # delta_0 = [2.0], delta_1 = [-2.0] → conflict!
+        # After PCGrad on deltas: both project to 0
+        # Result = ref + 0 = [10.0]
+        ref_pred = torch.tensor([10.0])
+        preds = {
+            "eval_ckpt_0": torch.tensor([12.0]),
+            "eval_ckpt_1": torch.tensor([8.0]),
+        }
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.tensor([0.0]),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad_residual",
+        )
+        # Weighted deltas: 0.5*[2.0]=[1.0] and 0.5*[-2.0]=[-1.0] → conflict → both → 0
+        # Result = ref + 0 = 10.0
+        torch.testing.assert_close(out.noise_pred, torch.tensor([10.0]))
+
+    def test_residual_aligned_deltas_equals_weighted(self) -> None:
+        """When deltas are aligned, residual mode equals weighted_sum."""
+        # ref = [0.0], ckpt_0 = [2.0], ckpt_1 = [4.0]
+        # delta_0 = [2.0], delta_1 = [4.0] → aligned (both positive)
+        # weighted deltas: 0.5*[2.0] + 0.5*[4.0] = [1.0] + [2.0] = [3.0]
+        # result = ref + [3.0] = [3.0]
+        # This equals weighted_sum: 0.5*[2.0] + 0.5*[4.0] = [3.0]
+        ref_pred = torch.tensor([0.0])
+        preds = {
+            "eval_ckpt_0": torch.tensor([2.0]),
+            "eval_ckpt_1": torch.tensor([4.0]),
+        }
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.tensor([0.0]),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad_residual",
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([3.0]))
+
+    def test_residual_single_checkpoint(self) -> None:
+        """Single checkpoint: result = ref + weight * delta = ckpt_pred * weight + ref * (1 - weight)."""
+        ref_pred = torch.tensor([5.0])
+        preds = {"eval_ckpt_0": torch.tensor([10.0])}
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0"],
+            [1.0],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.tensor([0.0]),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad_residual",
+        )
+        # delta = [10.0 - 5.0] = [5.0], single checkpoint → no PCGrad needed
+        # result = ref + 1.0 * delta = 5.0 + 5.0 = 10.0
+        torch.testing.assert_close(out.noise_pred, torch.tensor([10.0]))
+
+
+class TestEnsembleForwardStepChannelwiseMode(unittest.TestCase):
+    """Tests for blend_mode='pcgrad_channelwise' via ensemble_forward_step."""
+
+    def test_channelwise_4d_per_channel_conflict(self) -> None:
+        """4D per-channel conflict detection through ensemble_forward_step."""
+        # (B=1, C=2, H=1, W=1): channel 0 conflicts, channel 1 aligned
+        preds = {
+            "eval_ckpt_0": torch.tensor([[[[4.0]], [[2.0]]]]),
+            "eval_ckpt_1": torch.tensor([[[[-4.0]], [[6.0]]]]),
+        }
+        adapter = _MockAdapter(preds)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.zeros(1, 2, 1, 1),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad_channelwise",
+        )
+        # Scaled: 0.5*[4]=[2], 0.5*[-4]=[-2] in ch0 → conflict → 0
+        # Scaled: 0.5*[2]=[1], 0.5*[6]=[3] in ch1 → aligned → 4
+        torch.testing.assert_close(out.noise_pred, torch.tensor([[[[0.0]], [[4.0]]]]))
+
+
+# ---------------------------------------------------------------------------
+# Training Arguments Validation for blend modes
+# ---------------------------------------------------------------------------
+
+
+class TestBlendModeValidation(unittest.TestCase):
+    def test_accepts_all_valid_blend_modes(self) -> None:
+        for mode in ("weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"):
+            args = EnsembleEvalTrainingArguments(
+                checkpoint_paths=["/tmp/a"],
+                ensemble_blend_mode=mode,
+                unique_sample_num_per_epoch=1,
+                group_size=1,
+                per_device_batch_size=1,
+            )
+            self.assertEqual(args.ensemble_blend_mode, mode)
+
+    def test_rejects_invalid_blend_mode(self) -> None:
+        with self.assertRaises(ValueError):
+            EnsembleEvalTrainingArguments(
+                checkpoint_paths=["/tmp/a"],
+                ensemble_blend_mode="invalid",  # type: ignore[arg-type]
+                unique_sample_num_per_epoch=1,
+                group_size=1,
+                per_device_batch_size=1,
+            )
 
 
 class TestEnsembleEvalRegistry(unittest.TestCase):
