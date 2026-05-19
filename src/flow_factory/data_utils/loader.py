@@ -201,7 +201,7 @@ def get_dataloader(
     accelerator: Accelerator,
     preprocess_func: Optional[PreprocessCallable] = None,
     **kwargs,
-) -> Tuple[DataLoader, Dict[str, DataLoader]]:
+) -> Tuple[Optional[DataLoader], Dict[str, DataLoader]]:
     """
     Factory to create DDP/FSDP compatible DataLoader with distributed preprocessing.
 
@@ -219,8 +219,10 @@ def get_dataloader(
         **kwargs: Additional arguments (ignored)
 
     Returns:
-        Tuple of (train_dataloader, test_dataloaders). ``test_dataloaders`` maps test set
-        name to DataLoader; empty dict if no evaluation data is configured.
+        Tuple of (train_dataloader, test_dataloaders). ``train_dataloader`` is ``None``
+        when ``training_args.skips_train_dataloader`` is set (e.g. ensemble-eval).
+        ``test_dataloaders`` maps test set name to DataLoader; empty dict if no
+        evaluation data is configured.
     """
     data_args = config.data_args
     training_args = config.training_args
@@ -244,41 +246,45 @@ def get_dataloader(
     base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
     base_kwargs["force_reprocess"] = data_args.force_reprocess
 
-    # === CREATE/LOAD TRAIN DATASET ===
-    train_preprocess_kwargs = base_kwargs.get("preprocess_kwargs", {}).copy()
-    train_preprocess_kwargs.update(
-        {
-            "is_train": True,
-            **training_args,
-        }
-    )
-    # Use algorithm-aware guidance scale for preprocessing — ensures negative
-    # prompts are encoded when any optimizer-time CFG scale needs them
-    # (e.g., DGPO kl_cfg > 1.0 with training guidance_scale = 1.0).
-    train_preprocess_kwargs["guidance_scale"] = training_args.get_preprocess_guidance_scale()
-    train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
-    dataset = _create_or_load_dataset(
-        split="train",
-        accelerator=accelerator,
-        base_kwargs={**base_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
-        enable_distributed=enable_distributed,
-        preprocess_parallelism=preprocess_parallelism,
-    )
+    dataloader: Optional[DataLoader] = None
+    if training_args.skips_train_dataloader:
+        logger.info("ensemble-eval: skipping train split preprocessing and train DataLoader")
+    else:
+        # === CREATE/LOAD TRAIN DATASET ===
+        train_preprocess_kwargs = base_kwargs.get("preprocess_kwargs", {}).copy()
+        train_preprocess_kwargs.update(
+            {
+                "is_train": True,
+                **training_args,
+            }
+        )
+        # Use algorithm-aware guidance scale for preprocessing — ensures negative
+        # prompts are encoded when any optimizer-time CFG scale needs them
+        # (e.g., DGPO kl_cfg > 1.0 with training guidance_scale = 1.0).
+        train_preprocess_kwargs["guidance_scale"] = training_args.get_preprocess_guidance_scale()
+        train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
+        dataset = _create_or_load_dataset(
+            split="train",
+            accelerator=accelerator,
+            base_kwargs={**base_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
 
-    # === CREATE TRAIN DATALOADER ===
-    sampler = get_data_sampler(
-        dataset=dataset,
-        config=config,
-        accelerator=accelerator,
-    )
+        # === CREATE TRAIN DATALOADER ===
+        sampler = get_data_sampler(
+            dataset=dataset,
+            config=config,
+            accelerator=accelerator,
+        )
 
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        num_workers=data_args.dataloader_num_workers,
-        pin_memory=True,
-        collate_fn=GeneralDataset.collate_fn,
-    )
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=data_args.dataloader_num_workers,
+            pin_memory=True,
+            collate_fn=GeneralDataset.collate_fn,
+        )
 
     # === CREATE/LOAD TEST DATASET(S) ===
     test_dataloaders: Dict[str, DataLoader] = {}

@@ -519,6 +519,8 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
 
 Requires `model.finetune_type: lora` and matching `lora_rank` / `lora_alpha` across all checkpoints. Example: `ensemble-eval/lora/sd3_5/default.yaml`.
 
+Set top-level `num_processes` to your GPU count (default example uses `8`) so `eval.test_sets` preprocessing is sharded across ranks. Ensemble-eval does **not** preprocess the train split — only splits listed under `eval.test_sets`.
+
 Run: `ff-train ensemble-eval/lora/sd3_5/default.yaml`
 
 

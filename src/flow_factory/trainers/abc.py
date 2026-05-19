@@ -277,7 +277,7 @@ class BaseTrainer(ABC):
             return self.eval_reward_processor
         return self._eval_reward_processors_by_name[test_set_name]
 
-    def _init_dataloader(self) -> Tuple[DataLoader, Dict[str, DataLoader]]:
+    def _init_dataloader(self) -> Tuple[Optional[DataLoader], Dict[str, DataLoader]]:
         # Move text-encoder & vae to GPU for dataloader encoding
         self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules, device=self.accelerator.device
