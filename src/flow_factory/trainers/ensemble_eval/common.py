@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Literal, Optional, Sequence, Tuple, get_args
 
 import torch
@@ -35,6 +36,109 @@ SchedulerStepCache = Tuple[FrozenSet[str], bool]
 
 EnsembleBlendMode = Literal["weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"]
 ENSEMBLE_BLEND_MODES: Tuple[str, ...] = get_args(EnsembleBlendMode)
+
+
+# ---------------------------------------------------------------------------
+# PCGrad Statistics Accumulator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PCGradStats:
+    """Accumulates PCGrad conflict statistics across denoising steps.
+
+    Create one instance per evaluation run, pass it to ``ensemble_forward_step``
+    (via the ``stats`` parameter), then call :meth:`log_summary` after evaluation
+    completes.
+    """
+
+    # Per-step raw counters
+    num_steps: int = 0
+    total_pairs: int = 0
+    conflict_pairs: int = 0
+    total_elements: int = 0  # batch elements (global) or group elements (channelwise)
+    conflict_elements: int = 0
+
+    # Per-step cosine similarity accumulators (mean/min/max across steps)
+    _cosine_means: List[float] = field(default_factory=list)
+    _cosine_mins: List[float] = field(default_factory=list)
+    _cosine_maxs: List[float] = field(default_factory=list)
+
+    # Metadata (set on first call)
+    blend_mode: str = ""
+    tensor_shape: Tuple[int, ...] = ()
+    num_checkpoints: int = 0
+
+    def record_step(
+        self,
+        *,
+        step_total_pairs: int,
+        step_conflict_pairs: int,
+        step_total_elements: int,
+        step_conflict_elements: int,
+        cosine_means: Optional[List[float]] = None,
+        cosine_mins: Optional[List[float]] = None,
+        cosine_maxs: Optional[List[float]] = None,
+    ) -> None:
+        """Record statistics from one denoising step."""
+        self.num_steps += 1
+        self.total_pairs += step_total_pairs
+        self.conflict_pairs += step_conflict_pairs
+        self.total_elements += step_total_elements
+        self.conflict_elements += step_conflict_elements
+        if cosine_means:
+            self._cosine_means.extend(cosine_means)
+        if cosine_mins:
+            self._cosine_mins.extend(cosine_mins)
+        if cosine_maxs:
+            self._cosine_maxs.extend(cosine_maxs)
+
+    def log_summary(self) -> None:
+        """Log accumulated statistics as a single summary message."""
+        if self.num_steps == 0:
+            return
+
+        conflict_rate = (
+            self.conflict_elements / self.total_elements
+            if self.total_elements > 0
+            else 0.0
+        )
+        pairs_with_conflict_rate = (
+            self.conflict_pairs / self.total_pairs
+            if self.total_pairs > 0
+            else 0.0
+        )
+
+        summary_lines = [
+            f"PCGrad summary ({self.blend_mode}): "
+            f"{self.num_checkpoints} checkpoints, "
+            f"{self.num_steps} denoising steps, "
+            f"tensor_shape={self.tensor_shape}.",
+            f"  Conflict rate: {conflict_rate:.4f} "
+            f"({self.conflict_elements}/{self.total_elements} elements with dot<0 "
+            f"across all steps).",
+            f"  Pairs with ≥1 conflict: {pairs_with_conflict_rate:.4f} "
+            f"({self.conflict_pairs}/{self.total_pairs}).",
+        ]
+
+        if self._cosine_means:
+            avg_cos = sum(self._cosine_means) / len(self._cosine_means)
+            min_cos = min(self._cosine_mins) if self._cosine_mins else float("nan")
+            max_cos = max(self._cosine_maxs) if self._cosine_maxs else float("nan")
+            summary_lines.append(
+                f"  Cosine similarity (across all steps): "
+                f"avg_mean={avg_cos:.4f}, "
+                f"global_min={min_cos:.4f}, "
+                f"global_max={max_cos:.4f}."
+            )
+
+        if self.conflict_elements == 0:
+            summary_lines.append(
+                "  WARNING: No conflicts detected across any step. "
+                "Result is identical to weighted_sum."
+            )
+
+        logger.info("\n".join(summary_lines))
 
 
 def load_checkpoints(
@@ -188,6 +292,7 @@ def pcgrad_blend_noise_preds(
     *,
     eps: float = 1e-8,
     generator: Optional[torch.Generator] = None,
+    stats: Optional[PCGradStats] = None,
 ) -> torch.Tensor:
     """Blend checkpoint ``noise_pred`` tensors with PCGrad conflict projection.
 
@@ -201,6 +306,7 @@ def pcgrad_blend_noise_preds(
         scaled_preds: Per-checkpoint velocity tensors, same shape.
         eps: Minimum value for ``||v_j||^2`` when dividing.
         generator: Optional RNG for shuffling inner-loop task order.
+        stats: Optional accumulator for deferred summary logging.
 
     Returns:
         Combined ``noise_pred`` tensor.
@@ -276,50 +382,35 @@ def pcgrad_blend_noise_preds(
 
             pc[i] = torch.where(conflict_mask, pc[i] - proj, pc[i])
 
-    # Log diagnostics once per call
-    if total_pairs > 0:
-        conflict_rate = conflict_batches / total_batches if total_batches > 0 else 0.0
-        logger.info(
-            f"PCGrad diagnostics: {num_checkpoints} checkpoints, "
-            f"{total_pairs} direction pairs evaluated, "
-            f"{conflict_pairs}/{total_pairs} pairs had ≥1 conflict batch element, "
-            f"conflict_batch_rate={conflict_rate:.6f} "
-            f"({conflict_batches}/{total_batches} batch elements with dot<0). "
-            f"Tensor shape={tuple(ref_shape)}, global_dot_dim={ref_shape[0]}x{flat_orig[0].shape[1]}."
+    # Record statistics (deferred logging via stats.log_summary())
+    if stats is not None and total_pairs > 0:
+        if stats.num_steps == 0:
+            stats.tensor_shape = tuple(ref_shape)
+        cosine_means: List[float] = []
+        cosine_mins: List[float] = []
+        cosine_maxs: List[float] = []
+        for i in range(num_checkpoints):
+            for j in range(num_checkpoints):
+                if i == j:
+                    continue
+                flat_i = flat_orig[i]
+                flat_j = flat_orig[j]
+                cosine_sim = (
+                    (flat_i * flat_j).sum(dim=1)
+                    / (flat_i.norm(dim=1) * flat_j.norm(dim=1)).clamp_min(eps)
+                )
+                cosine_means.append(cosine_sim.mean().item())
+                cosine_mins.append(cosine_sim.min().item())
+                cosine_maxs.append(cosine_sim.max().item())
+        stats.record_step(
+            step_total_pairs=total_pairs,
+            step_conflict_pairs=conflict_pairs,
+            step_total_elements=total_batches,
+            step_conflict_elements=conflict_batches,
+            cosine_means=cosine_means,
+            cosine_mins=cosine_mins,
+            cosine_maxs=cosine_maxs,
         )
-        if conflict_batches == 0:
-            logger.warning(
-                "PCGrad: NO conflicts detected (all per-batch dot products ≥ 0). "
-                "Result is identical to weighted_sum. This is expected when noise "
-                "predictions from different LoRA checkpoints are globally aligned. "
-                "Consider using a finer-grained conflict granularity (e.g., "
-                "per-channel or per-spatial-patch) for meaningful PCGrad behavior "
-                "on diffusion model velocity predictions."
-            )
-        # Log per-pair dot product statistics for deeper insight
-        if logger.isEnabledFor(20):  # INFO level
-            for i in range(num_checkpoints):
-                for j in range(num_checkpoints):
-                    if i == j:
-                        continue
-                    flat_i = flat_orig[i]
-                    flat_j = flat_orig[j]
-                    cosine_sim = (
-                        (flat_i * flat_j).sum(dim=1)
-                        / (flat_i.norm(dim=1) * flat_j.norm(dim=1)).clamp_min(eps)
-                    )
-                    std_str = (
-                        f"{cosine_sim.std().item():.6f}"
-                        if batch > 1
-                        else "n/a(B=1)"
-                    )
-                    logger.info(
-                        f"  PCGrad cosine_sim(ckpt_{i}, ckpt_{j}): "
-                        f"mean={cosine_sim.mean().item():.6f}, "
-                        f"min={cosine_sim.min().item():.6f}, "
-                        f"max={cosine_sim.max().item():.6f}, "
-                        f"std={std_str}"
-                    )
 
     return torch.stack(pc, dim=0).sum(dim=0)
 
@@ -329,6 +420,7 @@ def pcgrad_blend_noise_preds_channelwise(
     *,
     eps: float = 1e-8,
     generator: Optional[torch.Generator] = None,
+    stats: Optional[PCGradStats] = None,
 ) -> torch.Tensor:
     """Blend checkpoint ``noise_pred`` tensors with per-channel/per-token PCGrad.
 
@@ -348,6 +440,7 @@ def pcgrad_blend_noise_preds_channelwise(
         scaled_preds: Per-checkpoint velocity tensors (weighted), same shape.
         eps: Minimum squared norm when dividing in projection.
         generator: Optional RNG for shuffling inner-loop task order.
+        stats: Optional accumulator for deferred summary logging.
 
     Returns:
         Combined ``noise_pred`` tensor.
@@ -433,25 +526,16 @@ def pcgrad_blend_noise_preds_channelwise(
 
             pc[i] = torch.where(conflict_mask, pc[i] - proj, pc[i])
 
-    # Log diagnostics
-    if total_pairs > 0:
-        conflict_rate = conflict_groups / total_groups if total_groups > 0 else 0.0
-        feature_dim = flat_orig[0].shape[1]
-        logger.info(
-            f"PCGrad-channelwise diagnostics: {num_checkpoints} checkpoints, "
-            f"{total_pairs} direction pairs, "
-            f"{conflict_pairs}/{total_pairs} pairs had ≥1 conflict group, "
-            f"conflict_group_rate={conflict_rate:.6f} "
-            f"({conflict_groups}/{total_groups} groups with dot<0). "
-            f"Tensor shape={tuple(ref_shape)}, "
-            f"group_batch={group_batch} (B={batch} × group_dim={group_dim_size}), "
-            f"feature_dim={feature_dim}."
+    # Record statistics (deferred logging via stats.log_summary())
+    if stats is not None and total_pairs > 0:
+        if stats.num_steps == 0:
+            stats.tensor_shape = tuple(ref_shape)
+        stats.record_step(
+            step_total_pairs=total_pairs,
+            step_conflict_pairs=conflict_pairs,
+            step_total_elements=total_groups,
+            step_conflict_elements=conflict_groups,
         )
-        if conflict_groups == 0:
-            logger.warning(
-                "PCGrad-channelwise: NO conflicts detected even at channel/token "
-                "granularity. Result is identical to weighted_sum."
-            )
 
     return torch.stack(pc, dim=0).sum(dim=0)
 
@@ -464,6 +548,7 @@ def _pcgrad_residual_blend(
     base_forward: Callable[..., Any],
     pcgrad_eps: float,
     pcgrad_generator: Optional[torch.Generator],
+    stats: Optional[PCGradStats] = None,
 ) -> torch.Tensor:
     """Compute PCGrad on deltas from pretrained model noise_pred.
 
@@ -508,6 +593,7 @@ def _pcgrad_residual_blend(
         scaled_deltas,
         eps=pcgrad_eps,
         generator=pcgrad_generator,
+        stats=stats,
     )
 
     # 5. Add back pretrained baseline
@@ -524,6 +610,7 @@ def ensemble_forward_step(
     blend_mode: EnsembleBlendMode = "weighted",
     pcgrad_eps: float = 1e-8,
     pcgrad_generator: Optional[torch.Generator] = None,
+    stats: Optional[PCGradStats] = None,
 ) -> Any:
     """Blend per-checkpoint ``noise_pred`` tensors, then run one scheduler step.
 
@@ -547,6 +634,7 @@ def ensemble_forward_step(
             ``'pcgrad_channelwise'``: per-channel/per-token PCGrad.
         pcgrad_eps: Epsilon for PCGrad denominator (any pcgrad mode).
         pcgrad_generator: Optional RNG for PCGrad inner-loop shuffle.
+        stats: Optional :class:`PCGradStats` accumulator for deferred logging.
 
     Returns:
         Scheduler step output (same type as ``adapter.forward``).
@@ -580,6 +668,7 @@ def ensemble_forward_step(
             base_forward=base_forward,
             pcgrad_eps=pcgrad_eps,
             pcgrad_generator=pcgrad_generator,
+            stats=stats,
         )
     else:
         # Collect weighted noise predictions (weighted, pcgrad, pcgrad_channelwise)
@@ -601,6 +690,7 @@ def ensemble_forward_step(
                 scaled_preds,
                 eps=pcgrad_eps,
                 generator=pcgrad_generator,
+                stats=stats,
             )
         else:
             # blend_mode == "pcgrad" (global)
@@ -608,6 +698,7 @@ def ensemble_forward_step(
                 scaled_preds,
                 eps=pcgrad_eps,
                 generator=pcgrad_generator,
+                stats=stats,
             )
 
     scheduler_kwargs = _build_scheduler_step_kwargs(
