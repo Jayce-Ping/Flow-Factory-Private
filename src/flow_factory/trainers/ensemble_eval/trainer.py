@@ -129,9 +129,17 @@ class EnsembleEvalTrainer(BaseTrainer):
             )
 
         self.adapter.forward = patched_forward  # type: ignore[method-assign]
+
+        # Disable autocast weight cache for the ensemble scope.
+        # use_named_parameters swaps LoRA weights via .data.copy_() which
+        # preserves tensor data_ptr; the autocast cache (keyed by data_ptr)
+        # would otherwise serve stale casted weights across checkpoint swaps.
+        prev_cache_enabled = torch.is_autocast_cache_enabled()
+        torch.set_autocast_cache_enabled(False)
         try:
             yield
         finally:
+            torch.set_autocast_cache_enabled(prev_cache_enabled)
             self.adapter.forward = original_forward
 
     def sample(self) -> List[BaseSample]:

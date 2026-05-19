@@ -319,11 +319,6 @@ def ensemble_forward_step(
     scaled_preds: List[torch.Tensor] = []
     for name, weight in zip(checkpoint_names, weights, strict=True):
         with adapter.use_named_parameters(name):
-            # Clear the autocast weight cache after parameter swap.  Autocast
-            # caches fp32→bf16 casts keyed by tensor data_ptr; .data.copy_()
-            # does not change data_ptr, so stale cached values would be used
-            # for subsequent checkpoints without this invalidation.
-            torch.clear_autocast_cache()
             out = base_forward(**noise_only_kwargs)
         if out.noise_pred is None:
             raise RuntimeError(
