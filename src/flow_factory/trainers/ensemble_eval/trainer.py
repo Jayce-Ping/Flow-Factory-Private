@@ -17,8 +17,9 @@
 Multi-checkpoint offline ensemble evaluation trainer.
 
 Loads multiple LoRA checkpoints as named-parameter snapshots (OPD-style) and
-evaluates on configured test sets. Each denoising step blends checkpoint
-``noise_pred`` outputs with configurable weights before a single scheduler step.
+evaluates on configured test sets. Each denoising step fuses checkpoint
+``noise_pred`` outputs (linear weighted blend or PCGrad) before a single
+scheduler step.
 
 When ``checkpoint_paths`` is empty, runs standard evaluation on the current
 adapter weights (no ensemble forward patch).
@@ -27,7 +28,9 @@ adapter weights (no ensemble forward patch).
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Iterator, List
+from typing import Any, Iterator, List, Optional
+
+import torch
 
 from ..abc import BaseTrainer
 from ...hparams import EnsembleEvalTrainingArguments
@@ -62,9 +65,15 @@ class EnsembleEvalTrainer(BaseTrainer):
                 self.training_args.checkpoint_weights,
                 len(self._checkpoint_names),
             )
+            blend_mode = self.training_args.ensemble_blend_mode
+            if blend_mode == "pcgrad" and len(self._checkpoint_names) == 1:
+                logger.info(
+                    "Ensemble eval: pcgrad blend with one checkpoint is equivalent to "
+                    "weighted blend (no conflict pairs)."
+                )
             logger.info(
                 f"Ensemble eval: {len(self._checkpoint_names)} checkpoint(s), "
-                f"weights={self._weights}."
+                f"weights={self._weights}, blend_mode={blend_mode!r}."
             )
         else:
             logger.info(
@@ -73,6 +82,14 @@ class EnsembleEvalTrainer(BaseTrainer):
             )
 
         self._sched_cache = cache_scheduler_step_signature(self.adapter.scheduler.step)
+        self._pcgrad_generator: Optional[torch.Generator] = None
+        if (
+            self._checkpoint_names
+            and self.training_args.ensemble_blend_mode == "pcgrad"
+        ):
+            self._pcgrad_generator = torch.Generator().manual_seed(
+                int(self.training_args.seed)
+            )
 
     def start(self) -> None:
         """Run a single offline evaluation pass over all configured test sets."""
@@ -106,6 +123,9 @@ class EnsembleEvalTrainer(BaseTrainer):
                 kwargs,
                 self._sched_cache,
                 base_forward=original_forward,
+                blend_mode=self.training_args.ensemble_blend_mode,
+                pcgrad_eps=self.training_args.pcgrad_eps,
+                pcgrad_generator=self._pcgrad_generator,
             )
 
         self.adapter.forward = patched_forward  # type: ignore[method-assign]

@@ -505,7 +505,9 @@ Logs appear under `eval/{name}/reward_*` (e.g. `eval/ocr/reward_ocr_mean`, `eval
 At each denoising step inside `adapter.inference`, `adapter.forward` is temporarily patched to:
 
 1. Forward each checkpoint under `use_named_parameters(eval_ckpt_i)` and collect `noise_pred_i`.
-2. Blend: `noise_pred = Σ_i w_i · noise_pred_i` (weights normalized to sum to 1).
+2. Blend (see `ensemble_blend_mode`):
+   - **`weighted`** (default): `noise_pred = Σ_i w_i · noise_pred_i` (weights normalized to sum to 1).
+   - **`pcgrad`**: Let `v_i = w_i · noise_pred_i`. For each pair `(i, j)` with negative per-batch dot product, project `v_i` off the conflicting component of the **original** `v_j` (PCGrad), then `noise_pred = Σ_i v_i^PC`. When no conflicts occur, this matches the weighted blend.
 3. Call `scheduler.step` once with the blended `noise_pred`.
 
 ### Key config fields (`train:`)
@@ -516,6 +518,8 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
 | `checkpoint_paths` | List of LoRA paths (local or HF Hub); `[]` = eval current adapter (no ensemble) |
 | `checkpoint_weights` | Optional blend weights (same length as paths); default uniform |
 | `checkpoint_param_device` | `'cpu'` or `'cuda'` for snapshot storage |
+| `ensemble_blend_mode` | `'weighted'` or `'pcgrad'` |
+| `pcgrad_eps` | Minimum squared norm per batch element in PCGrad projection (default `1e-8`) |
 
 Requires `model.finetune_type: lora`. Non-empty `checkpoint_paths` need matching `lora_rank` / `lora_alpha` across checkpoints. Empty `checkpoint_paths` uses the loaded student LoRA as-is (`model.resume_path` or initialized weights), not Hub ensemble snapshots. Example: `ensemble-eval/lora/sd3_5/default.yaml`.
 

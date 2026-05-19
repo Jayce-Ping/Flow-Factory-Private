@@ -1,9 +1,10 @@
 # Multi-checkpoint offline ensemble evaluation — SD3.5 LoRA example.
 #
 # Loads multiple LoRA checkpoints as named snapshots (OPD-style) and runs one
-# evaluation pass per entry in eval.test_sets. At each denoising step:
-#   noise_pred = sum_i w_i * noise_pred_i(checkpoint_i)
-# followed by a single scheduler.step.
+# evaluation pass per entry in eval.test_sets. At each denoising step, fuse
+# per-checkpoint noise_pred, then one scheduler.step:
+#   weighted (default): noise_pred = sum_i w_i * noise_pred_i
+#   pcgrad: PCGrad on w_i * noise_pred_i, then sum projected vectors
 #
 # Prerequisites:
 #   - `finetune_type: lora` with rank/alpha matching every checkpoint.
@@ -57,6 +58,8 @@ train:
   # Use [] to eval current adapter only (no ensemble); cannot combine with checkpoint_weights
   checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
   checkpoint_param_device: 'cuda'
+  ensemble_blend_mode: weighted  # weighted | pcgrad
+  pcgrad_eps: 1.0e-8
 
   max_epochs: 1
   unique_sample_num_per_epoch: 1

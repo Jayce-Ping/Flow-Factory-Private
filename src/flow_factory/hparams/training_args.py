@@ -1572,9 +1572,38 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
             )
         },
     )
+    ensemble_blend_mode: Literal["weighted", "pcgrad"] = field(
+        default="weighted",
+        metadata={
+            "help": (
+                "How to fuse per-checkpoint noise_pred at each denoising step. "
+                "'weighted': linear blend sum_i w_i * noise_pred_i. "
+                "'pcgrad': PCGrad conflict projection on w_i * noise_pred_i, "
+                "then sum projected vectors."
+            )
+        },
+    )
+    pcgrad_eps: float = field(
+        default=1e-8,
+        metadata={
+            "help": (
+                "Minimum squared norm per batch element when dividing in PCGrad "
+                "projection (only used when ensemble_blend_mode='pcgrad')."
+            )
+        },
+    )
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.ensemble_blend_mode not in ("weighted", "pcgrad"):
+            raise ValueError(
+                "ensemble_blend_mode must be 'weighted' or 'pcgrad', "
+                f"got ensemble_blend_mode={self.ensemble_blend_mode!r}."
+            )
+        if self.pcgrad_eps <= 0:
+            raise ValueError(
+                f"pcgrad_eps must be > 0, got pcgrad_eps={self.pcgrad_eps}."
+            )
         n_ckpt = len(self.checkpoint_paths)
         if n_ckpt == 0:
             if self.checkpoint_weights is not None:
