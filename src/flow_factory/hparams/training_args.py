@@ -1575,7 +1575,7 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
     ensemble_blend_mode: Literal[
         "weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"
     ] = field(
-        default="weighted",
+        default="pcgrad_residual",
         metadata={
             "help": (
                 "How to fuse per-checkpoint noise_pred at each denoising step. "
