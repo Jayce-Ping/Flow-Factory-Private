@@ -20,6 +20,8 @@ from .data_args import DataArguments
 from .model_args import ModelArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
+    TestSetArguments,
+    EvaluationArguments,
     TrainingArguments,
     GRPOTrainingArguments,
     NFTTrainingArguments,
@@ -29,6 +31,7 @@ from .training_args import (
     CRDTrainingArguments,
     OPDTrainingArguments,
     OPDODETrainingArguments,
+    EnsembleEvalTrainingArguments,
     get_training_args_class,
 )
 from .reward_args import RewardArguments, MultiRewardArguments
@@ -40,6 +43,8 @@ __all__ = [
     "DataArguments",
     "ModelArguments",
     "SchedulerArguments",
+    "TestSetArguments",
+    "EvaluationArguments",
     "TrainingArguments",
     "GRPOTrainingArguments",
     "NFTTrainingArguments",
@@ -49,6 +54,7 @@ __all__ = [
     "CRDTrainingArguments",
     "OPDTrainingArguments",
     "OPDODETrainingArguments",
+    "EnsembleEvalTrainingArguments",
     "get_training_args_class",
     "RewardArguments",
     "MultiRewardArguments",

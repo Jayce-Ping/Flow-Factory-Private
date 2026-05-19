@@ -23,6 +23,8 @@
 
 - [CRD: Centered Reward Distillation](#crd-centered-reward-distillation)
 
+- [Ensemble Eval: Multi-Checkpoint Offline Evaluation](#ensemble-eval-multi-checkpoint-offline-evaluation)
+
 - [References](#references)
 
 ## Overview
@@ -479,6 +481,45 @@ train:
 | `< 0` | Uniform (τ→∞) | Simple mean centering; recommended default |
 | `== 0` | Hard selection | Positive pool (adv > 0) vs negative pool (adv < 0) |
 | `> 0` | Softmax temperature | Dual-direction: `softmax(adv/τ)` and `softmax(-adv/τ)` |
+
+
+## Ensemble Eval: Multi-Checkpoint Offline Evaluation
+
+**Trainer**: `ensemble-eval` (`EnsembleEvalTrainer`)
+
+Eval-only workflow: load multiple LoRA checkpoints as named-parameter snapshots (same mechanism as OPD multi-teacher), run one pass per configured **`eval.test_sets`** entry, and log `eval_rewards` metrics. No policy training or EMA swap — inference uses the checkpoint ensemble only.
+
+### Multi test sets (`eval.test_sets`)
+
+Each entry defines a dataset (`dataset_dir`, `split`) and optional per-set overrides (`resolution`, `per_device_batch_size`, etc.). Use `eval_reward_names` to select a subset of the global `eval_rewards` list for that set only (`null` = all eval rewards).
+
+Default ensemble-eval example (OCR + PickScore benchmarks):
+
+| test set | `dataset_dir` | `eval_reward_names` |
+|----------|---------------|---------------------|
+| `ocr` | `dataset/ocr` | `[ocr, pick_score]` |
+| `pickscore` | `dataset/pickscore` | `[pick_score]` |
+
+Logs appear under `eval/{name}/reward_*` (e.g. `eval/ocr/reward_ocr_mean`, `eval/pickscore/reward_pick_score_mean`). Omit `test_sets` to use legacy single `data.dataset_dir/test.jsonl` as `test`.
+
+At each denoising step inside `adapter.inference`, `adapter.forward` is temporarily patched to:
+
+1. Forward each checkpoint under `use_named_parameters(eval_ckpt_i)` and collect `noise_pred_i`.
+2. Blend: `noise_pred = Σ_i w_i · noise_pred_i` (weights normalized to sum to 1).
+3. Call `scheduler.step` once with the blended `noise_pred`.
+
+### Key config fields (`train:`)
+
+| Field | Description |
+|---|---|
+| `trainer_type` | `'ensemble-eval'` |
+| `checkpoint_paths` | List of LoRA paths (local or HF Hub); ≥1 required |
+| `checkpoint_weights` | Optional blend weights (same length as paths); default uniform |
+| `checkpoint_param_device` | `'cpu'` or `'cuda'` for snapshot storage |
+
+Requires `model.finetune_type: lora` and matching `lora_rank` / `lora_alpha` across all checkpoints. Example: `ensemble-eval/lora/sd3_5/default.yaml`.
+
+Run: `ff-train ensemble-eval/lora/sd3_5/default.yaml`
 
 
 ## References

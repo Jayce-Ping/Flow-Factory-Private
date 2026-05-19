@@ -45,6 +45,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ...hparams import OPDODETrainingArguments
+from ...rewards import RewardBuffer
 from ...scheduler import set_scheduler_timesteps
 from ...utils.base import create_generator, create_generator_by_prompt, filter_kwargs
 from ...utils.dist import reduce_loss_info
@@ -204,61 +205,6 @@ class OPDODETrainer(BaseTrainer):
 
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
-
-    # =========================== Evaluation ============================
-    def evaluate(self) -> None:
-        """EMA-based evaluation loop (mirrors OPDTrainer / GRPO / NFT)."""
-        if self.test_dataloader is None:
-            return
-
-        self.adapter.eval()
-        self.eval_reward_buffer.clear()
-
-        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
-            all_samples: List[Any] = []
-
-            for batch in tqdm(
-                self.test_dataloader,
-                desc="Evaluating",
-                disable=not self.show_progress_bar,
-            ):
-                generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
-                inference_kwargs = {
-                    "compute_log_prob": False,
-                    "generator": generator,
-                    "trajectory_indices": None,
-                    **self.eval_args,
-                }
-                inference_kwargs.update(**batch)
-                inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
-                samples = self.adapter.inference(**inference_kwargs)
-                all_samples.extend(samples)
-                self.eval_reward_buffer.add_samples(samples)
-
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split="pointwise")
-
-            rewards = {
-                key: torch.as_tensor(value).to(self.accelerator.device)
-                for key, value in rewards.items()
-            }
-            gathered_rewards = {
-                key: self.accelerator.gather(value).cpu().numpy() for key, value in rewards.items()
-            }
-
-            if self.accelerator.is_main_process:
-                _log_data: Dict[str, Any] = {
-                    f"eval/reward_{key}_mean": np.mean(value)
-                    for key, value in gathered_rewards.items()
-                }
-                _log_data.update(
-                    {
-                        f"eval/reward_{key}_std": np.std(value)
-                        for key, value in gathered_rewards.items()
-                    }
-                )
-                _log_data["eval_samples"] = all_samples
-                self.log_data(_log_data, step=self.step)
-            self.accelerator.wait_for_everyone()
 
     # =========================== Sampling (prompt-only) ============================
     def sample(self) -> List[Dict[str, Any]]:

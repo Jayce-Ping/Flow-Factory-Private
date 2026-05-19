@@ -16,7 +16,7 @@
 import json
 import os
 import shutil
-from typing import Literal, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple, Union
 
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -30,7 +30,7 @@ from .sampler_loader import get_data_sampler
 
 logger = setup_logger(__name__, rank_zero_only=False)
 
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def _get_local_process_info(accelerator: Accelerator):
@@ -167,9 +167,7 @@ def _create_or_load_dataset(
     #    name; the rank_*_of_N subdir prevents cross-config collisions if a stale
     #    .tmp directory survives a launch-config change between runs. Layout is
     #    owned by GeneralDataset so the writer and the consolidator cannot drift.
-    part_arrow_path = GeneralDataset.build_part_arrow_path(
-        merged_cache_path, shard_idx, num_shards
-    )
+    part_arrow_path = GeneralDataset.build_part_arrow_path(merged_cache_path, shard_idx, num_shards)
     kwargs["target_arrow_path"] = part_arrow_path
 
     logger.info(
@@ -203,25 +201,26 @@ def get_dataloader(
     accelerator: Accelerator,
     preprocess_func: Optional[PreprocessCallable] = None,
     **kwargs,
-) -> Tuple[DataLoader, Union[DataLoader, None]]:
+) -> Tuple[DataLoader, Dict[str, DataLoader]]:
     """
     Factory to create DDP/FSDP compatible DataLoader with distributed preprocessing.
-    
+
     Features:
         - Automatic distributed preprocessing across multiple GPUs
         - Intelligent caching (reuses preprocessed data on subsequent runs)
         - Supports both train and test splits
         - Custom sampler for GRPO-style grouped sampling
-    
+        - Multiple test sets when ``eval.test_sets`` is set
+
     Args:
         config: Configuration object containing all arguments
         accelerator: Accelerator for distributed training
         preprocess_func: Function to preprocess batches
         **kwargs: Additional arguments (ignored)
-        
+
     Returns:
-        Tuple of (train_dataloader, test_dataloader)
-        test_dataloader is None if test split doesn't exist
+        Tuple of (train_dataloader, test_dataloaders). ``test_dataloaders`` maps test set
+        name to DataLoader; empty dict if no evaluation data is configured.
     """
     data_args = config.data_args
     training_args = config.training_args
@@ -229,34 +228,39 @@ def get_dataloader(
 
     # Determine if distributed preprocessing is needed
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
-    preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
+    preprocess_parallelism = getattr(data_args, "preprocess_parallelism", "local")
 
     # Common dataset kwargs
     base_kwargs = {
         "preprocess_func": preprocess_func,
-        "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args) if preprocess_func else None, # Preprocess kwargs
-        'extra_hash_strs': [config.model_args.model_type, config.model_args.model_name_or_path], # Use model info to differentiate caches
+        "preprocess_kwargs": (
+            filter_kwargs(preprocess_func, **data_args) if preprocess_func else None
+        ),  # Preprocess kwargs
+        "extra_hash_strs": [
+            config.model_args.model_type,
+            config.model_args.model_name_or_path,
+        ],  # Use model info to differentiate caches
     }
     base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
-    base_kwargs['force_reprocess'] = data_args.force_reprocess
+    base_kwargs["force_reprocess"] = data_args.force_reprocess
 
     # === CREATE/LOAD TRAIN DATASET ===
-    train_preprocess_kwargs = base_kwargs.get('preprocess_kwargs', {}).copy()
+    train_preprocess_kwargs = base_kwargs.get("preprocess_kwargs", {}).copy()
     train_preprocess_kwargs.update(
         {
-            'is_train': True,
+            "is_train": True,
             **training_args,
         }
     )
     # Use algorithm-aware guidance scale for preprocessing — ensures negative
     # prompts are encoded when any optimizer-time CFG scale needs them
     # (e.g., DGPO kl_cfg > 1.0 with training guidance_scale = 1.0).
-    train_preprocess_kwargs['guidance_scale'] = training_args.get_preprocess_guidance_scale()
+    train_preprocess_kwargs["guidance_scale"] = training_args.get_preprocess_guidance_scale()
     train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
     dataset = _create_or_load_dataset(
         split="train",
         accelerator=accelerator,
-        base_kwargs={**base_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
+        base_kwargs={**base_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
         enable_distributed=enable_distributed,
         preprocess_parallelism=preprocess_parallelism,
     )
@@ -267,7 +271,7 @@ def get_dataloader(
         config=config,
         accelerator=accelerator,
     )
-    
+
     dataloader = DataLoader(
         dataset,
         batch_sampler=sampler,
@@ -276,31 +280,72 @@ def get_dataloader(
         collate_fn=GeneralDataset.collate_fn,
     )
 
-    # === CREATE/LOAD TEST DATASET ===
-    test_dataloader = None
-    if GeneralDataset.check_exists(data_args.dataset, "test"):
-        test_preprocess_kwargs = base_kwargs.get('preprocess_kwargs', {}).copy()
-        test_preprocess_kwargs.update(
-            {
-                'is_train': False,
-                **eval_args,
-            }
-        )
-        test_preprocess_kwargs = filter_kwargs(preprocess_func, **test_preprocess_kwargs)
-        test_dataset = _create_or_load_dataset(
-            split="test",
-            accelerator=accelerator,
-            base_kwargs={**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs},
-            enable_distributed=enable_distributed,
-            preprocess_parallelism=preprocess_parallelism,
-        )
-        
-        test_dataloader = DataLoader(
-            test_dataset,
-            batch_size=eval_args.per_device_batch_size,
-            shuffle=False,
-            num_workers=data_args.dataloader_num_workers,
-            collate_fn=GeneralDataset.collate_fn,
-        )
+    # === CREATE/LOAD TEST DATASET(S) ===
+    test_dataloaders: Dict[str, DataLoader] = {}
 
-    return dataloader, test_dataloader
+    if eval_args.test_sets is None:
+        if GeneralDataset.check_exists(data_args.dataset, "test"):
+            test_preprocess_kwargs = base_kwargs.get("preprocess_kwargs", {}).copy()
+            test_preprocess_kwargs.update(
+                {
+                    "is_train": False,
+                    **eval_args,
+                }
+            )
+            test_preprocess_kwargs = filter_kwargs(preprocess_func, **test_preprocess_kwargs)
+            test_dataset = _create_or_load_dataset(
+                split="test",
+                accelerator=accelerator,
+                base_kwargs={**base_kwargs, "preprocess_kwargs": test_preprocess_kwargs},
+                enable_distributed=enable_distributed,
+                preprocess_parallelism=preprocess_parallelism,
+            )
+
+            test_dataloaders["test"] = DataLoader(
+                test_dataset,
+                batch_size=eval_args.per_device_batch_size,
+                shuffle=False,
+                num_workers=data_args.dataloader_num_workers,
+                collate_fn=GeneralDataset.collate_fn,
+            )
+    elif len(eval_args.test_sets) > 0:
+        for ts in eval_args.test_sets:
+            resolved_dir = ts.dataset_dir if ts.dataset_dir is not None else data_args.dataset
+            if not GeneralDataset.check_exists(resolved_dir, ts.split):
+                raise FileNotFoundError(
+                    f"eval.test_sets entry {ts.name!r}: no {ts.split}.jsonl or {ts.split}.txt "
+                    f"under {resolved_dir}"
+                )
+            merged_eval = eval_args.merged_eval_args_for_test_set(ts)
+            test_preprocess_kwargs = base_kwargs.get("preprocess_kwargs", {}).copy()
+            test_preprocess_kwargs.update(
+                {
+                    "is_train": False,
+                    **merged_eval,
+                }
+            )
+            test_preprocess_kwargs = filter_kwargs(preprocess_func, **test_preprocess_kwargs)
+
+            test_base = {**base_kwargs}
+            test_base["dataset_dir"] = resolved_dir
+            extra = list(base_kwargs.get("extra_hash_strs", []))
+            extra.append(f"testset:{ts.name}")
+            test_base["extra_hash_strs"] = extra
+
+            test_dataset = _create_or_load_dataset(
+                split=ts.split,
+                accelerator=accelerator,
+                base_kwargs={**test_base, "preprocess_kwargs": test_preprocess_kwargs},
+                enable_distributed=enable_distributed,
+                preprocess_parallelism=preprocess_parallelism,
+            )
+
+            test_dataloaders[ts.name] = DataLoader(
+                test_dataset,
+                batch_size=merged_eval.per_device_batch_size,
+                shuffle=False,
+                num_workers=data_args.dataloader_num_workers,
+                collate_fn=GeneralDataset.collate_fn,
+            )
+
+    return dataloader, test_dataloaders
