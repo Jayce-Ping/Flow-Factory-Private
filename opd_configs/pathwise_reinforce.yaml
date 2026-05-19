@@ -75,7 +75,7 @@ train:
   teacher_aggregation: 'average'         # Options: 'average' (forward every teacher per timestep), 'round_robin' (1 teacher per batch, cycling)
   pathwise_coef: 1.0                     # Coefficient on the pathwise term D_k(theta); 0 disables per-step distillation (see reinforce_only.yaml).
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term R_{k+1} * log p_theta(x_{k+1}|x_k); 0 drops the trajectory term.
-  normalize_d_k: true                    # If false: D_k = mean(||Δμ||²) without / (2*sigma_bar^2) (teacher D_k, R_bar, x-based KL anchor).
+  normalize_d_k: false                    # If false: D_k = mean(||Δμ||²) without / (2*sigma_bar^2) (teacher D_k, R_bar, x-based KL anchor).
   reinforce_future_reduction: "sum"      # Options: sum (paper Eq.11 R_bar), mean (average future D_j).
   reinforce_group_center: false          # If true: see group_reinforce_pathwise.yaml / group_reinforce_only.yaml.
 

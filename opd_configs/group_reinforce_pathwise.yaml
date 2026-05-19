@@ -57,7 +57,7 @@ train:
   teacher_aggregation: 'average'
   pathwise_coef: 1.0
   reinforce_coef: 1.0
-  normalize_d_k: true
+  normalize_d_k: false
   reinforce_future_reduction: "mean"
   reinforce_group_center: true
   reinforce_group_std: false   # true: (r - mean_g) / max(std_g, 1e-6)
