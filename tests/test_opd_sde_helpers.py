@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for OPD-SDE static helpers (R_bar aggregation, group centering)."""
+"""Unit tests for OPD-SDE static helpers (R_bar aggregation, group normalization)."""
 
 import unittest
 
 import torch
 
+from flow_factory.hparams.training_args import OPDTrainingArguments
 from flow_factory.trainers.opd.sde import OPDTrainer
 
 
@@ -90,6 +91,61 @@ class TestOPDGroupCenter(unittest.TestCase):
         group_ids = torch.tensor([1, 1, 1])
         with self.assertRaises(ValueError):
             OPDTrainer._group_center(values, group_ids, group_size=16, rank_index=3)
+
+
+class TestOPDGroupNormalize(unittest.TestCase):
+    def test_center_only_matches_group_center(self) -> None:
+        values = torch.tensor([1.0, 3.0, 10.0, 20.0])
+        group_ids = torch.tensor([1, 1, 2, 2])
+        centered = OPDTrainer._group_normalize(
+            values,
+            group_ids,
+            group_size=2,
+            center=True,
+            divide_by_std=False,
+        )
+        expected = OPDTrainer._group_center(values, group_ids, group_size=2)
+        torch.testing.assert_close(centered, expected)
+
+    def test_center_and_std(self) -> None:
+        values = torch.tensor([1.0, 3.0, 10.0, 20.0])
+        group_ids = torch.tensor([1, 1, 2, 2])
+        normalized = OPDTrainer._group_normalize(
+            values,
+            group_ids,
+            group_size=2,
+            center=True,
+            divide_by_std=True,
+            std_eps=1e-6,
+        )
+        for gid in (1, 2):
+            mask = group_ids == gid
+            g = values[mask]
+            centered = g - g.mean()
+            std = max(float(torch.std(g, unbiased=False).item()), 1e-6)
+            torch.testing.assert_close(normalized[mask], centered / std)
+
+    def test_constant_group_all_zero(self) -> None:
+        values = torch.tensor([5.0, 5.0, 7.0, 7.0])
+        group_ids = torch.tensor([1, 1, 2, 2])
+        normalized = OPDTrainer._group_normalize(
+            values,
+            group_ids,
+            group_size=2,
+            center=True,
+            divide_by_std=True,
+        )
+        torch.testing.assert_close(normalized, torch.zeros_like(values))
+
+
+class TestOPDTrainingArgumentsPostInit(unittest.TestCase):
+    def test_reinforce_group_std_requires_center(self) -> None:
+        with self.assertRaises(ValueError):
+            OPDTrainingArguments(
+                teacher_paths=["/tmp/teacher"],
+                reinforce_group_std=True,
+                reinforce_group_center=False,
+            )
 
 
 class TestOPDRankReinforcePipeline(unittest.TestCase):
