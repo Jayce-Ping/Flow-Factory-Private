@@ -37,6 +37,7 @@ from ...hparams import EnsembleEvalTrainingArguments
 from ...samples import BaseSample
 from ...utils.logger_utils import setup_logger
 from .common import (
+    PCGradStats,
     cache_scheduler_step_signature,
     ensemble_forward_step,
     load_checkpoints,
@@ -115,6 +116,15 @@ class EnsembleEvalTrainer(BaseTrainer):
 
         original_forward = self.adapter.forward
 
+        # Create stats accumulator for PCGrad modes (deferred summary logging)
+        blend_mode = self.training_args.ensemble_blend_mode
+        pcgrad_stats: Optional[PCGradStats] = None
+        if blend_mode.startswith("pcgrad"):
+            pcgrad_stats = PCGradStats(
+                blend_mode=blend_mode,
+                num_checkpoints=len(self._checkpoint_names),
+            )
+
         def patched_forward(**kwargs: Any) -> Any:
             return ensemble_forward_step(
                 self.adapter,
@@ -123,9 +133,10 @@ class EnsembleEvalTrainer(BaseTrainer):
                 kwargs,
                 self._sched_cache,
                 base_forward=original_forward,
-                blend_mode=self.training_args.ensemble_blend_mode,
+                blend_mode=blend_mode,
                 pcgrad_eps=self.training_args.pcgrad_eps,
                 pcgrad_generator=self._pcgrad_generator,
+                stats=pcgrad_stats,
             )
 
         self.adapter.forward = patched_forward  # type: ignore[method-assign]
@@ -141,6 +152,9 @@ class EnsembleEvalTrainer(BaseTrainer):
         finally:
             torch.set_autocast_cache_enabled(prev_cache_enabled)
             self.adapter.forward = original_forward
+            # Log PCGrad summary after all denoising steps complete
+            if pcgrad_stats is not None:
+                pcgrad_stats.log_summary()
 
     def sample(self) -> List[BaseSample]:
         """No-op: ensemble-eval does not sample for training."""
