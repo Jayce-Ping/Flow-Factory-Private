@@ -1,0 +1,114 @@
+# Multi-checkpoint offline ensemble evaluation — SD3.5 LoRA example.
+#
+# Loads multiple LoRA checkpoints as named snapshots (OPD-style) and runs one
+# evaluation pass per entry in eval.test_sets. At each denoising step:
+#   noise_pred = sum_i w_i * noise_pred_i(checkpoint_i)
+# followed by a single scheduler.step.
+#
+# Prerequisites:
+#   - `finetune_type: lora` with rank/alpha matching every checkpoint.
+#   - Each `checkpoint_paths` entry: local dir from `save_checkpoint()` or HF Hub id.
+#   - Each test set: `{dataset_dir}/{split}.jsonl` (default split: test).
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 1
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration
+# train split only (eval-only trainer does not sample); eval data comes from eval.test_sets
+data:
+  dataset_dir: "dataset/ocr"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+# Training Configuration (eval-only; no policy updates)
+train:
+  trainer_type: 'ensemble-eval'
+
+  checkpoint_paths:
+    - "jieliu/SD3.5M-FlowGRPO-Text"
+    - "jieliu/SD3.5M-FlowGRPO-PickScore"
+  checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
+  checkpoint_param_device: 'cuda'
+
+  max_epochs: 1
+  unique_sample_num_per_epoch: 1
+  group_size: 1
+  gradient_step_per_epoch: 1
+  per_device_batch_size: 1
+
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.5
+  learning_rate: 3.0e-4
+  seed: 42
+
+  ema_decay: 0.0
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 32
+  guidance_scale: 4.5
+  num_inference_steps: 40
+  eval_freq: 0
+  seed: 42
+  test_sets:
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+
+rewards: []
+
+eval_rewards:
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false

@@ -16,8 +16,9 @@
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
 import yaml
 
@@ -26,6 +27,70 @@ from ..utils.logger_utils import setup_logger
 from .abc import ArgABC
 
 logger = setup_logger(__name__, rank_zero_only=True)
+
+
+def _sanitize_test_set_name(name: str) -> str:
+    """Make test set names safe for wandb keys (alphanumeric + underscore)."""
+    s = re.sub(r"[^a-zA-Z0-9_]", "_", name.strip())
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        raise ValueError(f"Invalid test set name after sanitization: {name!r}")
+    return s
+
+
+@dataclass
+class TestSetArguments(ArgABC):
+    """One evaluation dataset when using ``eval.test_sets`` (multi-test-set mode)."""
+
+    name: str = field(metadata={"help": "Short id for logging (wandb keys under eval/{name}/...)."})
+    dataset_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Override data directory; defaults to training ``data.dataset_dir``."},
+    )
+    split: str = field(
+        default="test",
+        metadata={"help": "Split file basename, e.g. 'test' loads test.jsonl."},
+    )
+    resolution: Optional[Union[int, tuple[int, int], list[int]]] = field(
+        default=None,
+        metadata={"help": "Optional override for eval resolution."},
+    )
+    height: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional height override for this test set."},
+    )
+    width: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional width override for this test set."},
+    )
+    per_device_batch_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional eval batch size override for this test set."},
+    )
+    seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional eval seed override for this test set."},
+    )
+    guidance_scale: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional guidance scale override for this test set."},
+    )
+    num_inference_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional num_inference_steps override for this test set."},
+    )
+    eval_reward_names: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Names from the global ``eval_rewards`` list to run for this test set only. "
+                "``None`` runs all eval rewards; ``[]`` runs none (samples only)."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        self.name = _sanitize_test_set_name(self.name)
 
 
 @dataclass
@@ -62,6 +127,16 @@ class EvaluationArguments(ArgABC):
         default=10,
         metadata={"help": "Evaluation frequency (in epochs). 0 for no evaluation."},
     )
+    test_sets: Optional[List[TestSetArguments]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Explicit test datasets for evaluation. If omitted (null), a single "
+                "``test`` split under ``data.dataset_dir`` is used when test.jsonl exists "
+                "(legacy). If set to an empty list ``[]``, no test evaluation is run."
+            )
+        },
+    )
 
     def __post_init__(self):
         if not self.resolution:
@@ -92,9 +167,46 @@ class EvaluationArguments(ArgABC):
                 f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
                 f"Using width to override: ({self.resolution[0]}, {self.width})."
             )
+            self.resolution = (self.resolution[0], self.width)
 
         # Final assignment
         self.height, self.width = self.resolution
+
+        if self.test_sets is not None:
+            coerced: List[TestSetArguments] = []
+            for item in self.test_sets:
+                if isinstance(item, TestSetArguments):
+                    coerced.append(item)
+                elif isinstance(item, dict):
+                    coerced.append(TestSetArguments.from_dict(item))
+                else:
+                    raise TypeError(
+                        f"eval.test_sets entries must be dicts or TestSetArguments, "
+                        f"got {type(item).__name__}"
+                    )
+            names = [ts.name for ts in coerced]
+            if len(names) != len(set(names)):
+                raise ValueError(f"eval.test_sets names must be unique, got {names}")
+            self.test_sets = coerced
+
+    def merged_eval_args_for_test_set(self, test_set: TestSetArguments) -> "EvaluationArguments":
+        """Per-test-set eval args (global eval + overrides); omits ``test_sets``."""
+        d = self.to_dict()
+        d.pop("test_sets", None)
+        override_fields = (
+            "resolution",
+            "height",
+            "width",
+            "per_device_batch_size",
+            "seed",
+            "guidance_scale",
+            "num_inference_steps",
+        )
+        for f in override_fields:
+            v = getattr(test_set, f, None)
+            if v is not None:
+                d[f] = v
+        return EvaluationArguments.from_dict(d)
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()
@@ -1412,6 +1524,76 @@ class CRDTrainingArguments(TrainingArguments):
         return max(self.guidance_scale, self.kl_cfg)
 
 
+@dataclass
+class EnsembleEvalTrainingArguments(TrainingArguments):
+    r"""Training arguments for multi-checkpoint offline ensemble evaluation.
+
+    Loads multiple LoRA checkpoints as named-parameter snapshots (same mechanism
+    as OPD multi-teacher) and runs a single pass over the dataset ``test`` split.
+    At each denoising step, ``noise_pred`` is a weighted sum of per-checkpoint
+    predictions, followed by one ``scheduler.step`` call.
+    """
+
+    checkpoint_paths: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of LoRA checkpoint paths (local or Hugging Face Hub ids), "
+                "each written by `BaseAdapter.save_checkpoint()`. Must contain "
+                "at least one entry; every checkpoint must share the student's "
+                "LoRA rank/alpha."
+            )
+        },
+    )
+    checkpoint_weights: Optional[List[float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional per-checkpoint blend weights (same length as "
+                "`checkpoint_paths`). When omitted, uses uniform weights "
+                "normalized to sum to 1."
+            )
+        },
+    )
+    checkpoint_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={
+            "help": (
+                "Storage device for checkpoint LoRA snapshots. 'cuda' keeps "
+                "snapshots on-device for fast swaps; 'cpu' minimizes VRAM at "
+                "the cost of an H2D copy on each swap."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.checkpoint_paths:
+            raise ValueError(
+                "EnsembleEvalTrainingArguments requires `checkpoint_paths` to "
+                f"contain at least one LoRA checkpoint, got "
+                f"checkpoint_paths={self.checkpoint_paths!r}."
+            )
+        n_ckpt = len(self.checkpoint_paths)
+        if self.checkpoint_weights is not None:
+            if len(self.checkpoint_weights) != n_ckpt:
+                raise ValueError(
+                    f"`checkpoint_weights` length must match `checkpoint_paths` "
+                    f"({n_ckpt}), got len(checkpoint_weights)="
+                    f"{len(self.checkpoint_weights)}."
+                )
+            if any(w < 0 for w in self.checkpoint_weights):
+                raise ValueError(
+                    f"All `checkpoint_weights` must be >= 0, got "
+                    f"checkpoint_weights={self.checkpoint_weights!r}."
+                )
+            if sum(self.checkpoint_weights) <= 0:
+                raise ValueError(
+                    f"`checkpoint_weights` must sum to a positive value, got "
+                    f"checkpoint_weights={self.checkpoint_weights!r}."
+                )
+
+
 # ============================================================================
 # Training Arguments Registry
 # ============================================================================
@@ -1426,6 +1608,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "crd": CRDTrainingArguments,
     "opd": OPDTrainingArguments,
     "opd-ode": OPDODETrainingArguments,
+    "ensemble-eval": EnsembleEvalTrainingArguments,
 }
 
 
