@@ -358,11 +358,10 @@ def pcgrad_blend_noise_preds(
     num_checkpoints = len(scaled_preds)
     pc = [pred.clone() for pred in scaled_preds]
 
-    # --- PCGrad diagnostic counters ---
     total_pairs = 0
     conflict_pairs = 0
-    conflict_batches = 0  # total batch elements with dot < 0
-    total_batches = 0  # total batch elements evaluated
+    conflict_batches = 0
+    total_batches = 0
 
     for i in range(num_checkpoints):
         for j in _shuffled_other_indices(num_checkpoints, i, generator):
@@ -370,22 +369,26 @@ def pcgrad_blend_noise_preds(
             dot = (flat_pc_i * flat_orig[j]).sum(dim=1).view(broadcast_shape)
             coeff = dot / norm_sq_orig[j]
             proj = coeff * scaled_preds[j]
-
             conflict_mask = dot < 0
-            num_conflicts_this_pair = conflict_mask.sum().item()
-
-            total_pairs += 1
-            total_batches += batch
-            conflict_batches += num_conflicts_this_pair
-            if num_conflicts_this_pair > 0:
-                conflict_pairs += 1
-
             pc[i] = torch.where(conflict_mask, pc[i] - proj, pc[i])
+
+            if stats is not None:
+                n_conflicts = int(conflict_mask.sum().item())
+                total_pairs += 1
+                total_batches += batch
+                conflict_batches += n_conflicts
+                if n_conflicts > 0:
+                    conflict_pairs += 1
 
     # Record statistics (deferred logging via stats.log_summary())
     if stats is not None and total_pairs > 0:
         if stats.num_steps == 0:
             stats.tensor_shape = tuple(ref_shape)
+        # Reuse pre-computed norm_sq_orig for cosine similarity (avoid redundant .norm())
+        norm_orig = [
+            ns.view(batch, -1).squeeze(1).sqrt()  # (B,)
+            for ns in norm_sq_orig
+        ]
         cosine_means: List[float] = []
         cosine_mins: List[float] = []
         cosine_maxs: List[float] = []
@@ -393,11 +396,9 @@ def pcgrad_blend_noise_preds(
             for j in range(num_checkpoints):
                 if i == j:
                     continue
-                flat_i = flat_orig[i]
-                flat_j = flat_orig[j]
                 cosine_sim = (
-                    (flat_i * flat_j).sum(dim=1)
-                    / (flat_i.norm(dim=1) * flat_j.norm(dim=1)).clamp_min(eps)
+                    (flat_orig[i] * flat_orig[j]).sum(dim=1)
+                    / (norm_orig[i] * norm_orig[j]).clamp_min(eps)
                 )
                 cosine_means.append(cosine_sim.mean().item())
                 cosine_mins.append(cosine_sim.min().item())
@@ -412,7 +413,10 @@ def pcgrad_blend_noise_preds(
             cosine_maxs=cosine_maxs,
         )
 
-    return torch.stack(pc, dim=0).sum(dim=0)
+    result = pc[0]
+    for k in range(1, num_checkpoints):
+        result = result + pc[k]
+    return result
 
 
 def pcgrad_blend_noise_preds_channelwise(
@@ -502,10 +506,9 @@ def pcgrad_blend_noise_preds_channelwise(
     num_checkpoints = len(scaled_preds)
     pc = [pred.clone() for pred in scaled_preds]
 
-    # --- PCGrad channelwise diagnostic counters ---
     total_pairs = 0
     conflict_pairs = 0
-    conflict_groups = 0  # total group elements (B*group_dim) with dot < 0
+    conflict_groups = 0
     total_groups = 0
 
     for i in range(num_checkpoints):
@@ -514,17 +517,16 @@ def pcgrad_blend_noise_preds_channelwise(
             dot = (flat_pc_i * flat_orig[j]).sum(dim=1).view(broadcast_shape)
             coeff = dot / norm_sq_orig[j]
             proj = coeff * scaled_preds[j]
-
             conflict_mask = dot < 0
-            num_conflicts_this_pair = conflict_mask.sum().item()
-
-            total_pairs += 1
-            total_groups += group_batch
-            conflict_groups += num_conflicts_this_pair
-            if num_conflicts_this_pair > 0:
-                conflict_pairs += 1
-
             pc[i] = torch.where(conflict_mask, pc[i] - proj, pc[i])
+
+            if stats is not None:
+                n_conflicts = int(conflict_mask.sum().item())
+                total_pairs += 1
+                total_groups += group_batch
+                conflict_groups += n_conflicts
+                if n_conflicts > 0:
+                    conflict_pairs += 1
 
     # Record statistics (deferred logging via stats.log_summary())
     if stats is not None and total_pairs > 0:
@@ -537,7 +539,10 @@ def pcgrad_blend_noise_preds_channelwise(
             step_conflict_elements=conflict_groups,
         )
 
-    return torch.stack(pc, dim=0).sum(dim=0)
+    result = pc[0]
+    for k in range(1, num_checkpoints):
+        result = result + pc[k]
+    return result
 
 
 def _pcgrad_residual_blend(
