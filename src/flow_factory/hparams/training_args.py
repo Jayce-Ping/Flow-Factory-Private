@@ -681,6 +681,142 @@ class NFTTrainingArguments(TrainingArguments):
 
 
 @dataclass
+class MNFTTrainingArguments(TrainingArguments):
+    r"""Training arguments for Mixture NFT (MNFT).
+
+    Learns optimal per-timestep softmax mixing weights (lambda_k_i) over K
+    frozen teacher flow-matching velocities.  The combined velocity
+    ``v_combined_i = sum_k softmax(logits[:, i]) * v_k_i`` is a valid
+    flow-matching velocity (ODE linearity).  DiffusionNFT optimizes
+    these weights via external reward feedback.
+
+    Total learnable parameters: K × num_inference_steps (1:1 mapping).
+    """
+
+    # ---- Teacher administration (reuse OPD pattern) ----
+    teacher_paths: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of K teacher LoRA checkpoint paths.  Must contain at "
+                "least one entry.  Paths can be local or HF Hub repo ids."
+            )
+        },
+    )
+    teacher_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={
+            "help": (
+                "Device to store teacher LoRA snapshots. 'cuda' for fast "
+                "weight swaps (~1-2ms), 'cpu' for lower VRAM usage."
+            )
+        },
+    )
+
+    # ---- MNFT core ----
+    nft_beta: float = field(
+        default=1.0,
+        metadata={"help": "Beta parameter for NFT loss (positive/negative interpolation)."},
+    )
+    off_policy: bool = field(
+        default=True,
+        metadata={"help": "Use EMA of logits for sampling (off-policy NFT)."},
+    )
+    logits_init: Literal["zeros", "random"] = field(
+        default="zeros",
+        metadata={
+            "help": (
+                "Initialization for lambda logits. 'zeros' gives exactly uniform "
+                "softmax (1/K per teacher); 'random' uses small Gaussian noise "
+                "(std=0.01) to break symmetry while staying near-uniform."
+            )
+        },
+    )
+    logits_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Learning rate for lambda logits. None = use global learning_rate."},
+    )
+    logits_ema_decay: float = field(
+        default=0.99,
+        metadata={"help": "EMA decay for lambda logits (old-policy in off-policy NFT)."},
+    )
+    temperature: float = field(
+        default=1.0,
+        metadata={"help": "Softmax temperature: weights_i = softmax(logits[:, i] / temperature)."},
+    )
+
+    # ---- Advantage & clipping ----
+    global_std: bool = field(
+        default=True,
+        metadata={"help": "Whether to use global std for advantage normalization."},
+    )
+    advantage_aggregation: Literal["sum", "gdpo", "smart_grpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo', 'smart_grpo']."
+        },
+    )
+    adv_clip_range: tuple[float, float] = field(
+        default=(-5.0, 5.0),
+        metadata={"help": "Clipping range for advantages."},
+    )
+
+    # ---- Timestep control ----
+    # T always equals num_inference_steps (1:1 mapping).
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
+        metadata={"help": "Time sampling strategy for training timesteps."},
+    )
+    time_shift: float = field(
+        default=3.0,
+        metadata={"help": "Time shift for logit normal time sampling."},
+    )
+    timestep_range: Union[float, Tuple[float, float]] = field(
+        default=0.9,
+        metadata={
+            "help": "Fraction range along denoise axis 1000→0; maps to scheduler times "
+            "[1000*(1-end), 1000*(1-start)]. Float means [0, value]."
+        },
+    )
+
+    # ---- Optional KL (anchor to base model) ----
+    kl_type: Literal["v-based"] = field(
+        default="v-based",
+        metadata={"help": "Type of KL divergence. MNFT supports 'v-based' only."},
+    )
+    kl_beta: float = field(
+        default=0,
+        metadata={"help": "KL penalty beta. 0 to disable."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.timestep_range = _standardize_timestep_range(self.timestep_range)
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if not self.teacher_paths:
+            raise ValueError("MNFTTrainingArguments requires at least one teacher_paths entry.")
+        if self.logits_lr is None:
+            self.logits_lr = self.learning_rate
+        if self.logits_init not in ["zeros", "random"]:
+            raise ValueError(
+                f"Invalid logits_init: {self.logits_init!r}. "
+                f"Valid options are: ['zeros', 'random']."
+            )
+        if not (0 < self.logits_ema_decay < 1):
+            raise ValueError(
+                f"logits_ema_decay must be in (0, 1), got {self.logits_ema_decay}."
+            )
+        if self.nft_beta <= 0:
+            raise ValueError(f"nft_beta must be > 0, got {self.nft_beta}.")
+        if self.temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {self.temperature}")
+        if self.kl_type not in ["v-based"]:
+            raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
+
+
+@dataclass
 class AWMTrainingArguments(TrainingArguments):
     r"""Training arguments for Advantage Weighted Matching (AWM)."""
 
@@ -1652,6 +1788,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "grpo": GRPOTrainingArguments,
     "grpo-guard": GRPOTrainingArguments,
     "nft": NFTTrainingArguments,
+    "mnft": MNFTTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,
