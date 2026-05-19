@@ -513,11 +513,11 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
 | Field | Description |
 |---|---|
 | `trainer_type` | `'ensemble-eval'` |
-| `checkpoint_paths` | List of LoRA paths (local or HF Hub); ≥1 required |
+| `checkpoint_paths` | List of LoRA paths (local or HF Hub); `[]` = eval current adapter (no ensemble) |
 | `checkpoint_weights` | Optional blend weights (same length as paths); default uniform |
 | `checkpoint_param_device` | `'cpu'` or `'cuda'` for snapshot storage |
 
-Requires `model.finetune_type: lora` and matching `lora_rank` / `lora_alpha` across all checkpoints. Example: `ensemble-eval/lora/sd3_5/default.yaml`.
+Requires `model.finetune_type: lora`. Non-empty `checkpoint_paths` need matching `lora_rank` / `lora_alpha` across checkpoints. Empty `checkpoint_paths` uses the loaded student LoRA as-is (`model.resume_path` or initialized weights), not Hub ensemble snapshots. Example: `ensemble-eval/lora/sd3_5/default.yaml`.
 
 Set top-level `num_processes` to your GPU count (default example uses `8`) so `eval.test_sets` preprocessing is sharded across ranks. Ensemble-eval does **not** preprocess the train split — only splits listed under `eval.test_sets`.
 

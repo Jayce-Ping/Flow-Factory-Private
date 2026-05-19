@@ -58,10 +58,20 @@ class TestNormalizeCheckpointWeights(unittest.TestCase):
 
 
 class TestEnsembleEvalTrainingArgumentsPostInit(unittest.TestCase):
-    def test_requires_checkpoint_paths(self) -> None:
+    def test_allows_empty_checkpoint_paths(self) -> None:
+        args = EnsembleEvalTrainingArguments(
+            checkpoint_paths=[],
+            unique_sample_num_per_epoch=1,
+            group_size=1,
+            per_device_batch_size=1,
+        )
+        self.assertEqual(args.checkpoint_paths, [])
+
+    def test_rejects_weights_when_checkpoint_paths_empty(self) -> None:
         with self.assertRaises(ValueError):
             EnsembleEvalTrainingArguments(
                 checkpoint_paths=[],
+                checkpoint_weights=[1.0],
                 unique_sample_num_per_epoch=1,
                 group_size=1,
                 per_device_batch_size=1,

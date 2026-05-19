@@ -54,6 +54,7 @@ train:
   checkpoint_paths:
     - "jieliu/SD3.5M-FlowGRPO-Text"
     - "jieliu/SD3.5M-FlowGRPO-PickScore"
+  # Use [] to eval current adapter only (no ensemble); cannot combine with checkpoint_weights
   checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
   checkpoint_param_device: 'cuda'
 
