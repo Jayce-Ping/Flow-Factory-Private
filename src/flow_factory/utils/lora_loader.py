@@ -125,6 +125,36 @@ def load_lora_as_named_parameters(
     try:
         adapter._load_lora(lora_path)
 
+        # Verify that _load_lora actually modified the parameters. If the
+        # weights are unchanged (e.g. due to silent key mismatch in
+        # load_state_dict(strict=False)), the snapshot would capture stale
+        # data and the ensemble would silently degrade to using only one
+        # checkpoint's predictions.
+        current_params = adapter._get_component_parameters(target_components)
+        if len(current_params) != len(live_params):
+            raise RuntimeError(
+                f"Parameter count changed after _load_lora: "
+                f"before={len(live_params)}, after={len(current_params)}. "
+                f"This indicates _load_lora replaced the model structure."
+            )
+        # Check that at least some parameters actually changed
+        n_changed = sum(
+            1 for cur, orig in zip(current_params, saved_data)
+            if not torch.equal(cur.data.to(orig.device), orig)
+        )
+        if n_changed == 0:
+            raise RuntimeError(
+                f"load_lora_as_named_parameters: _load_lora('{lora_path}') did not "
+                f"modify any of the {len(live_params)} LoRA parameters. This likely "
+                f"means PEFT's load_adapter failed silently (key mismatch with "
+                f"strict=False). Check that the checkpoint format matches the model's "
+                f"adapter configuration."
+            )
+        logger.debug(
+            f"_load_lora modified {n_changed}/{len(live_params)} parameters "
+            f"for snapshot '{name}'."
+        )
+
         adapter.add_named_parameters(
             name=name,
             target_components=target_components,
