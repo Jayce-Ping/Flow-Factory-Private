@@ -41,7 +41,7 @@ model:
 
 log:
   run_name: null
-  project: "Flow-Factory"
+  project: "Flow-Factory-Ensemble-Eval"
   logging_backend: "wandb"
   save_dir: "saves/"
   save_freq: 0
