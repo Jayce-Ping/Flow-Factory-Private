@@ -164,19 +164,23 @@ def ensemble_forward_step(
     weights: Sequence[float],
     forward_kwargs: Dict[str, Any],
     sched_cache: SchedulerStepCache,
+    base_forward: Callable[..., Any],
 ) -> Any:
     """Blend per-checkpoint ``noise_pred`` tensors, then run one scheduler step.
 
-    For each snapshot, calls ``adapter.forward`` under
-    :meth:`BaseAdapter.use_named_parameters` with ``return_kwargs=['noise_pred']``.
-    The blended prediction is passed to a single ``adapter.scheduler.step`` call.
+    For each snapshot, calls ``base_forward`` (the unpatched ``adapter.forward``)
+    under :meth:`BaseAdapter.use_named_parameters` with
+    ``return_kwargs=['noise_pred']``. The blended prediction is passed to a single
+    ``adapter.scheduler.step`` call.
 
     Args:
-        adapter: Model adapter whose ``forward`` / ``scheduler`` are used.
+        adapter: Model adapter whose ``scheduler`` is used for the final step.
         checkpoint_names: Snapshot names from :func:`load_checkpoints`.
         weights: Normalized weights (same length as ``checkpoint_names``).
-        forward_kwargs: Keyword arguments passed to ``adapter.forward``.
+        forward_kwargs: Keyword arguments passed to ``base_forward``.
         sched_cache: Cached signature from :func:`cache_scheduler_step_signature`.
+        base_forward: Original ``adapter.forward`` before any ensemble patch; must
+            not re-enter :func:`ensemble_forward_step`.
 
     Returns:
         Scheduler step output (same type as ``adapter.forward``).
@@ -199,7 +203,7 @@ def ensemble_forward_step(
     combined_noise_pred: Optional[torch.Tensor] = None
     for name, weight in zip(checkpoint_names, weights, strict=True):
         with adapter.use_named_parameters(name):
-            out = adapter.forward(**noise_only_kwargs)
+            out = base_forward(**noise_only_kwargs)
         if out.noise_pred is None:
             raise RuntimeError(
                 f"Checkpoint '{name}' forward did not return `noise_pred`; "

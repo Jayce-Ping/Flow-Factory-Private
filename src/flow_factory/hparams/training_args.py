@@ -484,6 +484,11 @@ class TrainingArguments(ArgABC):
         """
         return getattr(self, "kl_beta", 0) > 0.0
 
+    @property
+    def skips_train_dataloader(self) -> bool:
+        """True for eval-only trainers that never sample from the train split."""
+        return str(self.trainer_type).lower() == "ensemble-eval"
+
     def get_preprocess_guidance_scale(self) -> float:
         """Return the guidance_scale for data preprocessing.
 

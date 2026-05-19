@@ -87,6 +87,7 @@ class EnsembleEvalTrainer(BaseTrainer):
                 self._weights,
                 kwargs,
                 self._sched_cache,
+                base_forward=original_forward,
             )
 
         self.adapter.forward = patched_forward  # type: ignore[method-assign]

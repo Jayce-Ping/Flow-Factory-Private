@@ -153,12 +153,44 @@ class TestEnsembleForwardStep(unittest.TestCase):
                 "return_kwargs": ["next_latents", "noise_pred"],
             },
             adapter._sched_cache,
+            base_forward=adapter.forward,
         )
         torch.testing.assert_close(out.noise_pred, torch.tensor([2.5]))
         torch.testing.assert_close(out.next_latents, torch.tensor([2.5]))
         adapter.scheduler.step.assert_called_once()
         call_kwargs = adapter.scheduler.step.call_args.kwargs
         torch.testing.assert_close(call_kwargs["noise_pred"], torch.tensor([2.5]))
+
+
+class TestEnsembleForwardStepWithPatchedForward(unittest.TestCase):
+    def test_uses_base_forward_not_patched_forward(self) -> None:
+        preds = {
+            "eval_ckpt_0": torch.tensor([1.0]),
+            "eval_ckpt_1": torch.tensor([3.0]),
+        }
+        adapter = _MockAdapter(preds)
+        real_forward = adapter.forward
+
+        def patched_forward(**kwargs: Any) -> _MockSchedulerOutput:
+            raise AssertionError("patched_forward must not be called from ensemble_forward_step")
+
+        adapter.forward = patched_forward  # type: ignore[method-assign]
+
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.tensor([0.0]),
+                "compute_log_prob": False,
+                "return_kwargs": ["noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=real_forward,
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([2.0]))
 
 
 class TestEnsembleEvalRegistry(unittest.TestCase):
