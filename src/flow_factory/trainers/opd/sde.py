@@ -58,6 +58,7 @@ from .common import (
     cache_forward_signature,
     filter_forward_kwargs,
     load_teachers,
+    pcgrad_project_gradients,
     teacher_indices_for_batch,
 )
 
@@ -837,15 +838,176 @@ class OPDTrainer(BaseTrainer):
                     else None
                 )
 
-                loss_info = self._optimize_train_pass(
-                    batch=batch,
-                    latents_index_map=latents_index_map,
-                    num_timesteps=num_timesteps,
-                    mu_teacher_list=mu_teacher_by_batch[batch_idx],
-                    r_per_k=r_per_k_mb,
-                    r_per_k_raw=r_per_k_raw_mb,
-                    loss_info=loss_info,
-                )
+                if self.training_args.teacher_aggregation == "pcgrad":
+                    # PCGrad mode: per-teacher D_k + PCGrad projection
+                    d_per_teacher_list, mu_teacher_pcgrad = self._precompute_d_per_timestep_pcgrad(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        num_timesteps=num_timesteps,
+                        teacher_indices=teacher_indices,
+                    )
+                    
+                    # Compute per-teacher R_bar
+                    r_per_k_per_teacher = self._reverse_cumulative_per_teacher(
+                        d_per_teacher_list=d_per_teacher_list,
+                        num_teachers=len(teacher_indices),
+                    )
+                    
+                    loss_info = self._optimize_train_pass_pcgrad(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        num_timesteps=num_timesteps,
+                        mu_teacher_list=mu_teacher_pcgrad,
+                        r_per_k_per_teacher=r_per_k_per_teacher,
+                        teacher_indices=teacher_indices,
+                        loss_info=loss_info,
+                    )
+                else:
+                    # Standard mode: averaged teacher D_k
+                    loss_info = self._optimize_train_pass(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        num_timesteps=num_timesteps,
+                        mu_teacher_list=mu_teacher_by_batch[batch_idx],
+                        r_per_k=r_per_k_mb,
+                        r_per_k_raw=r_per_k_raw_mb,
+                        loss_info=loss_info,
+                    )
+
+    def _precompute_d_per_timestep_pcgrad(
+        self,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        num_timesteps: int,
+        teacher_indices: List[int],
+    ) -> Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]]:
+        """No-grad pass for PCGrad: compute per-teacher D_k and cache per-teacher means.
+
+        In PCGrad mode, we need per-teacher means and per-teacher D_k values so that
+        we can compute K separate losses and apply PCGrad projection during the
+        main pass.
+
+        Returns:
+            ``(d_per_teacher_list, mu_teacher_list)``: per training timestep,
+            two lists of length K where each element contains per-sample tensors.
+            - ``d_per_teacher_list[t][k]``: shape (B,), D_k for teacher k at timestep t
+            - ``mu_teacher_list[t][k]``: latent shape, teacher k's mean at timestep t
+        """
+        d_per_teacher_list: List[List[torch.Tensor]] = []
+        mu_teacher_list: List[List[torch.Tensor]] = []
+        device = self.accelerator.device
+
+        with torch.no_grad(), self.autocast():
+            # Disable autocast weight cache for the scope of the teacher swap loop.
+            # use_named_parameters swaps LoRA weights via .data.copy_() which preserves
+            # data_ptr; the autocast cache (keyed by data_ptr) would otherwise serve
+            # stale casted weights from the first teacher to subsequent teachers.
+            prev_cache = torch.is_autocast_cache_enabled()
+            torch.set_autocast_cache_enabled(False)
+            try:
+                for timestep_index in self.adapter.scheduler.train_timesteps:
+                    t = batch["timesteps"][:, timestep_index]
+                    t_next = (
+                        batch["timesteps"][:, timestep_index + 1]
+                        if timestep_index + 1 < num_timesteps
+                        else torch.tensor(0, device=device)
+                    )
+                    latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                    next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
+
+                    forward_kwargs = self._build_forward_kwargs(
+                        batch=batch,
+                        t=t,
+                        t_next=t_next,
+                        latents=latents,
+                        next_latents=next_latents,
+                        compute_log_prob=False,
+                        return_kwargs=_TEACHER_RETURN_KWARGS,
+                    )
+
+                    # Student forward (for comparison)
+                    student_out = self.adapter.forward(**forward_kwargs)
+                    if student_out.next_latents_mean is None:
+                        raise RuntimeError(
+                            "Student forward did not return `next_latents_mean` during pre-pass; "
+                            f"requested return_kwargs={_TEACHER_RETURN_KWARGS!r}."
+                        )
+
+                    # Per-teacher forward
+                    d_teachers_t: List[torch.Tensor] = []
+                    mu_teachers_t: List[torch.Tensor] = []
+
+                    for teacher_k in teacher_indices:
+                        name = self._teacher_names[teacher_k]
+                        with self.adapter.use_named_parameters(name):
+                            teacher_out = self.adapter.forward(**forward_kwargs)
+
+                        if teacher_out.next_latents_mean is None:
+                            raise RuntimeError(
+                                f"Teacher '{name}' forward did not return `next_latents_mean`; "
+                                f"check `return_kwargs={forward_kwargs.get('return_kwargs')!r}`."
+                            )
+
+                        mu_k = teacher_out.next_latents_mean.detach()
+                        mu_teachers_t.append(mu_k)
+
+                        d_k = self._compute_per_step_kl(
+                            mu_student=student_out.next_latents_mean,
+                            mu_teacher=mu_k,
+                            std_dev_t=student_out.std_dev_t,
+                            dt=student_out.dt,
+                            normalize=self.normalize_d_k,
+                        )
+                        d_teachers_t.append(d_k.detach())
+
+                    d_per_teacher_list.append(d_teachers_t)
+                    mu_teacher_list.append(mu_teachers_t)
+            finally:
+                torch.set_autocast_cache_enabled(prev_cache)
+
+        return d_per_teacher_list, mu_teacher_list
+
+    def _reverse_cumulative_per_teacher(
+        self,
+        d_per_teacher_list: List[List[torch.Tensor]],
+        num_teachers: int,
+    ) -> List[List[torch.Tensor]]:
+        """Compute reverse-cumulative R_bar for each teacher independently.
+
+        For each teacher k, aggregate its D_k series into R_bar_k using the
+        same :meth:`_reverse_cumulative` logic as the standard path. This
+        ensures correct semantics: ``r_per_k_per_teacher[k][t]`` aggregates
+        D_j for j strictly after t (i.e., D_{t+1} ... D_{T-1}).
+
+        Args:
+            d_per_teacher_list: List of length T, each containing K D_k tensors
+                of shape (B,).
+            num_teachers: K, number of teachers.
+
+        Returns:
+            List of length K, each containing a list of length T with R_bar values.
+            ``r_per_k_per_teacher[k][t]`` has shape (B,) and represents the
+            future-aggregated reward for teacher k at timestep t.
+        """
+        T = len(d_per_teacher_list)
+
+        # Reorganize: for each teacher k, gather its D_k series across T timesteps
+        r_per_k_per_teacher: List[List[torch.Tensor]] = []
+        for teacher_k in range(num_teachers):
+            # Gather D_k series for this teacher: [D_0_k, D_1_k, ..., D_{T-1}_k]
+            d_series_k = [d_per_teacher_list[t][teacher_k] for t in range(T)]
+
+            # Delegate to the existing _reverse_cumulative which correctly
+            # computes r[k] = aggregate(D_{k+1}, ..., D_{T-1}) with proper
+            # horizon clipping and sum/mean reduction.
+            r_bar_k = self._reverse_cumulative(
+                d_series_k,
+                self.reinforce_horizon,
+                reduction=self.reinforce_future_reduction,
+            )
+            r_per_k_per_teacher.append(r_bar_k)
+
+        return r_per_k_per_teacher
 
     def _precompute_d_per_timestep(
         self,
@@ -1023,3 +1185,171 @@ class OPDTrainer(BaseTrainer):
                         loss_info = defaultdict(list)
 
         return loss_info
+
+    def _optimize_train_pass_pcgrad(
+        self,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        num_timesteps: int,
+        mu_teacher_list: List[List[torch.Tensor]],
+        r_per_k_per_teacher: List[List[torch.Tensor]],
+        teacher_indices: List[int],
+        loss_info: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, List[torch.Tensor]]:
+        """PCGrad main pass: per-timestep K backward + PCGrad projection + accumulation.
+
+        Unlike the standard _optimize_train_pass, this method:
+        1. Computes K per-teacher losses per timestep
+        2. Performs K backward passes with retain_graph
+        3. Applies PCGrad projection to resolve conflicts
+        4. Accumulates projected gradients across all T timesteps
+        5. Performs a single optimizer.step() after all timesteps
+
+        This ensures conflicting teacher signals are resolved per-timestep while
+        maintaining smooth gradient accumulation across the trajectory.
+
+        GAS compatibility: wraps the batch-level logic with
+        ``accelerator.accumulate()`` so cross-batch accumulation (base_GAS > 1)
+        is managed by Accelerate's internal counter. The T-step internal
+        accumulation is handled here; external GAS only controls how many
+        batches to accumulate before stepping.
+        """
+        device = self.accelerator.device
+        trainable_params = list(self.adapter.get_trainable_parameters())
+        K = len(teacher_indices)
+        T = len(self.adapter.scheduler.train_timesteps)
+
+        with self.accelerator.accumulate(*self.adapter.trainable_components):
+            # Local buffer for this batch's T-timestep accumulated gradients
+            batch_grad = [torch.zeros_like(p) for p in trainable_params]
+
+            with self.autocast():
+                for k_idx, timestep_index in enumerate(
+                    tqdm(
+                        self.adapter.scheduler.train_timesteps,
+                        desc=f"Epoch {self.epoch} Timestep",
+                        position=1,
+                        leave=False,
+                        disable=not self.show_progress_bar,
+                    )
+                ):
+                    t = batch["timesteps"][:, timestep_index]
+                    t_next = (
+                        batch["timesteps"][:, timestep_index + 1]
+                        if timestep_index + 1 < num_timesteps
+                        else torch.tensor(0, device=device)
+                    )
+                    latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                    next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
+
+                    forward_kwargs = self._build_forward_kwargs(
+                        batch=batch,
+                        t=t,
+                        t_next=t_next,
+                        latents=latents,
+                        next_latents=next_latents,
+                        compute_log_prob=True,
+                        return_kwargs=self._student_return_kwargs_for_train(),
+                    )
+
+                    # Student forward (with grad, shared across K teacher losses)
+                    student_out = self.adapter.forward(**forward_kwargs)
+                    if student_out.next_latents_mean is None or student_out.log_prob is None:
+                        raise RuntimeError(
+                            "Student forward must return both `next_latents_mean` "
+                            "and `log_prob` for OPD; got "
+                            f"next_latents_mean={'set' if student_out.next_latents_mean is not None else 'None'}, "
+                            f"log_prob={'set' if student_out.log_prob is not None else 'None'}."
+                        )
+
+                    log_prob_new = student_out.log_prob
+                    mu_teachers_k = mu_teacher_list[k_idx]
+
+                    # Compute K per-teacher losses
+                    per_teacher_losses: List[torch.Tensor] = []
+                    for teacher_k in range(K):
+                        d_k = self._compute_per_step_kl(
+                            mu_student=student_out.next_latents_mean,
+                            mu_teacher=mu_teachers_k[teacher_k],
+                            std_dev_t=student_out.std_dev_t,
+                            dt=student_out.dt,
+                            normalize=self.normalize_d_k,
+                        )
+
+                        loss_k = self.pathwise_coef * d_k.mean()
+                        if self.reinforce_coef > 0:
+                            r_bar_k = r_per_k_per_teacher[teacher_k][k_idx].detach()
+                            loss_k = loss_k + self.reinforce_coef * (r_bar_k * log_prob_new).mean()
+
+                        per_teacher_losses.append(loss_k)
+                        loss_info[f"d_k_teacher_{teacher_k}"].append(d_k.mean().detach())
+
+                    # K backward passes -> K gradient snapshots
+                    # retain_graph must stay True through the last teacher if KL loss
+                    # will also backward through the same student_out graph.
+                    per_teacher_grads: List[List[torch.Tensor]] = []
+                    for teacher_k in range(K):
+                        self.optimizer.zero_grad()
+                        retain = (teacher_k < K - 1) or self.enable_kl_loss
+                        per_teacher_losses[teacher_k].backward(retain_graph=retain)
+                        grad_snapshot = [
+                            p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                            for p in trainable_params
+                        ]
+                        per_teacher_grads.append(grad_snapshot)
+
+                    # PCGrad projection
+                    projected = pcgrad_project_gradients(
+                        per_teacher_grads, eps=self.training_args.pcgrad_eps
+                    )
+
+                    # Optional KL anchor (shared, not part of PCGrad conflict resolution)
+                    if self.enable_kl_loss:
+                        self.optimizer.zero_grad()
+                        kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
+                        kl_loss.backward()
+                        for i, p in enumerate(trainable_params):
+                            if p.grad is not None:
+                                projected[i] = projected[i] + p.grad
+                        loss_info["kl_div"].append(kl_div.detach())
+                        loss_info["kl_loss"].append(kl_loss.detach())
+
+                    # Accumulate this timestep's projected gradient into the batch buffer
+                    for i in range(len(trainable_params)):
+                        batch_grad[i] += projected[i]
+
+                    # Log average loss across teachers for this timestep
+                    avg_loss = sum(l.detach() for l in per_teacher_losses) / K
+                    loss_info["loss"].append(avg_loss)
+                    loss_info["log_prob"].append(log_prob_new.mean().detach())
+
+            # Set this batch's gradient contribution (averaged over T timesteps).
+            # When GAS > 1, p.grad may already contain contributions from previous
+            # batches; add to it rather than replacing.
+            self.optimizer.zero_grad()
+            for i, p in enumerate(trainable_params):
+                p.grad = batch_grad[i] / T
+
+            # Note: accelerator.backward() is not called here; we set p.grad
+            # directly from the projected buffer. The accumulate() context
+            # manages the sync_gradients flag for GAS tracking.
+
+        # Clip + step when sync_gradients becomes True (GAS counter reached)
+        if self.accelerator.sync_gradients:
+            grad_norm = self.accelerator.clip_grad_norm_(
+                trainable_params,
+                self.training_args.max_grad_norm,
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            loss_info = reduce_loss_info(self.accelerator, loss_info)
+            loss_info["grad_norm"] = grad_norm
+            self.log_data(
+                {f"train/{k}": v for k, v in loss_info.items()},
+                step=self.step,
+            )
+            self.step += 1
+            loss_info = defaultdict(list)
+
+        return loss_info
+
