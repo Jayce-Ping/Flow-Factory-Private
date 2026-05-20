@@ -63,12 +63,13 @@ DEFAULT_MAX_OBJECTS = 16
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OBJECT_NAMES_PATH = str(_PROJECT_ROOT / "dataset" / "geneval" / "object_names.txt")
 
-# Mask2Former Swin-S config/checkpoint (mmdet model zoo)
-DEFAULT_DETECTOR_CONFIG = "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco"
+# Mask2Former Swin-S config/checkpoint (mmdet 3.x model zoo).
+# Names follow the mmdet 3.x convention: `8xb2-lsj-50e` (mmdet 2.x used `lsj_8x2_50e`).
+DEFAULT_DETECTOR_CONFIG = "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco"
 DEFAULT_DETECTOR_CHECKPOINT = (
     "https://download.openmmlab.com/mmdetection/v3.0/mask2former/"
-    "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco/"
-    "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco_20220504_001756-c9d0c4f2.pth"
+    "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco/"
+    "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco_20220504_001756-c9d0c4f2.pth"
 )
 DEFAULT_CLIP_MODEL = "ViT-L-14"
 
@@ -189,14 +190,25 @@ class GenEvalRewardModel(PointwiseRewardModel):
             config, "detector_checkpoint", DEFAULT_DETECTOR_CHECKPOINT
         )
 
-        # If config is a short name, resolve from mmdet model zoo
-        if not os.path.exists(detector_config) and "/" not in detector_config:
-            try:
-                from mmdet.utils import get_model_config
-                detector_config = get_model_config(detector_config)
-            except (ImportError, Exception):
-                # Fallback: assume it's a model zoo name handled by mmdet
-                pass
+        # If config is a short name (no path separator, no .py), resolve from
+        # mmdet's bundled model zoo configs. mmdet 3.x no longer ships
+        # `mmdet.utils.get_model_config`; instead, configs are installed under
+        # `<mmdet>/.mim/configs/...` (via the mim editable install hooks).
+        if (
+            not os.path.exists(detector_config)
+            and not detector_config.endswith(".py")
+            and "/" not in detector_config
+        ):
+            resolved = self._resolve_mmdet_short_config(detector_config)
+            if resolved is None:
+                raise FileNotFoundError(
+                    f"Could not resolve mmdet config '{detector_config}'. "
+                    f"Pass an absolute path via `detector_config:` in your YAML, "
+                    f"or ensure mmdet was installed with its bundled model zoo "
+                    f"(`<mmdet>/.mim/configs/...`)."
+                )
+            logger.info(f"Resolved mmdet config: {detector_config} -> {resolved}")
+            detector_config = resolved
 
         device_str = f"cuda:{self.accelerator.local_process_index}"
         self._detector = init_detector(
@@ -205,6 +217,29 @@ class GenEvalRewardModel(PointwiseRewardModel):
             device=device_str,
         )
         logger.info(f"Mask2Former loaded on {device_str}.")
+
+    @staticmethod
+    def _resolve_mmdet_short_config(short_name: str) -> Optional[str]:
+        """Locate `<short_name>.py` inside mmdet's bundled `.mim/configs` tree.
+
+        Returns the absolute path on success, or None if not found.
+        """
+        import mmdet
+
+        mmdet_root = Path(mmdet.__file__).parent
+        # Standard layout for `mim install mmdet` / pip wheel:
+        #   <mmdet>/.mim/configs/<algo>/<short_name>.py
+        candidate_roots = [
+            mmdet_root / ".mim" / "configs",
+            mmdet_root.parent / "configs",  # legacy / source install
+        ]
+        target = f"{short_name}.py"
+        for root in candidate_roots:
+            if not root.is_dir():
+                continue
+            for path in root.rglob(target):
+                return str(path)
+        return None
 
     def _init_clip(self, config: RewardArguments) -> None:
         """Initialize CLIP model for zero-shot color classification."""
