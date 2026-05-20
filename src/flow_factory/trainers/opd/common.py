@@ -28,6 +28,8 @@ from __future__ import annotations
 import inspect
 from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Tuple
 
+import torch
+
 from ...utils.logger_utils import setup_logger
 from ...utils.lora_loader import load_lora_as_named_parameters
 
@@ -97,7 +99,7 @@ def teacher_indices_for_batch(
 ) -> List[int]:
     """Pick which teacher(s) to evaluate for one micro-batch.
 
-    Two strategies:
+    Three strategies:
 
     - ``'round_robin'``: a single teacher, cycling across ``(epoch,
       inner_epoch, batch_idx)``. The schedule folds ``inner_epoch`` in so
@@ -106,9 +108,11 @@ def teacher_indices_for_batch(
       pick the same teacher for the same ``batch_idx``).
     - ``'average'``: all teachers; the caller is expected to forward each
       and average their predictions.
+    - ``'pcgrad'``: all teachers; compute per-teacher losses and apply
+      PCGrad (Projected Gradient Descent) to resolve conflicts.
 
     Args:
-        teacher_aggregation: ``'round_robin'`` or ``'average'``.
+        teacher_aggregation: ``'round_robin'``, ``'average'``, or ``'pcgrad'``.
         num_teachers: ``len(self._teacher_names)`` -- pre-computed.
         epoch: Current outer epoch (``self.epoch``).
         inner_epoch: Current inner-epoch index within :meth:`optimize`.
@@ -127,9 +131,11 @@ def teacher_indices_for_batch(
         return [global_batch % num_teachers]
     if teacher_aggregation == "average":
         return list(range(num_teachers))
+    if teacher_aggregation == "pcgrad":
+        return list(range(num_teachers))
     raise ValueError(
         f"Unknown teacher_aggregation={teacher_aggregation!r}; "
-        "expected 'round_robin' or 'average'."
+        "expected 'round_robin', 'average', or 'pcgrad'."
     )
 
 
@@ -183,3 +189,66 @@ def filter_forward_kwargs(
     if accepts_var_kwargs:
         return full_kwargs
     return {k: v for k, v in full_kwargs.items() if k in param_names}
+
+
+def pcgrad_project_gradients(
+    per_teacher_grads: List[List[torch.Tensor]],
+    eps: float = 1e-8,
+) -> List[torch.Tensor]:
+    """Apply PCGrad (Projected Gradient Descent) to per-teacher gradient lists.
+
+    For each pair of teachers (i, j): if grad_i · grad_j < 0 (conflicting),
+    subtract the projection of grad_i onto grad_j from grad_i. This ensures
+    grad_i never moves against grad_j's direction.
+
+    Args:
+        per_teacher_grads: K lists, each containing one gradient tensor per
+            trainable parameter (same order across all K teachers).
+            Shape: [K][num_params], where K = num_teachers and num_params
+            is the count of trainable parameters.
+        eps: Minimum squared norm for projection denominator clamping.
+            Prevents division by near-zero gradients. Default 1e-8.
+
+    Returns:
+        Single list of tensors (one per parameter) = sum of all K projected
+        gradient sets. Shape: [num_params], same structure as per_teacher_grads[0].
+
+    Example:
+        >>> grad_teacher_0 = [g0_p0, g0_p1, ...]
+        >>> grad_teacher_1 = [g1_p0, g1_p1, ...]
+        >>> projected = pcgrad_project_gradients([grad_teacher_0, grad_teacher_1])
+        >>> # projected[0] = projected_g0_p0 + projected_g1_p0
+    """
+    K = len(per_teacher_grads)
+    if K == 1:
+        # Single teacher: no conflicts to resolve
+        return per_teacher_grads[0]
+
+    # Flatten each teacher's gradient list into a single vector for dot products
+    flat_grads = [torch.cat([g.flatten() for g in grads]) for grads in per_teacher_grads]
+
+    # Pre-cache squared norms to avoid redundant O(K²) recomputation
+    norm_sq_cache = [(g * g).sum().clamp(min=eps) for g in flat_grads]
+
+    # PCGrad projection: iteratively remove conflicts
+    pc = [g.clone() for g in flat_grads]
+    for i in range(K):
+        for j in range(K):
+            if i == j:
+                continue
+            dot = (pc[i] * flat_grads[j]).sum()
+            if dot < 0:
+                pc[i] = pc[i] - (dot / norm_sq_cache[j]) * flat_grads[j]
+
+    # Sum projected gradients across all teachers
+    combined_flat = sum(pc)
+
+    # Unflatten back to per-parameter tensor structure
+    result = []
+    offset = 0
+    for g in per_teacher_grads[0]:  # Use first teacher's shapes as template
+        numel = g.numel()
+        result.append(combined_flat[offset : offset + numel].view_as(g))
+        offset += numel
+
+    return result
