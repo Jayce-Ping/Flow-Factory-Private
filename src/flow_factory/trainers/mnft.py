@@ -268,6 +268,12 @@ class MNFTTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Forward each teacher and return stacked velocities (all detached).
 
+        Disables autocast weight cache during the loop because
+        ``use_named_parameters`` swaps LoRA weights via ``.data.copy_()``,
+        which preserves ``data_ptr``. The autocast cache (keyed by data_ptr)
+        would otherwise serve stale casted weights from the first teacher
+        to all subsequent teachers.
+
         Args:
             batch: Batch containing prompt embeddings and other inputs.
             timestep: Timestep tensor of shape (B,) in scheduler scale [0, 1000].
@@ -278,10 +284,18 @@ class MNFTTrainer(BaseTrainer):
         """
         forward_kwargs = self._build_forward_kwargs(batch, timestep, noised_latents)
         velocities = []
-        for name in self._teacher_names:
-            with self.adapter.use_named_parameters(name):
-                output = self.adapter.forward(**forward_kwargs)
-            velocities.append(output.noise_pred.detach())
+
+        # Must disable autocast cache when swapping named parameters
+        prev_cache = torch.is_autocast_cache_enabled()
+        torch.set_autocast_cache_enabled(False)
+        try:
+            for name in self._teacher_names:
+                with self.adapter.use_named_parameters(name):
+                    output = self.adapter.forward(**forward_kwargs)
+                velocities.append(output.noise_pred.detach())
+        finally:
+            torch.set_autocast_cache_enabled(prev_cache)
+
         return torch.stack(velocities, dim=0)  # (K, B, C, ...)
 
     def _combine_velocities(
