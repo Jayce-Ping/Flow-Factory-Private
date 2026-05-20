@@ -30,7 +30,7 @@ data:
   dataloader_num_workers: 16
   force_reprocess: false
   cache_dir: "~/.cache/flow_factory/datasets"
-  max_dataset_size: null
+  max_dataset_size: 1024
   sampler_type: "auto"
 
 # Model Configuration
@@ -80,7 +80,7 @@ train:
   guidance_scale: 4.5
 
   # Batch geometry
-  per_device_batch_size: 4
+  per_device_batch_size: 8
   group_size: 1
   unique_sample_num_per_epoch: 64
   gradient_step_per_epoch: 1
