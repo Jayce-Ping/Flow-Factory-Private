@@ -846,18 +846,41 @@ class OPDTrainer(BaseTrainer):
                         num_timesteps=num_timesteps,
                         teacher_indices=teacher_indices,
                     )
-                    
+
                     # Compute per-teacher R_bar
                     r_per_k_per_teacher = self._reverse_cumulative_per_teacher(
                         d_per_teacher_list=d_per_teacher_list,
                         num_teachers=len(teacher_indices),
                     )
-                    
+
                     loss_info = self._optimize_train_pass_pcgrad(
                         batch=batch,
                         latents_index_map=latents_index_map,
                         num_timesteps=num_timesteps,
                         mu_teacher_list=mu_teacher_pcgrad,
+                        r_per_k_per_teacher=r_per_k_per_teacher,
+                        teacher_indices=teacher_indices,
+                        loss_info=loss_info,
+                    )
+                elif self.training_args.teacher_aggregation == "sum":
+                    # Sum mode: per-teacher losses summed, single backward (no projection)
+                    d_per_teacher_list, mu_teacher_sum = self._precompute_d_per_timestep_pcgrad(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        num_timesteps=num_timesteps,
+                        teacher_indices=teacher_indices,
+                    )
+
+                    r_per_k_per_teacher = self._reverse_cumulative_per_teacher(
+                        d_per_teacher_list=d_per_teacher_list,
+                        num_teachers=len(teacher_indices),
+                    )
+
+                    loss_info = self._optimize_train_pass_sum(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        num_timesteps=num_timesteps,
+                        mu_teacher_list=mu_teacher_sum,
                         r_per_k_per_teacher=r_per_k_per_teacher,
                         teacher_indices=teacher_indices,
                         loss_info=loss_info,
@@ -1183,6 +1206,127 @@ class OPDTrainer(BaseTrainer):
                         )
                         self.step += 1
                         loss_info = defaultdict(list)
+
+        return loss_info
+
+    def _optimize_train_pass_sum(
+        self,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        num_timesteps: int,
+        mu_teacher_list: List[List[torch.Tensor]],
+        r_per_k_per_teacher: List[List[torch.Tensor]],
+        teacher_indices: List[int],
+        loss_info: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, List[torch.Tensor]]:
+        """Sum mode: per-teacher losses summed into a single backward per timestep.
+
+        Unlike PCGrad, this mode does NOT project gradients to resolve conflicts.
+        Each teacher's loss is computed independently and summed; the combined loss
+        is backpropagated in a single pass. Gradients from all K teachers accumulate
+        naturally (direct sum in gradient space).
+
+        This serves as the ablation baseline for PCGrad — same per-teacher loss
+        decomposition, same per-teacher R_bar, but without conflict resolution.
+
+        Uses the same T-step internal accumulation pattern as PCGrad: all T
+        timesteps are processed per batch with a single optimizer.step() at the end.
+        """
+        device = self.accelerator.device
+        K = len(teacher_indices)
+        T = len(self.adapter.scheduler.train_timesteps)
+
+        with self.accelerator.accumulate(*self.adapter.trainable_components):
+            with self.autocast():
+                for k_idx, timestep_index in enumerate(
+                    tqdm(
+                        self.adapter.scheduler.train_timesteps,
+                        desc=f"Epoch {self.epoch} Timestep",
+                        position=1,
+                        leave=False,
+                        disable=not self.show_progress_bar,
+                    )
+                ):
+                    t = batch["timesteps"][:, timestep_index]
+                    t_next = (
+                        batch["timesteps"][:, timestep_index + 1]
+                        if timestep_index + 1 < num_timesteps
+                        else torch.tensor(0, device=device)
+                    )
+                    latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                    next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
+
+                    forward_kwargs = self._build_forward_kwargs(
+                        batch=batch,
+                        t=t,
+                        t_next=t_next,
+                        latents=latents,
+                        next_latents=next_latents,
+                        compute_log_prob=True,
+                        return_kwargs=self._student_return_kwargs_for_train(),
+                    )
+
+                    # Single student forward (grad flows through all K teacher losses)
+                    student_out = self.adapter.forward(**forward_kwargs)
+                    if student_out.next_latents_mean is None or student_out.log_prob is None:
+                        raise RuntimeError(
+                            "Student forward must return both `next_latents_mean` "
+                            "and `log_prob` for OPD; got "
+                            f"next_latents_mean={'set' if student_out.next_latents_mean is not None else 'None'}, "
+                            f"log_prob={'set' if student_out.log_prob is not None else 'None'}."
+                        )
+
+                    log_prob_new = student_out.log_prob
+                    mu_teachers_k = mu_teacher_list[k_idx]
+
+                    # Sum K per-teacher losses into a single scalar
+                    combined_loss = torch.tensor(0.0, device=device)
+                    for teacher_k in range(K):
+                        d_k = self._compute_per_step_kl(
+                            mu_student=student_out.next_latents_mean,
+                            mu_teacher=mu_teachers_k[teacher_k],
+                            std_dev_t=student_out.std_dev_t,
+                            dt=student_out.dt,
+                            normalize=self.normalize_d_k,
+                        )
+
+                        loss_k = self.pathwise_coef * d_k.mean()
+                        if self.reinforce_coef > 0:
+                            r_bar_k = r_per_k_per_teacher[teacher_k][k_idx].detach()
+                            loss_k = loss_k + self.reinforce_coef * (r_bar_k * log_prob_new).mean()
+
+                        combined_loss = combined_loss + loss_k
+                        loss_info[f"d_k_teacher_{teacher_k}"].append(d_k.mean().detach())
+
+                    # Optional KL anchor
+                    if self.enable_kl_loss:
+                        kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
+                        combined_loss = combined_loss + kl_loss
+                        loss_info["kl_div"].append(kl_div.detach())
+                        loss_info["kl_loss"].append(kl_loss.detach())
+
+                    loss_info["loss"].append(combined_loss.detach())
+                    loss_info["log_prob"].append(log_prob_new.mean().detach())
+
+                    # Single backward for the summed loss, divided by T for averaging
+                    self.accelerator.backward(combined_loss / T)
+
+        # Clip + step when sync_gradients becomes True (GAS counter reached)
+        if self.accelerator.sync_gradients:
+            grad_norm = self.accelerator.clip_grad_norm_(
+                self.adapter.get_trainable_parameters(),
+                self.training_args.max_grad_norm,
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            loss_info = reduce_loss_info(self.accelerator, loss_info)
+            loss_info["grad_norm"] = grad_norm
+            self.log_data(
+                {f"train/{k}": v for k, v in loss_info.items()},
+                step=self.step,
+            )
+            self.step += 1
+            loss_info = defaultdict(list)
 
         return loss_info
 
