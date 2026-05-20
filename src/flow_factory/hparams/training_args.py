@@ -1559,6 +1559,149 @@ class OPDODETrainingArguments(TrainingArguments):
 
 
 @dataclass
+class DiffusionOPDTaskConfig(ArgABC):
+    """Configuration for one task in multi-task DiffusionOPD.
+
+    Each task pairs a teacher LoRA checkpoint with a task-specific prompt
+    dataset. During training, prompts from ``dataset_dir`` are used ONLY
+    with the corresponding ``teacher_path`` — this is the key property that
+    distinguishes DiffusionOPD from single-dataset OPD variants.
+    """
+
+    teacher_path: str = field(
+        metadata={
+            "help": (
+                "Teacher LoRA checkpoint path (local directory from "
+                "`BaseAdapter.save_checkpoint()` or HF Hub repo id). "
+                "Must share the student's LoRA rank/alpha."
+            )
+        },
+    )
+    dataset_dir: str = field(
+        metadata={
+            "help": (
+                "Path to the task-specific prompt dataset directory. "
+                "Must contain a train.jsonl (or equivalent split file) "
+                "with prompts for this task."
+            )
+        },
+    )
+
+
+@dataclass
+class DiffusionOPDTrainingArguments(TrainingArguments):
+    r"""Training arguments for multi-task DiffusionOPD (Algorithm 1).
+
+    Implements the DiffusionOPD paper's multi-task on-policy distillation:
+    each training round iterates through M tasks, where task m samples
+    prompts from its own dataset C^(m), rolls out the student (no-grad),
+    and computes L_m = Σ_j (1/2)||μ_S(x_{t_j}) - μ_T^(m)(x_{t_j})||²
+    using only teacher m. All task losses are summed for a single
+    backward pass + optimizer step.
+
+    Key properties:
+    - Per-task prompt datasets (no shared prompts across teachers)
+    - No PCGrad / round-robin / averaging — each task is self-contained
+    - On-policy (no-grad) rollout + per-step pathwise loss
+    - Single backward on L_total = Σ_m L_m
+    """
+
+    # ===== Per-task configuration (replaces old teacher_paths) =====
+    tasks: List[Any] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of task configs, each with 'teacher_path' and 'dataset_dir'. "
+                "Parsed into DiffusionOPDTaskConfig objects in __post_init__."
+            )
+        },
+    )
+    teacher_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={
+            "help": (
+                "Storage device for teacher LoRA snapshots. 'cuda' keeps "
+                "snapshots on-device for fast swaps; 'cpu' minimizes VRAM at "
+                "the cost of an H2D copy each time a teacher is swapped in."
+            )
+        },
+    )
+
+    # ===== Loss configuration =====
+    pathwise_coef: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Weight on the per-step ODE pathwise loss D_j. "
+                "D_j = (1/2) * mean(||μ_S - μ_T||²)."
+            )
+        },
+    )
+
+    # ===== KL anchor to pretrained base (optional regularization) =====
+    kl_beta: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "KL penalty coefficient against the pre-trained base model. "
+                "0 (default) disables the KL term, keeping DiffusionOPD on "
+                "its pure teacher-distillation objective."
+            )
+        },
+    )
+    kl_type: Literal["v-based", "x-based"] = field(
+        default="x-based",
+        metadata={
+            "help": (
+                "KL divergence type for anchor to reference model. "
+                "'x-based': Gaussian KL on latent means. "
+                "'v-based': MSE on velocity/noise predictions."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.tasks:
+            raise ValueError(
+                "DiffusionOPDTrainingArguments requires `tasks` to contain at least "
+                f"one task entry (with teacher_path and dataset_dir), got tasks={self.tasks!r}."
+            )
+        # Convert raw dicts (from YAML) to DiffusionOPDTaskConfig objects
+        parsed_tasks = []
+        for i, task in enumerate(self.tasks):
+            if isinstance(task, DiffusionOPDTaskConfig):
+                parsed_tasks.append(task)
+            elif isinstance(task, dict):
+                if "teacher_path" not in task:
+                    raise ValueError(f"Task {i} missing 'teacher_path': {task!r}.")
+                if "dataset_dir" not in task:
+                    raise ValueError(f"Task {i} missing 'dataset_dir': {task!r}.")
+                parsed_tasks.append(DiffusionOPDTaskConfig(**task))
+            else:
+                raise ValueError(
+                    f"Each task entry must be a dict or DiffusionOPDTaskConfig, "
+                    f"got tasks[{i}]={task!r}."
+                )
+        self.tasks = parsed_tasks
+
+        if self.pathwise_coef < 0:
+            raise ValueError(
+                f"`pathwise_coef` must be >= 0, got pathwise_coef={self.pathwise_coef!r}."
+            )
+        if self.kl_beta < 0:
+            raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        """One full trajectory per task per training round."""
+        return self.num_inference_steps
+
+    @property
+    def requires_ref_model(self) -> bool:
+        return self.kl_beta > 0.0
+
+
+@dataclass
 class CRDTrainingArguments(TrainingArguments):
     r"""Training arguments for Centered Reward Distillation (CRD).
 
@@ -1834,6 +1977,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "crd": CRDTrainingArguments,
     "opd": OPDTrainingArguments,
     "opd-ode": OPDODETrainingArguments,
+    "diffusion-opd": DiffusionOPDTrainingArguments,
     "ensemble-eval": EnsembleEvalTrainingArguments,
 }
 

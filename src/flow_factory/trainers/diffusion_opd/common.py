@@ -12,22 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/__init__.py
-"""
-Trainers module for various RL algorithms.
-"""
-from .abc import BaseTrainer
-from .registry import get_trainer_class, list_registered_trainers
-from .loader import load_trainer
-from .diffusion_opd import DiffusionOPDTrainer
+# src/flow_factory/trainers/diffusion_opd/common.py
+"""Shared helpers for DiffusionOPD — re-exports from opd/common.py.
 
-# Built-in Trainers
-# from .grpo import GRPOTrainer
+The DiffusionOPD trainer reuses the same teacher loading and forward-kwarg
+filtering utilities as the OPD trainers.
+"""
 
-__all__ = [
-    'BaseTrainer',
-    'get_trainer_class',
-    'list_registered_trainers',
-    'load_trainer',
-    'DiffusionOPDTrainer',
-]
+from ..opd.common import (
+    cache_forward_signature,
+    filter_forward_kwargs,
+    load_teachers,
+)
+
+__all__ = ["cache_forward_signature", "filter_forward_kwargs", "load_teachers"]

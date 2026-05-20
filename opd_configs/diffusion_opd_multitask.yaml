@@ -1,0 +1,156 @@
+# DiffusionOPD: Multi-task On-Policy Distillation (Algorithm 1).
+#
+# Trains a unified student model to match M task-specific teachers. Each task
+# has its own prompt dataset and teacher LoRA. Per training round:
+#   1. For each task m: sample prompts from C^(m), rollout student (no-grad),
+#      compute L_m = Σ_j (1/2)||μ_S(x_{t_j}) - μ_T^(m)(x_{t_j})||²
+#   2. L_total = Σ_m L_m → backward → optimizer.step()
+#
+# Prerequisites:
+#   - `finetune_type: lora` with rank/alpha matching every teacher checkpoint.
+#   - Each task: `dataset_dir` contains train.jsonl with prompts for that task.
+#   - Each task: `teacher_path` is a local LoRA dir or HF Hub repo id.
+#   - scheduler.dynamics_type: 'ODE' and scheduler.noise_level: 0 (deterministic).
+#
+# Reference: DiffusionOPD paper (arXiv:2605.15055), Algorithm 1.
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration
+# `data.dataset_dir` is used for test/eval preprocessing only.
+# Training data comes from per-task `dataset_dir` in `train.tasks`.
+data:
+  dataset_dir: "dataset/ocr"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 1024
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "sd3-5_diffusion_opd_multitask"
+  project: "Flow-Factory-DiffusionOPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+# Training Configuration — DiffusionOPD Algorithm 1
+train:
+  trainer_type: 'diffusion-opd'
+
+  # Per-task configuration: each entry = (teacher LoRA, prompt dataset)
+  tasks:
+    - teacher_path: "jieliu/SD3.5M-FlowGRPO-Text"
+      dataset_dir: "dataset/ocr"
+    - teacher_path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+      dataset_dir: "dataset/pickscore"
+    - teacher_path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+      dataset_dir: "dataset/geneval"
+
+  teacher_param_device: 'cuda'    # 'cpu' to save VRAM (slower swaps)
+
+  # Loss: L_m = pathwise_coef * Σ_j D_j
+  pathwise_coef: 1.0
+
+  # Optional KL anchor to pretrained base (set > 0 to prevent drift)
+  kl_beta: 0.0
+  kl_type: 'x-based'
+
+  # ODE rollout settings
+  resolution: 512
+  num_inference_steps: 6          # N (trajectory length); 6 fits ~24GB at bs=4
+  guidance_scale: 4.5
+
+  # Batch geometry
+  per_device_batch_size: 4
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  num_inner_epochs: 1
+
+  # Optimization
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # EMA
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  seed: 42
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"         # Required for DiffusionOPD.
+  noise_level: 0               # Required: deterministic Euler rollout.
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 32
+  guidance_scale: 4.5
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+
+# Auxiliary reward logging (optional, for monitoring only)
+rewards: []
+
+eval_rewards:
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false

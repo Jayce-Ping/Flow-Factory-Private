@@ -12,22 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/__init__.py
-"""
-Trainers module for various RL algorithms.
-"""
-from .abc import BaseTrainer
-from .registry import get_trainer_class, list_registered_trainers
-from .loader import load_trainer
-from .diffusion_opd import DiffusionOPDTrainer
+# src/flow_factory/trainers/diffusion_opd/__init__.py
+"""Diffusion On-Policy Distillation trainer (DiffusionOPDTrainer).
 
-# Built-in Trainers
-# from .grpo import GRPOTrainer
+Adapts the OPD training pattern to diffusion models in the diffusion regime
+(deterministic denoising). Trains a student diffusion model to match frozen
+teacher LoRA adapters via per-step Gaussian KL divergence.
+"""
 
-__all__ = [
-    'BaseTrainer',
-    'get_trainer_class',
-    'list_registered_trainers',
-    'load_trainer',
-    'DiffusionOPDTrainer',
-]
+from .trainer import DiffusionOPDTrainer
+
+__all__ = ["DiffusionOPDTrainer"]

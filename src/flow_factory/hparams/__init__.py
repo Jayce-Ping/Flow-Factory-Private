@@ -32,6 +32,8 @@ from .training_args import (
     CRDTrainingArguments,
     OPDTrainingArguments,
     OPDODETrainingArguments,
+    DiffusionOPDTaskConfig,
+    DiffusionOPDTrainingArguments,
     EnsembleEvalTrainingArguments,
     get_training_args_class,
 )
@@ -56,6 +58,8 @@ __all__ = [
     "CRDTrainingArguments",
     "OPDTrainingArguments",
     "OPDODETrainingArguments",
+    "DiffusionOPDTaskConfig",
+    "DiffusionOPDTrainingArguments",
     "EnsembleEvalTrainingArguments",
     "get_training_args_class",
     "RewardArguments",
