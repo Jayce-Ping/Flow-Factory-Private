@@ -95,7 +95,11 @@ class OPDTrainer(BaseTrainer):
         super().__init__(**kwargs)
         self.training_args: OPDTrainingArguments
 
-        self.num_train_timesteps = self.adapter.scheduler.num_sde_steps
+        self._is_ode = self.adapter.scheduler.dynamics_type == "ODE"
+        if self._is_ode:
+            self.num_train_timesteps = self.training_args.num_inference_steps
+        else:
+            self.num_train_timesteps = self.adapter.scheduler.num_sde_steps
         self.pathwise_coef = self.training_args.pathwise_coef
         self.reinforce_coef = self.training_args.reinforce_coef
         self.reinforce_horizon = self.training_args.reinforce_horizon
@@ -158,6 +162,13 @@ class OPDTrainer(BaseTrainer):
         """
         return self.training_args.kl_beta > 0.0
 
+    @property
+    def _train_timestep_indices(self):
+        """Training timestep indices: all steps for ODE, scheduler-selected for SDE."""
+        if self._is_ode:
+            return list(range(self.training_args.num_inference_steps))
+        return self.adapter.scheduler.train_timesteps
+
     # =========================== Helper Shims ============================
     def _teacher_indices_for_batch(self, batch_idx: int, inner_epoch: int) -> List[int]:
         """Thin shim around :func:`common.teacher_indices_for_batch` capturing
@@ -208,7 +219,7 @@ class OPDTrainer(BaseTrainer):
         samples: List[BaseSample] = []
         data_iter = iter(self.dataloader)
         trajectory_indices = compute_trajectory_indices(
-            train_timestep_indices=self.adapter.scheduler.train_timesteps,
+            train_timestep_indices=self._train_timestep_indices,
             num_inference_steps=self.training_args.num_inference_steps,
         )
 
@@ -380,6 +391,13 @@ class OPDTrainer(BaseTrainer):
         # `(B, 1, 1)` (per-sample scalars broadcast across spatial dims), so a
         # single `.flatten()` collapses to `(B,)` without a redundant `mean`.
         sigma_bar_sq = ((std_dev_t.float() ** 2) * (-dt.float())).flatten()
+
+        # Under ODE, std_dev_t is zero → σ_bar² = 0. Use σ²=1 convention
+        # (plain MSE) to avoid division by zero. Under SDE this gives
+        # time-reweighted MSE.
+        if sigma_bar_sq.abs().max() < 1e-10:
+            return diff_sq
+
         sigma_bar_sq = sigma_bar_sq.clamp(min=1e-12)
 
         return diff_sq / (2.0 * sigma_bar_sq)
@@ -928,7 +946,7 @@ class OPDTrainer(BaseTrainer):
             prev_cache = torch.is_autocast_cache_enabled()
             torch.set_autocast_cache_enabled(False)
             try:
-                for timestep_index in self.adapter.scheduler.train_timesteps:
+                for timestep_index in self._train_timestep_indices:
                     t = batch["timesteps"][:, timestep_index]
                     t_next = (
                         batch["timesteps"][:, timestep_index + 1]
@@ -1053,7 +1071,7 @@ class OPDTrainer(BaseTrainer):
         device = self.accelerator.device
 
         with torch.no_grad(), self.autocast():
-            for timestep_index in self.adapter.scheduler.train_timesteps:
+            for timestep_index in self._train_timestep_indices:
                 t = batch["timesteps"][:, timestep_index]
                 t_next = (
                     batch["timesteps"][:, timestep_index + 1]
@@ -1121,7 +1139,7 @@ class OPDTrainer(BaseTrainer):
         with self.autocast():
             for k_idx, timestep_index in enumerate(
                 tqdm(
-                    self.adapter.scheduler.train_timesteps,
+                    self._train_timestep_indices,
                     desc=f"Epoch {self.epoch} Timestep",
                     position=1,
                     leave=False,
@@ -1234,13 +1252,13 @@ class OPDTrainer(BaseTrainer):
         """
         device = self.accelerator.device
         K = len(teacher_indices)
-        T = len(self.adapter.scheduler.train_timesteps)
+        T = len(self._train_timestep_indices)
 
         with self.accelerator.accumulate(*self.adapter.trainable_components):
             with self.autocast():
                 for k_idx, timestep_index in enumerate(
                     tqdm(
-                        self.adapter.scheduler.train_timesteps,
+                        self._train_timestep_indices,
                         desc=f"Epoch {self.epoch} Timestep",
                         position=1,
                         leave=False,
@@ -1361,7 +1379,7 @@ class OPDTrainer(BaseTrainer):
         device = self.accelerator.device
         trainable_params = list(self.adapter.get_trainable_parameters())
         K = len(teacher_indices)
-        T = len(self.adapter.scheduler.train_timesteps)
+        T = len(self._train_timestep_indices)
 
         with self.accelerator.accumulate(*self.adapter.trainable_components):
             # Local buffer for this batch's T-timestep accumulated gradients
@@ -1370,7 +1388,7 @@ class OPDTrainer(BaseTrainer):
             with self.autocast():
                 for k_idx, timestep_index in enumerate(
                     tqdm(
-                        self.adapter.scheduler.train_timesteps,
+                        self._train_timestep_indices,
                         desc=f"Epoch {self.epoch} Timestep",
                         position=1,
                         leave=False,
