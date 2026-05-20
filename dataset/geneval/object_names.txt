@@ -62,8 +62,8 @@ dining table
 toilet
 tv
 laptop
-mouse
-remote
+computer mouse
+tv remote
 computer keyboard
 cell phone
 microwave
