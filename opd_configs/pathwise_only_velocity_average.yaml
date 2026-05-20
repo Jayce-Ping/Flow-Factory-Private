@@ -28,7 +28,7 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 # Data Configuration
 data:
   dataset_dir: "dataset/ocr"  # Path to dataset folder
-  preprocessing_batch_size: 8  # Batch size for preprocessing
+  preprocessing_batch_size: 32  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
   cache_dir: "~/.cache/flow_factory/datasets"  # Cache directory for preprocessed datasets
@@ -68,6 +68,7 @@ train:
   teacher_paths:
     - "jieliu/SD3.5M-FlowGRPO-Text"      # HF Hub repo id (auto-downloaded)
     - "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - "jieliu/SD3.5M-FlowGRPO-GenEval"
     # - "/path/to/local/lora_dir"          # local directory
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
