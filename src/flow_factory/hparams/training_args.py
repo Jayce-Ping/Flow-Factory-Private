@@ -681,8 +681,8 @@ class NFTTrainingArguments(TrainingArguments):
 
 
 @dataclass
-class MNFTTrainingArguments(TrainingArguments):
-    r"""Training arguments for Mixture NFT (MNFT).
+class MoTVTrainingArguments(TrainingArguments):
+    r"""Training arguments for MoTV (Mixture of Temporal Velocities).
 
     Learns optimal per-timestep softmax mixing weights (lambda_k_i) over K
     frozen teacher flow-matching velocities.  The combined velocity
@@ -713,7 +713,7 @@ class MNFTTrainingArguments(TrainingArguments):
         },
     )
 
-    # ---- MNFT core ----
+    # ---- MoTV core ----
     nft_beta: float = field(
         default=1.0,
         metadata={"help": "Beta parameter for NFT loss (positive/negative interpolation)."},
@@ -784,7 +784,7 @@ class MNFTTrainingArguments(TrainingArguments):
     # ---- Optional KL (anchor to base model) ----
     kl_type: Literal["v-based"] = field(
         default="v-based",
-        metadata={"help": "Type of KL divergence. MNFT supports 'v-based' only."},
+        metadata={"help": "Type of KL divergence. MoTV supports 'v-based' only."},
     )
     kl_beta: float = field(
         default=0,
@@ -796,7 +796,7 @@ class MNFTTrainingArguments(TrainingArguments):
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
         if not self.teacher_paths:
-            raise ValueError("MNFTTrainingArguments requires at least one teacher_paths entry.")
+            raise ValueError("MoTVTrainingArguments requires at least one teacher_paths entry.")
         if self.logits_lr is None:
             self.logits_lr = self.learning_rate
         if self.logits_init not in ["zeros", "random"]:
@@ -1788,7 +1788,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "grpo": GRPOTrainingArguments,
     "grpo-guard": GRPOTrainingArguments,
     "nft": NFTTrainingArguments,
-    "mnft": MNFTTrainingArguments,
+    "motv": MoTVTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,

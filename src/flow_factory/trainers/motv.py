@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/mnft.py
+# src/flow_factory/trainers/motv.py
 """
-Mixture NFT (MNFT) Trainer.
+MoTV (Mixture of Temporal Velocities) Trainer.
 
 Learns optimal per-timestep softmax mixing weights (lambda_k_i) over K frozen
 teacher flow-matching velocities, optimized via the DiffusionNFT algorithm
@@ -41,7 +41,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
-from ..hparams import MNFTTrainingArguments
+from ..hparams import MoTVTrainingArguments
 from ..samples import BaseSample
 from ..rewards import RewardBuffer
 from ..ema import EMAModuleWrapper
@@ -58,10 +58,11 @@ from .ensemble_eval.common import (
 logger = setup_logger(__name__)
 
 
-class MNFTTrainer(BaseTrainer):
+class MoTVTrainer(BaseTrainer):
     """
-    Mixture NFT: learns per-timestep softmax mixing weights over K frozen
-    teacher velocities, optimized via DiffusionNFT with external reward.
+    MoTV (Mixture of Temporal Velocities): learns per-timestep softmax mixing
+    weights over K frozen teacher velocities, optimized via DiffusionNFT with
+    external reward.
 
     Key differences from DiffusionNFTTrainer:
     - No model (LoRA) weights are trained; only K×T logits get gradient.
@@ -72,7 +73,7 @@ class MNFTTrainer(BaseTrainer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.training_args: MNFTTrainingArguments
+        self.training_args: MoTVTrainingArguments
 
         # ---- Unpack config ----
         self.nft_beta = self.training_args.nft_beta
@@ -92,7 +93,7 @@ class MNFTTrainer(BaseTrainer):
         )
         self.K = len(self._teacher_names)
         logger.info(
-            f"MNFT: {self.K} teacher(s) loaded, "
+            f"MoTV: {self.K} teacher(s) loaded, "
             f"T={self.num_train_timesteps} timesteps, "
             f"total learnable params = {self.K * self.num_train_timesteps}"
         )
@@ -154,7 +155,7 @@ class MNFTTrainer(BaseTrainer):
         """Override: freeze adapter LoRA params; return dummy optimizer.
 
         BaseTrainer calls this and passes result to accelerator.prepare().
-        For MNFT, all adapter parameters are frozen — we manage
+        For MoTV, all adapter parameters are frozen — we manage
         _logits_optimizer separately (not wrapped by accelerator since
         the parameter is a single small tensor, no DDP needed).
         """
@@ -200,7 +201,7 @@ class MNFTTrainer(BaseTrainer):
             yield
 
     @contextmanager
-    def _mnft_inference_context(self):
+    def _motv_inference_context(self):
         """Patch adapter.forward to return lambda-combined teacher velocity.
 
         During sampling (rollout), replaces adapter.forward so that each
@@ -444,7 +445,7 @@ class MNFTTrainer(BaseTrainer):
                     str(self.log_args.run_name),
                     'checkpoints',
                 )
-                self._save_mnft_checkpoint(save_dir, epoch=self.epoch)
+                self._save_motv_checkpoint(save_dir, epoch=self.epoch)
 
             # Evaluation
             if (
@@ -475,7 +476,7 @@ class MNFTTrainer(BaseTrainer):
         samples = []
         data_iter = iter(self.dataloader)
 
-        with torch.no_grad(), self.autocast(), self._mnft_inference_context():
+        with torch.no_grad(), self.autocast(), self._motv_inference_context():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
                 desc=f'Epoch {self.epoch} Sampling',
@@ -725,16 +726,16 @@ class MNFTTrainer(BaseTrainer):
 
     @contextmanager
     def _eval_inference_context(self):
-        """Override: use MNFT inference patching for evaluation too."""
-        with self._mnft_inference_context():
+        """Override: use MoTV inference patching for evaluation too."""
+        with self._motv_inference_context():
             yield
 
     # =========================================================================
     # Checkpointing
     # =========================================================================
 
-    def _save_mnft_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
-        """Save MNFT-specific state (lambda logits + EMA)."""
+    def _save_motv_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
+        """Save MoTV-specific state (lambda logits + EMA)."""
         if epoch is not None:
             save_directory = os.path.join(save_directory, f"checkpoint-{epoch}")
 
@@ -748,17 +749,17 @@ class MNFTTrainer(BaseTrainer):
                 'K': self.K,
                 'T': self.num_train_timesteps,
             }
-            save_path = os.path.join(save_directory, 'mnft_state.pt')
+            save_path = os.path.join(save_directory, 'motv_state.pt')
             torch.save(state, save_path)
-            logger.info(f"MNFT checkpoint saved to {save_path}")
+            logger.info(f"MoTV checkpoint saved to {save_path}")
 
         self.accelerator.wait_for_everyone()
 
-    def load_mnft_checkpoint(self, path: str):
-        """Load MNFT state from checkpoint."""
-        state_path = os.path.join(path, 'mnft_state.pt')
+    def load_motv_checkpoint(self, path: str):
+        """Load MoTV state from checkpoint."""
+        state_path = os.path.join(path, 'motv_state.pt')
         if not os.path.exists(state_path):
-            raise FileNotFoundError(f"MNFT checkpoint not found at {state_path}")
+            raise FileNotFoundError(f"MoTV checkpoint not found at {state_path}")
 
         state = torch.load(state_path, map_location=self.accelerator.device)
 
@@ -773,4 +774,4 @@ class MNFTTrainer(BaseTrainer):
         self._logits_ema.load_state_dict(state['logits_ema'])
         self.epoch = state['epoch']
         self.step = state['step']
-        logger.info(f"MNFT checkpoint loaded from {state_path} (epoch={self.epoch})")
+        logger.info(f"MoTV checkpoint loaded from {state_path} (epoch={self.epoch})")
