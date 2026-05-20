@@ -519,6 +519,37 @@ class BaseTrainer(ABC):
             inference_kwargs.update(**batch)
             inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
             samples = self.adapter.inference(**inference_kwargs)
+
+            # Stitch dataset-level metadata (e.g. GenEval's `include`/`exclude`/`tag`)
+            # back onto the generated samples. The dataloader exposes per-row
+            # non-preprocess fields under `batch["metadata"]` as a List[Dict];
+            # `filter_kwargs` above strips it before reaching `adapter.inference`,
+            # so reward models that depend on these fields (read via
+            # `getattr(sample, key)` in the reward processor) would otherwise
+            # see them as missing. Inject them into `sample.extra_kwargs` here.
+            metadata = batch.get("metadata") if isinstance(batch, dict) else None
+            if metadata is not None and len(metadata) == len(samples):
+                for sample, meta in zip(samples, metadata):
+                    if not isinstance(meta, dict):
+                        continue
+                    for mk, mv in meta.items():
+                        # Never overwrite a field that the sample already owns
+                        # (declared dataclass field or already-populated extra).
+                        if mk in sample.extra_kwargs:
+                            continue
+                        try:
+                            object.__getattribute__(sample, mk)
+                            continue  # field exists on the dataclass; leave it.
+                        except AttributeError:
+                            pass
+                        sample.extra_kwargs[mk] = mv
+            elif metadata is not None:
+                logger.warning(
+                    "Eval batch metadata length (%d) != samples length (%d); "
+                    "skipping metadata stitch for test_set=%s.",
+                    len(metadata), len(samples), test_set_name,
+                )
+
             all_samples.extend(samples)
             self.eval_reward_buffer.add_samples(samples)
         return all_samples
