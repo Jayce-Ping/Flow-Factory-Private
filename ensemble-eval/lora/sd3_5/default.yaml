@@ -55,6 +55,7 @@ train:
   checkpoint_paths:
     - "jieliu/SD3.5M-FlowGRPO-Text"
     - "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - "jieliu/SD3.5M-FlowGRPO-GenEval"
   # Use [] to eval current adapter only (no ensemble); cannot combine with checkpoint_weights
   checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
   checkpoint_param_device: 'cuda'
@@ -100,6 +101,10 @@ eval:
       dataset_dir: dataset/pickscore
       split: test
       eval_reward_names: [pick_score]
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
 
 rewards: []
 
@@ -113,6 +118,12 @@ eval_rewards:
   - name: "pick_score"
     reward_model: "PickScore"
     batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 4
     device: "cuda"
     dtype: bfloat16
     async_reward: false
