@@ -49,22 +49,6 @@ from ..utils.logger_utils import setup_logger
 logger = setup_logger(__name__)
 
 
-# Names of reward models for which the per-sample ``tag`` field carries
-# semantic meaning, so that ``_log_eval_reward_metrics`` will emit per-tag
-# sub-metrics (``{log_pfx}/reward_{name}/{tag}_mean``) for them.
-#
-# Currently ``tag`` originates from the GenEval dataset (categories such as
-# ``counting`` / ``colors`` / ``color_attr`` / ``position`` / ``single_object``
-# / ``two_object``); applying these buckets to other rewards (e.g. pick_score,
-# ocr) would conflate GenEval-specific evaluation axes with reward-agnostic
-# metrics and is therefore disabled by default.
-#
-# To enable per-tag breakdown for an additional reward, append its name to
-# this set. A future refactor may replace this allow-list with a per-reward
-# ``consumes_tag`` attribute on the reward model class itself.
-_TAG_AWARE_REWARDS: frozenset = frozenset({"geneval"})
-
-
 class BaseTrainer(ABC):
     """
     Abstract Base Class for Flow-Factory trainers.
@@ -578,17 +562,6 @@ class BaseTrainer(ABC):
         }
         return {key: self.accelerator.gather(value).cpu().numpy() for key, value in rewards.items()}
 
-    def _is_tag_aware_reward(self, reward_name: str) -> bool:
-        """Return True iff ``reward_name`` opts into GenEval-style per-tag
-        sub-metric breakdown. See module-level ``_TAG_AWARE_REWARDS`` for the
-        rationale and how to extend.
-
-        Unknown reward names default to False (need 5.1): a misspelt or newly
-        added reward will simply not get per-tag metrics, never crash and
-        never silently inherit GenEval's bucket semantics.
-        """
-        return reward_name in _TAG_AWARE_REWARDS
-
     def _log_eval_reward_metrics(
         self,
         gathered_rewards: Dict[str, np.ndarray],
@@ -606,33 +579,17 @@ class BaseTrainer(ABC):
             }
         )
 
-        # Per-tag sub-metrics: only emitted for rewards that explicitly
-        # consume the ``tag`` field (currently GenEval). Applying the GenEval
-        # bucket taxonomy to reward-agnostic models (pick_score, ocr, ...)
-        # would conflate evaluation axes, so we hard-skip them here. See
-        # module-level ``_TAG_AWARE_REWARDS`` for the allow-list.
+        # Per-tag sub-metrics: if samples carry a 'tag' field (e.g. GenEval),
+        # compute per-tag reward breakdowns for each reward model.
         if all_samples and hasattr(all_samples[0], "tag"):
             tags = [getattr(s, "tag", None) for s in all_samples]
-            if any(isinstance(t, str) and t.strip() for t in tags):
+            if any(t is not None for t in tags):
                 for reward_name, reward_values in gathered_rewards.items():
-                    if not self._is_tag_aware_reward(reward_name):
-                        continue
                     tag_groups: Dict[str, List[float]] = {}
                     for tag, val in zip(tags, reward_values):
-                        # Skip None / non-string / empty-string tags so we
-                        # never produce a "" bucket nor crash on unhashable
-                        # types (need 5.2).
-                        if not isinstance(tag, str):
-                            continue
-                        tag_key = tag.strip()
-                        if not tag_key:
-                            continue
-                        tag_groups.setdefault(tag_key, []).append(float(val))
+                        if tag is not None:
+                            tag_groups.setdefault(tag, []).append(float(val))
                     for tag_name, tag_vals in tag_groups.items():
-                        # Defensive: skip empty buckets to avoid NaN from
-                        # np.mean on an empty list (need 5.3).
-                        if not tag_vals:
-                            continue
                         log_data[f"{log_pfx}/reward_{reward_name}/{tag_name}_mean"] = (
                             np.mean(tag_vals)
                         )
