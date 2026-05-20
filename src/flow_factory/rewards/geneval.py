@@ -493,11 +493,24 @@ class GenEvalRewardModel(PointwiseRewardModel):
         batch_size = len(image)
         rewards = []
 
-        for i in range(batch_size):
-            inc = include[i] if include else []
-            exc = exclude[i] if exclude and i < len(exclude) else None
-            reward = self._evaluate_single(image[i], inc, exc)
-            rewards.append(reward)
+        # Force FP32 for the entire reward computation.
+        #
+        # The trainer wraps eval in `torch.autocast(..., dtype=bfloat16)` for
+        # the diffusion forward path. If that autocast leaks into the reward
+        # call, mmdet's Mask2Former hits mmcv's `ms_deform_attn_forward_cuda`,
+        # whose CUDA kernel only registers float / double / at::Half — bf16
+        # raises `"ms_deform_attn_forward_cuda" not implemented for 'BFloat16'`.
+        # CLIP's transformer is also unsafe to autocast here because its
+        # weights stay fp32 (loaded by open_clip with default dtype). We
+        # therefore disable AMP for the whole evaluation and rely on the
+        # detector / CLIP being natively fp32 — matches the upstream
+        # GenEval / DiffusionNFT reference implementations.
+        with torch.amp.autocast("cuda", enabled=False):
+            for i in range(batch_size):
+                inc = include[i] if include else []
+                exc = exclude[i] if exclude and i < len(exclude) else None
+                reward = self._evaluate_single(image[i], inc, exc)
+                rewards.append(reward)
 
         extra_info = {}
         if tag is not None:
