@@ -23,6 +23,8 @@
 #
 # OPD does not consume external reward models; `rewards: []` keeps the
 # reward / advantage stages as a no-op.
+#
+# Evaluation: covers three test_sets (ocr / pickscore / geneval) — see eval.test_sets below.
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
@@ -141,6 +143,19 @@ eval:
   num_inference_steps: 40
   eval_freq: 10
   seed: 42
+  test_sets:
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
 
 # Reward Model Configuration
 # OPD derives its dense reward signal from the teacher KL (D_k); no external
@@ -174,4 +189,12 @@ eval_rewards:
     batch_size: 64
     device: "cuda"
     dtype: bfloat16
+    async_reward: false
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    # NOTE: GenEval reward 内部强制 fp32 计算（autocast disabled + model.float()），
+    # 此处 dtype 仅作配置占位，实际不被消费；显式写 float32 避免"yaml 控制 GenEval 精度"的误会。
+    dtype: float32
     async_reward: false
