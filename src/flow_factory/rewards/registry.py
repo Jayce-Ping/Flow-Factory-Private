@@ -32,6 +32,7 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'clap': 'flow_factory.rewards.clap.CLAPRewardModel',
     'imagebind': 'flow_factory.rewards.imagebind_reward.ImageBindRewardModel',
     'ocr': 'flow_factory.rewards.ocr.OCRRewardModel',
+    'geneval': 'flow_factory.rewards.geneval.GenEvalRewardModel',
     'vllm_evaluate': 'flow_factory.rewards.vllm_evaluate.VLMEvaluateRewardModel',
     'rational_rewards_t2i': 'flow_factory.rewards.rational_rewards_t2i.RationalRewardsT2IRewardModel',
     'rational_rewards_edit': 'flow_factory.rewards.rational_rewards_edit.RationalRewardsEditRewardModel',

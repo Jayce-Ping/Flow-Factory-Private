@@ -547,6 +547,22 @@ class BaseTrainer(ABC):
                 for key, value in gathered_rewards.items()
             }
         )
+
+        # Per-tag sub-metrics: if samples carry a 'tag' field (e.g. GenEval),
+        # compute per-tag reward breakdowns for each reward model.
+        if all_samples and hasattr(all_samples[0], "tag"):
+            tags = [getattr(s, "tag", None) for s in all_samples]
+            if any(t is not None for t in tags):
+                for reward_name, reward_values in gathered_rewards.items():
+                    tag_groups: Dict[str, List[float]] = {}
+                    for tag, val in zip(tags, reward_values):
+                        if tag is not None:
+                            tag_groups.setdefault(tag, []).append(float(val))
+                    for tag_name, tag_vals in tag_groups.items():
+                        log_data[f"{log_pfx}/reward_{reward_name}/{tag_name}_mean"] = (
+                            np.mean(tag_vals)
+                        )
+
         samples_key = "eval_samples" if log_pfx == "eval" else f"{log_pfx}/eval_samples"
         log_data[samples_key] = all_samples
         self.log_data(log_data, step=self.step)
