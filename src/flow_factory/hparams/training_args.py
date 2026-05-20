@@ -588,14 +588,14 @@ class GRPOTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based']."
             )
-        if self.teacher_aggregation not in ["round_robin", "average", "pcgrad"]:
+        if self.teacher_aggregation not in ["round_robin", "average", "sum", "pcgrad"]:
             raise ValueError(
                 f"Invalid teacher_aggregation for OPD: {self.teacher_aggregation!r}. "
-                "Valid options are: ['round_robin', 'average', 'pcgrad']."
+                "Valid options are: ['round_robin', 'average', 'sum', 'pcgrad']."
             )
         if self.pcgrad_eps < 0:
             raise ValueError(f"`pcgrad_eps` must be >= 0, got pcgrad_eps={self.pcgrad_eps!r}.")
-        if self.teacher_aggregation == "pcgrad" and len(self.teacher_paths) < 2:
+        if self.teacher_aggregation in ("pcgrad", "sum") and len(self.teacher_paths) < 2:
             raise ValueError(
                 "PCGrad aggregation requires at least 2 teachers; "
                 f"got {len(self.teacher_paths)} teacher(s)."
@@ -603,10 +603,10 @@ class GRPOTrainingArguments(TrainingArguments):
 
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        # PCGrad mode manages T-step accumulation internally, so return 1
+        # PCGrad and sum modes manage T-step accumulation internally, so return 1
         # to prevent GAS from being multiplied by T (which would cause over-accumulation).
         # In "average" and "round_robin" modes, GAS is multiplied by T as normal.
-        if self.teacher_aggregation == "pcgrad":
+        if self.teacher_aggregation in ("pcgrad", "sum"):
             return 1
         return args.scheduler_args.num_sde_steps
 
@@ -1182,7 +1182,7 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    teacher_aggregation: Literal["round_robin", "average", "pcgrad"] = field(
+    teacher_aggregation: Literal["round_robin", "average", "sum", "pcgrad"] = field(
         default="round_robin",
         metadata={
             "help": (
@@ -1191,6 +1191,9 @@ class OPDTrainingArguments(TrainingArguments):
                 "(cheapest, matches paper's outer m-loop in expectation). "
                 "'average': forward every teacher and average the velocity "
                 "prediction per timestep (M x teacher forward cost). "
+                "'sum': compute per-teacher losses separately and sum them "
+                "into a single backward (gradient-space accumulation, no "
+                "conflict resolution; PCGrad ablation baseline). "
                 "'pcgrad': compute per-teacher losses separately, apply "
                 "PCGrad (Projected Gradient Descent) to resolve conflicts."
             )
@@ -1384,10 +1387,10 @@ class OPDTrainingArguments(TrainingArguments):
             )
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        # PCGrad mode manages T-step accumulation internally, so return 1
+        # PCGrad and sum modes manage T-step accumulation internally, so return 1
         # to prevent GAS from being multiplied by T (which would cause over-accumulation).
         # In "average" and "round_robin" modes, GAS is multiplied by T as normal.
-        if self.teacher_aggregation == "pcgrad":
+        if self.teacher_aggregation in ("pcgrad", "sum"):
             return 1
         return args.scheduler_args.num_sde_steps
 
@@ -1428,7 +1431,7 @@ class OPDODETrainingArguments(TrainingArguments):
             )
         },
     )
-    teacher_aggregation: Literal["round_robin", "average", "pcgrad"] = field(
+    teacher_aggregation: Literal["round_robin", "average", "sum", "pcgrad"] = field(
         default="round_robin",
         metadata={
             "help": (

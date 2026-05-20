@@ -99,7 +99,7 @@ def teacher_indices_for_batch(
 ) -> List[int]:
     """Pick which teacher(s) to evaluate for one micro-batch.
 
-    Three strategies:
+    Four strategies:
 
     - ``'round_robin'``: a single teacher, cycling across ``(epoch,
       inner_epoch, batch_idx)``. The schedule folds ``inner_epoch`` in so
@@ -108,11 +108,13 @@ def teacher_indices_for_batch(
       pick the same teacher for the same ``batch_idx``).
     - ``'average'``: all teachers; the caller is expected to forward each
       and average their predictions.
+    - ``'sum'``: all teachers; compute per-teacher losses and sum gradients
+      directly (no conflict resolution; PCGrad ablation baseline).
     - ``'pcgrad'``: all teachers; compute per-teacher losses and apply
       PCGrad (Projected Gradient Descent) to resolve conflicts.
 
     Args:
-        teacher_aggregation: ``'round_robin'``, ``'average'``, or ``'pcgrad'``.
+        teacher_aggregation: ``'round_robin'``, ``'average'``, ``'sum'``, or ``'pcgrad'``.
         num_teachers: ``len(self._teacher_names)`` -- pre-computed.
         epoch: Current outer epoch (``self.epoch``).
         inner_epoch: Current inner-epoch index within :meth:`optimize`.
@@ -131,11 +133,11 @@ def teacher_indices_for_batch(
         return [global_batch % num_teachers]
     if teacher_aggregation == "average":
         return list(range(num_teachers))
-    if teacher_aggregation == "pcgrad":
+    if teacher_aggregation in ("sum", "pcgrad"):
         return list(range(num_teachers))
     raise ValueError(
         f"Unknown teacher_aggregation={teacher_aggregation!r}; "
-        "expected 'round_robin', 'average', or 'pcgrad'."
+        "expected 'round_robin', 'average', 'sum', or 'pcgrad'."
     )
 
 
