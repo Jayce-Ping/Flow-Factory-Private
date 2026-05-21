@@ -1459,12 +1459,9 @@ class OPDTrainingArguments(TrainingArguments):
             )
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        # PCGrad and sum modes manage T-step accumulation internally, so return 1
-        # to prevent GAS from being multiplied by T (which would cause over-accumulation).
-        # In "average" and "round_robin" modes, GAS is multiplied by T as normal.
-        if self.teacher_aggregation in ("pcgrad", "sum"):
-            return 1
-        # Under ODE, num_sde_steps=0; use num_inference_steps instead.
+        # All modes: GAS is multiplied by T (number of training timesteps).
+        # Each timestep enters accumulate() independently for correct
+        # DeepSpeed gradient accumulation boundary tracking.
         if args.scheduler_args.dynamics_type == "ODE":
             return self.num_inference_steps
         return args.scheduler_args.num_sde_steps
