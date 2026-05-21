@@ -925,6 +925,7 @@ class OPDTrainer(BaseTrainer):
                         latents_index_map=latents_index_map,
                         num_timesteps=num_timesteps,
                         teacher_indices=teacher_indices,
+                        batch_samples=batch_samples,
                     )
 
                     # Compute per-teacher R_bar
@@ -941,6 +942,7 @@ class OPDTrainer(BaseTrainer):
                         r_per_k_per_teacher=r_per_k_per_teacher,
                         teacher_indices=teacher_indices,
                         loss_info=loss_info,
+                        batch_samples=batch_samples,
                     )
                 elif self.training_args.teacher_aggregation == "sum":
                     # Sum mode: per-teacher losses summed, single backward (no projection)
@@ -949,6 +951,7 @@ class OPDTrainer(BaseTrainer):
                         latents_index_map=latents_index_map,
                         num_timesteps=num_timesteps,
                         teacher_indices=teacher_indices,
+                        batch_samples=batch_samples,
                     )
 
                     r_per_k_per_teacher = self._reverse_cumulative_per_teacher(
@@ -964,6 +967,7 @@ class OPDTrainer(BaseTrainer):
                         r_per_k_per_teacher=r_per_k_per_teacher,
                         teacher_indices=teacher_indices,
                         loss_info=loss_info,
+                        batch_samples=batch_samples,
                     )
                 else:
                     # Standard mode: averaged teacher D_k
@@ -983,12 +987,16 @@ class OPDTrainer(BaseTrainer):
         latents_index_map: torch.Tensor,
         num_timesteps: int,
         teacher_indices: List[int],
+        batch_samples: Optional[List["BaseSample"]] = None,
     ) -> Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]]:
         """No-grad pass for PCGrad: compute per-teacher D_k and cache per-teacher means.
 
         In PCGrad mode, we need per-teacher means and per-teacher D_k values so that
         we can compute K separate losses and apply PCGrad projection during the
         main pass.
+
+        When ``teacher_route_by_source`` is active, D_k for non-applicable samples
+        is zeroed out so that R_bar only accumulates from source-matching samples.
 
         Returns:
             ``(d_per_teacher_list, mu_teacher_list)``: per training timestep,
@@ -1061,7 +1069,16 @@ class OPDTrainer(BaseTrainer):
                             dt=student_out.dt,
                             normalize=self.normalize_d_k,
                         )
-                        d_teachers_t.append(d_k.detach())
+                        # Zero D_k for non-applicable samples so R_bar only
+                        # accumulates from source-matching samples.
+                        d_k_detached = d_k.detach()
+                        if batch_samples is not None:
+                            mask_k = self._get_teacher_source_mask(
+                                teacher_k, batch_samples
+                            )
+                            if mask_k is not None:
+                                d_k_detached = d_k_detached * mask_k.float()
+                        d_teachers_t.append(d_k_detached)
 
                     d_per_teacher_list.append(d_teachers_t)
                     mu_teacher_list.append(mu_teachers_t)
@@ -1298,6 +1315,7 @@ class OPDTrainer(BaseTrainer):
         r_per_k_per_teacher: List[List[torch.Tensor]],
         teacher_indices: List[int],
         loss_info: Dict[str, List[torch.Tensor]],
+        batch_samples: Optional[List["BaseSample"]] = None,
     ) -> Dict[str, List[torch.Tensor]]:
         """Sum mode: per-teacher losses summed into a single backward per timestep.
 
@@ -1370,13 +1388,33 @@ class OPDTrainer(BaseTrainer):
                             normalize=self.normalize_d_k,
                         )
 
-                        loss_k = self.pathwise_coef * d_k.mean()
+                        # Apply source routing mask: only average over applicable samples
+                        mask_k = (
+                            self._get_teacher_source_mask(teacher_indices[teacher_k], batch_samples)
+                            if batch_samples is not None
+                            else None
+                        )
+                        if mask_k is not None:
+                            if not mask_k.any():
+                                # No applicable samples for this teacher in this batch
+                                loss_info[f"d_k_teacher_{teacher_k}"].append(
+                                    torch.tensor(0.0, device=device)
+                                )
+                                continue
+                            d_k_masked = d_k[mask_k]
+                            log_prob_masked = log_prob_new[mask_k]
+                        else:
+                            d_k_masked = d_k
+                            log_prob_masked = log_prob_new
+
+                        loss_k = self.pathwise_coef * d_k_masked.mean()
                         if self.reinforce_coef > 0:
                             r_bar_k = r_per_k_per_teacher[teacher_k][k_idx].detach()
-                            loss_k = loss_k + self.reinforce_coef * (r_bar_k * log_prob_new).mean()
+                            r_bar_masked = r_bar_k[mask_k] if mask_k is not None else r_bar_k
+                            loss_k = loss_k + self.reinforce_coef * (r_bar_masked * log_prob_masked).mean()
 
                         combined_loss = combined_loss + loss_k
-                        loss_info[f"d_k_teacher_{teacher_k}"].append(d_k.mean().detach())
+                        loss_info[f"d_k_teacher_{teacher_k}"].append(d_k_masked.mean().detach())
 
                     # Optional KL anchor
                     if self.enable_kl_loss:
@@ -1419,6 +1457,7 @@ class OPDTrainer(BaseTrainer):
         r_per_k_per_teacher: List[List[torch.Tensor]],
         teacher_indices: List[int],
         loss_info: Dict[str, List[torch.Tensor]],
+        batch_samples: Optional[List["BaseSample"]] = None,
     ) -> Dict[str, List[torch.Tensor]]:
         """PCGrad main pass: per-timestep K backward + PCGrad projection + accumulation.
 
@@ -1489,8 +1528,9 @@ class OPDTrainer(BaseTrainer):
                     log_prob_new = student_out.log_prob
                     mu_teachers_k = mu_teacher_list[k_idx]
 
-                    # Compute K per-teacher losses
+                    # Compute K per-teacher losses (with source routing mask)
                     per_teacher_losses: List[torch.Tensor] = []
+                    per_teacher_active: List[bool] = []  # track which teachers have applicable samples
                     for teacher_k in range(K):
                         d_k = self._compute_per_step_kl(
                             mu_student=student_out.next_latents_mean,
@@ -1500,21 +1540,46 @@ class OPDTrainer(BaseTrainer):
                             normalize=self.normalize_d_k,
                         )
 
-                        loss_k = self.pathwise_coef * d_k.mean()
+                        # Apply source routing mask
+                        mask_k = (
+                            self._get_teacher_source_mask(teacher_indices[teacher_k], batch_samples)
+                            if batch_samples is not None
+                            else None
+                        )
+                        if mask_k is not None and not mask_k.any():
+                            # No applicable samples — zero loss placeholder
+                            per_teacher_losses.append(torch.tensor(0.0, device=device, requires_grad=True))
+                            per_teacher_active.append(False)
+                            loss_info[f"d_k_teacher_{teacher_k}"].append(torch.tensor(0.0, device=device))
+                            continue
+
+                        if mask_k is not None:
+                            d_k_masked = d_k[mask_k]
+                            log_prob_masked = log_prob_new[mask_k]
+                        else:
+                            d_k_masked = d_k
+                            log_prob_masked = log_prob_new
+
+                        loss_k = self.pathwise_coef * d_k_masked.mean()
                         if self.reinforce_coef > 0:
                             r_bar_k = r_per_k_per_teacher[teacher_k][k_idx].detach()
-                            loss_k = loss_k + self.reinforce_coef * (r_bar_k * log_prob_new).mean()
+                            r_bar_masked = r_bar_k[mask_k] if mask_k is not None else r_bar_k
+                            loss_k = loss_k + self.reinforce_coef * (r_bar_masked * log_prob_masked).mean()
 
                         per_teacher_losses.append(loss_k)
-                        loss_info[f"d_k_teacher_{teacher_k}"].append(d_k.mean().detach())
+                        per_teacher_active.append(True)
+                        loss_info[f"d_k_teacher_{teacher_k}"].append(d_k_masked.mean().detach())
 
                     # K backward passes -> K gradient snapshots
                     # retain_graph must stay True through the last teacher if KL loss
                     # will also backward through the same student_out graph.
+                    # Only backward active teachers (those with applicable samples).
                     per_teacher_grads: List[List[torch.Tensor]] = []
-                    for teacher_k in range(K):
+                    active_indices = [i for i, active in enumerate(per_teacher_active) if active]
+                    for pos, teacher_k in enumerate(active_indices):
                         self.optimizer.zero_grad()
-                        retain = (teacher_k < K - 1) or self.enable_kl_loss
+                        is_last_active = (pos == len(active_indices) - 1)
+                        retain = (not is_last_active) or self.enable_kl_loss
                         per_teacher_losses[teacher_k].backward(retain_graph=retain)
                         grad_snapshot = [
                             p.grad.clone() if p.grad is not None else torch.zeros_like(p)
@@ -1522,10 +1587,14 @@ class OPDTrainer(BaseTrainer):
                         ]
                         per_teacher_grads.append(grad_snapshot)
 
-                    # PCGrad projection
-                    projected = pcgrad_project_gradients(
-                        per_teacher_grads, eps=self.training_args.pcgrad_eps
-                    )
+                    # PCGrad projection (only if there are active teachers)
+                    if per_teacher_grads:
+                        projected = pcgrad_project_gradients(
+                            per_teacher_grads, eps=self.training_args.pcgrad_eps
+                        )
+                    else:
+                        # No active teachers for this batch — zero gradient
+                        projected = [torch.zeros_like(p) for p in trainable_params]
 
                     # Optional KL anchor (shared, not part of PCGrad conflict resolution)
                     if self.enable_kl_loss:
@@ -1542,8 +1611,12 @@ class OPDTrainer(BaseTrainer):
                     for i in range(len(trainable_params)):
                         batch_grad[i] += projected[i]
 
-                    # Log average loss across teachers for this timestep
-                    avg_loss = sum(l.detach() for l in per_teacher_losses) / K
+                    # Log average loss across active teachers for this timestep
+                    num_active = max(sum(per_teacher_active), 1)
+                    avg_loss = sum(
+                        l.detach() for l, active in zip(per_teacher_losses, per_teacher_active)
+                        if active
+                    ) / num_active
                     loss_info["loss"].append(avg_loss)
                     loss_info["log_prob"].append(log_prob_new.mean().detach())
 
