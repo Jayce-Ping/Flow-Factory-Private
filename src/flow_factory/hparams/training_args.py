@@ -1150,6 +1150,35 @@ class DGPOTrainingArguments(GRPOTrainingArguments):
 
 
 @dataclass
+class TeacherConfig(ArgABC):
+    """Configuration for a single teacher in multi-teacher OPD.
+
+    Each teacher has a LoRA checkpoint path and an optional list of dataset
+    source names it applies to. When ``sources`` is ``None``, the teacher
+    applies to all samples regardless of their ``__source__`` metadata.
+    """
+
+    path: str = field(
+        metadata={
+            "help": (
+                "Teacher LoRA checkpoint path (local dir or HF Hub repo id). "
+                "Must share the student's LoRA rank/alpha."
+            )
+        },
+    )
+    sources: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Dataset source names this teacher applies to (matched against "
+                "the sample's `__source__` metadata). None means the teacher "
+                "applies to all samples (broadcast mode)."
+            )
+        },
+    )
+
+
+@dataclass
 class OPDTrainingArguments(TrainingArguments):
     r"""Training arguments for On-Policy Distillation (OPD), SDE regime.
 
@@ -1165,10 +1194,36 @@ class OPDTrainingArguments(TrainingArguments):
         default_factory=list,
         metadata={
             "help": (
-                "List of teacher LoRA checkpoint paths, each written by "
-                "`BaseAdapter.save_checkpoint()`. Must contain at least one entry; "
-                "every teacher must share the student's LoRA rank/alpha so its "
-                "weights can be loaded into the same adapter slot."
+                "List of teacher LoRA checkpoint paths (legacy flat format). "
+                "When `teachers` is also set, `teacher_paths` is ignored. "
+                "For per-teacher source routing, use `teachers` instead."
+            )
+        },
+    )
+    teachers: Optional[List[TeacherConfig]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Rich teacher configuration with per-teacher source routing. "
+                "Each entry specifies a LoRA path and which dataset sources "
+                "it applies to. Overrides `teacher_paths` when set. Example:\n"
+                "  teachers:\n"
+                "    - path: owner/repo-text\n"
+                "      sources: [ocr]\n"
+                "    - path: owner/repo-pick\n"
+                "      sources: [pickscore]\n"
+            )
+        },
+    )
+    teacher_route_by_source: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When True (default), each teacher's D_k is only computed on "
+                "samples whose __source__ matches the teacher's `sources` list. "
+                "When False, all teachers distill on all samples regardless of "
+                "source (broadcast mode). Only meaningful with multi-dataset "
+                "training (data.dataset_dirs) and the `teachers` config."
             )
         },
     )
@@ -1340,10 +1395,27 @@ class OPDTrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
-        if not self.teacher_paths:
+
+        # Resolve teachers: prefer `teachers` (rich format) over `teacher_paths` (legacy flat).
+        if self.teachers is not None:
+            # Coerce dicts to TeacherConfig
+            coerced: List[TeacherConfig] = []
+            for item in self.teachers:
+                if isinstance(item, TeacherConfig):
+                    coerced.append(item)
+                elif isinstance(item, dict):
+                    coerced.append(TeacherConfig.from_dict(item))
+                else:
+                    raise TypeError(
+                        f"teachers entries must be dicts or TeacherConfig, got {type(item).__name__}"
+                    )
+            self.teachers = coerced
+            # Derive teacher_paths from teachers for backward compat with load_teachers()
+            self.teacher_paths = [t.path for t in self.teachers]
+        elif not self.teacher_paths:
             raise ValueError(
-                "OPDTrainingArguments requires `teacher_paths` to contain at least "
-                f"one teacher LoRA checkpoint, got teacher_paths={self.teacher_paths!r}."
+                "OPDTrainingArguments requires either `teachers` or `teacher_paths` "
+                "to contain at least one teacher LoRA checkpoint."
             )
         if self.pathwise_coef < 0:
             raise ValueError(
