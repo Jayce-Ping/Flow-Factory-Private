@@ -1577,16 +1577,16 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
         """Override: DiffusionOPD loops over batches_per_task rounds (not num_batches_per_epoch).
 
         base_GAS = batches_per_task / gradient_step_per_epoch
-        Then multiplied by get_num_train_timesteps() = M × (N-1).
+        Then multiplied by get_num_train_timesteps() = M × N.
         """
         num_teachers = len(self.teachers) if self.teachers else 1
         batches_per_task = max(1, num_batches_per_epoch // num_teachers)
         return max(1, batches_per_task // self.gradient_step_per_epoch)
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        # Per-round accumulate() calls = M × (N-1)
+        # Per-round accumulate() calls = M × N (each teacher does N denoising steps)
         num_teachers = len(self.teachers) if self.teachers else 1
-        return num_teachers * (self.num_inference_steps - 1)
+        return num_teachers * self.num_inference_steps
 
     @property
     def requires_ref_model(self) -> bool:
