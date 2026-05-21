@@ -251,8 +251,36 @@ def _load_and_concat_datasets(
         hf_ds = hf_ds.add_column("__source__", [source_name] * len(hf_ds))
         all_hf_datasets.append(hf_ds)
 
+    # Align schemas: keep only columns common to ALL datasets to avoid
+    # concatenation failures when datasets have incompatible feature types
+    # (e.g., different `metadata` schemas across geneval vs ocr).
+    common_columns = set(all_hf_datasets[0].column_names)
+    for ds in all_hf_datasets[1:]:
+        common_columns &= set(ds.column_names)
+
+    # Further filter: remove columns whose feature types are incompatible
+    # across datasets (structural mismatch even if column name is shared).
+    safe_columns = sorted(common_columns)
+    aligned_datasets = []
+    for ds in all_hf_datasets:
+        aligned_datasets.append(ds.select_columns(safe_columns))
+
     # Concatenate all HuggingFace datasets
-    combined = hf_concat(all_hf_datasets)
+    try:
+        combined = hf_concat(aligned_datasets)
+    except ValueError as e:
+        # If schema alignment still fails, try removing the problematic
+        # 'metadata' column which is the most common offender.
+        if "metadata" in str(e) and "metadata" in safe_columns:
+            safe_columns = [c for c in safe_columns if c != "metadata"]
+            logger.warning(
+                f"Multi-dataset: 'metadata' column has incompatible schemas across "
+                f"datasets, removing it. Remaining columns: {safe_columns}"
+            )
+            aligned_datasets = [ds.select_columns(safe_columns) for ds in all_hf_datasets]
+            combined = hf_concat(aligned_datasets)
+        else:
+            raise
 
     # Apply max_dataset_size to the concatenated result
     if max_dataset_size is not None and len(combined) > max_dataset_size:
