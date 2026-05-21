@@ -208,7 +208,7 @@ class DiffusionOPDTrainer(BaseTrainer):
 
         # Number of rounds: each round processes M batches (one per teacher)
         batches_per_task = max(1, self.training_args.num_batches_per_epoch // self.num_tasks)
-        total_steps = batches_per_task * self.num_tasks * (num_steps - 1)
+        total_steps = batches_per_task * self.num_tasks * num_steps
 
         # Disable autocast cache for entire optimize (teacher swaps inside)
         prev_cache = torch.is_autocast_cache_enabled()
@@ -229,11 +229,15 @@ class DiffusionOPDTrainer(BaseTrainer):
                     # Sample initial noise for this teacher's rollout
                     x = self._sample_initial_latents(batch).float()
 
-                    for j in range(num_steps - 1):
+                    for j in range(num_steps):
                         with self.accelerator.accumulate(*self.adapter.trainable_components):
                             with self.autocast():
                                 t = timesteps[j]
-                                t_next = timesteps[j + 1]
+                                t_next = (
+                                    timesteps[j + 1]
+                                    if j + 1 < num_steps
+                                    else torch.tensor(0, device=device)
+                                )
 
                                 # Student forward (WITH grad)
                                 student_fwd = self._build_forward_kwargs(
