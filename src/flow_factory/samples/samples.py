@@ -368,10 +368,13 @@ class BaseSample:
         
         sample_cls = type(samples[0]) # Dynamically use the sample's class
         sample_dicts = [s.to_dict() for s in samples]
-        
+
+        # Use key intersection to handle samples from different sources
+        # (e.g., geneval has 'tag' but ocr doesn't)
+        all_keys = set.intersection(*(set(d.keys()) for d in sample_dicts))
         return {
             key: sample_cls._stack_values(key, [d[key] for d in sample_dicts])
-            for key in sample_dicts[0].keys()
+            for key in all_keys
         }
 
 
