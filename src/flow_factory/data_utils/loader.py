@@ -196,6 +196,87 @@ def _create_or_load_dataset(
     return GeneralDataset.load_merged(merged_cache_path)
 
 
+def _load_and_concat_datasets(
+    dataset_dirs: list,
+    accelerator: "Accelerator",
+    base_kwargs: dict,
+    train_preprocess_kwargs: dict,
+    enable_distributed: bool,
+    preprocess_parallelism: str,
+    max_dataset_size: Optional[int] = None,
+) -> "GeneralDataset":
+    """Load multiple datasets, inject ``__source__`` column, and concatenate.
+
+    Each dataset is loaded and preprocessed independently. A ``__source__``
+    column is added to each (= basename of its directory path) so downstream
+    components (reward models, teacher routing) can identify sample origin.
+    The resulting datasets are concatenated into a single ``GeneralDataset``.
+
+    Args:
+        dataset_dirs: List of dataset directory paths.
+        accelerator: Accelerator for distributed sync.
+        base_kwargs: Base kwargs for ``_create_or_load_dataset``.
+        train_preprocess_kwargs: Preprocess kwargs for training split.
+        enable_distributed: Whether distributed preprocessing is active.
+        preprocess_parallelism: ``"global"`` or ``"local"``.
+        max_dataset_size: If set, truncate the concatenated dataset.
+
+    Returns:
+        A single ``GeneralDataset`` containing all samples with ``__source__``.
+    """
+    from datasets import concatenate_datasets as hf_concat
+
+    all_hf_datasets = []
+    for dataset_dir in dataset_dirs:
+        source_name = os.path.basename(os.path.expanduser(dataset_dir).rstrip("/"))
+        logger.info(f"Multi-dataset: loading '{source_name}' from {dataset_dir}")
+
+        per_dir_kwargs = {**base_kwargs}
+        per_dir_kwargs["dataset_dir"] = dataset_dir
+        # Add source to extra_hash_strs so caches are distinct per source
+        extra = list(base_kwargs.get("extra_hash_strs", []))
+        extra.append(f"source:{source_name}")
+        per_dir_kwargs["extra_hash_strs"] = extra
+
+        ds = _create_or_load_dataset(
+            split="train",
+            accelerator=accelerator,
+            base_kwargs={**per_dir_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
+
+        # Inject __source__ column
+        hf_ds = ds.processed_dataset
+        hf_ds = hf_ds.add_column("__source__", [source_name] * len(hf_ds))
+        all_hf_datasets.append(hf_ds)
+
+    # Concatenate all HuggingFace datasets
+    combined = hf_concat(all_hf_datasets)
+
+    # Apply max_dataset_size to the concatenated result
+    if max_dataset_size is not None and len(combined) > max_dataset_size:
+        combined = combined.select(range(max_dataset_size))
+        logger.info(f"Multi-dataset: truncated concatenated dataset to {max_dataset_size} samples.")
+
+    logger.info(
+        f"Multi-dataset: concatenated {len(dataset_dirs)} datasets, "
+        f"total {len(combined)} samples."
+    )
+
+    # Wrap back into a GeneralDataset shell
+    result = GeneralDataset.__new__(GeneralDataset)
+    result.processed_dataset = combined
+    try:
+        result.processed_dataset.set_format(
+            type="torch", columns=result.processed_dataset.column_names
+        )
+    except Exception:
+        pass
+
+    return result
+
+
 def get_dataloader(
     config: Arguments,
     accelerator: Accelerator,
@@ -263,13 +344,26 @@ def get_dataloader(
         # (e.g., DGPO kl_cfg > 1.0 with training guidance_scale = 1.0).
         train_preprocess_kwargs["guidance_scale"] = training_args.get_preprocess_guidance_scale()
         train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
-        dataset = _create_or_load_dataset(
-            split="train",
-            accelerator=accelerator,
-            base_kwargs={**base_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
-            enable_distributed=enable_distributed,
-            preprocess_parallelism=preprocess_parallelism,
-        )
+
+        if data_args.dataset_dirs:
+            # Multi-dataset mode: load each dataset, inject __source__, concatenate
+            dataset = _load_and_concat_datasets(
+                dataset_dirs=data_args.dataset_dirs,
+                accelerator=accelerator,
+                base_kwargs=base_kwargs,
+                train_preprocess_kwargs=train_preprocess_kwargs,
+                enable_distributed=enable_distributed,
+                preprocess_parallelism=preprocess_parallelism,
+                max_dataset_size=data_args.max_dataset_size,
+            )
+        else:
+            dataset = _create_or_load_dataset(
+                split="train",
+                accelerator=accelerator,
+                base_kwargs={**base_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
+                enable_distributed=enable_distributed,
+                preprocess_parallelism=preprocess_parallelism,
+            )
 
         # === CREATE TRAIN DATALOADER ===
         sampler = get_data_sampler(

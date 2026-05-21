@@ -237,27 +237,63 @@ class RewardProcessor:
         epoch: Optional[int] = None,
         models: Optional[Dict[str, PointwiseRewardModel]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute rewards for PointwiseRewardModels."""
+        """Compute rewards for PointwiseRewardModels.
+
+        Respects ``applicable_sources`` from each reward model's config: when
+        set, only samples whose ``__source__`` metadata matches are evaluated;
+        non-applicable samples receive NaN rewards.
+        """
         models = models if models is not None else self._pointwise_models
         results: Dict[str, torch.Tensor] = {}
-        
+
         for name, model in models.items():
+            # Source filtering: determine which samples this reward applies to
+            config = self.reward_configs.get(name)
+            applicable_sources = (
+                getattr(config, "applicable_sources", None) if config else None
+            )
+
+            if applicable_sources is not None:
+                applicable_set = set(applicable_sources)
+                applicable_indices = [
+                    i for i, s in enumerate(samples)
+                    if s.extra_kwargs.get("__source__", "") in applicable_set
+                ]
+                filtered_samples = [samples[i] for i in applicable_indices]
+            else:
+                applicable_indices = None
+                filtered_samples = samples
+
+            if not filtered_samples:
+                # No applicable samples for this reward model
+                results[name] = torch.full((len(samples),), float("nan"))
+                continue
+
             rewards = []
             batch_size = self._resolve_batch_size(name, model)
 
             desc = f'Epoch {epoch} Pointwise Rewards: {name}' if epoch is not None else f'Pointwise Rewards: {name}'
             pbar = tqdm(
-                range(0, len(samples), batch_size),
+                range(0, len(filtered_samples), batch_size),
                 desc=desc,
                 disable=not self.show_progress_bar,
             )
             for i in pbar:
-                batch_samples = samples[i : i + batch_size]
+                batch_samples = filtered_samples[i : i + batch_size]
                 reward_tensor = self._compute_pointwise_batch(name, model, batch_samples)
                 rewards.append(reward_tensor)
-            
-            results[name] = torch.cat(rewards, dim=0)
-        
+
+            filtered_rewards = torch.cat(rewards, dim=0)
+
+            if applicable_indices is not None:
+                # Scatter filtered rewards back into full-sized tensor (NaN for non-applicable)
+                full_rewards = torch.full((len(samples),), float("nan"))
+                for idx, reward_val in zip(applicable_indices, filtered_rewards):
+                    full_rewards[idx] = reward_val
+                results[name] = full_rewards
+            else:
+                results[name] = filtered_rewards
+
         return results
 
     # ============================ Groupwise Computation ============================
