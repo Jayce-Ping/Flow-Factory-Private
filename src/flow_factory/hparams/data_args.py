@@ -62,6 +62,20 @@ class DataArguments(ArgABC):
         default=None,
         metadata={"help": "If set, limits the maximum number of samples in the dataset."},
     )
+    dataset_dirs: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "List of dataset directories to concatenate for training. "
+                "Each directory is loaded independently; a `__source__` column "
+                "(= basename of the directory) is injected so downstream "
+                "components (reward models, teacher routing) can identify "
+                "each sample's origin. When set, overrides `dataset_dir` for "
+                "the training split; `dataset_dir` is still used for eval/test "
+                "fallback. When None (default), single-dataset mode via `dataset_dir`."
+            )
+        },
+    )
     preprocess_parallelism: Literal["global", "local"] = field(
         default="local",
         metadata={
