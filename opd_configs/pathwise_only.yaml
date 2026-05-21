@@ -68,6 +68,7 @@ train:
   teacher_paths:
     - "jieliu/SD3.5M-FlowGRPO-Text"      # HF Hub repo id (auto-downloaded)
     - "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - "jieliu/SD3.5M-FlowGRPO-GenEval"
     # - "/path/to/local/lora_dir"          # local directory
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.

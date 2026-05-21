@@ -1,18 +1,10 @@
-# DiffusionOPD: Multi-task On-Policy Distillation (Algorithm 1).
+# OPD pathwise-only: round_robin — one teacher per batch, cycling.
 #
-# Trains a unified student model to match M task-specific teachers. Each task
-# has its own prompt dataset and teacher LoRA. Per training round:
-#   1. For each task m: sample prompts from C^(m), rollout student (no-grad),
-#      compute L_m = Σ_j (1/2)||μ_S(x_{t_j}) - μ_T^(m)(x_{t_j})||²
-#   2. L_total = Σ_m L_m → backward → optimizer.step()
+# Cheapest multi-teacher mode: each micro-batch uses only 1 teacher forward.
+# In expectation over training, all M teachers get equal coverage.
 #
-# Prerequisites:
-#   - `finetune_type: lora` with rank/alpha matching every teacher checkpoint.
-#   - Each task: `dataset_dir` contains train.jsonl with prompts for that task.
-#   - Each task: `teacher_path` is a local LoRA dir or HF Hub repo id.
-#   - scheduler.dynamics_type: 'ODE' and scheduler.noise_level: 0 (deterministic).
-#
-# Reference: DiffusionOPD paper (arXiv:2605.15055), Algorithm 1.
+# 3 teachers × 3 datasets: Text(OCR), PickScore, GenEval.
+# Evaluation on all three test_sets.
 
 # Environment Configuration
 launcher: "accelerate"
@@ -22,15 +14,13 @@ main_process_port: 29500
 mixed_precision: "bf16"
 
 # Data Configuration
-# `data.dataset_dir` is used for test/eval preprocessing only.
-# Training data comes from per-task `dataset_dir` in `train.tasks`.
 data:
   dataset_dir: "dataset/ocr"
-  preprocessing_batch_size: 8
+  preprocessing_batch_size: 32
   dataloader_num_workers: 16
   force_reprocess: false
   cache_dir: "~/.cache/flow_factory/datasets"
-  max_dataset_size: 1024
+  max_dataset_size: null
   sampler_type: "auto"
 
 # Model Configuration
@@ -45,41 +35,36 @@ model:
   resume_type: null
 
 log:
-  run_name: "sd3-5_diffusion_opd_multitask"
-  project: "Flow-Factory-DiffusionOPD"
+  run_name: "sd3-5_lora_opd_pathwise_only_round_robin"
+  project: "Flow-Factory-OPD"
   logging_backend: "wandb"
   save_dir: "saves/"
   save_freq: 20
   save_model_only: true
 
-# Training Configuration — DiffusionOPD Algorithm 1
+# Training Configuration
 train:
-  trainer_type: 'diffusion-opd'
+  trainer_type: 'opd'
 
-  # Per-task configuration: each entry = (teacher LoRA, prompt dataset)
-  tasks:
-    - teacher_path: "jieliu/SD3.5M-FlowGRPO-Text"
-      dataset_dir: "dataset/ocr"
-    - teacher_path: "jieliu/SD3.5M-FlowGRPO-PickScore"
-      dataset_dir: "dataset/pickscore"
-    - teacher_path: "jieliu/SD3.5M-FlowGRPO-GenEval"
-      dataset_dir: "dataset/geneval"
-
-  teacher_param_device: 'cuda'    # 'cpu' to save VRAM (slower swaps)
-
-  # Loss: L_m = pathwise_coef * Σ_j D_j
+  teacher_paths:
+    - "jieliu/SD3.5M-FlowGRPO-Text"
+    - "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - "jieliu/SD3.5M-FlowGRPO-GenEval"
+  teacher_param_device: 'cuda'
+  teacher_aggregation: 'round_robin'   # One teacher per batch, cycling across (epoch, inner_epoch, batch_idx)
   pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  normalize_d_k: false
+  reinforce_future_reduction: "sum"
+  reinforce_group_center: false
 
-  # Optional KL anchor to pretrained base (set > 0 to prevent drift)
   kl_beta: 0.0
   kl_type: 'x-based'
 
-  # ODE rollout settings
   resolution: 512
-  num_inference_steps: 6          # N (trajectory length); 6 fits ~24GB at bs=4
+  num_inference_steps: 10
   guidance_scale: 4.5
 
-  # Batch geometry
   per_device_batch_size: 8
   group_size: 1
   unique_sample_num_per_epoch: 64
@@ -87,14 +72,12 @@ train:
   gradient_accumulation_steps: auto
   num_inner_epochs: 1
 
-  # Optimization
   learning_rate: 3.0e-4
   adam_weight_decay: 1.0e-4
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
 
-  # EMA
   ema_decay: 0.99
   ema_update_interval: 4
   ema_device: "cuda"
@@ -104,8 +87,8 @@ train:
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "ODE"         # Required for DiffusionOPD.
-  noise_level: 0               # Required: deterministic Euler rollout.
+  dynamics_type: "Flow-SDE"
+  noise_level: 0.8
   num_sde_steps: null
   sde_steps: null
   seed: 42
@@ -132,8 +115,19 @@ eval:
       split: test
       eval_reward_names: [geneval, pick_score]
 
-# Auxiliary reward logging (optional, for monitoring only)
-rewards: []
+rewards:
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
 
 eval_rewards:
   - name: "ocr"
