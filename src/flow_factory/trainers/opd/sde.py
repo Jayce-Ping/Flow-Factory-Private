@@ -352,8 +352,10 @@ class OPDTrainer(BaseTrainer):
             if rewards and self.accelerator.is_main_process:
                 for key, value in rewards.items():
                     value_np = torch.as_tensor(value).cpu().numpy()
-                    log_data[f"train/aux_reward_{key}_mean"] = float(np.mean(value_np))
-                    log_data[f"train/aux_reward_{key}_std"] = float(np.std(value_np))
+                    # Use nanmean/nanstd: applicable_sources filtering fills
+                    # non-applicable positions with NaN
+                    log_data[f"train/aux_reward_{key}_mean"] = float(np.nanmean(value_np))
+                    log_data[f"train/aux_reward_{key}_std"] = float(np.nanstd(value_np))
 
         # 2-3. Rollout-sample images + teacher metadata (main process only;
         # samples are rank-local, matching GRPO's `_log_data['train_samples'] = samples[:30]`
