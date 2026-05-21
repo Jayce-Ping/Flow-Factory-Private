@@ -36,7 +36,7 @@ model:
 
 log:
   run_name: "sd3-5_lora_opd_pathwise_only_round_robin"
-  project: "Flow-Factory-OPD"
+  project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
   save_freq: 20
