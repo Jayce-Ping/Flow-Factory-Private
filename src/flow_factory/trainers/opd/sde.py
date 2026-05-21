@@ -201,6 +201,12 @@ class OPDTrainer(BaseTrainer):
                     batch = next(iters[name])
                 # Tag batch with source for downstream routing
                 batch["__source__"] = name
+                # Inject __source__ into per-sample metadata so
+                # stitch_batch_metadata propagates it to BaseSample.extra_kwargs
+                if "metadata" in batch:
+                    for meta in batch["metadata"]:
+                        if isinstance(meta, dict):
+                            meta["__source__"] = name
                 yield batch
 
     # =========================== Helper Shims ============================

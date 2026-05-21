@@ -29,9 +29,13 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from contextlib import contextmanager
+from functools import partial
 from typing import Any, Dict, Iterator, List, Set
 
 import torch
+import tqdm as tqdm_
+
+tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ..abc import BaseTrainer
 from ...hparams import DiffusionOPDTrainingArguments
@@ -190,97 +194,106 @@ class DiffusionOPDTrainer(BaseTrainer):
     # ========================= Optimization =========================
 
     def optimize(self, samples=None) -> None:
-        """One training round of Algorithm 1.
+        """One epoch of Algorithm 1.
 
-        Per-timestep backward + gradient accumulation to keep peak memory
-        at 1 forward pass. GAS = M × (N-1) ensures one optimizer.step()
-        per training round.
+        Processes num_batches_per_epoch // num_tasks rounds, each round
+        sampling one batch per teacher. Per-timestep backward + gradient
+        accumulation keeps peak memory at 1 forward pass.
         """
         self.adapter.train()
         device = self.accelerator.device
         loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        timesteps = self._timesteps
+        num_steps = self._num_steps
 
-        # Sample one batch per teacher (balanced)
-        per_teacher_batches = self._sample_balanced_batches(device)
+        # Number of rounds: each round processes M batches (one per teacher)
+        batches_per_task = max(1, self.training_args.num_batches_per_epoch // self.num_tasks)
+        total_steps = batches_per_task * self.num_tasks * (num_steps - 1)
 
         # Disable autocast cache for entire optimize (teacher swaps inside)
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
         try:
-            for m in range(self.num_tasks):
-                batch = per_teacher_batches[m]
-                teacher_name = self._teacher_names[m]
-                timesteps = self._timesteps
-                num_steps = self._num_steps
+            step_counter = 0
+            for round_idx in tqdm(
+                range(batches_per_task),
+                desc=f"Epoch {self.epoch} Training",
+                disable=not self.show_progress_bar,
+            ):
+                per_teacher_batches = self._sample_balanced_batches(device)
 
-                # Sample initial noise for this teacher's rollout
-                x = self._sample_initial_latents(batch).float()
+                for m in range(self.num_tasks):
+                    batch = per_teacher_batches[m]
+                    teacher_name = self._teacher_names[m]
 
-                for j in range(num_steps - 1):
-                    with self.accelerator.accumulate(*self.adapter.trainable_components):
-                        with self.autocast():
-                            t = timesteps[j]
-                            t_next = timesteps[j + 1]
+                    # Sample initial noise for this teacher's rollout
+                    x = self._sample_initial_latents(batch).float()
 
-                            # Student forward (WITH grad)
-                            student_fwd = self._build_forward_kwargs(
-                                batch, t, t_next, x,
-                                return_kwargs=["next_latents_mean"],
-                            )
-                            student_out = self.adapter.forward(**student_fwd)
-                            if student_out.next_latents_mean is None:
-                                raise RuntimeError(
-                                    "Student forward must return `next_latents_mean`."
+                    for j in range(num_steps - 1):
+                        with self.accelerator.accumulate(*self.adapter.trainable_components):
+                            with self.autocast():
+                                t = timesteps[j]
+                                t_next = timesteps[j + 1]
+
+                                # Student forward (WITH grad)
+                                student_fwd = self._build_forward_kwargs(
+                                    batch, t, t_next, x,
+                                    return_kwargs=["next_latents_mean"],
                                 )
-                            mu_S = student_out.next_latents_mean
-
-                            # Teacher forward (no grad, frozen)
-                            with torch.no_grad():
-                                with self._teacher_frozen_context(teacher_name):
-                                    teacher_fwd = self._build_forward_kwargs(
-                                        batch, t, t_next, x,
-                                        return_kwargs=["next_latents_mean"],
+                                student_out = self.adapter.forward(**student_fwd)
+                                if student_out.next_latents_mean is None:
+                                    raise RuntimeError(
+                                        "Student forward must return `next_latents_mean`."
                                     )
-                                    teacher_out = self.adapter.forward(**teacher_fwd)
-                            if teacher_out.next_latents_mean is None:
-                                raise RuntimeError(
-                                    f"Teacher '{teacher_name}' must return "
-                                    "`next_latents_mean`."
+                                mu_S = student_out.next_latents_mean
+
+                                # Teacher forward (no grad, frozen)
+                                with torch.no_grad():
+                                    with self._teacher_frozen_context(teacher_name):
+                                        teacher_fwd = self._build_forward_kwargs(
+                                            batch, t, t_next, x,
+                                            return_kwargs=["next_latents_mean"],
+                                        )
+                                        teacher_out = self.adapter.forward(**teacher_fwd)
+                                if teacher_out.next_latents_mean is None:
+                                    raise RuntimeError(
+                                        f"Teacher '{teacher_name}' must return "
+                                        "`next_latents_mean`."
+                                    )
+                                mu_T = teacher_out.next_latents_mean
+
+                                # D_j = pathwise_coef * (1/2) * mean(||μ_S - μ_T||²)
+                                d_j = self.training_args.pathwise_coef * 0.5 * (
+                                    (mu_S.float() - mu_T.float())
+                                    .pow(2)
+                                    .flatten(1)
+                                    .mean(dim=1)
+                                    .mean()
                                 )
-                            mu_T = teacher_out.next_latents_mean
 
-                            # D_j = pathwise_coef * (1/2) * mean(||μ_S - μ_T||²)
-                            d_j = self.training_args.pathwise_coef * 0.5 * (
-                                (mu_S.float() - mu_T.float())
-                                .pow(2)
-                                .flatten(1)
-                                .mean(dim=1)
-                                .mean()
-                            )
+                            # Per-timestep backward (activations freed immediately)
+                            self.accelerator.backward(d_j)
+                            loss_info["d_j"].append(d_j.detach())
 
-                        # Per-timestep backward (activations freed immediately)
-                        self.accelerator.backward(d_j)
-                        loss_info["d_j"].append(d_j.detach())
+                            # Advance trajectory (detached from graph)
+                            x = mu_S.detach().float()
 
-                        # Advance trajectory (detached from graph)
-                        x = mu_S.detach().float()
+                            if self.accelerator.sync_gradients:
+                                grad_norm = self.accelerator.clip_grad_norm_(
+                                    self.adapter.get_trainable_parameters(),
+                                    self.training_args.max_grad_norm,
+                                )
+                                self.optimizer.step()
+                                self.optimizer.zero_grad()
 
-                        if self.accelerator.sync_gradients:
-                            grad_norm = self.accelerator.clip_grad_norm_(
-                                self.adapter.get_trainable_parameters(),
-                                self.training_args.max_grad_norm,
-                            )
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-
-                            loss_info = reduce_loss_info(self.accelerator, loss_info)
-                            loss_info["grad_norm"] = grad_norm
-                            self.log_data(
-                                {f"train/{k}": v for k, v in loss_info.items()},
-                                step=self.step,
-                            )
-                            self.step += 1
-                            loss_info = defaultdict(list)
+                                loss_info = reduce_loss_info(self.accelerator, loss_info)
+                                loss_info["grad_norm"] = grad_norm
+                                self.log_data(
+                                    {f"train/{k}": v for k, v in loss_info.items()},
+                                    step=self.step,
+                                )
+                                self.step += 1
+                                loss_info = defaultdict(list)
         finally:
             torch.set_autocast_cache_enabled(prev_cache)
 
