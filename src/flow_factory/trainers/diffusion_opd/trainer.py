@@ -192,8 +192,9 @@ class DiffusionOPDTrainer(BaseTrainer):
     def optimize(self, samples=None) -> None:
         """One training round of Algorithm 1.
 
-        Sample balanced batches (equal per teacher), then for each teacher:
-        interleaved rollout + loss. Sum all losses, single backward.
+        Per-timestep backward + gradient accumulation to keep peak memory
+        at 1 forward pass. GAS = M × (N-1) ensures one optimizer.step()
+        per training round.
         """
         self.adapter.train()
         device = self.accelerator.device
@@ -202,101 +203,86 @@ class DiffusionOPDTrainer(BaseTrainer):
         # Sample one batch per teacher (balanced)
         per_teacher_batches = self._sample_balanced_batches(device)
 
-        with self.accelerator.accumulate(*self.adapter.trainable_components):
-            loss_total = None
-
-            for m in range(self.num_tasks):
-                batch = per_teacher_batches[m]
-
-                with self.autocast():
-                    loss_m = self._interleaved_rollout_and_loss(batch, teacher_idx=m)
-
-                if loss_total is None:
-                    loss_total = loss_m
-                else:
-                    loss_total = loss_total + loss_m
-                loss_info[f"loss_task_{m}"].append(loss_m.detach())
-
-            assert loss_total is not None
-            loss_info["loss"].append(loss_total.detach())
-
-            self.accelerator.backward(loss_total)
-
-            if self.accelerator.sync_gradients:
-                grad_norm = self.accelerator.clip_grad_norm_(
-                    self.adapter.get_trainable_parameters(),
-                    self.training_args.max_grad_norm,
-                )
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
-                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                loss_info["grad_norm"] = grad_norm
-                self.log_data(
-                    {f"train/{k}": v for k, v in loss_info.items()},
-                    step=self.step,
-                )
-                self.step += 1
-
-    # ========================= Core Algorithm =========================
-
-    def _interleaved_rollout_and_loss(
-        self, batch: Dict[str, Any], teacher_idx: int
-    ) -> torch.Tensor:
-        """Interleaved on-policy rollout + loss (Eq. 12).
-
-        Single loop: student forward (with grad) produces μ_S for loss AND
-        advances trajectory. Teacher forward (no grad) provides μ_T.
-
-        CRITICAL: autocast cache disabled during teacher swap.
-        """
-        teacher_name = self._teacher_names[teacher_idx]
-        device = self.accelerator.device
-        timesteps = self._timesteps
-        num_steps = self._num_steps
-
-        x = self._sample_initial_latents(batch).float()
-        loss = torch.tensor(0.0, device=device)
-
+        # Disable autocast cache for entire optimize (teacher swaps inside)
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
         try:
-            for j in range(num_steps - 1):
-                t = timesteps[j]
-                t_next = timesteps[j + 1]
+            for m in range(self.num_tasks):
+                batch = per_teacher_batches[m]
+                teacher_name = self._teacher_names[m]
+                timesteps = self._timesteps
+                num_steps = self._num_steps
 
-                # Student forward (WITH grad)
-                student_fwd = self._build_forward_kwargs(
-                    batch, t, t_next, x, return_kwargs=["next_latents_mean"],
-                )
-                student_out = self.adapter.forward(**student_fwd)
-                if student_out.next_latents_mean is None:
-                    raise RuntimeError("Student forward must return `next_latents_mean`.")
-                mu_S = student_out.next_latents_mean
+                # Sample initial noise for this teacher's rollout
+                x = self._sample_initial_latents(batch).float()
 
-                # Teacher forward (no grad, frozen)
-                with torch.no_grad():
-                    with self._teacher_frozen_context(teacher_name):
-                        teacher_fwd = self._build_forward_kwargs(
-                            batch, t, t_next, x, return_kwargs=["next_latents_mean"],
-                        )
-                        teacher_out = self.adapter.forward(**teacher_fwd)
-                if teacher_out.next_latents_mean is None:
-                    raise RuntimeError(f"Teacher '{teacher_name}' must return `next_latents_mean`.")
-                mu_T = teacher_out.next_latents_mean
+                for j in range(num_steps - 1):
+                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                        with self.autocast():
+                            t = timesteps[j]
+                            t_next = timesteps[j + 1]
 
-                # D_j = (1/2) * mean(||μ_S - μ_T||²)
-                d_j = 0.5 * (
-                    (mu_S.float() - mu_T.float()).pow(2).flatten(1).mean(dim=1).mean()
-                )
-                loss = loss + d_j
+                            # Student forward (WITH grad)
+                            student_fwd = self._build_forward_kwargs(
+                                batch, t, t_next, x,
+                                return_kwargs=["next_latents_mean"],
+                            )
+                            student_out = self.adapter.forward(**student_fwd)
+                            if student_out.next_latents_mean is None:
+                                raise RuntimeError(
+                                    "Student forward must return `next_latents_mean`."
+                                )
+                            mu_S = student_out.next_latents_mean
 
-                # Advance trajectory
-                x = mu_S.detach().float()
+                            # Teacher forward (no grad, frozen)
+                            with torch.no_grad():
+                                with self._teacher_frozen_context(teacher_name):
+                                    teacher_fwd = self._build_forward_kwargs(
+                                        batch, t, t_next, x,
+                                        return_kwargs=["next_latents_mean"],
+                                    )
+                                    teacher_out = self.adapter.forward(**teacher_fwd)
+                            if teacher_out.next_latents_mean is None:
+                                raise RuntimeError(
+                                    f"Teacher '{teacher_name}' must return "
+                                    "`next_latents_mean`."
+                                )
+                            mu_T = teacher_out.next_latents_mean
+
+                            # D_j = pathwise_coef * (1/2) * mean(||μ_S - μ_T||²)
+                            d_j = self.training_args.pathwise_coef * 0.5 * (
+                                (mu_S.float() - mu_T.float())
+                                .pow(2)
+                                .flatten(1)
+                                .mean(dim=1)
+                                .mean()
+                            )
+
+                        # Per-timestep backward (activations freed immediately)
+                        self.accelerator.backward(d_j)
+                        loss_info["d_j"].append(d_j.detach())
+
+                        # Advance trajectory (detached from graph)
+                        x = mu_S.detach().float()
+
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.adapter.get_trainable_parameters(),
+                                self.training_args.max_grad_norm,
+                            )
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+
+                            loss_info = reduce_loss_info(self.accelerator, loss_info)
+                            loss_info["grad_norm"] = grad_norm
+                            self.log_data(
+                                {f"train/{k}": v for k, v in loss_info.items()},
+                                step=self.step,
+                            )
+                            self.step += 1
+                            loss_info = defaultdict(list)
         finally:
             torch.set_autocast_cache_enabled(prev_cache)
-
-        return self.training_args.pathwise_coef * loss
 
     # ========================= Helpers =========================
 

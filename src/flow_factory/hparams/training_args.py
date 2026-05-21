@@ -1574,7 +1574,9 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
             raise ValueError(f"`kl_beta` must be >= 0, got {self.kl_beta!r}.")
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        return self.num_inference_steps
+        # M teachers × (N-1) timesteps per teacher = total accumulate() calls per batch
+        num_teachers = len(self.teachers) if self.teachers else 1
+        return num_teachers * (self.num_inference_steps - 1)
 
     @property
     def requires_ref_model(self) -> bool:
