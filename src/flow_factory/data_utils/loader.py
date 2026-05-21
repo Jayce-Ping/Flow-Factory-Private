@@ -271,8 +271,8 @@ def _load_and_concat_datasets(
         result.processed_dataset.set_format(
             type="torch", columns=result.processed_dataset.column_names
         )
-    except Exception:
-        pass
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Multi-dataset: could not set torch format: {e}")
 
     return result
 

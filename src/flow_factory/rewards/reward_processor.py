@@ -288,8 +288,7 @@ class RewardProcessor:
             if applicable_indices is not None:
                 # Scatter filtered rewards back into full-sized tensor (NaN for non-applicable)
                 full_rewards = torch.full((len(samples),), float("nan"))
-                for idx, reward_val in zip(applicable_indices, filtered_rewards):
-                    full_rewards[idx] = reward_val
+                full_rewards[applicable_indices] = filtered_rewards
                 results[name] = full_rewards
             else:
                 results[name] = filtered_rewards

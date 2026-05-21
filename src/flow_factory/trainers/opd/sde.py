@@ -49,7 +49,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 from ...hparams import OPDTrainingArguments
 from ...rewards import RewardBuffer
 from ...samples import BaseSample
-from ...utils.base import create_generator, create_generator_by_prompt, filter_kwargs
+from ...utils.base import create_generator, create_generator_by_prompt, filter_kwargs, stitch_batch_metadata
 from ...utils.dist import reduce_loss_info
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import compute_trajectory_indices
@@ -283,22 +283,8 @@ class OPDTrainer(BaseTrainer):
                 sample_batch = self.adapter.inference(**sample_kwargs)
 
                 # Stitch dataset metadata (including __source__ from multi-dataset
-                # training) onto generated samples so reward models and teacher
-                # routing can identify each sample's origin.
-                metadata = batch.get("metadata") if isinstance(batch, dict) else None
-                if metadata is not None and len(metadata) == len(sample_batch):
-                    for sample, meta in zip(sample_batch, metadata):
-                        if not isinstance(meta, dict):
-                            continue
-                        for mk, mv in meta.items():
-                            if mk in sample.extra_kwargs:
-                                continue
-                            try:
-                                object.__getattribute__(sample, mk)
-                                continue
-                            except AttributeError:
-                                pass
-                            sample.extra_kwargs[mk] = mv
+                # training) onto generated samples for reward/teacher routing.
+                stitch_batch_metadata(batch, sample_batch)
 
                 # Deterministic D2H so reward_buffer sees CPU-resident samples
                 # (no-op when offload_samples_to_cpu is False).
@@ -1334,6 +1320,13 @@ class OPDTrainer(BaseTrainer):
         K = len(teacher_indices)
         T = len(self._train_timestep_indices)
 
+        # Pre-compute source routing masks once (constant for the whole batch)
+        teacher_masks: List[Optional[torch.Tensor]] = [
+            self._get_teacher_source_mask(teacher_indices[k], batch_samples)
+            if batch_samples is not None else None
+            for k in range(K)
+        ]
+
         with self.accelerator.accumulate(*self.adapter.trainable_components):
             with self.autocast():
                 for k_idx, timestep_index in enumerate(
@@ -1389,11 +1382,7 @@ class OPDTrainer(BaseTrainer):
                         )
 
                         # Apply source routing mask: only average over applicable samples
-                        mask_k = (
-                            self._get_teacher_source_mask(teacher_indices[teacher_k], batch_samples)
-                            if batch_samples is not None
-                            else None
-                        )
+                        mask_k = teacher_masks[teacher_k]
                         if mask_k is not None:
                             if not mask_k.any():
                                 # No applicable samples for this teacher in this batch
@@ -1482,6 +1471,13 @@ class OPDTrainer(BaseTrainer):
         K = len(teacher_indices)
         T = len(self._train_timestep_indices)
 
+        # Pre-compute source routing masks once (constant for the whole batch)
+        teacher_masks: List[Optional[torch.Tensor]] = [
+            self._get_teacher_source_mask(teacher_indices[k], batch_samples)
+            if batch_samples is not None else None
+            for k in range(K)
+        ]
+
         with self.accelerator.accumulate(*self.adapter.trainable_components):
             # Local buffer for this batch's T-timestep accumulated gradients
             batch_grad = [torch.zeros_like(p) for p in trainable_params]
@@ -1541,14 +1537,10 @@ class OPDTrainer(BaseTrainer):
                         )
 
                         # Apply source routing mask
-                        mask_k = (
-                            self._get_teacher_source_mask(teacher_indices[teacher_k], batch_samples)
-                            if batch_samples is not None
-                            else None
-                        )
+                        mask_k = teacher_masks[teacher_k]
                         if mask_k is not None and not mask_k.any():
-                            # No applicable samples — zero loss placeholder
-                            per_teacher_losses.append(torch.tensor(0.0, device=device, requires_grad=True))
+                            # No applicable samples — skip this teacher entirely
+                            per_teacher_losses.append(None)
                             per_teacher_active.append(False)
                             loss_info[f"d_k_teacher_{teacher_k}"].append(torch.tensor(0.0, device=device))
                             continue

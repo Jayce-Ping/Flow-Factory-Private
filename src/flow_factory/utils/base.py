@@ -424,3 +424,35 @@ def move_tensors_to_device(
     if isinstance(value, dict):
         return {k: move_tensors_to_device(v, device, next_depth) for k, v in value.items()}
     return value
+
+
+def stitch_batch_metadata(batch: Dict[str, Any], samples: List[Any]) -> None:
+    """Inject per-row dataset metadata onto generated samples' extra_kwargs.
+
+    Dataloader batches expose non-preprocess columns under ``batch["metadata"]``
+    as a List[Dict]. This function stitches those fields back onto generated
+    samples so downstream components (reward models, teacher routing) can
+    access dataset-level attributes (e.g., ``__source__``, ``include``, ``tag``).
+
+    Fields that already exist on the sample (dataclass field or extra_kwargs)
+    are never overwritten.
+
+    Args:
+        batch: Collated batch dict from the dataloader.
+        samples: List of generated BaseSample instances (modified in-place).
+    """
+    metadata = batch.get("metadata") if isinstance(batch, dict) else None
+    if metadata is None or len(metadata) != len(samples):
+        return
+    for sample, meta in zip(samples, metadata):
+        if not isinstance(meta, dict):
+            continue
+        for mk, mv in meta.items():
+            if mk in sample.extra_kwargs:
+                continue
+            try:
+                object.__getattribute__(sample, mk)
+                continue
+            except AttributeError:
+                pass
+            sample.extra_kwargs[mk] = mv
