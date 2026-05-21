@@ -49,7 +49,7 @@ model:
 
 log:
   run_name: "reproduce_diffusion_opd_via_dedicated_trainer"
-  project: "Flow-Factory-DiffusionOPD"
+  project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
   save_freq: 20
