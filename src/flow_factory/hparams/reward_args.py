@@ -127,6 +127,19 @@ class RewardArguments(ArgABC):
                           "Set >1 for IO-bound models (e.g. API calls) to enable concurrent requests."},
     )
 
+    applicable_sources: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Dataset source names this reward applies to. Matched against "
+                "sample's `__source__` metadata from multi-dataset training. "
+                "None (default) means the reward applies to all samples. "
+                "Example: ['ocr'] means only compute this reward on samples "
+                "from the 'ocr' dataset."
+            )
+        },
+    )
+
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_map[self.dtype]

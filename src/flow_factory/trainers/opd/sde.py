@@ -143,6 +143,20 @@ class OPDTrainer(BaseTrainer):
             self.training_args.teacher_param_device,
         )
 
+        # Per-teacher source routing: _teacher_sources[i] is the set of dataset
+        # source names teacher i applies to, or None (applies to all samples).
+        self._teacher_sources: List[Optional[set]] = []
+        if self.training_args.teachers is not None:
+            for tc in self.training_args.teachers:
+                self._teacher_sources.append(
+                    set(tc.sources) if tc.sources else None
+                )
+        else:
+            # Legacy teacher_paths: all teachers apply to all sources
+            self._teacher_sources = [None] * len(self._teacher_names)
+
+        self._teacher_route_by_source = self.training_args.teacher_route_by_source
+
     @property
     def enable_kl_loss(self) -> bool:
         """KL anchor to pre-trained base is enabled when ``kl_beta > 0``.
@@ -182,6 +196,35 @@ class OPDTrainer(BaseTrainer):
             num_inner=self.training_args.num_inner_epochs,
             num_batches=self.training_args.num_batches_per_epoch,
         )
+
+    def _get_teacher_source_mask(
+        self,
+        teacher_idx: int,
+        batch_samples: List["BaseSample"],
+    ) -> Optional[torch.Tensor]:
+        """Return a boolean mask selecting samples this teacher applies to.
+
+        When ``teacher_route_by_source=False`` or this teacher's ``sources``
+        is None (broadcast), returns None (= all samples).
+
+        Args:
+            teacher_idx: Index into ``self._teacher_sources``.
+            batch_samples: List of BaseSample with ``extra_kwargs["__source__"]``.
+
+        Returns:
+            Bool tensor of shape (B,) or None if all samples apply.
+        """
+        if not self._teacher_route_by_source:
+            return None
+        sources = self._teacher_sources[teacher_idx]
+        if sources is None:
+            return None
+        mask = torch.tensor(
+            [s.extra_kwargs.get("__source__", "") in sources for s in batch_samples],
+            dtype=torch.bool,
+            device=self.accelerator.device,
+        )
+        return mask
 
     # =========================== Main Loop ============================
     def start(self):
@@ -238,6 +281,25 @@ class OPDTrainer(BaseTrainer):
                 }
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)
+
+                # Stitch dataset metadata (including __source__ from multi-dataset
+                # training) onto generated samples so reward models and teacher
+                # routing can identify each sample's origin.
+                metadata = batch.get("metadata") if isinstance(batch, dict) else None
+                if metadata is not None and len(metadata) == len(sample_batch):
+                    for sample, meta in zip(sample_batch, metadata):
+                        if not isinstance(meta, dict):
+                            continue
+                        for mk, mv in meta.items():
+                            if mk in sample.extra_kwargs:
+                                continue
+                            try:
+                                object.__getattribute__(sample, mk)
+                                continue
+                            except AttributeError:
+                                pass
+                            sample.extra_kwargs[mk] = mv
+
                 # Deterministic D2H so reward_buffer sees CPU-resident samples
                 # (no-op when offload_samples_to_cpu is False).
                 self._maybe_offload_samples_to_cpu(sample_batch)
