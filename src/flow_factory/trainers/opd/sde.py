@@ -183,6 +183,26 @@ class OPDTrainer(BaseTrainer):
             return list(range(self.training_args.num_inference_steps))
         return self.adapter.scheduler.train_timesteps
 
+    def _interleaved_source_iter(self):
+        """Round-robin iterator over per-source dataloaders.
+
+        Yields batches cycling through sources. Each batch is tagged with
+        __source__ metadata on its samples for teacher routing.
+        """
+        source_names = sorted(self.train_dataloaders_by_source.keys())
+        iters = {name: iter(dl) for name, dl in self.train_dataloaders_by_source.items()}
+
+        while True:
+            for name in source_names:
+                try:
+                    batch = next(iters[name])
+                except StopIteration:
+                    iters[name] = iter(self.train_dataloaders_by_source[name])
+                    batch = next(iters[name])
+                # Tag batch with source for downstream routing
+                batch["__source__"] = name
+                yield batch
+
     # =========================== Helper Shims ============================
     def _teacher_indices_for_batch(self, batch_idx: int, inner_epoch: int) -> List[int]:
         """Thin shim around :func:`common.teacher_indices_for_batch` capturing
@@ -260,7 +280,15 @@ class OPDTrainer(BaseTrainer):
         self.adapter.rollout()
         self.reward_buffer.clear()
         samples: List[BaseSample] = []
-        data_iter = iter(self.dataloader)
+
+        # Build a unified data iterator: either from single dataloader or
+        # round-robin across per-source dataloaders.
+        if self.dataloader is not None:
+            data_iter = iter(self.dataloader)
+        else:
+            # Multi-source mode: interleave batches from per-source dataloaders
+            data_iter = self._interleaved_source_iter()
+
         trajectory_indices = compute_trajectory_indices(
             train_timestep_indices=self._train_timestep_indices,
             num_inference_steps=self.training_args.num_inference_steps,
