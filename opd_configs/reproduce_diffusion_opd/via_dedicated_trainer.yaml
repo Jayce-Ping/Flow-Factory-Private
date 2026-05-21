@@ -144,12 +144,21 @@ rewards:
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+    applicable_sources: [ocr]
   - name: "pick_score"
     reward_model: "PickScore"
     batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+    applicable_sources: [pickscore]
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
 
 eval_rewards:
   - name: "ocr"
