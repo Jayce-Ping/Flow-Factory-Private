@@ -87,7 +87,7 @@ train:
   # Batch geometry
   per_device_batch_size: 8
   group_size: 1
-  unique_sample_num_per_epoch: 64
+  unique_sample_num_per_epoch: 576   # 24 samples/source/GPU × 3 sources × 8 GPUs; each teacher gets 3 batches of 8
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
   num_inner_epochs: 1
