@@ -1,0 +1,722 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm,algorithmic}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!5},
+    keywordstyle=\color{blue!70},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red!60},
+    language=Python,
+}
+
+\title{OPDTrainer \& DiffusionOPDTrainer:\\Complete Data Flow and Training Logic Analysis}
+\author{Internal Technical Document}
+\date{May 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%=============================================================================
+\section{Reference Configuration}
+
+All analysis uses the following shared parameters:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Parameter & Symbol & Value \\
+\midrule
+\texttt{world\_size} & $W$ & 8 \\
+\texttt{per\_device\_batch\_size} & $B$ & 8 \\
+\texttt{unique\_sample\_num\_per\_epoch} & $S$ & 576 \\
+\texttt{group\_size} & $G$ & 1 \\
+\texttt{num\_inference\_steps} & $N$ & 10 \\
+\texttt{num\_teachers} & $M$ & 3 \\
+\texttt{gradient\_step\_per\_epoch} & & 1 \\
+\texttt{num\_inner\_epochs} & & 1 \\
+\texttt{dynamics\_type} & & ODE \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Derived quantities:
+\[
+\texttt{sample\_num\_per\_iteration} = W \times B = 64
+\]
+\[
+\texttt{num\_batches\_per\_epoch} = \frac{S \times G}{W \times B} = \frac{576 \times 1}{64} = 9
+\]
+
+%=============================================================================
+\section{OPDTrainer (\texttt{trainers/opd/sde.py})}
+
+\subsection{Initialization}
+
+\begin{lstlisting}
+self._is_ode = True  # scheduler.dynamics_type == "ODE"
+self.num_train_timesteps = num_inference_steps = 10
+self._train_timestep_indices = [0, 1, ..., 9]  # 10 items
+
+# Load M=3 teacher LoRA snapshots into named-parameter slots
+self._teacher_names = load_teachers(adapter, teacher_paths, device)
+# Build teacher -> source routing map
+self._teacher_sources[i] = set(teachers[i].sources) or None
+\end{lstlisting}
+
+\subsection{Gradient Accumulation Steps (GAS)}
+
+\begin{align}
+\text{base\_GAS} &= \frac{\texttt{num\_batches\_per\_epoch}}{\texttt{gradient\_step\_per\_epoch}} = \frac{9}{1} = 9 \\[6pt]
+\texttt{get\_num\_train\_timesteps()} &= N = 10 \quad \text{(ODE mode)} \\[6pt]
+\text{GAS} &= \text{base\_GAS} \times N = 9 \times 10 = 90
+\end{align}
+
+Meaning: every 90 calls to \texttt{accelerator.accumulate()} triggers one \texttt{optimizer.step()}.
+
+\subsection{Main Loop (\texttt{start})}
+
+\begin{algorithm}[H]
+\caption{OPDTrainer.start()}
+\begin{algorithmic}
+\WHILE{\texttt{should\_continue\_training()}}
+    \STATE scheduler.set\_seed(epoch + seed)
+    \STATE \textit{// Optional: checkpoint, evaluation}
+    \STATE samples $\leftarrow$ \texttt{self.sample()} \COMMENT{Phase 1: Rollout}
+    \STATE \texttt{self.prepare\_feedback(samples)} \COMMENT{Phase 2: Aux rewards (logging only)}
+    \STATE \texttt{self.optimize(samples)} \COMMENT{Phase 3: Training}
+    \STATE adapter.ema\_step(epoch)
+    \STATE epoch $\leftarrow$ epoch + 1
+\ENDWHILE
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Phase 1: \texttt{sample()} --- Trajectory Rollout}
+
+\begin{algorithm}[H]
+\caption{OPD sample() --- ODE mode}
+\begin{algorithmic}
+\STATE adapter.rollout() \COMMENT{Switch to eval mode}
+\STATE data\_iter $\leftarrow$ \texttt{\_interleaved\_source\_iter()} \COMMENT{Round-robin across sources}
+\STATE trajectory\_indices $\leftarrow$ \texttt{compute\_trajectory\_indices([0..9], 10)}
+\FOR{$b = 0, \ldots, 8$ (9 batches)}
+    \STATE batch $\leftarrow$ next(data\_iter) \COMMENT{$B=8$ samples from one source}
+    \STATE \textbf{with} \texttt{torch.no\_grad()}, \texttt{autocast()}:
+    \STATE \quad sample\_batch $\leftarrow$ adapter.inference(batch, compute\_log\_prob=True, ...)
+    \STATE \quad \textit{// Each sample stores: timesteps(10), all\_latents(11), log\_probs=None}
+    \STATE \quad stitch\_batch\_metadata(batch, sample\_batch) \COMMENT{Inject \_\_source\_\_}
+    \STATE \quad samples.extend(sample\_batch)
+\ENDFOR
+\RETURN samples \COMMENT{72 BaseSample objects}
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Data iterator: \texttt{\_interleaved\_source\_iter()}}
+
+Round-robin over \texttt{sorted(train\_dataloaders\_by\_source.keys())}:
+\begin{itemize}[nosep]
+    \item batch 0: geneval $\rightarrow$ 8 samples
+    \item batch 1: ocr $\rightarrow$ 8 samples
+    \item batch 2: t2i\_comp $\rightarrow$ 8 samples
+    \item batch 3: geneval $\rightarrow$ 8 samples
+    \item $\ldots$ (repeating)
+\end{itemize}
+Each source contributes 24 samples/GPU/epoch.
+
+The iterator injects \texttt{\_\_source\_\_} into both the batch dict and each sample's \texttt{metadata} list for downstream teacher routing.
+
+\paragraph{Output per sample:}
+\begin{itemize}[nosep]
+    \item \texttt{timesteps}: shape $(10,)$ --- $[1000, 900, \ldots, 100]$
+    \item \texttt{all\_latents}: shape $(11, C, H/8, W/8)$ --- initial noise + 10 denoised states
+    \item \texttt{latent\_index\_map}: shape $(T\!+\!1,)$ --- timestep index $\to$ all\_latents index
+    \item \texttt{log\_probs}: \texttt{None} (ODE mode: noise\_level=0, deterministic transition)
+    \item \texttt{extra\_kwargs["\_\_source\_\_"]}: dataset source tag
+\end{itemize}
+
+\paragraph{Memory:} $72 \times 11 \times \text{latent\_size} \approx 25$\,GB (full trajectories stored; optionally offloaded to CPU).
+
+\subsection{Phase 2: \texttt{prepare\_feedback()} --- Auxiliary Rewards}
+
+OPD does \emph{not} use external rewards for optimization. This phase:
+\begin{enumerate}[nosep]
+    \item Drains async reward workers (if configured), logs \texttt{aux\_reward\_*} via \texttt{nanmean}/\texttt{nanstd}
+    \item Logs first 30 sample images to wandb
+    \item Records teacher metadata for this epoch
+\end{enumerate}
+
+\subsection{Phase 3: \texttt{optimize(samples)} --- Training}
+
+\subsubsection{Overall Structure}
+
+\begin{algorithm}[H]
+\caption{OPD optimize() --- high-level}
+\begin{algorithmic}
+\STATE adapter.train()
+\FOR{inner\_epoch $= 0, \ldots, 0$ (1 inner epoch)}
+    \STATE shuffled\_samples $\leftarrow$ random\_permute(72 samples)
+    \STATE \textit{// Two-pass architecture:}
+    \STATE \textbf{Pass 1 (no\_grad):} Compute all $D_k$, $\bar{R}_{k+1}$, cache $\mu_T$ per timestep
+    \STATE \textbf{Pass 2 (with\_grad):} Per-batch, per-timestep student forward + backward
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Teacher Aggregation Strategies}
+
+The \texttt{teacher\_aggregation} parameter controls how multiple teachers are combined:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llp{7cm}}
+\toprule
+Strategy & Teachers/batch & Behavior \\
+\midrule
+\texttt{round\_robin} & 1 (cycling) & $\text{teacher} = (\text{epoch} \times \text{inner} \times \text{batches} + \text{batch\_idx}) \bmod M$ \\
+\texttt{average} & All $M$ & Forward all teachers, average $\mu_T$ in latent space, single $D_k$ \\
+\texttt{sum} & All $M$ & Per-teacher losses summed into single backward \\
+\texttt{sum} + \texttt{route\_by\_source} & All $M$ & Same as sum, but each teacher only computes loss on matching-source samples via boolean mask \\
+\texttt{pcgrad} & All $M$ & Per-teacher backward, PCGrad projection, manual grad accumulation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Pre-pass: \texttt{\_precompute\_rank\_reinforce\_and\_teacher}}
+
+Iterates over all 9 micro-batches $\times$ 10 timesteps under \texttt{no\_grad}:
+
+\begin{algorithm}[H]
+\caption{OPD Pre-pass (standard/average/round\_robin)}
+\begin{algorithmic}
+\FOR{batch\_idx $= 0, \ldots, 8$}
+    \STATE batch $\leftarrow$ BaseSample.stack(shuffled\_samples[start:end]) \COMMENT{8 samples}
+    \STATE teacher\_indices $\leftarrow$ \texttt{\_teacher\_indices\_for\_batch(batch\_idx)}
+    \FOR{timestep\_index $\in [0, 1, \ldots, 9]$}
+        \STATE $t \leftarrow$ batch.timesteps[:, timestep\_index]
+        \STATE $t_\text{next} \leftarrow$ batch.timesteps[:, timestep\_index+1] \textbf{or} 0
+        \STATE $x_k \leftarrow$ batch.all\_latents[:, index\_map[timestep\_index]]
+        \STATE $\mu_S \leftarrow$ student\_forward($x_k$, $t$, $t_\text{next}$).next\_latents\_mean
+        \STATE $\mu_T \leftarrow$ teacher\_forward($x_k$, $t$, $t_\text{next}$).next\_latents\_mean \COMMENT{Averaged if multiple}
+        \STATE $D_k \leftarrow \text{mean}(\|\mu_S - \mu_T\|^2)$ \COMMENT{Per-sample, shape (B,)}
+        \STATE d\_accum[k][start:end] $\leftarrow D_k$
+    \ENDFOR
+\ENDFOR
+\STATE $\bar{R}_k \leftarrow$ reverse\_cumulative(d\_accum) \COMMENT{$\bar{R}_{k+1} = \sum_{j>k} D_j$}
+\STATE \textit{// Optional: group center/std normalization on $\bar{R}$}
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Main-pass: \texttt{\_optimize\_train\_pass} (standard/average/round\_robin)}
+
+\begin{algorithm}[H]
+\caption{OPD Main-pass (standard)}
+\begin{algorithmic}
+\FOR{$k = 0, \ldots, 9$ (10 timesteps)}
+    \STATE \textbf{with} \texttt{accelerator.accumulate(*trainable\_components)}:
+    \STATE \quad $t, t_\text{next}, x_k, x_{k+1} \leftarrow$ from pre-stored trajectory
+    \STATE \quad student\_out $\leftarrow$ adapter.forward($x_k$, $t$, $t_\text{next}$, compute\_log\_prob=True)
+    \STATE \quad $\mu_S \leftarrow$ student\_out.next\_latents\_mean \COMMENT{WITH grad}
+    \STATE \quad $\mu_T \leftarrow$ mu\_teacher\_list[$k$] \COMMENT{Cached from pre-pass}
+    \STATE \quad $D_k \leftarrow \text{mean}(\|\mu_S - \mu_T\|^2)$
+    \STATE \quad $\bar{R}_{k+1} \leftarrow$ r\_per\_k[$k$].detach()
+    \STATE \quad $\ell_\text{path} = D_k.\text{mean}()$
+    \STATE \quad $\ell_\text{rf} = (\bar{R}_{k+1} \cdot \log p_\theta).\text{mean}()$
+    \STATE \quad $\mathcal{L} = \alpha_\text{path} \cdot \ell_\text{path} + \alpha_\text{rf} \cdot \ell_\text{rf}$ \COMMENT{$+\beta_\text{KL} \cdot$ KL if enabled}
+    \STATE \quad accelerator.backward($\mathcal{L}$) \COMMENT{Activations freed}
+    \STATE \quad \textbf{if} sync\_gradients: clip\_grad $\to$ step $\to$ zero\_grad
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+Total \texttt{accumulate()} calls: $9 \text{ batches} \times 10 \text{ timesteps} = 90 = \text{GAS}$ \checkmark
+
+\subsubsection{Main-pass: \texttt{\_optimize\_train\_pass\_sum} (sum + route\_by\_source)}
+
+\begin{algorithm}[H]
+\caption{OPD Main-pass (sum mode)}
+\begin{algorithmic}
+\STATE Precompute source masks: mask$_m$ = (sample.\_\_source\_\_ $\in$ teacher$_m$.sources)
+\FOR{$k = 0, \ldots, 9$}
+    \STATE \textbf{with} \texttt{accelerator.accumulate(*trainable\_components)}:
+    \STATE \quad student\_out $\leftarrow$ adapter.forward($x_k$, $t$, $t_\text{next}$)
+    \STATE \quad combined\_loss $\leftarrow 0$
+    \FOR{teacher $m = 0, \ldots, M-1$}
+        \STATE \quad $D_k^m \leftarrow \|\mu_S - \mu_T^m\|^2$ on mask$_m$-selected samples
+        \STATE \quad $\ell_m = \alpha_\text{path} \cdot D_k^m[\text{mask}_m].\text{mean}()$
+        \STATE \quad \textbf{if} $\alpha_\text{rf} > 0$: $\ell_m \mathrel{+}= \alpha_\text{rf} \cdot (\bar{R}^m_{k+1}[\text{mask}_m] \cdot \log p[\text{mask}_m]).\text{mean}()$
+        \STATE \quad combined\_loss $\mathrel{+}= \ell_m$
+    \ENDFOR
+    \STATE \quad accelerator.backward(combined\_loss)
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Main-pass: \texttt{\_optimize\_train\_pass\_pcgrad}}
+
+PCGrad uses a different GAS pattern: \emph{one} \texttt{accumulate()} per batch (not per timestep). All $T$ timesteps are accumulated internally via a manual gradient buffer.
+
+\begin{algorithm}[H]
+\caption{OPD Main-pass (PCGrad mode)}
+\begin{algorithmic}
+\STATE \textbf{with} \texttt{accelerator.accumulate(*trainable\_components)}: \COMMENT{Once per batch}
+\STATE \quad batch\_grad $\leftarrow$ [zeros\_like($p$) for $p$ in params]
+\FOR{$k = 0, \ldots, 9$}
+    \STATE \quad student\_out $\leftarrow$ adapter.forward($x_k$)
+    \STATE \quad Compute $K$ per-teacher losses: $\ell_0, \ell_1, \ldots, \ell_{K-1}$
+    \STATE \quad $K$ backward passes (retain\_graph) $\to$ $K$ grad snapshots
+    \STATE \quad projected $\leftarrow$ pcgrad\_project(grad\_snapshots)
+    \STATE \quad batch\_grad $\mathrel{+}=$ projected
+\ENDFOR
+\STATE \quad $p.\text{grad} \leftarrow$ batch\_grad / $T$
+\STATE \textbf{if} sync\_gradients: clip $\to$ step $\to$ zero\_grad
+\end{algorithmic}
+\end{algorithm}
+
+PCGrad GAS = base\_GAS = 9 (NOT multiplied by $T$; internal $T$-step accumulation is manual).
+
+\subsection{ODE-mode Loss Formula}
+
+Under ODE dynamics: $\log p_\theta = 0$ (deterministic transition), so REINFORCE is inactive:
+\begin{equation}
+\mathcal{L} = \alpha_\text{path} \sum_{k=0}^{N-1} D_k(\theta) + \beta_\text{KL} \cdot \text{KL}(\theta \| \theta_\text{ref})
+\end{equation}
+where $D_k = \text{mean}\bigl(\|\mu_S(x_k, t_k) - \mu_T(x_k, t_k)\|^2\bigr)$.
+
+With \texttt{route\_by\_source}:
+\begin{equation}
+\mathcal{L} = \alpha_\text{path} \sum_{k=0}^{N-1} \sum_{m=0}^{M-1} \text{mean}\bigl(D_k^m[\text{mask}_m]\bigr)
+\end{equation}
+
+\subsection{Model Forward Count (per GPU per epoch)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+Phase & Student & Teacher & Mode \\
+\midrule
+\texttt{sample()} & $72 \times 10 = 720$ & 0 & no\_grad (rollout) \\
+Pre-pass & $72 \times 10 = 720$ & $72 \times 10 \times K$ & no\_grad (train mode) \\
+Main-pass & $72 \times 10 = 720$ & 0 (cached) & with\_grad \\
+\midrule
+\textbf{Total} & \textbf{2160} & $\mathbf{720K}$ & --- \\
+\bottomrule
+\end{tabular}
+\caption{$K$ = active teachers per batch (depends on aggregation strategy).}
+\end{table}
+
+\subsection{Memory Profile}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+Phase & Peak Memory \\
+\midrule
+After \texttt{sample()} & $72 \times 11 \times \text{latent\_size} \approx 25$\,GB (trajectories) \\
+Pre-pass & + 1 student forward (no\_grad, no activations stored) \\
+Main-pass peak & 1 student forward activations + accumulated \texttt{.grad} \\
+After backward & Activations freed, only \texttt{.grad} retained \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{DiffusionOPDTrainer (\texttt{trainers/diffusion\_opd/trainer.py})}
+
+\subsection{Initialization}
+
+\begin{lstlisting}
+# Enforce ODE-only
+assert adapter.scheduler.dynamics_type == "ODE"
+
+# Load M=3 teacher LoRA snapshots
+_teacher_names = load_teachers(adapter, [tc.path for tc in teachers], device)
+_teacher_sources = [set(tc.sources) for tc in teachers]
+num_tasks = 3
+
+# Precompute timesteps (constant)
+_timesteps = prepare_train_timesteps(scheduler, N=10, ...)
+# -> tensor([1000, 900, 800, 700, 600, 500, 400, 300, 200, 100])
+_num_steps = 10
+
+# Per-source dataloader iterators for balanced sampling
+_source_iters = {name: iter(dl) for ...}
+\end{lstlisting}
+
+\subsection{Gradient Accumulation Steps (GAS)}
+
+\begin{align}
+\texttt{batches\_per\_task} &= \lfloor \texttt{num\_batches\_per\_epoch} / M \rfloor = \lfloor 9/3 \rfloor = 3 \\[6pt]
+\text{base\_GAS} &= \frac{\texttt{batches\_per\_task}}{\texttt{gradient\_step\_per\_epoch}} = \frac{3}{1} = 3 \\[6pt]
+\texttt{get\_num\_train\_timesteps()} &= M \times N = 3 \times 10 = 30 \\[6pt]
+\text{GAS} &= 3 \times 30 = 90
+\end{align}
+
+Both trainers achieve GAS $= 90$, hence 1 \texttt{optimizer.step()} per epoch.
+
+\subsection{Main Loop (\texttt{start})}
+
+\begin{algorithm}[H]
+\caption{DiffusionOPDTrainer.start()}
+\begin{algorithmic}
+\WHILE{\texttt{should\_continue\_training()}}
+    \STATE scheduler.set\_seed(epoch + seed)
+    \STATE \textit{// Optional: checkpoint, evaluation}
+    \STATE \texttt{self.optimize()} \COMMENT{Sampling + training combined}
+    \STATE adapter.ema\_step(epoch)
+    \STATE epoch $\leftarrow$ epoch + 1
+\ENDWHILE
+\end{algorithmic}
+\end{algorithm}
+
+No separate \texttt{sample()} or \texttt{prepare\_feedback()} phase.
+
+\subsection{\texttt{optimize()} --- Complete Training Logic}
+
+\begin{algorithm}[H]
+\caption{DiffusionOPD optimize() --- Algorithm 1}
+\begin{algorithmic}
+\STATE adapter.train()
+\STATE \texttt{torch.set\_autocast\_cache\_enabled(False)} \COMMENT{Teacher weight swap safety}
+\FOR{round $= 0, 1, 2$ (\texttt{batches\_per\_task} rounds)}
+    \STATE per\_teacher\_batches $\leftarrow$ \texttt{\_sample\_balanced\_batches(device)}
+    \STATE \COMMENT{$\rightarrow$ [geneval(8), ocr(8), t2i\_comp(8)] --- one batch per teacher}
+    \FOR{$m = 0, 1, 2$ ($M$ teachers)}
+        \STATE batch $\leftarrow$ per\_teacher\_batches[$m$]
+        \STATE teacher\_name $\leftarrow$ \_teacher\_names[$m$]
+        \STATE $x \leftarrow$ sample\_noise() \COMMENT{Initial Gaussian latent}
+        \FOR{$j = 0, \ldots, 9$ ($N=10$ denoising steps)}
+            \STATE \textbf{with} \texttt{accumulate(*trainable\_components)}:
+            \STATE \quad \textbf{with} \texttt{autocast()}:
+            \STATE \quad\quad $t \leftarrow$ timesteps[$j$]
+            \STATE \quad\quad $t_\text{next} \leftarrow$ timesteps[$j+1$] if $j+1 < N$ else 0
+            \STATE \quad\quad $\mu_S \leftarrow$ student\_forward($x$, $t$, $t_\text{next}$) \COMMENT{WITH grad}
+            \STATE \quad\quad \textbf{with} no\_grad(), teacher\_frozen\_context(teacher\_name):
+            \STATE \quad\quad\quad $\mu_T \leftarrow$ teacher\_forward($x$, $t$, $t_\text{next}$) \COMMENT{Frozen}
+            \STATE \quad\quad $D_j = \tfrac{\alpha_\text{path}}{2} \cdot \text{mean}(\|\mu_S - \mu_T\|^2)$
+            \STATE \quad accelerator.backward($D_j$) \COMMENT{Activations freed}
+            \STATE \quad $x \leftarrow \mu_S.\text{detach}()$ \COMMENT{Advance trajectory on-policy}
+            \STATE \quad \textbf{if} sync\_gradients: clip $\to$ step $\to$ zero\_grad
+        \ENDFOR
+    \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+Total \texttt{accumulate()} calls: $3 \text{ rounds} \times 3 \text{ teachers} \times 10 \text{ steps} = 90 = \text{GAS}$ \checkmark
+
+\subsection{Balanced Sampling: \texttt{\_sample\_balanced\_batches}}
+
+\begin{lstlisting}
+def _sample_balanced_batches(self, device):
+    per_teacher_batches = []
+    for m in range(num_tasks):  # 3
+        src = list(_teacher_sources[m])[0]   # First source for this teacher
+        batch = _next_source_batch(src, device)  # B=8 samples from that source
+        per_teacher_batches.append(batch)
+    return per_teacher_batches
+\end{lstlisting}
+
+Data allocation across 3 rounds $\times$ 3 teachers:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & Teacher 0 (geneval) & Teacher 1 (ocr) & Teacher 2 (t2i\_comp) \\
+\midrule
+Round 0 & geneval(8) & ocr(8) & t2i\_comp(8) \\
+Round 1 & geneval(8) & ocr(8) & t2i\_comp(8) \\
+Round 2 & geneval(8) & ocr(8) & t2i\_comp(8) \\
+\midrule
+Total & 24 & 24 & 24 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each teacher sees \textbf{exactly} 24 samples/GPU/epoch from its assigned source. No cross-source contamination.
+
+\subsection{Teacher Weight Swap: \texttt{\_teacher\_frozen\_context}}
+
+\begin{lstlisting}
+@contextmanager
+def _teacher_frozen_context(self, name):
+    info = adapter._named_parameters[name]
+    live = adapter._get_component_parameters(info.target_components)
+    saved_flags = [p.requires_grad for p in live]
+    try:
+        with adapter.use_named_parameters(name):  # .data.copy_() swap
+            for p in live:
+                p.requires_grad_(False)
+            yield
+    finally:
+        for p, flag in zip(live, saved_flags):
+            p.requires_grad_(flag)
+\end{lstlisting}
+
+\textbf{Critical:} \texttt{use\_named\_parameters} swaps via \texttt{.data.copy\_()} which preserves \texttt{data\_ptr}. The autocast cache (keyed by \texttt{data\_ptr}) must be disabled to prevent serving stale cached weights from a previous teacher.
+
+\subsection{Loss Formula}
+
+\begin{equation}
+\mathcal{L} = \frac{\alpha_\text{path}}{2} \sum_{\text{round}} \sum_{m=0}^{M-1} \sum_{j=0}^{N-1} \text{mean}\bigl(\|\mu_S(x_j) - \mu_T^m(x_j)\|^2\bigr)
+\end{equation}
+
+Each teacher computes loss \emph{only} on its own source batch (natural isolation, no mask needed). No REINFORCE term. No KL anchor.
+
+\subsection{Model Forward Count (per GPU per epoch)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+Component & Forward Count & Mode & Total \\
+\midrule
+Student & $3 \times 3 \times 10 = 90$ & with\_grad & 90 \\
+Teacher & $3 \times 3 \times 10 = 90$ & no\_grad & 90 \\
+\midrule
+\textbf{Total} & \multicolumn{3}{c}{\textbf{180}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Memory Profile}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+Moment & Memory \\
+\midrule
+Per-timestep peak & 1 student fwd (activations) + 1 teacher fwd (no activations) \\
+After backward & Activations freed; only \texttt{.grad} + current $x$ (1 latent) \\
+Entire epoch & $O(1)$ latent storage (only current $x$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Comparative Analysis}
+
+\subsection{Summary Table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+ & \textbf{OPDTrainer} & \textbf{DiffusionOPDTrainer} \\
+\midrule
+Sampling & Separate \texttt{sample()} phase & Inline in \texttt{optimize()} \\
+Trajectory storage & Full (25 GB) & $O(1)$ (1 latent) \\
+GAS & $9 \times 10 = 90$ & $3 \times 30 = 90$ \\
+\texttt{accumulate()} mode & Per-timestep & Per-timestep \\
+\texttt{optimizer.step()}/epoch & 1 & 1 \\
+Student fwd/epoch & 2160 & 90 \\
+Teacher fwd/epoch & $720K$ & 90 \\
+Peak memory & 25 GB + 1 fwd & 1 student fwd + 1 teacher fwd \\
+Supports SDE & \checkmark & $\times$ (ODE only) \\
+Supports REINFORCE & \checkmark & $\times$ (pathwise only) \\
+Supports KL anchor & \checkmark & $\times$ \\
+Teacher aggregation & 5 strategies & Fixed per-teacher isolation \\
+Source routing & Probabilistic (shuffle) & Deterministic (guaranteed) \\
+Samples/teacher/GPU & $\sim$24 (probabilistic) & 24 (exact) \\
+Total samples/GPU/epoch & 72 & 72 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{GAS Computation Path}
+
+Both trainers follow the same computation chain:
+
+\begin{lstlisting}
+# In Arguments.__post_init__():
+#   1. TrainingArguments.__post_init__(world_size):
+num_batches_per_epoch = (576 * 1) / (8 * 8) = 9
+gradient_accumulation_steps = compute_gradient_accumulation_steps(9)
+#     -> OPD: 9 / 1 = 9
+#     -> DiffusionOPD: batches_per_task / 1 = 3 / 1 = 3
+
+#   2. Arguments._adjust_gradient_accumulation():
+num_train_timesteps = get_num_train_timesteps(args)
+#     -> OPD: 10 (N for ODE)
+#     -> DiffusionOPD: M * N = 3 * 10 = 30
+gradient_accumulation_steps *= num_train_timesteps
+#     -> OPD: 9 * 10 = 90
+#     -> DiffusionOPD: 3 * 30 = 90
+\end{lstlisting}
+
+\subsection{Trajectory Advancement}
+
+\paragraph{OPD: Pre-stored trajectory (off-policy latents).}
+\begin{itemize}[nosep]
+    \item \texttt{sample()} generates full trajectory with the student at epoch start (eval mode)
+    \item \texttt{optimize()} reads latents from \texttt{all\_latents[:, index\_map[k]]}
+    \item Main-pass student forward uses the \emph{same} fixed latents as pre-pass
+    \item The latent $x_k$ does NOT change even as the student's predictions differ
+\end{itemize}
+
+\paragraph{DiffusionOPD: Online trajectory (on-policy latents).}
+\begin{itemize}[nosep]
+    \item No separate rollout; trajectory generated inline
+    \item After each step: $x \leftarrow \mu_S.\text{detach}()$
+    \item Each step's input is the \emph{current} student's output from the previous step
+    \item Gradient does not backpropagate across steps (detach boundary)
+\end{itemize}
+
+\paragraph{Semantic difference:}
+Since no \texttt{optimizer.step()} occurs within an epoch (both trainers step exactly once at the end), the student weights are identical throughout. Under eval$\approx$train (no dropout), both approaches produce the same latent trajectory within a single epoch. The difference only manifests when \texttt{num\_inner\_epochs} $> 1$: OPD reuses the epoch-start trajectory while DiffusionOPD would regenerate (though current config uses inner\_epochs=1).
+
+\subsection{Data Isolation Semantics}
+
+\paragraph{OPD (\texttt{sum} + \texttt{route\_by\_source=true}):}
+\begin{enumerate}[nosep]
+    \item \texttt{sample()} collects 72 samples in round-robin source order
+    \item \texttt{optimize()} \textbf{shuffles} all 72 samples randomly
+    \item Each micro-batch may contain mixed-source samples
+    \item Per-teacher mask filters: only matching-source samples contribute to that teacher's loss
+    \item Some batches may have 0 samples for a given teacher (handled via dummy backward)
+\end{enumerate}
+
+\paragraph{DiffusionOPD:}
+\begin{enumerate}[nosep]
+    \item Each round explicitly samples one batch per teacher from its source dataloader
+    \item Teacher $m$'s batch contains \emph{only} source-$m$ samples (by construction)
+    \item No masking needed; natural isolation
+    \item Every teacher always sees exactly $B$ effective samples per round
+\end{enumerate}
+
+\subsection{On-Policy Semantics}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+ & OPD & DiffusionOPD \\
+\midrule
+Trajectory generator & Student (eval mode, \texttt{sample()}) & Student (train mode, \texttt{optimize()}) \\
+Trajectory consumer & Student (train mode, main-pass) & Same forward (inline) \\
+Policy consistency & Weak off-policy\footnotemark & Fully on-policy \\
+Gradient scope & Per-timestep (detached) & Per-timestep (detached) \\
+\bottomrule
+\end{tabular}
+\end{table}
+\footnotetext{``Weak off-policy'': the student weights don't change between \texttt{sample()} and \texttt{optimize()} within the same epoch, so the policy is identical. Truly off-policy only when \texttt{num\_inner\_epochs} $> 1$.}
+
+%=============================================================================
+\section{Autocast Cache Handling}
+
+Both trainers must disable the autocast weight cache when performing teacher LoRA swaps:
+
+\paragraph{OPD:} Disables in pre-pass (\texttt{\_precompute\_d\_per\_timestep\_pcgrad}) around the teacher swap loop. Main-pass does not re-run teachers (uses cached $\mu_T$), so no issue.
+
+\paragraph{DiffusionOPD:} Disables for the \emph{entire} \texttt{optimize()} scope, since every timestep performs a teacher swap.
+
+\begin{lstlisting}
+# DiffusionOPD pattern:
+prev_cache = torch.is_autocast_cache_enabled()
+torch.set_autocast_cache_enabled(False)
+try:
+    # Full training loop (3 rounds x 3 teachers x 10 steps)
+finally:
+    torch.set_autocast_cache_enabled(prev_cache)
+\end{lstlisting}
+
+\textbf{Why:} \texttt{use\_named\_parameters} swaps via \texttt{.data.copy\_()} preserving \texttt{data\_ptr}. The autocast cache keys on \texttt{data\_ptr}, so it would serve teacher\_0's cached cast to teacher\_1's forward.
+
+%=============================================================================
+\section{Boundary Conditions}
+
+\subsection{Last Denoising Step ($j=9$ / timestep\_index=9)}
+
+Both trainers handle the terminal step identically:
+\begin{lstlisting}
+t = timesteps[9]  # = 100 (last non-zero timestep)
+t_next = torch.tensor(0, device=device)  # Terminal: clean image
+
+# adapter.forward(t=100, t_next=0, latents=x)
+# -> Predicts final denoised result mu
+\end{lstlisting}
+
+This matches the inference loop in \texttt{SD3\_5Adapter.inference()}:
+\begin{lstlisting}
+for i, t in enumerate(timesteps):  # i=0..9
+    t_next = timesteps[i+1] if i+1 < len(timesteps) else tensor(0)
+    output = self.forward(t=t, t_next=t_next, latents=latents, ...)
+\end{lstlisting}
+
+\subsection{\texttt{latent\_index\_map} (OPD only)}
+
+\texttt{all\_latents} has 11 states (indices 0--10):
+\begin{itemize}[nosep]
+    \item Index 0: initial noise $x_0$
+    \item Index 1--10: denoised states after each of the 10 steps
+\end{itemize}
+
+\texttt{latent\_index\_map[timestep\_index]} maps training timestep index to the corresponding \texttt{all\_latents} position. For the last step:
+\begin{itemize}[nosep]
+    \item \texttt{latents = all\_latents[:, map[9]]} --- input to step 9
+    \item \texttt{next\_latents = all\_latents[:, map[10]]} --- output of step 9 (final result)
+\end{itemize}
+
+%=============================================================================
+\section{DeepSpeed Gradient Accumulation Interaction}
+
+\subsection{Per-timestep \texttt{accumulate()} Requirement}
+
+DeepSpeed's \texttt{engine.backward()} internally triggers \texttt{engine.step()} when the gradient accumulation counter reaches the configured GAS value. Each \texttt{accumulate()} context increments this counter by 1.
+
+\textbf{Correct pattern} (both trainers use this):
+\begin{lstlisting}
+for timestep in timesteps:
+    with accelerator.accumulate(*components):  # Counter += 1
+        loss = compute_loss(timestep)
+        accelerator.backward(loss)  # Single backward per accumulate
+\end{lstlisting}
+
+\textbf{Wrong pattern} (would cause premature steps):
+\begin{lstlisting}
+with accelerator.accumulate(*components):  # Counter += 1 (once)
+    for timestep in timesteps:
+        loss = compute_loss(timestep)
+        accelerator.backward(loss)  # T backwards, but only 1 counter increment!
+\end{lstlisting}
+
+\subsection{PCGrad Exception}
+
+PCGrad mode handles $T$ timesteps manually within a single \texttt{accumulate()} and sets \texttt{p.grad} directly (bypassing \texttt{accelerator.backward}). Its GAS = \texttt{base\_GAS} = 9 (not multiplied by $T$).
+
+%=============================================================================
+\section{Conclusion}
+
+Both trainers guarantee:
+\begin{itemize}[nosep]
+    \item \textbf{1 optimizer step per epoch} with the reference configuration
+    \item \textbf{10 model forwards per sample} matching the inference loop
+    \item \textbf{Identical effective batch size}: 576 samples across 8 GPUs
+    \item \textbf{Per-timestep backward}: $O(1)$ activation memory
+\end{itemize}
+
+The key architectural trade-offs:
+\begin{enumerate}
+    \item \textbf{Memory vs.\ flexibility}: OPD stores full trajectories (25 GB) enabling REINFORCE and multi-pass optimization; DiffusionOPD achieves $O(1)$ storage via interleaved rollout.
+    \item \textbf{Compute}: OPD requires $12\times$ more student forwards (2160 vs.\ 180 total) due to the separate sample/pre-pass/main-pass architecture.
+    \item \textbf{Data isolation}: DiffusionOPD guarantees per-teacher sample isolation by construction; OPD requires \texttt{route\_by\_source} masking (probabilistic per-batch counts after shuffle).
+    \item \textbf{Generality}: OPD supports SDE dynamics, REINFORCE, KL anchoring, and 5 teacher aggregation strategies. DiffusionOPD is ODE-only, pathwise-only, with fixed per-teacher isolation.
+\end{enumerate}
+
+\end{document}
