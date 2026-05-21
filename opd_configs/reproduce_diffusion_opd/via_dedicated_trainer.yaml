@@ -22,10 +22,13 @@ main_process_port: 29500
 mixed_precision: "bf16"
 
 # Data Configuration
-# NOTE: data.dataset_dir is used for eval/test only.
-# Training data comes from per-task `dataset_dir` in `train.tasks`.
+# ALL datasets declared here — preprocessed ONCE by BaseTrainer.
 data:
-  dataset_dir: "dataset/ocr"
+  dataset_dir: "dataset/ocr"        # Fallback for eval/test
+  dataset_dirs:                      # Multi-source (each → __source__ = basename)
+    - "dataset/ocr"
+    - "dataset/pickscore"
+    - "dataset/geneval"
   preprocessing_batch_size: 32
   dataloader_num_workers: 16
   force_reprocess: false
@@ -56,15 +59,16 @@ log:
 train:
   trainer_type: 'diffusion-opd'
 
-  # Per-task configuration: each entry = (teacher LoRA, task-specific prompt dataset)
-  # Strict alignment: OCR teacher ↔ OCR prompts, PickScore teacher ↔ PickScore prompts, etc.
-  tasks:
-    - teacher_path: "jieliu/SD3.5M-FlowGRPO-Text"
-      dataset_dir: "dataset/ocr"
-    - teacher_path: "jieliu/SD3.5M-FlowGRPO-PickScore"
-      dataset_dir: "dataset/pickscore"
-    - teacher_path: "jieliu/SD3.5M-FlowGRPO-GenEval"
-      dataset_dir: "dataset/geneval"
+  # Teacher-source mapping (unified format, same as OPD trainer)
+  # Each teacher only distills on samples from its assigned sources.
+  # Sources match basenames of data.dataset_dirs.
+  teachers:
+    - path: "jieliu/SD3.5M-FlowGRPO-Text"
+      sources: [ocr]
+    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+      sources: [pickscore]
+    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+      sources: [geneval]
 
   teacher_param_device: 'cuda'
 
