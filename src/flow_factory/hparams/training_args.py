@@ -1464,6 +1464,9 @@ class OPDTrainingArguments(TrainingArguments):
         # In "average" and "round_robin" modes, GAS is multiplied by T as normal.
         if self.teacher_aggregation in ("pcgrad", "sum"):
             return 1
+        # Under ODE, num_sde_steps=0; use num_inference_steps instead.
+        if args.scheduler_args.dynamics_type == "ODE":
+            return self.num_inference_steps
         return args.scheduler_args.num_sde_steps
 
 
