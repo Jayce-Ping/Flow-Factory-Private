@@ -44,8 +44,8 @@ from ..opd.common import (
     cache_forward_signature,
     filter_forward_kwargs,
     load_teachers,
+    prepare_train_timesteps,
 )
-from ..opd.ode import prepare_train_timesteps
 
 logger = setup_logger(__name__)
 
