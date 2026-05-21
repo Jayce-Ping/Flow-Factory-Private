@@ -1,0 +1,169 @@
+# Experiment: OPD Pathwise-Only — teacher_aggregation = 'sum' (no source routing)
+#
+# All M teachers active at every timestep. Per-teacher losses computed
+# independently and summed into a single backward. No source routing mask —
+# every teacher computes loss on ALL samples regardless of source.
+#
+# Loss: L = pathwise_coef × Σ_k Σ_m mean(||μ_S - μ_T^m||²)
+#
+# Characteristics:
+#   - Each teacher distills on all data (no source isolation)
+#   - Single student forward, M teacher loss computations, single backward
+#   - Gradient = sum of M teacher gradients (may conflict if teachers disagree)
+#   - Ablation baseline for PCGrad (same loss decomposition, no projection)
+
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "dataset/ocr"
+  dataset_dirs:
+    - "dataset/ocr"
+    - "dataset/pickscore"
+    - "dataset/geneval"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "exp_pathwise_sum"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+train:
+  trainer_type: 'opd'
+
+  teachers:
+    - path: "jieliu/SD3.5M-FlowGRPO-Text"
+      sources: [ocr]
+    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+      sources: [pickscore]
+    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+      sources: [geneval]
+
+  teacher_param_device: 'cuda'
+  teacher_aggregation: 'sum'
+  teacher_route_by_source: false    # No source routing — all teachers see all samples
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  normalize_d_k: false
+  reinforce_future_reduction: "sum"
+  reinforce_group_center: false
+
+  kl_beta: 0.0
+  kl_type: 'x-based'
+
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.5
+
+  per_device_batch_size: 8
+  group_size: 1
+  unique_sample_num_per_epoch: 576
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  num_inner_epochs: 1
+
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+eval:
+  resolution: 512
+  per_device_batch_size: 32
+  guidance_scale: 4.5
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+
+rewards:
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [pickscore]
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+
+eval_rewards:
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
