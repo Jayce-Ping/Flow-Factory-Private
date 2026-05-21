@@ -1443,7 +1443,14 @@ class OPDTrainer(BaseTrainer):
                     loss_info["loss"].append(combined_loss.detach())
                     loss_info["log_prob"].append(log_prob_new.mean().detach())
 
-                    self.accelerator.backward(combined_loss)
+                    # Skip backward if no teacher contributed (all masked out)
+                    if combined_loss.requires_grad:
+                        self.accelerator.backward(combined_loss)
+                    else:
+                        # Still need to count this as an accumulate step for GAS
+                        self.accelerator.backward(
+                            combined_loss + 0.0 * student_out.next_latents_mean.sum()
+                        )
 
                     if self.accelerator.sync_gradients:
                         grad_norm = self.accelerator.clip_grad_norm_(
