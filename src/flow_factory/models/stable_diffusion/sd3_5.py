@@ -333,6 +333,11 @@ class SD3_5Adapter(BaseAdapter):
         latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
+        # Under ODE, noise_level=0 at every step so no log_probs are collected.
+        # Treat empty collection as None to avoid stack() on empty list.
+        if all_log_probs is not None and len(all_log_probs) == 0:
+            all_log_probs = None
+            log_prob_index_map = None
         samples = [
             SD3_5Sample(
                 # Denoising trajectory
