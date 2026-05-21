@@ -1355,17 +1355,17 @@ class OPDTrainer(BaseTrainer):
             for k in range(K)
         ]
 
-        with self.accelerator.accumulate(*self.adapter.trainable_components):
-            with self.autocast():
-                for k_idx, timestep_index in enumerate(
-                    tqdm(
-                        self._train_timestep_indices,
-                        desc=f"Epoch {self.epoch} Timestep",
-                        position=1,
-                        leave=False,
-                        disable=not self.show_progress_bar,
-                    )
-                ):
+        with self.autocast():
+            for k_idx, timestep_index in enumerate(
+                tqdm(
+                    self._train_timestep_indices,
+                    desc=f"Epoch {self.epoch} Timestep",
+                    position=1,
+                    leave=False,
+                    disable=not self.show_progress_bar,
+                )
+            ):
+                with self.accelerator.accumulate(*self.adapter.trainable_components):
                     t = batch["timesteps"][:, timestep_index]
                     t_next = (
                         batch["timesteps"][:, timestep_index + 1]
@@ -1443,25 +1443,23 @@ class OPDTrainer(BaseTrainer):
                     loss_info["loss"].append(combined_loss.detach())
                     loss_info["log_prob"].append(log_prob_new.mean().detach())
 
-                    # Single backward for the summed loss, divided by T for averaging
-                    self.accelerator.backward(combined_loss / T)
+                    self.accelerator.backward(combined_loss)
 
-        # Clip + step when sync_gradients becomes True (GAS counter reached)
-        if self.accelerator.sync_gradients:
-            grad_norm = self.accelerator.clip_grad_norm_(
-                self.adapter.get_trainable_parameters(),
-                self.training_args.max_grad_norm,
-            )
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            loss_info = reduce_loss_info(self.accelerator, loss_info)
-            loss_info["grad_norm"] = grad_norm
-            self.log_data(
-                {f"train/{k}": v for k, v in loss_info.items()},
-                step=self.step,
-            )
-            self.step += 1
-            loss_info = defaultdict(list)
+                    if self.accelerator.sync_gradients:
+                        grad_norm = self.accelerator.clip_grad_norm_(
+                            self.adapter.get_trainable_parameters(),
+                            self.training_args.max_grad_norm,
+                        )
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                        loss_info = reduce_loss_info(self.accelerator, loss_info)
+                        loss_info["grad_norm"] = grad_norm
+                        self.log_data(
+                            {f"train/{k}": v for k, v in loss_info.items()},
+                            step=self.step,
+                        )
+                        self.step += 1
+                        loss_info = defaultdict(list)
 
         return loss_info
 
