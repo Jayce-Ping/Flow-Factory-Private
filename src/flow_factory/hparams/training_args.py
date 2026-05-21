@@ -1631,60 +1631,36 @@ class OPDODETrainingArguments(TrainingArguments):
 
 
 @dataclass
-class DiffusionOPDTaskConfig(ArgABC):
-    """Configuration for one task in multi-task DiffusionOPD.
-
-    Each task pairs a teacher LoRA checkpoint with a task-specific prompt
-    dataset. During training, prompts from ``dataset_dir`` are used ONLY
-    with the corresponding ``teacher_path`` — this is the key property that
-    distinguishes DiffusionOPD from single-dataset OPD variants.
-    """
-
-    teacher_path: str = field(
-        metadata={
-            "help": (
-                "Teacher LoRA checkpoint path (local directory from "
-                "`BaseAdapter.save_checkpoint()` or HF Hub repo id). "
-                "Must share the student's LoRA rank/alpha."
-            )
-        },
-    )
-    dataset_dir: str = field(
-        metadata={
-            "help": (
-                "Path to the task-specific prompt dataset directory. "
-                "Must contain a train.jsonl (or equivalent split file) "
-                "with prompts for this task."
-            )
-        },
-    )
-
-
-@dataclass
 class DiffusionOPDTrainingArguments(TrainingArguments):
     r"""Training arguments for multi-task DiffusionOPD (Algorithm 1).
 
-    Implements the DiffusionOPD paper's multi-task on-policy distillation:
-    each training round iterates through M tasks, where task m samples
-    prompts from its own dataset C^(m), rolls out the student (no-grad),
-    and computes L_m = Σ_j (1/2)||μ_S(x_{t_j}) - μ_T^(m)(x_{t_j})||²
-    using only teacher m. All task losses are summed for a single
-    backward pass + optimizer step.
+    Implements the DiffusionOPD paper's multi-task on-policy distillation.
+    Each teacher is paired with dataset sources via ``TeacherConfig.sources``.
+    Data is declared in ``data.dataset_dirs`` (preprocessed once by base class).
+    During training, each batch is balanced: every teacher gets equal samples
+    from its assigned sources.
 
     Key properties:
-    - Per-task prompt datasets (no shared prompts across teachers)
-    - No PCGrad / round-robin / averaging — each task is self-contained
-    - On-policy (no-grad) rollout + per-step pathwise loss
+    - Data declared in ``data.dataset_dirs`` (single preprocessing pass)
+    - Teacher-source mapping via ``teachers[m].sources``
+    - Balanced per-source sampling (each teacher gets ``per_device_batch_size`` samples)
+    - On-policy (no-grad) ODE rollout + per-step pathwise loss
     - Single backward on L_total = Σ_m L_m
     """
 
-    # ===== Per-task configuration (replaces old teacher_paths) =====
-    tasks: List[Any] = field(
-        default_factory=list,
+    # ===== Teacher configuration (reuses TeacherConfig from OPD) =====
+    teachers: Optional[List[Any]] = field(
+        default=None,
         metadata={
             "help": (
-                "List of task configs, each with 'teacher_path' and 'dataset_dir'. "
-                "Parsed into DiffusionOPDTaskConfig objects in __post_init__."
+                "List of teacher configs with per-source routing. Each entry "
+                "specifies a LoRA path and which dataset sources it applies to. "
+                "Sources must match basenames of data.dataset_dirs. Example:\n"
+                "  teachers:\n"
+                "    - path: owner/repo-text\n"
+                "      sources: [ocr]\n"
+                "    - path: owner/repo-pick\n"
+                "      sources: [pickscore]\n"
             )
         },
     )
@@ -1716,8 +1692,7 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
         metadata={
             "help": (
                 "KL penalty coefficient against the pre-trained base model. "
-                "0 (default) disables the KL term, keeping DiffusionOPD on "
-                "its pure teacher-distillation objective."
+                "0 (default) disables the KL term."
             )
         },
     )
@@ -1734,38 +1709,33 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
-        if not self.tasks:
+        if not self.teachers:
             raise ValueError(
-                "DiffusionOPDTrainingArguments requires `tasks` to contain at least "
-                f"one task entry (with teacher_path and dataset_dir), got tasks={self.tasks!r}."
+                "DiffusionOPDTrainingArguments requires `teachers` with at least one entry."
             )
-        # Convert raw dicts (from YAML) to DiffusionOPDTaskConfig objects
-        parsed_tasks = []
-        for i, task in enumerate(self.tasks):
-            if isinstance(task, DiffusionOPDTaskConfig):
-                parsed_tasks.append(task)
-            elif isinstance(task, dict):
-                if "teacher_path" not in task:
-                    raise ValueError(f"Task {i} missing 'teacher_path': {task!r}.")
-                if "dataset_dir" not in task:
-                    raise ValueError(f"Task {i} missing 'dataset_dir': {task!r}.")
-                parsed_tasks.append(DiffusionOPDTaskConfig(**task))
+        # Convert raw dicts (from YAML) to TeacherConfig objects
+        parsed = []
+        for i, tc in enumerate(self.teachers):
+            if isinstance(tc, TeacherConfig):
+                parsed.append(tc)
+            elif isinstance(tc, dict):
+                parsed.append(TeacherConfig.from_dict(tc))
             else:
+                raise ValueError(f"teachers[{i}] must be a dict or TeacherConfig, got {type(tc)}")
+        self.teachers = parsed
+        # Validate each teacher has sources (required for DiffusionOPD)
+        for i, tc in enumerate(self.teachers):
+            if not tc.sources:
                 raise ValueError(
-                    f"Each task entry must be a dict or DiffusionOPDTaskConfig, "
-                    f"got tasks[{i}]={task!r}."
+                    f"DiffusionOPD requires each teacher to specify `sources`. "
+                    f"teachers[{i}] (path={tc.path!r}) has sources=None."
                 )
-        self.tasks = parsed_tasks
-
         if self.pathwise_coef < 0:
-            raise ValueError(
-                f"`pathwise_coef` must be >= 0, got pathwise_coef={self.pathwise_coef!r}."
-            )
+            raise ValueError(f"`pathwise_coef` must be >= 0, got {self.pathwise_coef!r}.")
         if self.kl_beta < 0:
-            raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")
+            raise ValueError(f"`kl_beta` must be >= 0, got {self.kl_beta!r}.")
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        """One full trajectory per task per training round."""
         return self.num_inference_steps
 
     @property
