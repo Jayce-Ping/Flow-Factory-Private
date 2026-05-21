@@ -277,12 +277,12 @@ class BaseTrainer(ABC):
             return self.eval_reward_processor
         return self._eval_reward_processors_by_name[test_set_name]
 
-    def _init_dataloader(self) -> Tuple[Optional[DataLoader], Dict[str, DataLoader]]:
+    def _init_dataloader(self) -> Tuple[Optional[DataLoader], Dict[str, DataLoader], Dict[str, DataLoader]]:
         # Move text-encoder & vae to GPU for dataloader encoding
         self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules, device=self.accelerator.device
         )
-        dataloader, test_dataloaders = get_dataloader(
+        dataloader, train_dataloaders_by_source, test_dataloaders = get_dataloader(
             config=self.config,
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
@@ -294,7 +294,7 @@ class BaseTrainer(ABC):
 
         self.accelerator.wait_for_everyone()
 
-        return dataloader, test_dataloaders
+        return dataloader, train_dataloaders_by_source, test_dataloaders
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""
@@ -342,7 +342,7 @@ class BaseTrainer(ABC):
             self._synchronize_frozen_components()
 
         # Init dataloader and optimizer
-        self.dataloader, self.test_dataloaders = self._init_dataloader()
+        self.dataloader, self.train_dataloaders_by_source, self.test_dataloaders = self._init_dataloader()
         self.optimizer = self._init_optimizer()
         # Prepare everything with accelerator
         # Dynamically get all trainable modules from target_module_map

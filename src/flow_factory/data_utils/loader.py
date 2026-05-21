@@ -305,33 +305,88 @@ def _load_and_concat_datasets(
     return result
 
 
+def _load_per_source_dataloaders(
+    dataset_dirs: list,
+    accelerator: "Accelerator",
+    base_kwargs: dict,
+    train_preprocess_kwargs: dict,
+    enable_distributed: bool,
+    preprocess_parallelism: str,
+    max_dataset_size: Optional[int],
+    config: "Arguments",
+    data_args,
+) -> Dict[str, DataLoader]:
+    """Load each dataset independently and create per-source DataLoaders.
+
+    Each dataset is loaded, preprocessed, and wrapped in its own DataLoader.
+    The source name is the basename of the directory path. Metadata columns
+    are preserved (no schema alignment needed since datasets are never merged).
+
+    Returns:
+        Dict mapping source name to its DataLoader.
+    """
+    from .sampler_loader import get_data_sampler
+
+    result: Dict[str, DataLoader] = {}
+    for dataset_dir in dataset_dirs:
+        source_name = os.path.basename(os.path.expanduser(dataset_dir).rstrip("/"))
+        logger.info(f"Multi-dataset: loading source '{source_name}' from {dataset_dir}")
+
+        per_dir_kwargs = {**base_kwargs}
+        per_dir_kwargs["dataset_dir"] = dataset_dir
+        extra = list(base_kwargs.get("extra_hash_strs", []))
+        extra.append(f"source:{source_name}")
+        per_dir_kwargs["extra_hash_strs"] = extra
+
+        dataset = _create_or_load_dataset(
+            split="train",
+            accelerator=accelerator,
+            base_kwargs={**per_dir_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
+
+        if max_dataset_size is not None and len(dataset) > max_dataset_size:
+            dataset.processed_dataset = dataset.processed_dataset.select(
+                range(max_dataset_size)
+            )
+
+        sampler = get_data_sampler(
+            dataset=dataset,
+            config=config,
+            accelerator=accelerator,
+        )
+
+        dl = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=data_args.dataloader_num_workers,
+            pin_memory=True,
+            collate_fn=GeneralDataset.collate_fn,
+        )
+        result[source_name] = dl
+        logger.info(
+            f"Multi-dataset: source '{source_name}' → {len(dataset)} samples"
+        )
+
+    return result
+
+
 def get_dataloader(
     config: Arguments,
     accelerator: Accelerator,
     preprocess_func: Optional[PreprocessCallable] = None,
     **kwargs,
-) -> Tuple[Optional[DataLoader], Dict[str, DataLoader]]:
+) -> Tuple[Optional[DataLoader], Dict[str, DataLoader], Dict[str, DataLoader]]:
     """
     Factory to create DDP/FSDP compatible DataLoader with distributed preprocessing.
 
-    Features:
-        - Automatic distributed preprocessing across multiple GPUs
-        - Intelligent caching (reuses preprocessed data on subsequent runs)
-        - Supports both train and test splits
-        - Custom sampler for GRPO-style grouped sampling
-        - Multiple test sets when ``eval.test_sets`` is set
-
-    Args:
-        config: Configuration object containing all arguments
-        accelerator: Accelerator for distributed training
-        preprocess_func: Function to preprocess batches
-        **kwargs: Additional arguments (ignored)
-
     Returns:
-        Tuple of (train_dataloader, test_dataloaders). ``train_dataloader`` is ``None``
-        when ``training_args.skips_train_dataloader`` is set (e.g. ensemble-eval).
-        ``test_dataloaders`` maps test set name to DataLoader; empty dict if no
-        evaluation data is configured.
+        Tuple of (train_dataloader, train_dataloaders_by_source, test_dataloaders).
+        - train_dataloader: Single DataLoader (from dataset_dir) or None.
+        - train_dataloaders_by_source: Dict mapping source name to DataLoader
+          when dataset_dirs is set; empty dict otherwise.
+        - test_dataloaders: Dict mapping test set name to DataLoader.
     """
     data_args = config.data_args
     training_args = config.training_args
@@ -356,6 +411,7 @@ def get_dataloader(
     base_kwargs["force_reprocess"] = data_args.force_reprocess
 
     dataloader: Optional[DataLoader] = None
+    train_dataloaders_by_source: Dict[str, DataLoader] = {}
     if training_args.skips_train_dataloader:
         logger.info("ensemble-eval: skipping train split preprocessing and train DataLoader")
     else:
@@ -374,8 +430,8 @@ def get_dataloader(
         train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
 
         if data_args.dataset_dirs:
-            # Multi-dataset mode: load each dataset, inject __source__, concatenate
-            dataset = _load_and_concat_datasets(
+            # Multi-dataset mode: create per-source DataLoaders (no concat)
+            train_dataloaders_by_source = _load_per_source_dataloaders(
                 dataset_dirs=data_args.dataset_dirs,
                 accelerator=accelerator,
                 base_kwargs=base_kwargs,
@@ -383,6 +439,8 @@ def get_dataloader(
                 enable_distributed=enable_distributed,
                 preprocess_parallelism=preprocess_parallelism,
                 max_dataset_size=data_args.max_dataset_size,
+                config=config,
+                data_args=data_args,
             )
         else:
             dataset = _create_or_load_dataset(
@@ -393,20 +451,20 @@ def get_dataloader(
                 preprocess_parallelism=preprocess_parallelism,
             )
 
-        # === CREATE TRAIN DATALOADER ===
-        sampler = get_data_sampler(
-            dataset=dataset,
-            config=config,
-            accelerator=accelerator,
-        )
+            # === CREATE TRAIN DATALOADER ===
+            sampler = get_data_sampler(
+                dataset=dataset,
+                config=config,
+                accelerator=accelerator,
+            )
 
-        dataloader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=data_args.dataloader_num_workers,
-            pin_memory=True,
-            collate_fn=GeneralDataset.collate_fn,
-        )
+            dataloader = DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                num_workers=data_args.dataloader_num_workers,
+                pin_memory=True,
+                collate_fn=GeneralDataset.collate_fn,
+            )
 
     # === CREATE/LOAD TEST DATASET(S) ===
     test_dataloaders: Dict[str, DataLoader] = {}
@@ -476,4 +534,4 @@ def get_dataloader(
                 collate_fn=GeneralDataset.collate_fn,
             )
 
-    return dataloader, test_dataloaders
+    return dataloader, train_dataloaders_by_source, test_dataloaders

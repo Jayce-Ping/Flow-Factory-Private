@@ -29,10 +29,9 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Set
 
 import torch
-from torch.utils.data import DataLoader
 
 from ..abc import BaseTrainer
 from ...hparams import DiffusionOPDTrainingArguments
@@ -102,40 +101,59 @@ class DiffusionOPDTrainer(BaseTrainer):
         )
         self._num_steps = len(self._timesteps)
 
-        # Build per-source index mapping from merged dataset
-        self._source_indices: Dict[str, List[int]] = self._build_source_indices()
+        # Per-source dataloader iterators for balanced sampling
+        self._source_iters: Dict[str, Iterator] = {
+            name: iter(dl) for name, dl in self.train_dataloaders_by_source.items()
+        }
+
+        # Validate teacher sources match available dataloaders
+        available_sources = set(self.train_dataloaders_by_source.keys())
+        for m, tc in enumerate(self.training_args.teachers):
+            for src in tc.sources:
+                if src not in available_sources:
+                    raise ValueError(
+                        f"Teacher {m} (path={tc.path!r}) references source '{src}' "
+                        f"not in train_dataloaders_by_source. "
+                        f"Available: {sorted(available_sources)}. "
+                        f"Check data.dataset_dirs has a directory with basename '{src}'."
+                    )
 
         logger.info(
             f"DiffusionOPDTrainer initialized: {self.num_tasks} task(s), "
             f"{self._num_steps} timesteps, "
-            f"sources={list(self._source_indices.keys())}, "
+            f"sources={sorted(available_sources)}, "
             f"pathwise_coef={self.training_args.pathwise_coef}"
         )
 
-    # ========================= Source Index =========================
+    # ========================= Balanced Sampling =========================
 
-    def _build_source_indices(self) -> Dict[str, List[int]]:
-        """Build per-source sample index mapping from the merged dataset."""
-        dataset = self.dataloader.dataset
-        source_col = dataset.processed_dataset["__source__"]
-        indices: Dict[str, List[int]] = defaultdict(list)
-        for i, src in enumerate(source_col):
-            indices[src].append(i)
+    def _next_source_batch(self, source_name: str, device: torch.device) -> Dict[str, Any]:
+        """Get next batch from a source's dataloader (cyclic restart)."""
+        try:
+            batch = next(self._source_iters[source_name])
+        except StopIteration:
+            self._source_iters[source_name] = iter(
+                self.train_dataloaders_by_source[source_name]
+            )
+            batch = next(self._source_iters[source_name])
+        return {
+            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+            for k, v in batch.items()
+        }
 
-        # Validate all teacher sources exist in dataset
-        all_sources = set(indices.keys())
-        for m, tc in enumerate(self.training_args.teachers):
-            for src in tc.sources:
-                if src not in all_sources:
-                    raise ValueError(
-                        f"Teacher {m} (path={tc.path!r}) references source '{src}' "
-                        f"but it's not in the dataset. Available: {sorted(all_sources)}. "
-                        f"Check that data.dataset_dirs includes a directory with "
-                        f"basename '{src}'."
-                    )
-        return dict(indices)
+    def _sample_balanced_batches(self, device: torch.device) -> List[Dict[str, Any]]:
+        """Sample one batch per teacher from its assigned source dataloaders.
 
-    # ========================= Main Loop =========================
+        Each teacher gets one full batch (per_device_batch_size samples) from
+        the first source in its sources list. Guarantees equal sample counts.
+        """
+        per_teacher_batches = []
+        for m in range(self.num_tasks):
+            # Use the first source for this teacher
+            src = list(self._teacher_sources[m])[0]
+            batch = self._next_source_batch(src, device)
+            per_teacher_batches.append(batch)
+        return per_teacher_batches
 
     def start(self) -> None:
         """Main training loop (Algorithm 1 Stage 2)."""
@@ -169,43 +187,6 @@ class DiffusionOPDTrainer(BaseTrainer):
         """No-op."""
         pass
 
-    # ========================= Balanced Sampling =========================
-
-    def _sample_balanced_batch(self, device: torch.device) -> List[Dict[str, Any]]:
-        """Sample per_device_batch_size samples per teacher from their sources.
-
-        Returns a list of M batches (one per teacher), each with batch_size samples
-        drawn from that teacher's assigned sources.
-        """
-        batch_size = self.training_args.per_device_batch_size
-        dataset = self.dataloader.dataset
-        generator = create_generator(
-            self.training_args.seed, self.epoch, self.step, device="cpu"
-        )
-
-        per_teacher_batches = []
-        for m in range(self.num_tasks):
-            # Gather indices from all sources assigned to this teacher
-            task_indices = []
-            for src in self._teacher_sources[m]:
-                task_indices.extend(self._source_indices[src])
-
-            # Random sample with replacement
-            n = len(task_indices)
-            selected = torch.randint(n, (batch_size,), generator=generator)
-            sample_indices = [task_indices[i] for i in selected.tolist()]
-
-            # Fetch and collate
-            samples = [dataset[i] for i in sample_indices]
-            batch = dataset.collate_fn(samples)
-            batch = {
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                for k, v in batch.items()
-            }
-            per_teacher_batches.append(batch)
-
-        return per_teacher_batches
-
     # ========================= Optimization =========================
 
     def optimize(self, samples=None) -> None:
@@ -219,7 +200,7 @@ class DiffusionOPDTrainer(BaseTrainer):
         loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         # Sample one batch per teacher (balanced)
-        per_teacher_batches = self._sample_balanced_batch(device)
+        per_teacher_batches = self._sample_balanced_batches(device)
 
         with self.accelerator.accumulate(*self.adapter.trainable_components):
             loss_total = None
