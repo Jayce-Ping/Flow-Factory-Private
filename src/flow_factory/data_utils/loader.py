@@ -363,6 +363,7 @@ def _load_per_source_dataloaders(
             num_workers=data_args.dataloader_num_workers,
             pin_memory=True,
             collate_fn=GeneralDataset.collate_fn,
+            persistent_workers=data_args.dataloader_num_workers > 0,
         )
         result[source_name] = dl
         logger.info(
@@ -464,6 +465,7 @@ def get_dataloader(
                 num_workers=data_args.dataloader_num_workers,
                 pin_memory=True,
                 collate_fn=GeneralDataset.collate_fn,
+                persistent_workers=data_args.dataloader_num_workers > 0,
             )
 
     # === CREATE/LOAD TEST DATASET(S) ===
@@ -493,6 +495,7 @@ def get_dataloader(
                 shuffle=False,
                 num_workers=data_args.dataloader_num_workers,
                 collate_fn=GeneralDataset.collate_fn,
+                persistent_workers=data_args.dataloader_num_workers > 0,
             )
     elif len(eval_args.test_sets) > 0:
         for ts in eval_args.test_sets:
@@ -532,6 +535,7 @@ def get_dataloader(
                 shuffle=False,
                 num_workers=data_args.dataloader_num_workers,
                 collate_fn=GeneralDataset.collate_fn,
+                persistent_workers=data_args.dataloader_num_workers > 0,
             )
 
     return dataloader, train_dataloaders_by_source, test_dataloaders

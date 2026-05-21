@@ -353,15 +353,37 @@ class DiffusionOPDTrainer(BaseTrainer):
 
     @contextmanager
     def _teacher_frozen_context(self, name: str) -> Iterator[None]:
-        """Swap in teacher LoRA + disable requires_grad on swapped slots."""
+        """Swap in teacher LoRA weights — GPU-only, avoids CPU roundtrip.
+
+        The default :meth:`BaseAdapter.use_named_parameters` path goes through
+        :meth:`EMAModuleWrapper.use_ema_parameters` which stores temporaries on
+        CPU (``p.detach().cpu().clone()``).  That triggers an implicit
+        ``cudaStreamSynchronize`` + PCIe DMA on every call, stalling all SMs.
+
+        Since this context is entered once per *timestep* in the inner loop,
+        the cumulative stall time is significant (10+ swaps/round × 5-10 ms
+        each).  This override keeps the backup clone on the same device as the
+        live parameter — a pure HBM memcpy (~0.05 ms for typical LoRA sizes)
+        with no stream synchronization.
+        """
         info = self.adapter._named_parameters[name]
         live = self.adapter._get_component_parameters(info.target_components)
+
+        # Clone student weights ON GPU (no cudaStreamSynchronize, no PCIe)
+        saved_data = [p.data.clone() for p in live]
         saved_flags = [p.requires_grad for p in live]
+
         try:
-            with self.adapter.use_named_parameters(name):
-                for p in live:
-                    p.requires_grad_(False)
-                yield
+            # Copy teacher EMA weights into live model
+            for ema_param, param in zip(
+                info.ema_wrapper.ema_parameters, live, strict=True
+            ):
+                if param.numel() > 0:
+                    param.data.copy_(ema_param.to(param.device).data)
+                param.requires_grad_(False)
+            yield
         finally:
-            for p, flag in zip(live, saved_flags, strict=True):
-                p.requires_grad_(flag)
+            # Restore student weights from GPU buffer
+            for saved, param, flag in zip(saved_data, live, saved_flags, strict=True):
+                param.data.copy_(saved)
+                param.requires_grad_(flag)
