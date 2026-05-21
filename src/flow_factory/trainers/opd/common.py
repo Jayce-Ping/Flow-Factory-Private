@@ -13,14 +13,11 @@
 # limitations under the License.
 
 # src/flow_factory/trainers/opd/common.py
-"""Shared helpers for the OPD trainer family (``sde.py`` and ``ode.py``).
+"""Shared helpers for the OPD trainer family.
 
-These are module-level pure functions to keep the two trainers DRY without
-introducing class-inheritance coupling (constraint #11 -- flat trainer
-hierarchy). Both :class:`flow_factory.trainers.opd.sde.OPDTrainer` (SDE) and
-:class:`flow_factory.trainers.opd.ode.OPDODETrainer` (ODE) own their own
-algorithm-specific machinery and only delegate teacher administration and
-``adapter.forward`` kwarg plumbing here.
+Module-level pure functions used by :class:`OPDTrainer` (SDE/ODE) and
+:class:`DiffusionOPDTrainer`. Handles teacher administration, forward-kwarg
+plumbing, and timestep preparation.
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Tuple
 
 import torch
 
+from ...scheduler import set_scheduler_timesteps
 from ...utils.logger_utils import setup_logger
 from ...utils.lora_loader import load_lora_as_named_parameters
 
@@ -254,3 +252,29 @@ def pcgrad_project_gradients(
         offset += numel
 
     return result
+
+
+def prepare_train_timesteps(
+    scheduler,
+    *,
+    num_inference_steps: int,
+    height: int,
+    width: int,
+    patch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """SD3.5-compatible noise schedule for ODE Euler training.
+
+    Mirrors ``SD3_5Adapter.inference`` step 5: ``image_seq_len`` from latent
+    spatial size, then ``set_scheduler_timesteps`` (shift + retrieve_timesteps).
+    Returns scheduler-scale timesteps in inference order (noisy → clean).
+    """
+    latent_h = height // 8
+    latent_w = width // 8
+    image_seq_len = (latent_h // patch_size) * (latent_w // patch_size)
+    return set_scheduler_timesteps(
+        scheduler=scheduler,
+        num_inference_steps=num_inference_steps,
+        seq_len=image_seq_len,
+        device=device,
+    )
