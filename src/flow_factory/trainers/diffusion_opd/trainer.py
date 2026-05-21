@@ -129,11 +129,21 @@ class DiffusionOPDTrainer(BaseTrainer):
     # ========================= Dataloader Setup =========================
 
     def _init_task_dataloaders(self) -> List[DataLoader]:
-        """Create one DataLoader per task from each task's dataset_dir."""
+        """Create one DataLoader per task from each task's dataset_dir.
+
+        Mirrors BaseTrainer._init_dataloader: moves preprocessing modules
+        (text-encoder, VAE) to GPU before encoding, then offloads after.
+        """
         from ...data_utils.loader import _create_or_load_dataset
         from ...data_utils.sampler_loader import get_data_sampler
         from ...data_utils.dataset import GeneralDataset
         from ...utils.base import filter_kwargs as base_filter_kwargs
+
+        # Move text-encoder & VAE to GPU for preprocessing (same as BaseTrainer)
+        self.adapter.on_load_components(
+            components=self.adapter.preprocessing_modules,
+            device=self.accelerator.device,
+        )
 
         task_dataloaders: List[DataLoader] = []
         data_args = self.config.data_args
@@ -201,6 +211,12 @@ class DiffusionOPDTrainer(BaseTrainer):
                 collate_fn=GeneralDataset.collate_fn,
             )
             task_dataloaders.append(dl)
+
+        # Offload text-encoder & VAE after preprocessing (same as BaseTrainer)
+        self.adapter.off_load_components(
+            components=self.adapter.preprocessing_modules,
+        )
+        self.accelerator.wait_for_everyone()
 
         return task_dataloaders
 
