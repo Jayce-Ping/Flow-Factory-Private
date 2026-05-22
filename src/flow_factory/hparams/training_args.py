@@ -588,14 +588,14 @@ class GRPOTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based']."
             )
-        if self.teacher_aggregation not in ["round_robin", "average", "sum", "pcgrad"]:
+        if self.teacher_aggregation not in ["round_robin", "average", "sum", "pcgrad", "v_pcgrad"]:
             raise ValueError(
                 f"Invalid teacher_aggregation for OPD: {self.teacher_aggregation!r}. "
-                "Valid options are: ['round_robin', 'average', 'sum', 'pcgrad']."
+                "Valid options are: ['round_robin', 'average', 'sum', 'pcgrad', 'v_pcgrad']."
             )
         if self.pcgrad_eps < 0:
             raise ValueError(f"`pcgrad_eps` must be >= 0, got pcgrad_eps={self.pcgrad_eps!r}.")
-        if self.teacher_aggregation in ("pcgrad", "sum") and len(self.teacher_paths) < 2:
+        if self.teacher_aggregation in ("pcgrad", "sum", "v_pcgrad") and len(self.teacher_paths) < 2:
             raise ValueError(
                 "PCGrad aggregation requires at least 2 teachers; "
                 f"got {len(self.teacher_paths)} teacher(s)."
@@ -1237,7 +1237,7 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    teacher_aggregation: Literal["round_robin", "average", "sum", "pcgrad"] = field(
+    teacher_aggregation: Literal["round_robin", "average", "sum", "pcgrad", "v_pcgrad"] = field(
         default="round_robin",
         metadata={
             "help": (
@@ -1250,7 +1250,10 @@ class OPDTrainingArguments(TrainingArguments):
                 "into a single backward (gradient-space accumulation, no "
                 "conflict resolution; PCGrad ablation baseline). "
                 "'pcgrad': compute per-teacher losses separately, apply "
-                "PCGrad (Projected Gradient Descent) to resolve conflicts."
+                "PCGrad (Projected Gradient Descent) to resolve conflicts. "
+                "'v_pcgrad': PCGrad conflict resolution in velocity "
+                "(prediction) space — projects conflicting teacher residuals "
+                "before forming a fused target. Single backward per timestep."
             )
         },
     )
