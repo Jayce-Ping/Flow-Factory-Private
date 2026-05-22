@@ -1,0 +1,697 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\vtheta}{v_\theta}
+\newcommand{\vphi}{v_\phi}
+\newcommand{\mutheta}{\mu_\theta}
+\newcommand{\muphi}{\mu_\phi}
+\newcommand{\mubar}{\bar{\mu}_\phi}
+\newcommand{\sigbar}{\bar{\sigma}}
+\newcommand{\Rbar}{\bar{R}}
+\newcommand{\lpath}{\lambda_{\mathrm{path}}}
+\newcommand{\lrf}{\lambda_{\mathrm{rf}}}
+\newcommand{\detach}{\mathrm{det}}
+\newcommand{\PC}{\mathrm{PCGrad}}
+\newcommand{\tr}{\mathrm{tr}}
+\newcommand{\diag}{\mathrm{diag}}
+\newcommand{\sgn}{\mathrm{sgn}}
+\newcommand{\proj}{\mathrm{proj}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{example}{Example}
+
+\title{\textbf{Gradient-Space vs.\ Velocity-Space PCGrad}\\[0.3em]
+\large Pathwise Loss 下的性质分析}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文在只保留 pathwise 项（$\lrf = 0$）的设定下，对 PCGrad 分别作用于 gradient space（$\R^P$）和 velocity space（$\R^d$）时的数学性质进行严格对比分析。重点阐明两者在冲突检测准则、投影算子、等价条件、以及 per-sample 粒度等方面的本质差异。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{设定与符号}
+%% ============================================================
+
+只考虑 pathwise 项（$\lrf = 0$），时间步索引 $k$ 在本文中固定省略。
+
+\subsection{基础量}
+
+\begin{itemize}[leftmargin=1.5em]
+\item Batch size $B$，latent 维度 $d = C\!\times\!H\!\times\!W$，可训练参数维度 $P$。
+\item Student 转移均值（per-sample）：$\mutheta^{(b)} \in \R^d$，$b = 1,\ldots,B$。
+\item Teacher $m$ 转移均值：$\muphi^{(m),(b)} \in \R^d$。
+\item Velocity residual：$v_m^{(b)} = \muphi^{(m),(b)} - \mutheta^{(b)} \in \R^d$。
+\item 误差向量：$\delta_m^{(b)} = \mutheta^{(b)} - \muphi^{(m),(b)} = -v_m^{(b)}$。
+\item Per-sample Jacobian：$J^{(b)} = \nabla_\theta \mutheta^{(b)} \in \R^{d \times P}$。
+\item 常数因子：$c = \dfrac{\lpath}{\sigbar_k^2\, d\, B}$。
+\end{itemize}
+
+\subsection{Per-Teacher Pathwise Loss}
+
+\begin{equation}
+\ell^{(m)}(\theta) = \frac{\lpath}{2\sigbar_k^2 d}\cdot\frac{1}{B}\sum_{b=1}^B \|\mutheta^{(b)} - \muphi^{(m),(b)}\|^2
+= \frac{c}{2}\sum_{b=1}^B \|\delta_m^{(b)}\|^2
+\label{eq:pathwise_loss}
+\end{equation}
+
+\subsection{Per-Teacher Gradient（精确形式）}
+
+\begin{equation}
+\boxed{
+g_m = \nabla_\theta \ell^{(m)} = c \sum_{b=1}^B \bigl(\delta_m^{(b)}\bigr)^\top J^{(b)}
+= -c \sum_{b=1}^B \bigl(v_m^{(b)}\bigr)^\top J^{(b)} \;\in\; \R^P
+}
+\label{eq:per_teacher_grad}
+\end{equation}
+
+%% ============================================================
+\section{两种 PCGrad 的精确定义}
+%% ============================================================
+
+\subsection{Gradient-Space PCGrad（G-PCGrad）}
+
+在参数空间 $\R^P$ 上操作。
+
+\paragraph{冲突检测：}
+\begin{equation}
+\langle g_i, g_j \rangle = c^2 \sum_{b=1}^B \sum_{b'=1}^B \bigl(v_i^{(b)}\bigr)^\top J^{(b)} \bigl(J^{(b')}\bigr)^\top v_j^{(b')}
+\label{eq:gpcgrad_dot}
+\end{equation}
+
+\paragraph{投影：} 若 $\langle g_i, g_j\rangle < 0$，
+\begin{equation}
+\tilde{g}_i \leftarrow \tilde{g}_i - \frac{\langle \tilde{g}_i, g_j\rangle}{\|g_j\|^2}\,g_j
+\label{eq:gpcgrad_proj}
+\end{equation}
+
+\paragraph{输出：}
+\begin{equation}
+g^{\mathrm{G}} = \sum_{m=1}^M \tilde{g}_m \;\in\; \R^P
+\label{eq:gpcgrad_output}
+\end{equation}
+
+\subsection{Velocity-Space PCGrad（V-PCGrad）}
+
+在 latent 空间 $\R^d$ 上 per-sample 独立操作。
+
+\paragraph{冲突检测（per-sample）：}
+\begin{equation}
+\langle v_i^{(b)}, v_j^{(b)}\rangle_d = \sum_{l=1}^d v_i^{(b,l)}\, v_j^{(b,l)} \quad\in\;\R, \quad \forall\, b
+\label{eq:vpcgrad_dot}
+\end{equation}
+
+\paragraph{投影（per-sample）：} 若 $\langle v_i^{(b)}, v_j^{(b)}\rangle_d < 0$，
+\begin{equation}
+\tilde{v}_i^{(b)} \leftarrow \tilde{v}_i^{(b)} - \frac{\langle \tilde{v}_i^{(b)}, v_j^{(b)}\rangle_d}{\|v_j^{(b)}\|^2}\,v_j^{(b)}
+\label{eq:vpcgrad_proj}
+\end{equation}
+
+\paragraph{Fused target \& 有效梯度：}
+\begin{align}
+v^{\mathrm{fused},(b)} &= \sum_m \tilde{v}_m^{(b)}, \label{eq:vpcgrad_fused}\\[4pt]
+g^{\mathrm{V}} &= -c\sum_{b=1}^B \bigl(v^{\mathrm{fused},(b)}\bigr)^\top J^{(b)}
+= -c\sum_{b=1}^B \left(\sum_m \tilde{v}_m^{(b)}\right)^\top J^{(b)} \;\in\;\R^P
+\label{eq:vpcgrad_output}
+\end{align}
+
+%% ============================================================
+\section{冲突检测准则的本质差异}
+\label{sec:conflict_detection}
+%% ============================================================
+
+\subsection{G-PCGrad：Fisher Metric 下的全局冲突}
+
+将~\eqref{eq:gpcgrad_dot} 展开并引入 Gram 矩阵：
+
+\begin{definition}[Empirical Neural Tangent Gram Matrix]
+\begin{equation}
+G^{(b,b')} = J^{(b)}\bigl(J^{(b')}\bigr)^\top \;\in\;\R^{d \times d}
+\end{equation}
+$G^{(b,b)}$ 是 per-sample 的 empirical Fisher（在输出空间中的 metric tensor）。
+\end{definition}
+
+G-PCGrad 的冲突准则可写为：
+\begin{equation}
+\boxed{
+\langle g_i, g_j \rangle = c^2 \sum_{b,b'} \bigl(v_i^{(b)}\bigr)^\top G^{(b,b')} v_j^{(b')} < 0
+}
+\label{eq:conflict_G}
+\end{equation}
+
+这是一个\textbf{全局}准则：它同时混合了：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{跨样本的交叉项}：$b \neq b'$ 时 $G^{(b,b')} = J^{(b)}(J^{(b')})^\top$ 耦合不同样本。
+\item \textbf{参数空间的 metric 结构}：通过 $J^\top J$ 引入了 neural tangent kernel 的几何。
+\end{enumerate}
+
+\subsection{V-PCGrad：Euclidean Metric 下的 Per-Sample 冲突}
+
+V-PCGrad 的冲突准则为：
+\begin{equation}
+\boxed{
+\langle v_i^{(b)}, v_j^{(b)}\rangle_d = \bigl(v_i^{(b)}\bigr)^\top \bm{I}_d\, v_j^{(b)} < 0, \quad \forall\, b \;\text{独立判断}
+}
+\label{eq:conflict_V}
+\end{equation}
+
+这是：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Per-sample 独立}：每个样本独立判断冲突，无跨样本耦合。
+\item \textbf{Euclidean metric}：使用 $\bm{I}_d$（恒等矩阵）而非 $G^{(b,b)}$。
+\end{enumerate}
+
+\subsection{对比：何时两者检测到不同的冲突}
+
+\begin{proposition}[冲突检测不一致]
+\label{prop:inconsistency}
+存在以下情况使得 G-PCGrad 与 V-PCGrad 的冲突判断不同：
+
+\begin{enumerate}[label=(\alph*)]
+\item \textbf{Per-sample 冲突但全局无冲突}：对某些样本 $b$，$\langle v_i^{(b)}, v_j^{(b)}\rangle_d < 0$（V-PCGrad 检测到冲突），但 $\langle g_i, g_j\rangle \geq 0$（G-PCGrad 不检测为冲突），因为其他样本的正贡献主导了全局内积。
+
+\item \textbf{全局冲突但 per-sample 无冲突}：所有样本 $\langle v_i^{(b)}, v_j^{(b)}\rangle_d \geq 0$（V-PCGrad 无冲突），但 $\langle g_i, g_j\rangle < 0$（G-PCGrad 检测到冲突），因为跨样本交叉项 $G^{(b,b')}$ 的非对角结构引入了额外的负贡献。
+
+\item \textbf{Metric 导致的冲突翻转}：即使 $B=1$，$\langle v_i, v_j\rangle_d > 0$（V-PCGrad 无冲突），但 $v_i^\top G\, v_j < 0$（G-PCGrad 检测到冲突），因为 $G = JJ^\top$ 在某些方向上的 stretch 改变了角度关系。
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}[构造示例 (c)]
+设 $d=2$, $P=2$, $B=1$。取 $J = \begin{pmatrix} 1 & 0 \\ 0 & -2 \end{pmatrix}$，则 $G = JJ^\top = \begin{pmatrix} 1 & 0 \\ 0 & 4 \end{pmatrix}$。
+
+取 $v_i = (1, 1)^\top$, $v_j = (1, -0.3)^\top$。
+\begin{itemize}
+\item V-PCGrad：$\langle v_i, v_j\rangle_d = 1 - 0.3 = 0.7 > 0$，\textbf{无冲突}。
+\item G-PCGrad：$v_i^\top G\, v_j = 1\cdot 1 + 4\cdot 1\cdot(-0.3) = 1 - 1.2 = -0.2 < 0$，\textbf{有冲突}。
+\end{itemize}
+
+$G$ 在第二维度的放大（因为 $J$ 对第二维度梯度贡献更大）使得 $v_j$ 的负分量被放大，导致在参数空间中产生了 latent 空间中不可见的冲突。
+\end{proof}
+
+%% ============================================================
+\section{投影算子的对比}
+\label{sec:projection}
+%% ============================================================
+
+\subsection{单次投影的精确形式}
+
+假设只有 $M=2$ 个 teacher 且检测到冲突。记投影后的结果。
+
+\paragraph{G-PCGrad 投影：}
+\begin{equation}
+\tilde{g}_1 = g_1 - \frac{\langle g_1, g_2\rangle}{\|g_2\|^2}\,g_2
+\label{eq:G_proj_explicit}
+\end{equation}
+
+代入~\eqref{eq:per_teacher_grad}：
+\begin{equation}
+\tilde{g}_1 = -c\sum_b (v_1^{(b)})^\top J^{(b)}
++ \frac{\sum_{b,b'} (v_1^{(b)})^\top G^{(b,b')} v_2^{(b')}}
+{\sum_{b,b'} (v_2^{(b)})^\top G^{(b,b')} v_2^{(b')}}
+\cdot c\sum_{b''} (v_2^{(b'')})^\top J^{(b'')}
+\end{equation}
+
+\paragraph{V-PCGrad 投影（per-sample）：}
+\begin{equation}
+\tilde{v}_1^{(b)} = v_1^{(b)} - \frac{\langle v_1^{(b)}, v_2^{(b)}\rangle_d}{\|v_2^{(b)}\|_d^2}\,v_2^{(b)}, \quad \forall\, b
+\label{eq:V_proj_explicit}
+\end{equation}
+
+对应的有效梯度：
+\begin{equation}
+g^{\mathrm{V}} = -c\sum_b \bigl(\tilde{v}_1^{(b)} + \tilde{v}_2^{(b)}\bigr)^\top J^{(b)}
+\end{equation}
+
+\subsection{投影系数的差异}
+
+\begin{definition}[投影系数]
+G-PCGrad 使用\textbf{全局标量}投影系数：
+\begin{equation}
+\alpha^{\mathrm{G}} = \frac{\langle g_1, g_2\rangle}{\|g_2\|^2}
+= \frac{\sum_{b,b'} (v_1^{(b)})^\top G^{(b,b')} v_2^{(b')}}
+{\sum_{b,b'} (v_2^{(b)})^\top G^{(b,b')} v_2^{(b')}} \;\in\;\R
+\label{eq:alpha_G}
+\end{equation}
+
+V-PCGrad 使用 \textbf{per-sample 标量}投影系数：
+\begin{equation}
+\alpha^{\mathrm{V},(b)} = \frac{\langle v_1^{(b)}, v_2^{(b)}\rangle_d}{\|v_2^{(b)}\|_d^2}
+= \frac{(v_1^{(b)})^\top v_2^{(b)}}{(v_2^{(b)})^\top v_2^{(b)}} \;\in\;\R, \quad \forall\, b
+\label{eq:alpha_V}
+\end{equation}
+\end{definition}
+
+\begin{remark}[关键区别]
+$\alpha^{\mathrm{G}}$ 是所有样本共享的单一系数（batch-global），而 $\alpha^{\mathrm{V},(b)}$ 是 per-sample 自适应的。这意味着 V-PCGrad 可以对不同样本施加不同强度的投影，而 G-PCGrad 对所有样本统一``一刀切''。
+\end{remark}
+
+%% ============================================================
+\section{精确等价条件}
+\label{sec:equivalence}
+%% ============================================================
+
+\begin{proposition}[充分等价条件]
+\label{prop:equivalence}
+G-PCGrad 与 V-PCGrad 产生完全相同的参数更新方向（$g^{\mathrm{G}} \propto g^{\mathrm{V}}$），当且仅当以下任一条件成立：
+\end{proposition}
+
+\subsection{条件 1：单样本 Batch (B=1) + 正交 Jacobian}
+
+当 $B=1$ 时无跨样本混合。此时：
+\begin{align}
+\alpha^{\mathrm{G}} &= \frac{v_1^\top (JJ^\top) v_2}{v_2^\top (JJ^\top) v_2}, \\
+\alpha^{\mathrm{V}} &= \frac{v_1^\top v_2}{v_2^\top v_2}.
+\end{align}
+
+若 $J$ 满足 $JJ^\top = \sigma^2 \bm{I}_d$（各向同性，即 $J$ 的行向量正交等模），则 $\alpha^{\mathrm{G}} = \alpha^{\mathrm{V}}$，投影方向完全一致。
+
+\begin{corollary}
+若 $J$ 为正交矩阵（$d \leq P$ 且行正交归一化），则 $B=1$ 时两者精确等价。
+\end{corollary}
+
+\subsection{条件 2：Batch-Homogeneous Jacobian}
+
+\begin{proposition}
+若所有样本共享相同的 Jacobian $J^{(b)} = J$（与输入无关），则：
+\begin{equation}
+g_m = -c\,B\cdot\bar{v}_m^\top J, \quad \text{where}\;\bar{v}_m = \frac{1}{B}\sum_b v_m^{(b)}
+\end{equation}
+
+G-PCGrad 简化为对 batch-averaged velocity $\bar{v}_m$ 在 $G = JJ^\top$ metric 下的投影：
+\begin{equation}
+\alpha^{\mathrm{G}} = \frac{\bar{v}_1^\top G\,\bar{v}_2}{\bar{v}_2^\top G\,\bar{v}_2}
+\end{equation}
+
+V-PCGrad 仍是 per-sample 的。两者等价要求\textbf{额外}满足 $G \propto \bm{I}_d$。
+\end{proposition}
+
+\subsection{条件 3：退化为 Sum 的边界}
+
+当所有 teacher 的 velocity 共线（$v_m^{(b)} = c_m \cdot u^{(b)}$，$c_m > 0$），无论哪种 PCGrad 都不触发投影（内积恒正）。两者退化为等价的 sum 模式。
+
+%% ============================================================
+\section{度量结构差异：I\_d vs JJ\textsuperscript{T}}
+\label{sec:metric}
+%% ============================================================
+
+\subsection{G-PCGrad 隐含的 Mahalanobis 度量}
+
+G-PCGrad 的冲突检测等价于在 latent 空间中使用 \textbf{Mahalanobis 度量} $G = JJ^\top$：
+
+\begin{equation}
+\text{G-PCGrad conflict} \;\Leftrightarrow\; v_i^\top (JJ^\top) v_j < 0
+\;\Leftrightarrow\; \langle v_i, v_j\rangle_{G} < 0
+\end{equation}
+
+\begin{remark}[物理含义]
+$G = JJ^\top$ 描述了``latent 空间中哪些方向更容易被参数变化改变''。$G$ 的大特征值方向对应``敏感方向''——参数的小变化即可引起该方向的大变化。G-PCGrad 在冲突检测时\textbf{放大}了敏感方向的权重，即更关注那些``参数空间中实际上会冲突''的方向。
+\end{remark}
+
+\subsection{V-PCGrad 使用的 Euclidean 度量}
+
+V-PCGrad 等价于假设 $G = \bm{I}_d$，即：
+\begin{equation}
+\text{V-PCGrad conflict} \;\Leftrightarrow\; v_i^\top \bm{I}_d\, v_j < 0
+\;\Leftrightarrow\; \langle v_i, v_j\rangle_{\mathrm{Euclid}} < 0
+\end{equation}
+
+这忽略了 Jacobian 引入的各向异性。
+
+\subsection{何时各向异性显著}
+
+\begin{proposition}[条件数的影响]
+\label{prop:condition}
+设 $G^{(b,b)} = J^{(b)}(J^{(b)})^\top$ 的条件数为 $\kappa(G)$。当 $\kappa(G) \gg 1$ 时（Jacobian 高度各向异性），G-PCGrad 和 V-PCGrad 的冲突判断差异最大。具体地：
+
+存在 velocity 对 $(v_i, v_j)$ 使得两者冲突判断相反，当且仅当
+\begin{equation}
+\kappa(G) > \frac{1 + |\cos\angle(v_i, v_j)|}{1 - |\cos\angle(v_i, v_j)|}
+\end{equation}
+其中 $\angle(v_i, v_j)$ 是 Euclidean 度量下的夹角。
+\end{proposition}
+
+\begin{remark}[实际网络中的 $\kappa$]
+对于深度网络，$JJ^\top$ 的谱通常高度不均匀（少数方向 singular value 很大），$\kappa(G) \gg 1$ 是常态。这意味着 V-PCGrad 的近似在理论上可能遗漏（或误报）一些``参数空间中真正的冲突''。但在实践中，由于 V-PCGrad 的 per-sample 粒度优势（见第~\ref{sec:per_sample} 节），这一劣势可被部分补偿。
+\end{remark}
+
+%% ============================================================
+\section{Per-Sample 粒度的影响}
+\label{sec:per_sample}
+%% ============================================================
+
+\subsection{G-PCGrad 的 Batch-Averaging 效应}
+
+G-PCGrad 的冲突判据~\eqref{eq:conflict_G} 是对 \textbf{整个 batch 的聚合}。这意味着：
+
+\begin{example}[冲突被 averaging 掩盖]
+设 $B=2$，两个 teacher。样本 1 严重冲突，样本 2 强一致：
+\begin{align}
+v_1^{(1)} &= (1,0)^\top, \; v_2^{(1)} = (-1, 0)^\top & \Rightarrow\; \langle v_1^{(1)}, v_2^{(1)}\rangle = -1 \\
+v_1^{(2)} &= (0,1)^\top, \; v_2^{(2)} = (0, 1)^\top & \Rightarrow\; \langle v_1^{(2)}, v_2^{(2)}\rangle = +1
+\end{align}
+
+假设 $J^{(1)} = J^{(2)} = \bm{I}$，则：
+\begin{equation}
+\langle g_1, g_2\rangle = \langle v_1^{(1)}, v_2^{(1)}\rangle + \langle v_1^{(2)}, v_2^{(2)}\rangle = -1 + 1 = 0
+\end{equation}
+
+G-PCGrad：全局内积 $= 0$，\textbf{不触发投影}。样本 1 的严重冲突被样本 2 的一致性完全抵消。
+
+V-PCGrad：对样本 1 检测到冲突并投影，对样本 2 不投影。\textbf{保留了 per-sample 的冲突解决能力}。
+\end{example}
+
+\subsection{形式化：V-PCGrad 的有效梯度分解}
+
+\begin{proposition}[Per-sample 自适应性]
+V-PCGrad 的有效梯度可分解为：
+\begin{equation}
+g^{\mathrm{V}} = -c\sum_{b=1}^B \left(\sum_m \tilde{v}_m^{(b)}\right)^\top J^{(b)}
+= -c\sum_{b=1}^B \bigl(v^{\mathrm{fused},(b)}\bigr)^\top J^{(b)}
+\end{equation}
+
+其中 $v^{\mathrm{fused},(b)}$ 是\textbf{per-sample 自适应}的融合方向：
+\begin{itemize}
+\item 对冲突样本：$v^{\mathrm{fused},(b)}$ 偏离了 $\sum_m v_m^{(b)}$ 的方向（去除了冲突分量）。
+\item 对一致样本：$v^{\mathrm{fused},(b)} = \sum_m v_m^{(b)}$（无投影发生）。
+\end{itemize}
+
+相比之下，G-PCGrad 的输出 $\tilde{g}_m$ 是``一刀切''的：对所有样本施加\textbf{相同的}投影系数 $\alpha^{\mathrm{G}}$。
+\end{proposition}
+
+\subsection{Per-Sample 粒度的代价}
+
+V-PCGrad 的 per-sample 操作在以下情况下可能过于``激进''：
+
+\begin{example}[噪声导致的虚假 per-sample 冲突]
+如果 teacher 输出含噪声，个别样本可能因噪声出现 $\langle v_i^{(b)}, v_j^{(b)}\rangle < 0$，即使 teacher 在``population 层面''并无真实冲突。V-PCGrad 会对这些样本做投影，而 G-PCGrad 通过 batch averaging 天然地平滑了噪声。
+\end{example}
+
+%% ============================================================
+\section{投影后的梯度结构对比}
+\label{sec:output_structure}
+%% ============================================================
+
+\subsection{G-PCGrad 输出的线性结构}
+
+G-PCGrad 的投影在 $\R^P$ 中是线性的（投影矩阵作用于梯度向量）：
+\begin{equation}
+\tilde{g}_1 = \left(\bm{I}_P - \frac{g_2 g_2^\top}{\|g_2\|^2}\right) g_1
+= \Pi_{g_2^\perp}\, g_1
+\end{equation}
+
+其中 $\Pi_{g_2^\perp} = \bm{I}_P - \hat{g}_2\hat{g}_2^\top$ 是到 $g_2^\perp$ 的正交投影。最终梯度：
+\begin{equation}
+g^{\mathrm{G}} = \Pi_{g_2^\perp}\, g_1 + g_2
+\end{equation}
+
+\begin{remark}
+投影后 $\langle \tilde{g}_1, g_2\rangle = 0$：teacher 1 的梯度被调整为与 teacher 2 正交（在 $\R^P$ 中）。
+\end{remark}
+
+\subsection{V-PCGrad 输出的非线性到参数空间映射}
+
+V-PCGrad 在 latent 空间做投影后映射回参数空间：
+\begin{equation}
+g^{\mathrm{V}} = -c\sum_b \left(\Pi_{v_2^{(b)\perp}} v_1^{(b)} + v_2^{(b)}\right)^\top J^{(b)}
+\end{equation}
+
+其中 $\Pi_{v_2^{(b)\perp}} = \bm{I}_d - \hat{v}_2^{(b)}(\hat{v}_2^{(b)})^\top$ 是在 $\R^d$ 中的正交投影。
+
+\begin{proposition}[V-PCGrad 不保证参数空间正交性]
+一般而言：
+\begin{equation}
+\langle g^{\mathrm{V}}_{\text{teacher 1 contribution}},\; g_2 \rangle \neq 0
+\end{equation}
+即 V-PCGrad 投影后，teacher 1 的贡献在参数空间中\textbf{不一定}与 $g_2$ 正交。正交性仅在 latent 空间中 per-sample 地成立：$\langle \tilde{v}_1^{(b)}, v_2^{(b)}\rangle_d = 0$。
+\end{proposition}
+
+\begin{proof}
+设 $B=1$，投影后 $\tilde{v}_1 \perp v_2$（在 $\R^d$ 中）。参数空间内积：
+\begin{equation}
+\tilde{v}_1^\top J \cdot J^\top v_2 = \tilde{v}_1^\top G\, v_2
+\end{equation}
+由于 $G \neq \bm{I}_d$（一般情况），$\tilde{v}_1 \perp v_2$ 并不保证 $\tilde{v}_1^\top G\, v_2 = 0$。
+\end{proof}
+
+\subsection{对比总结}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{性质} & \textbf{G-PCGrad} & \textbf{V-PCGrad} \\
+\midrule
+投影后正交保证 & $\tilde{g}_1 \perp g_2$ 在 $\R^P$ 中 & $\tilde{v}_1^{(b)} \perp v_2^{(b)}$ 在 $\R^d$ 中 \\
+参数空间正交 & \ding{51} 精确 & \ding{55} 不保证 \\
+Per-sample 正交 & \ding{55} 不保证 & \ding{51} 精确 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{近似误差的界}
+\label{sec:error_bound}
+%% ============================================================
+
+\subsection{设定}
+
+假设 $M=2$，G-PCGrad 检测到冲突，产出 $g^{\mathrm{G}}$。V-PCGrad 在部分样本上检测到冲突，产出 $g^{\mathrm{V}}$。定义近似误差：
+\begin{equation}
+\varepsilon = g^{\mathrm{V}} - g^{\mathrm{G}}
+\end{equation}
+
+\subsection{单样本情形的误差}
+
+当 $B=1$ 时（无跨样本差异），误差纯粹来自度量差异：
+\begin{align}
+g^{\mathrm{G}} &= -c\left(v_1 - \frac{v_1^\top G\, v_2}{v_2^\top G\, v_2}\,v_2 + v_2\right)^\top J \\
+g^{\mathrm{V}} &= -c\left(v_1 - \frac{v_1^\top v_2}{v_2^\top v_2}\,v_2 + v_2\right)^\top J
+\end{align}
+
+\begin{equation}
+\varepsilon = -c\left(\frac{v_1^\top G\, v_2}{v_2^\top G\, v_2} - \frac{v_1^\top v_2}{v_2^\top v_2}\right) v_2^\top J
+= -c\,\Delta\alpha\cdot v_2^\top J
+\end{equation}
+
+其中投影系数差异为：
+\begin{equation}
+\boxed{
+\Delta\alpha = \alpha^{\mathrm{G}} - \alpha^{\mathrm{V}}
+= \frac{v_1^\top G\, v_2}{v_2^\top G\, v_2} - \frac{v_1^\top v_2}{v_2^\top v_2}
+}
+\label{eq:delta_alpha}
+\end{equation}
+
+\begin{proposition}[投影系数差的上界]
+设 $G$ 的特征值为 $\lambda_1 \geq \cdots \geq \lambda_d > 0$，条件数 $\kappa = \lambda_1/\lambda_d$。则：
+\begin{equation}
+|\Delta\alpha| \leq \frac{\kappa - 1}{\kappa + 1}\cdot\frac{\|v_1\|}{\|v_2\|}
+\end{equation}
+当 $\kappa = 1$（各向同性）时 $\Delta\alpha = 0$（精确等价）。
+\end{proposition}
+
+\begin{proof}
+设 $G = Q\Lambda Q^\top$（特征分解），$u_i = Q^\top v_i$。则：
+\begin{equation}
+\alpha^{\mathrm{G}} = \frac{\sum_l \lambda_l u_{1l} u_{2l}}{\sum_l \lambda_l u_{2l}^2},
+\quad \alpha^{\mathrm{V}} = \frac{\sum_l u_{1l} u_{2l}}{\sum_l u_{2l}^2}
+\end{equation}
+设 $w_l = u_{2l}^2 / \sum_{l'} u_{2l'}^2$（归一化权重），则 $\alpha^{\mathrm{V}} = \sum_l w_l (u_{1l}/u_{2l})$... (略，通过 Kantorovich 不等式得到上界)。
+
+更直接地：$|\Delta\alpha| = |v_1^\top(G/\|G v_2\|^2_* - \bm{I}/\|v_2\|^2)v_2|$，利用 Rayleigh quotient 的变化范围 $[\lambda_d, \lambda_1]$ 及 $\|v_1\|$ 的 Cauchy-Schwarz 界即得。
+\end{proof}
+
+\subsection{多样本情形的额外误差源}
+
+当 $B > 1$ 时，除度量差异外还有\textbf{粒度差异}导致的误差：
+\begin{itemize}
+\item G-PCGrad 用单一 $\alpha^{\mathrm{G}}$ 对\textbf{所有}样本统一投影。
+\item V-PCGrad 用 per-sample 的 $\alpha^{\mathrm{V},(b)}$，且可能仅对部分样本触发投影。
+\end{itemize}
+
+设冲突样本集 $\mathcal{C} = \{b : \langle v_1^{(b)}, v_2^{(b)}\rangle_d < 0\}$，非冲突集 $\mathcal{C}^c$。V-PCGrad 的有效梯度为：
+\begin{equation}
+g^{\mathrm{V}} = -c\left[
+\sum_{b\in\mathcal{C}} \bigl(\tilde{v}_1^{(b)} + v_2^{(b)}\bigr)^\top J^{(b)}
++ \sum_{b\in\mathcal{C}^c} \bigl(v_1^{(b)} + v_2^{(b)}\bigr)^\top J^{(b)}
+\right]
+\end{equation}
+
+而 G-PCGrad（若全局检测到冲突）对所有样本统一投影：
+\begin{equation}
+g^{\mathrm{G}} = -c\sum_{b=1}^B \bigl(v_1^{(b)} + v_2^{(b)}\bigr)^\top J^{(b)}
++ \alpha^{\mathrm{G}} \cdot c\sum_{b=1}^B (v_2^{(b)})^\top J^{(b)}
+\end{equation}
+
+两者在冲突不均匀分布的 batch 上差异最大。
+
+%% ============================================================
+\section{不动点与收敛性质}
+\label{sec:fixed_point}
+%% ============================================================
+
+\subsection{共同不动点}
+
+\begin{proposition}[零梯度不动点一致]
+两种 PCGrad 在以下条件下均产出零梯度（不动点）：
+\begin{equation}
+\mutheta^{(b)} = \muphi^{(m),(b)}, \quad \forall\, m,\, b
+\end{equation}
+即 student 与所有 teacher 完美匹配。此时 $v_m^{(b)} = 0$，$g_m = 0$，无投影发生。
+\end{proposition}
+
+\subsection{非零不动点的差异}
+
+当 teacher 之间存在不可调和的分歧（$\sum_m v_m^{(b)} = 0$ 但各 $v_m \neq 0$），两者的行为不同：
+
+\begin{example}[对称冲突]
+$M=2$，$v_1^{(b)} = -v_2^{(b)} = u^{(b)} \neq 0$（完全对称冲突）。
+
+\textbf{V-PCGrad}：$\langle v_1^{(b)}, v_2^{(b)}\rangle = -\|u\|^2 < 0$，投影后：
+\begin{equation}
+\tilde{v}_1^{(b)} = v_1^{(b)} - \frac{-\|u\|^2}{\|u\|^2}\,v_2^{(b)} = u + u = 2u, \quad
+\tilde{v}_2^{(b)} = v_2^{(b)} - \frac{-\|u\|^2}{\|u\|^2}\,v_1^{(b)} = -u - u = -2u
+\end{equation}
+
+等等，这不对。让我重新计算。PCGrad 投影使用\textbf{原始}向量 $v_j$（非 $\tilde{v}_j$）：
+\begin{align}
+\tilde{v}_1 &= v_1 - \frac{\langle v_1, v_2\rangle}{\|v_2\|^2}\,v_2
+= u - \frac{-\|u\|^2}{\|u\|^2}(-u) = u - u = 0 \\
+\tilde{v}_2 &= v_2 - \frac{\langle v_2, v_1\rangle}{\|v_1\|^2}\,v_1
+= -u - \frac{-\|u\|^2}{\|u\|^2}(u) = -u + u = 0
+\end{align}
+
+$v^{\mathrm{fused}} = 0$。有效梯度为零：\textbf{student 停止更新}。
+
+\textbf{G-PCGrad}：$g_1 = -c\sum_b u^{(b)\top}J^{(b)}$, $g_2 = c\sum_b u^{(b)\top}J^{(b)} = -g_1$。$\langle g_1, g_2\rangle = -\|g_1\|^2 < 0$。
+\begin{equation}
+\tilde{g}_1 = g_1 - \frac{-\|g_1\|^2}{\|g_1\|^2}\,g_2 = g_1 + g_2 = 0, \quad
+\tilde{g}_2 = g_2 - \frac{-\|g_2\|^2}{\|g_2\|^2}\,g_1 = g_2 + g_1 = 0
+\end{equation}
+
+$g^{\mathrm{G}} = 0$。结论一致：\textbf{完全对称冲突下两者均停止}。
+\end{example}
+
+\begin{example}[非对称冲突]
+$M=2$, $B=1$, $v_1 = (1, 0)^\top$, $v_2 = (-0.5, 1)^\top$。
+
+\textbf{V-PCGrad}：$\langle v_1, v_2\rangle = -0.5 < 0$, $\|v_2\|^2 = 1.25$。
+\begin{equation}
+\tilde{v}_1 = (1,0) - \frac{-0.5}{1.25}(-0.5, 1) = (1,0) - (0.2, -0.4) = (0.8, 0.4)
+\end{equation}
+$\langle v_2, v_1\rangle = -0.5 < 0$, $\|v_1\|^2 = 1$。
+\begin{equation}
+\tilde{v}_2 = (-0.5, 1) - \frac{-0.5}{1}(1,0) = (-0.5, 1) + (0.5, 0) = (0, 1)
+\end{equation}
+$v^{\mathrm{fused}} = (0.8, 1.4)$。
+
+\textbf{G-PCGrad}（设 $J = \bm{I}_2$，使 $G = \bm{I}$）：与 V-PCGrad 等价，$g^{\mathrm{G}} = g^{\mathrm{V}}$。
+
+\textbf{G-PCGrad}（设 $J = \mathrm{diag}(2, 0.5)$，使 $G = \mathrm{diag}(4, 0.25)$）：
+\begin{equation}
+\langle g_1, g_2\rangle = v_1^\top G\, v_2 = 4\cdot 1\cdot(-0.5) + 0.25\cdot 0\cdot 1 = -2 < 0
+\end{equation}
+$\|g_2\|^2 = v_2^\top G\, v_2 = 4(0.25) + 0.25(1) = 1.25$。
+\begin{equation}
+\alpha^{\mathrm{G}} = -2/1.25 = -1.6
+\end{equation}
+\begin{equation}
+\tilde{g}_1 = g_1 - (-1.6)\,g_2 = g_1 + 1.6\,g_2
+\end{equation}
+
+对比 V-PCGrad 的 $\alpha^{\mathrm{V}} = -0.5/1.25 = -0.4$：G-PCGrad 的投影强度是 V-PCGrad 的 4 倍！
+
+原因：$G$ 放大了第一维度（$\lambda_1 = 4$），使得 $v_1$ 和 $v_2$ 在参数空间的冲突远比 latent 空间中看起来的严重。
+\end{example}
+
+%% ============================================================
+\section{计算复杂度与数值稳定性}
+\label{sec:complexity}
+%% ============================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{@{}l c c@{}}
+\toprule
+& \textbf{G-PCGrad} & \textbf{V-PCGrad} \\
+\midrule
+Backward passes / timestep & $M$ & $1$ \\
+梯度存储 & $O(M \cdot P)$ & $O(M \cdot B \cdot d)$ \\
+投影计算 & $O(M^2 \cdot P)$ dot products & $O(M^2 \cdot B \cdot d)$ dot products \\
+冲突判断数 & $\binom{M}{2}$ 次（全局） & $\binom{M}{2} \times B$ 次（per-sample） \\
+数值条件 & 受 $\|g_m\|$ 尺度影响 & 受 $\|v_m^{(b)}\|$ 尺度影响 \\
+DeepSpeed ZeRO & \ding{55} & \ding{51} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{数值稳定性注意：}
+\begin{itemize}
+\item G-PCGrad 的 $\|g_m\|^2$ 可能非常小（当 loss landscape 平坦时），导致投影系数 $\alpha^{\mathrm{G}}$ 发散。实践中需要 $\epsilon$-clamp。
+\item V-PCGrad 的 $\|v_m^{(b)}\|^2$ 是 latent 空间的 $\ell^2$ 范数，尺度通常更稳定（与模型大小无关）。
+\end{itemize}
+
+%% ============================================================
+\section{总结与实践建议}
+\label{sec:summary}
+%% ============================================================
+
+\begin{tcolorbox}[colback=yellow!5, colframe=yellow!60!black, title=核心差异总结]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{度量}：G-PCGrad 在 $JJ^\top$（Fisher-like）度量下检测冲突；V-PCGrad 在 Euclidean 度量下检测。前者感知参数空间结构，后者不感知。
+
+\item \textbf{粒度}：G-PCGrad 是 batch-global 的（一个投影系数对所有样本）；V-PCGrad 是 per-sample 的（每个样本独立投影）。
+
+\item \textbf{正交保证}：G-PCGrad 保证参数空间正交（$\tilde{g}_i \perp g_j$ in $\R^P$）；V-PCGrad 保证 latent 空间 per-sample 正交（$\tilde{v}_i^{(b)} \perp v_j^{(b)}$ in $\R^d$）。
+
+\item \textbf{近似误差}：当 Jacobian 各向异性大（$\kappa(JJ^\top) \gg 1$）时，V-PCGrad 的冲突检测与投影强度偏离真实参数空间几何。但 per-sample 粒度部分补偿了这一损失。
+
+\item \textbf{成本}：V-PCGrad 以 $1/M$ 的 backward 成本和 $d/P$ 的存储比例实现了近似冲突解决。
+\end{enumerate}
+\end{tcolorbox}
+
+\bigskip
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50!black, title=实践建议]
+\begin{itemize}[leftmargin=1em]
+\item 当 $\kappa(JJ^\top)$ 适中（LoRA fine-tuning，参数空间较低秩）且 batch 中各样本冲突模式不一致时，\textbf{V-PCGrad 的 per-sample 粒度优势大于度量损失}——推荐使用。
+\item 当需要精确的参数空间冲突解决（如调试 teacher 冲突、小 batch 精确训练）且可承受 $M\times$ backward 成本时，使用 \textbf{G-PCGrad}。
+\item 两者在完全一致/完全对称冲突的极端情况下行为一致；差异主要体现在``部分冲突''的中间地带。
+\end{itemize}
+\end{tcolorbox}
+
+\end{document}

@@ -1,0 +1,616 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\vtheta}{v_\theta}
+\newcommand{\vphi}{v_\phi}
+\newcommand{\mutheta}{\mu_\theta}
+\newcommand{\muphi}{\mu_\phi}
+\newcommand{\mubar}{\bar{\mu}_\phi}
+\newcommand{\sigbar}{\bar{\sigma}}
+\newcommand{\Rbar}{\bar{R}}
+\newcommand{\lpath}{\lambda_{\mathrm{path}}}
+\newcommand{\lrf}{\lambda_{\mathrm{rf}}}
+\newcommand{\detach}{\mathrm{detach}}
+\newcommand{\PC}{\mathrm{PCGrad}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+
+\title{\textbf{Teacher Aggregation Loss Formulations}\\[0.3em]
+\large Mathematical Specification for OPDTrainer}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文档给出 OPDTrainer 中五种 \texttt{teacher\_aggregation} 模式（\texttt{round\_robin}, \texttt{average}, \texttt{sum}, \texttt{pcgrad}, \texttt{v\_pcgrad}）的严格数学形式。核心 pathwise loss 本质上是对 teacher 转移均值的直接 KL regression（等价于 time-weighted MSE regression），各模式的区别在于 teacher 信号在哪个空间上做 aggregation。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{前置：符号与 Per-Step KL}
+%% ============================================================
+
+\subsection{符号表}
+
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{符号} & \textbf{含义} \\
+\midrule
+$M$ & Teacher 总数 \\
+$N$ (或 $T$) & 离散化时间步数 \\
+$d$ & Latent 空间维度 $= C \times H \times W$ \\
+$B$ & Batch size \\
+$P$ & 可训练参数总量 \\
+$x_{t_k}$ & 第 $k$ 步的 latent state \\
+$\Delta t_k = t_{k+1} - t_k < 0$ & 逆向时间步长 \\
+$\sigma_{t_k}$ & Flow-SDE 扩散系数，$\sigma_t^2 = a^2 t/(1-t)$ \\
+$\vtheta(x,t)$ & Student velocity field \\
+$\vphi^{(m)}(x,t)$ & 第 $m$ 个 teacher 的 velocity field \\
+$\lpath,\; \lrf$ & Pathwise 与 REINFORCE 系数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{SDE 离散化下的高斯转移核}
+
+在 Flow-SDE Euler-Maruyama 离散化下，student 与 teacher 共享相同方差的条件高斯：
+\begin{align}
+p_\theta(x_{t_{k+1}} | x_{t_k}) &= \N(\mutheta^k,\; \sigbar_k^2 \bm{I}), \\
+p_{\phi^{(m)}}(x_{t_{k+1}} | x_{t_k}) &= \N(\muphi^{(m),k},\; \sigbar_k^2 \bm{I}),
+\end{align}
+其中：
+\begin{align}
+\mutheta^k &= \beta_k x_{t_k} + \alpha_k \vtheta(x_{t_k}, t_k)\, \Delta t_k, \label{eq:mu_student}\\
+\muphi^{(m),k} &= \beta_k x_{t_k} + \alpha_k \vphi^{(m)}(x_{t_k}, t_k)\, \Delta t_k, \label{eq:mu_teacher}\\
+\sigbar_k^2 &= \sigma_{t_k}^2 (-\Delta t_k), \label{eq:sigma_bar}\\
+\alpha_k &= 1 + \frac{\sigma_{t_k}^2(1-t_k)}{2t_k}, \quad
+\beta_k = 1 + \frac{\sigma_{t_k}^2}{2t_k}\Delta t_k. \notag
+\end{align}
+
+\begin{remark}[共享方差]
+$\sigbar_k^2$ 仅依赖于 noise schedule 和时间步，与 $\theta$ 或 $\phi$ 无关。这一性质是闭式 KL 的关键。
+\end{remark}
+
+\subsection{Per-Step KL（单 Teacher）}
+
+\begin{definition}[Per-Step KL]
+\begin{equation}
+\boxed{
+D_k^{(m)}(\theta) \;=\; \KL\!\bigl(p_\theta(\cdot|x_{t_k}) \;\|\; p_{\phi^{(m)}}(\cdot|x_{t_k})\bigr)
+\;=\; \frac{1}{2\sigbar_k^2}\,\|\mutheta^k - \muphi^{(m),k}\|^2
+}
+\label{eq:per_step_kl}
+\end{equation}
+\end{definition}
+
+\noindent 代码中的实际计算（含空间均值归一化）：
+\begin{equation}
+\tilde{D}_k^{(m)} = \frac{1}{d}\,\frac{\|\mutheta^k - \muphi^{(m),k}\|^2}{2\sigbar_k^2}
+\label{eq:per_step_kl_code}
+\end{equation}
+后续统一使用 $D_k^{(m)}$ 表示~\eqref{eq:per_step_kl_code} 形式（含 $1/d$ 因子）。
+
+\begin{remark}[ODE 模式]
+当 $\sigma_t \equiv 0$ 时，$\sigbar_k^2 = 0$。此时退化为纯 MSE：
+\begin{equation}
+D_k^{(m)}\big|_{\mathrm{ODE}} = \frac{1}{d}\|\mutheta^k - \muphi^{(m),k}\|^2
+\end{equation}
+\end{remark}
+
+\subsection{Trajectory-Level Loss 与梯度分解}
+
+完整 trajectory-level 逆 KL：
+\begin{equation}
+\loss(\theta) = \sum_{k=0}^{N-1} \E_{\tau \sim q_\theta}\!\bigl[D_k(\tau,\theta)\bigr]
+\label{eq:trajectory_loss}
+\end{equation}
+
+其梯度按 pathwise + REINFORCE 分解（Rao-Blackwell）：
+\begin{equation}
+\nabla_\theta \loss = \E_\tau\!\left[\sum_{k=0}^{N-1} \underbrace{\nabla_\theta D_k}_{\text{pathwise}}
++ \underbrace{\Rbar_{k+1}\,\nabla_\theta \log p_\theta(x_{t_{k+1}}|x_{t_k})}_{\text{REINFORCE}}\right]
+\label{eq:grad_decomp}
+\end{equation}
+其中 $\Rbar_{k+1} = \sum_{j>k} D_j$ 是 cumulative future KL。
+
+\medskip
+\begin{tcolorbox}[colback=blue!5, colframe=blue!40, title=本文重点]
+以下各 aggregation 模式的区别完全体现在 \textbf{pathwise loss $D_k$ 的构造方式}上。REINFORCE 项的结构类似，仅 $\Rbar_{k+1}$ 的来源（由哪些 teacher 计算）不同。
+\end{tcolorbox}
+
+%% ============================================================
+\section{Round-Robin}
+\label{sec:round_robin}
+%% ============================================================
+
+\begin{tcolorbox}[colback=gray!5, colframe=gray!50]
+\textbf{Aggregation 空间：无}（每个 micro-batch 仅使用单个 teacher）
+\end{tcolorbox}
+
+\subsection{Teacher 选择}
+
+每个 micro-batch 确定性地选取一个 teacher：
+\begin{equation}
+m^* = \bigl(\text{epoch} \times N_{\mathrm{inner}} + \text{inner\_epoch}\bigr) \times N_{\mathrm{batches}} + \text{batch\_idx} \pmod{M}
+\end{equation}
+
+\subsection{Loss 公式}
+
+\begin{equation}
+\boxed{
+\loss_k^{\mathrm{rr}}(\theta) = \lpath \cdot D_k^{(m^*)}
++ \lrf \cdot \Rbar_{k+1}^{(m^*)}\,\log p_\theta(x_{t_{k+1}}|x_{t_k})
+}
+\label{eq:loss_rr}
+\end{equation}
+
+展开 pathwise 项：
+\begin{equation}
+\loss_k^{\mathrm{rr,\,path}}(\theta) = \frac{\lpath}{2\sigbar_k^2 d}\,\|\mutheta^k - \muphi^{(m^*),k}\|^2
+\end{equation}
+
+\subsection{性质}
+
+\begin{itemize}[leftmargin=1.5em]
+\item 每步 1 次 teacher forward + 1 次 backward
+\item Teacher 间不存在任何 aggregation 或 conflict
+\item 确定性轮流保证各 teacher 均匀暴露
+\item 有效 target：$\mu_T^k = \muphi^{(m^*),k}$
+\end{itemize}
+
+%% ============================================================
+\section{Average（Prediction 空间均值）}
+\label{sec:average}
+%% ============================================================
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50]
+\textbf{Aggregation 空间：Prediction/latent 空间} — 对所有 teacher 的转移均值 $\muphi^{(m),k}$ 取算术平均
+\end{tcolorbox}
+
+\subsection{Teacher Target 构造}
+
+\begin{equation}
+\mubar^k = \frac{1}{M}\sum_{m=1}^M \muphi^{(m),k}
+\label{eq:mu_avg}
+\end{equation}
+
+\subsection{Loss 公式}
+
+\begin{equation}
+\boxed{
+\loss_k^{\mathrm{avg}}(\theta) = \frac{\lpath}{2\sigbar_k^2 d}\,\bigl\|\mutheta^k - \mubar^k\bigr\|^2
++ \lrf \cdot \Rbar_{k+1}\,\log p_\theta(x_{t_{k+1}}|x_{t_k})
+}
+\label{eq:loss_avg}
+\end{equation}
+
+其中 $\Rbar_{k+1}$ 基于 averaged target $\mubar$ 计算。
+
+\subsection{与 Per-Teacher KL 的关系}
+
+\begin{proposition}[Jensen 下界]
+\begin{equation}
+D_k^{\mathrm{avg}} = \frac{1}{2\sigbar_k^2 d}\|\mutheta^k - \mubar^k\|^2
+\;\leq\; \frac{1}{M}\sum_{m=1}^M D_k^{(m)}
+\end{equation}
+即 average loss 是各 teacher per-step KL 均值的下界。等号成立当且仅当所有 teacher 预测一致。
+\end{proposition}
+
+\begin{proof}
+由 $\|a - \bar{b}\|^2 \leq \frac{1}{M}\sum_m \|a - b_m\|^2$（Jensen 不等式应用于凸函数 $\|\cdot\|^2$）。
+\end{proof}
+
+\subsection{有效梯度}
+
+\begin{equation}
+\nabla_\theta \loss_k^{\mathrm{avg,\,path}} = \frac{\lpath}{\sigbar_k^2 d}\,
+\bigl(\mutheta^k - \mubar^k\bigr)^\top \nabla_\theta \mutheta^k
+= \frac{\lpath}{\sigbar_k^2 d}\left(\frac{1}{M}\sum_m \delta_m^k\right)^\top J_k
+\end{equation}
+其中 $\delta_m^k = \mutheta^k - \muphi^{(m),k}$，$J_k = \nabla_\theta \mutheta^k$。
+
+\begin{remark}
+Student 向所有 teacher 的``共识预测''做 MSE regression。等价于对 teacher 输出分布做一阶矩匹配（moment matching）。
+\end{remark}
+
+%% ============================================================
+\section{Sum（Loss 标量空间求和）}
+\label{sec:sum}
+%% ============================================================
+
+\begin{tcolorbox}[colback=orange!5, colframe=orange!50]
+\textbf{Aggregation 空间：Loss/scalar 空间} — 各 teacher 独立计算 per-step KL，标量相加
+\end{tcolorbox}
+
+\subsection{Loss 公式}
+
+\begin{equation}
+\boxed{
+\loss_k^{\mathrm{sum}}(\theta) = \sum_{m=1}^M \left[
+\frac{\lpath}{2\sigbar_k^2 d}\,\|\mutheta^k - \muphi^{(m),k}\|^2
++ \lrf \cdot \Rbar_{k+1}^{(m)}\,\log p_\theta(x_{t_{k+1}}|x_{t_k})
+\right]
+}
+\label{eq:loss_sum}
+\end{equation}
+
+Pathwise 项展开：
+\begin{equation}
+\loss_k^{\mathrm{sum,\,path}}(\theta) = \frac{\lpath}{2\sigbar_k^2 d}\sum_{m=1}^M \|\mutheta^k - \muphi^{(m),k}\|^2
+\label{eq:loss_sum_path}
+\end{equation}
+
+\subsection{梯度}
+
+\begin{equation}
+\nabla_\theta \loss_k^{\mathrm{sum,\,path}} = \frac{\lpath}{\sigbar_k^2 d}\sum_{m=1}^M \delta_m^{k\,\top} J_k
+= \frac{\lpath}{\sigbar_k^2 d}\left(\sum_m \delta_m^k\right)^\top J_k
+\end{equation}
+
+各 teacher 梯度\textbf{无条件叠加}，不做任何冲突处理。
+
+\subsection{与 Average 的恒等关系}
+
+\begin{proposition}[Bias-Variance 分解]
+\begin{equation}
+\sum_{m=1}^M \|\mutheta^k - \muphi^{(m),k}\|^2
+= M\,\|\mutheta^k - \mubar^k\|^2 + \underbrace{\sum_{m=1}^M \|\muphi^{(m),k} - \mubar^k\|^2}_{\text{const w.r.t.}\;\theta}
+\label{eq:bias_variance}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+展开 $\|\mutheta - \muphi^{(m)}\|^2 = \|(\mutheta - \mubar) + (\mubar - \muphi^{(m)})\|^2$，交叉项求和为零。
+\end{proof}
+
+\begin{remark}[Sum $\equiv$ Average 梯度等价]
+由~\eqref{eq:bias_variance}，pathwise 项的梯度满足：
+\begin{equation}
+\nabla_\theta \loss_k^{\mathrm{sum,\,path}} = M \cdot \nabla_\theta \loss_k^{\mathrm{avg,\,path}}
+\end{equation}
+因此 \texttt{sum} 与 \texttt{average} 在纯 pathwise loss 下\textbf{梯度方向完全相同}（仅差常数倍 $M$）。但由于 REINFORCE 项中 $\Rbar_{k+1}^{(m)}$ 是 per-teacher 的（vs.\ average 使用共享的 $\Rbar_{k+1}$），总体梯度在 $\lrf > 0$ 时并不完全等比。
+\end{remark}
+
+%% ============================================================
+\section{PCGrad（Parameter/Gradient 空间投影）}
+\label{sec:pcgrad}
+%% ============================================================
+
+\begin{tcolorbox}[colback=red!5, colframe=red!50]
+\textbf{Aggregation 空间：Full parameter space $\R^P$} — 计算每个 teacher 的完整参数梯度，在梯度空间做冲突投影
+\end{tcolorbox}
+
+\subsection{Per-Teacher Loss}
+
+每个 teacher 独立定义一个标量 loss：
+\begin{equation}
+\ell_k^{(m)}(\theta) = \frac{\lpath}{2\sigbar_k^2 d}\,\|\mutheta^k - \muphi^{(m),k}\|^2
++ \lrf \cdot \Rbar_{k+1}^{(m)}\,\log p_\theta(x_{t_{k+1}}|x_{t_k})
+\label{eq:per_teacher_loss}
+\end{equation}
+
+\subsection{Per-Teacher 梯度}
+
+对每步 $k$，通过 $M$ 次独立 backward 获取：
+\begin{equation}
+g_m^k = \nabla_\theta \ell_k^{(m)} \;\in\; \R^P, \quad m = 1,\ldots,M
+\end{equation}
+
+\subsection{PCGrad 投影算法}
+
+\begin{algorithm}[H]
+\caption{PCGrad Projection in Parameter Space}
+\label{alg:pcgrad}
+\begin{algorithmic}[1]
+\Require $M$ gradient vectors $\{g_1, \ldots, g_M\} \subset \R^P$
+\Ensure Projected blended gradient $g^{\mathrm{blend}} \in \R^P$
+\State $\tilde{g}_m \gets g_m$ for all $m$
+\For{$i = 1, \ldots, M$}
+    \For{$j \in \{1,\ldots,M\} \setminus \{i\}$}
+        \If{$\langle \tilde{g}_i,\, g_j \rangle < 0$} \Comment{冲突检测}
+            \State $\tilde{g}_i \gets \tilde{g}_i - \dfrac{\langle \tilde{g}_i,\, g_j \rangle}{\|g_j\|^2}\, g_j$ \Comment{投影去除冲突分量}
+        \EndIf
+    \EndFor
+\EndFor
+\State \Return $g^{\mathrm{blend}} = \sum_{m=1}^M \tilde{g}_m$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{数学形式}
+
+PCGrad \textbf{不显式定义}一个标量 loss，而是直接定义有效梯度更新方向：
+\begin{equation}
+\boxed{
+g_k^{\mathrm{pcgrad}} = \sum_{m=1}^M \tilde{g}_m^k,
+\quad\text{where}\quad
+\tilde{g}_m^k = g_m^k - \sum_{\substack{j=1\\j\neq m}}^M \min\!\bigl(0,\;\langle g_m^k, g_j^k\rangle\bigr)\,\frac{g_j^k}{\|g_j^k\|^2}
+}
+\label{eq:pcgrad_grad}
+\end{equation}
+
+跨时间步累积：
+\begin{equation}
+g^{\mathrm{total}} = \frac{1}{T}\sum_{k=0}^{T-1} g_k^{\mathrm{pcgrad}}
+\label{eq:pcgrad_total}
+\end{equation}
+
+\subsection{几何解释}
+
+对每对 $(i,j)$：若 $g_i \cdot g_j < 0$（两 teacher 梯度方向冲突），则将 $g_i$ 投影到与 $g_j$ 正交的子空间：
+\begin{equation}
+\tilde{g}_i = g_i - \mathrm{proj}_{g_j}(g_i) = g_i - \frac{\langle g_i, g_j\rangle}{\|g_j\|^2}\,g_j
+\quad\Longrightarrow\quad \langle \tilde{g}_i,\, g_j\rangle = 0
+\end{equation}
+
+\subsection{计算复杂度}
+
+\begin{itemize}[leftmargin=1.5em]
+\item 每 timestep 需要 $M$ 次 backward pass（\texttt{retain\_graph=True}）
+\item 内存：$O(M \times P)$（存储 $M$ 个梯度快照）
+\item 不兼容 DeepSpeed ZeRO（多次 backward 破坏 ZeRO gradient bucket 状态）
+\end{itemize}
+
+%% ============================================================
+\section{V-PCGrad（Velocity/Prediction 空间投影）}
+\label{sec:v_pcgrad}
+%% ============================================================
+
+\begin{tcolorbox}[colback=purple!5, colframe=purple!50]
+\textbf{Aggregation 空间：Velocity (prediction residual) 空间 $\R^d$} — 在 latent 预测残差方向上做冲突投影，然后融合为单一 target
+\end{tcolorbox}
+
+\subsection{核心思想}
+
+将 PCGrad 的冲突投影从高维参数空间 $\R^P$ 降维到低维 latent 空间 $\R^d$（$d = C\!\times\!H\!\times\!W \ll P$）。
+
+\subsection{Velocity Residual 定义}
+
+\begin{definition}[Per-Teacher Velocity Residual]
+\begin{equation}
+v_m^k = \muphi^{(m),k} - \mutheta^k\big|_{\detach} \;\in\; \R^{B \times C \times H \times W}
+\label{eq:velocity_residual}
+\end{equation}
+即 teacher $m$ 相对于当前 student 预测的``拉力方向''（detach 断梯度）。
+\end{definition}
+
+\subsection{PCGrad 投影（Velocity 空间）}
+
+\begin{algorithm}[H]
+\caption{PCGrad Projection in Velocity Space (per-sample)}
+\label{alg:v_pcgrad}
+\begin{algorithmic}[1]
+\Require $M$ velocity tensors $\{v_1, \ldots, v_M\} \subset \R^{B \times d}$，tolerance $\epsilon$
+\Ensure Fused velocity $v^{\mathrm{fused}} \in \R^{B \times d}$
+\State $\tilde{v}_m \gets v_m$ for all $m$
+\State $n_j \gets \|v_j\|_{\mathrm{spatial}}^2 = \sum_{c,h,w} (v_j)_{c,h,w}^2 \in \R^B$ for all $j$, clamped $\geq \epsilon$
+\For{$i = 1, \ldots, M$}
+    \For{$j \in \{1,\ldots,M\} \setminus \{i\}$}
+        \State $\mathrm{dot}_{ij} \gets \sum_{c,h,w} (\tilde{v}_i)_{c,h,w} \cdot (v_j)_{c,h,w} \;\in\; \R^B$ \Comment{per-sample 内积}
+        \State $\tilde{v}_i \gets \tilde{v}_i - \mathbb{1}[\mathrm{dot}_{ij} < 0]\;\dfrac{\mathrm{dot}_{ij}}{n_j}\,v_j$ \Comment{per-sample 条件投影}
+    \EndFor
+\EndFor
+\State \Return $v^{\mathrm{fused}} = \sum_{m=1}^M \tilde{v}_m$
+\end{algorithmic}
+\end{algorithm}
+
+\noindent 数学公式：
+\begin{equation}
+\tilde{v}_m^k = v_m^k - \sum_{\substack{j=1\\j\neq m}}^M
+\min\!\left(0,\;\frac{\langle v_m^k,\, v_j^k\rangle_{\mathrm{sp}}}{\|v_j^k\|_{\mathrm{sp}}^2}\right) v_j^k
+\label{eq:v_pcgrad_proj}
+\end{equation}
+其中内积和范数在空间维度上 per-sample 独立计算：
+\begin{equation}
+\langle v_m, v_j \rangle_{\mathrm{sp}}^{(b)} = \sum_{c,h,w} v_m^{(b,c,h,w)}\, v_j^{(b,c,h,w)} \;\in\; \R
+\end{equation}
+
+\subsection{Fused Teacher Target}
+
+\begin{equation}
+\mu_T^{\mathrm{fused},k} = \mutheta^k\big|_{\detach} + \sum_{m=1}^M \tilde{v}_m^k
+\label{eq:fused_target}
+\end{equation}
+
+\subsection{Loss 公式}
+
+\begin{equation}
+\boxed{
+\loss_k^{\mathrm{v\text{-}pcgrad}}(\theta) = \frac{\lpath}{2\sigbar_k^2 d}\,
+\bigl\|\mutheta^k - \mu_T^{\mathrm{fused},k}\bigr\|^2
++ \lrf \cdot \Rbar_{k+1}\,\log p_\theta(x_{t_{k+1}}|x_{t_k})
+}
+\label{eq:loss_vpcgrad}
+\end{equation}
+
+其中 $\Rbar_{k+1} = \frac{1}{M}\sum_{m=1}^M \Rbar_{k+1}^{(m)}$。
+
+\subsection{梯度形式}
+
+由于 $\mu_T^{\mathrm{fused},k}$ 相对于 $\theta$ 是 detached 的（基于 $\mutheta|_{\detach}$ 构造）：
+\begin{equation}
+\nabla_\theta \loss_k^{\mathrm{v\text{-}pcgrad,\,path}}
+= \frac{\lpath}{\sigbar_k^2 d}\,\bigl(\mutheta^k - \mu_T^{\mathrm{fused},k}\bigr)^\top \nabla_\theta \mutheta^k
+\label{eq:grad_vpcgrad}
+\end{equation}
+
+代入~\eqref{eq:fused_target}：
+\begin{equation}
+\mutheta^k - \mu_T^{\mathrm{fused},k}
+= \mutheta^k - \mutheta^k\big|_{\detach} - \sum_m \tilde{v}_m^k
+= -\sum_m \tilde{v}_m^k
+\quad\text{(at evaluation point)}
+\end{equation}
+
+因此：
+\begin{equation}
+\nabla_\theta \loss_k^{\mathrm{v\text{-}pcgrad,\,path}}
+= -\frac{\lpath}{\sigbar_k^2 d}\left(\sum_m \tilde{v}_m^k\right)^\top J_k
+= -\frac{\lpath}{\sigbar_k^2 d}\,\bigl(\PC(\{v_m^k\}_m)\bigr)^\top J_k
+\end{equation}
+
+\subsection{与 Gradient-Space PCGrad 的关系}
+
+\begin{proposition}[近似等价性]
+设 $J_k = \nabla_\theta \mutheta^k \in \R^{d \times P}$ 为 student 的 Jacobian。Gradient-space PCGrad 中第 $m$ 个 teacher 的 pathwise 梯度为：
+\begin{equation}
+g_m^k = -\frac{\lpath}{\sigbar_k^2 d}\,(v_m^k)^\top J_k \;\in\; \R^P
+\end{equation}
+
+\noindent Gradient-space PCGrad 对 $\{g_m^k\}_m$ 投影：
+\begin{equation}
+g^{\mathrm{pcgrad}}_k = \PC\!\bigl(\{(v_m^k)^\top J_k\}_m\bigr) \cdot \left(-\frac{\lpath}{\sigbar_k^2 d}\right)
+\end{equation}
+
+\noindent V-PCGrad 的有效梯度为：
+\begin{equation}
+g^{\mathrm{v\text{-}pcgrad}}_k = \bigl(\PC(\{v_m^k\}_m)\bigr)^\top J_k \cdot \left(-\frac{\lpath}{\sigbar_k^2 d}\right)
+\end{equation}
+
+两者的关系：
+\begin{equation}
+\boxed{
+\PC\!\bigl(\{v_m^\top J\}_m\bigr) \;\approx\; \bigl(\PC(\{v_m\}_m)\bigr)^\top J
+}
+\label{eq:approx_relation}
+\end{equation}
+
+等式成立条件：$J$ 为正交矩阵（或所有 sample 共享相同的 $J$）。当 Jacobian 在 batch 内变化较小时，近似精度较高。
+\end{proposition}
+
+\subsection{计算复杂度对比}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+& \textbf{PCGrad (gradient space)} & \textbf{V-PCGrad (velocity space)} \\
+\midrule
+投影空间维度 & $P$ (模型参数量) & $d = C\!\times\!H\!\times\!W$ (latent 维度) \\
+Backward/timestep & $M$ & $1$ \\
+梯度存储 & $O(M \times P)$ & $O(M \times d)$ \\
+DeepSpeed 兼容 & \ding{55} & \ding{51} \\
+精确性 & 精确 & 近似 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{总结对比}
+\label{sec:comparison}
+%% ============================================================
+
+\subsection{有效 Target 与 Loss 形式}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.6}
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{模式} & \textbf{有效 Target $\mu_T^k$} & \textbf{Pathwise Loss $\loss_k^{\mathrm{path}}$} \\
+\midrule
+\texttt{round\_robin}
+& $\muphi^{(m^*),k}$
+& $\dfrac{\lpath}{2\sigbar_k^2 d}\|\mutheta^k - \muphi^{(m^*),k}\|^2$ \\[6pt]
+\texttt{average}
+& $\dfrac{1}{M}\sum_m \muphi^{(m),k}$
+& $\dfrac{\lpath}{2\sigbar_k^2 d}\bigl\|\mutheta^k - \dfrac{1}{M}\sum_m \muphi^{(m),k}\bigr\|^2$ \\[6pt]
+\texttt{sum}
+& 各 $\muphi^{(m),k}$ 独立
+& $\dfrac{\lpath}{2\sigbar_k^2 d}\sum_m\|\mutheta^k - \muphi^{(m),k}\|^2$ \\[6pt]
+\texttt{pcgrad}
+& 各 $\muphi^{(m),k}$ 独立
+& 无显式 loss；$g_k = \PC(\{\nabla_\theta \ell_k^{(m)}\}_m)$ \\[6pt]
+\texttt{v\_pcgrad}
+& $\mutheta^k|_{\det}\!+ \sum_m \tilde{v}_m^k$
+& $\dfrac{\lpath}{2\sigbar_k^2 d}\bigl\|\mutheta^k - \mu_T^{\mathrm{fused},k}\bigr\|^2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{有效梯度方向}
+
+设 $J_k = \nabla_\theta \mutheta^k$，$\delta_m^k = \mutheta^k - \muphi^{(m),k} = -v_m^k$：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{模式} & \textbf{有效梯度} $\nabla_\theta \loss_k^{\mathrm{path}} \propto$ & \textbf{投影空间} \\
+\midrule
+\texttt{round\_robin} & $(\delta_{m^*}^k)^\top J_k$ & --- \\
+\texttt{average} & $\bigl(\frac{1}{M}\sum_m \delta_m^k\bigr)^\top J_k$ & $\R^d$ (隐式均值) \\
+\texttt{sum} & $\bigl(\sum_m \delta_m^k\bigr)^\top J_k$ & --- (无投影) \\
+\texttt{pcgrad} & $\sum_m \PC(\delta_m^{k\,\top} J_k)$ & $\R^P$ \\
+\texttt{v\_pcgrad} & $\bigl(\PC(\{-\delta_m^k\}_m)\bigr)^\top J_k$ & $\R^d$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{核心 Insight}
+
+\begin{tcolorbox}[colback=yellow!5, colframe=yellow!60!black]
+\begin{itemize}[leftmargin=1em]
+\item 所有模式的 pathwise loss 本质上都是\textbf{同方差高斯 KL}（$= $ time-weighted MSE），区别仅在于\textbf{如何构造 regression target}。
+\item \texttt{sum} 与 \texttt{average} 在纯 pathwise loss 下\textbf{梯度方向等价}（Bias-Variance 分解恒等式~\eqref{eq:bias_variance}）。
+\item \texttt{v\_pcgrad} 是 \texttt{pcgrad} 的高效近似：将冲突投影从 $\R^P$ 降维到 $\R^d$（\eqref{eq:approx_relation}），代价是丢失 Jacobian 各向异性信息，换来单次 backward + DeepSpeed 兼容。
+\item 从信息论角度：\texttt{average} 等价于对 teacher mixture 做 moment matching（一阶矩）；\texttt{pcgrad}/\texttt{v\_pcgrad} 则保留了 per-teacher 的 ``方向性'' 信息并显式处理冲突。
+\end{itemize}
+\end{tcolorbox}
+
+%% ============================================================
+\section{Source Routing 扩展}
+\label{sec:source_routing}
+%% ============================================================
+
+当 \texttt{teacher\_route\_by\_source=True} 时，每个 teacher $m$ 仅对其适用的样本子集 $\mathcal{B}_m \subseteq \{1,\ldots,B\}$ 有效。
+
+\subsection{Sum / PCGrad 模式}
+
+Loss 中只对 $b \in \mathcal{B}_m$ 的样本求均值：
+\begin{equation}
+\ell_k^{(m)} = \frac{\lpath}{2\sigbar_k^2 d}\,\frac{1}{|\mathcal{B}_m|}\sum_{b \in \mathcal{B}_m}
+\|\mutheta^{k,(b)} - \muphi^{(m),k,(b)}\|^2
+\end{equation}
+
+\subsection{V-PCGrad 模式}
+
+通过 mask 将不适用样本的 velocity 置零：
+\begin{equation}
+v_m^{k,(b)} = \begin{cases}
+\muphi^{(m),k,(b)} - \mutheta^{k,(b)}\big|_{\det} & \text{if } b \in \mathcal{B}_m \\[4pt]
+\bm{0} & \text{if } b \notin \mathcal{B}_m
+\end{cases}
+\end{equation}
+
+零向量与任何向量的内积为 0，因此不参与冲突检测，也不被其他 teacher 投影影响。这实现了``不适用 teacher 被动退出''的语义。
+
+\end{document}
