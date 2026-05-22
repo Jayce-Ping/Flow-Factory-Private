@@ -1665,17 +1665,20 @@ class OPDTrainer(BaseTrainer):
         loss_info: Dict[str, List[torch.Tensor]],
         batch_samples: Optional[List["BaseSample"]] = None,
     ) -> Dict[str, List[torch.Tensor]]:
-        """PCGrad main pass: per-timestep K gradient computations + projection + accumulation.
+        """PCGrad main pass: per-timestep K backward + PCGrad projection + accumulation.
 
         Unlike the standard _optimize_train_pass, this method:
         1. Computes K per-teacher losses per timestep
-        2. Computes K gradients via torch.autograd.grad (no DeepSpeed hook conflict)
+        2. Performs K backward passes with retain_graph
         3. Applies PCGrad projection to resolve conflicts
         4. Accumulates projected gradients across all T timesteps
-        5. Injects the final gradient via a surrogate backward for DeepSpeed compatibility
+        5. Sets p.grad directly and steps the optimizer
 
-        This ensures conflicting teacher signals are resolved per-timestep while
-        maintaining smooth gradient accumulation across the trajectory.
+        **Incompatible with DeepSpeed ZeRO.** DeepSpeed hooks into the C++
+        autograd engine and triggers gradient all-reduce on every backward
+        pass. Multiple backward(retain_graph=True) calls corrupt ZeRO's
+        internal gradient bucket state. Use ``v_pcgrad`` (velocity-space
+        PCGrad) for DeepSpeed, or switch to DDP for gradient-space PCGrad.
 
         GAS compatibility: wraps the batch-level logic with
         ``accelerator.accumulate()`` so cross-batch accumulation (base_GAS > 1)
@@ -1683,6 +1686,17 @@ class OPDTrainer(BaseTrainer):
         accumulation is handled here; external GAS only controls how many
         batches to accumulate before stepping.
         """
+        # DeepSpeed ZeRO incompatibility check
+        if hasattr(self.accelerator, "deepspeed_config") and self.accelerator.deepspeed_config:
+            raise RuntimeError(
+                "teacher_aggregation='pcgrad' is incompatible with DeepSpeed ZeRO "
+                "(multiple backward passes trigger repeated gradient all-reduce). "
+                "Solutions:\n"
+                "  1. Use teacher_aggregation='v_pcgrad' (velocity-space PCGrad, "
+                "single backward, fully DeepSpeed-compatible)\n"
+                "  2. Switch to DDP (remove DeepSpeed config) for gradient-space PCGrad"
+            )
+
         device = self.accelerator.device
         trainable_params = list(self.adapter.get_trainable_parameters())
         K = len(teacher_indices)
@@ -1779,22 +1793,20 @@ class OPDTrainer(BaseTrainer):
                         per_teacher_active.append(True)
                         loss_info[f"d_k_teacher_{teacher_k}"].append(d_k_masked.mean().detach())
 
-                    # K gradient computations via torch.autograd.grad (avoids
-                    # DeepSpeed backward hooks that trigger premature all-reduce).
-                    # Only compute for active teachers (those with applicable samples).
+                    # K backward passes -> K gradient snapshots
+                    # retain_graph must stay True through the last teacher if KL loss
+                    # will also backward through the same student_out graph.
+                    # Only backward active teachers (those with applicable samples).
                     per_teacher_grads: List[List[torch.Tensor]] = []
                     active_indices = [i for i, active in enumerate(per_teacher_active) if active]
                     for pos, teacher_k in enumerate(active_indices):
+                        self.optimizer.zero_grad()
                         is_last_active = (pos == len(active_indices) - 1)
                         retain = (not is_last_active) or self.enable_kl_loss
-                        grads = torch.autograd.grad(
-                            per_teacher_losses[teacher_k],
-                            trainable_params,
-                            retain_graph=retain,
-                        )
+                        per_teacher_losses[teacher_k].backward(retain_graph=retain)
                         grad_snapshot = [
-                            g.detach().clone() if g is not None else torch.zeros_like(p)
-                            for g, p in zip(grads, trainable_params)
+                            p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                            for p in trainable_params
                         ]
                         per_teacher_grads.append(grad_snapshot)
 
@@ -1809,13 +1821,12 @@ class OPDTrainer(BaseTrainer):
 
                     # Optional KL anchor (shared, not part of PCGrad conflict resolution)
                     if self.enable_kl_loss:
+                        self.optimizer.zero_grad()
                         kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
-                        kl_grads = torch.autograd.grad(
-                            kl_loss, trainable_params, retain_graph=False,
-                        )
-                        for i, g in enumerate(kl_grads):
-                            if g is not None:
-                                projected[i] = projected[i] + g.detach()
+                        kl_loss.backward()
+                        for i, p in enumerate(trainable_params):
+                            if p.grad is not None:
+                                projected[i] = projected[i] + p.grad
                         loss_info["kl_div"].append(kl_div.detach())
                         loss_info["kl_loss"].append(kl_loss.detach())
 
@@ -1832,16 +1843,10 @@ class OPDTrainer(BaseTrainer):
                     loss_info["loss"].append(avg_loss)
                     loss_info["log_prob"].append(log_prob_new.mean().detach())
 
-            # Inject the projected gradient into DeepSpeed's gradient pipeline
-            # via a surrogate scalar whose autograd gradient equals batch_grad/T.
-            # Direct p.grad assignment bypasses ZeRO's partitioned gradient buffers.
+            # Set this batch's gradient contribution (averaged over T timesteps).
             self.optimizer.zero_grad()
-            avg_grad = [g / T for g in batch_grad]
-            surrogate = sum(
-                (p * g.detach()).sum()
-                for p, g in zip(trainable_params, avg_grad)
-            )
-            self.accelerator.backward(surrogate)
+            for i, p in enumerate(trainable_params):
+                p.grad = batch_grad[i] / T
 
         # Clip + step when sync_gradients becomes True (GAS counter reached)
         if self.accelerator.sync_gradients:

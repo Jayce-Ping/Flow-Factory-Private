@@ -1,17 +1,18 @@
 # Experiment: OPD Pathwise-Only — teacher_aggregation = 'pcgrad'
 #
-# All M teachers active at every timestep. Per-teacher losses computed
-# independently, K backward passes performed per timestep, then PCGrad
-# projects conflicting gradients to resolve inter-teacher disagreements.
+# Gradient-space PCGrad: K backward passes per timestep, PCGrad projection.
+#
+# ⚠️ REQUIRES DDP (not DeepSpeed ZeRO). DeepSpeed's parameter-level backward
+# hooks are incompatible with multiple backward(retain_graph=True) calls.
+# For DeepSpeed, use pathwise_v_pcgrad.yaml instead.
 #
 # Loss: L_m = pathwise_coef × mean(||μ_S - μ_T^m||²)
 # Gradient: PCGrad(∇L_0, ∇L_1, ..., ∇L_{M-1}) → projected gradient
 #
 # Characteristics:
 #   - Most expensive: K backward passes per timestep (retain_graph)
-#   - PCGrad resolves conflicting teacher signals
-#   - GAS = base_GAS = 9 (internal T-step accumulation is manual, not per-timestep)
-#   - Gradient conflicts logged for analysis
+#   - PCGrad resolves conflicting teacher signals in full parameter space
+#   - GAS = base_GAS = 9 (internal T-step accumulation is manual)
 #   - With route_by_source: each teacher only has grad on its source samples
 
 launcher: "accelerate"
