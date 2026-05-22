@@ -105,6 +105,7 @@ train:
   ema_device: "cuda"
 
   enable_gradient_checkpointing: false
+  max_epochs: 200
   seed: 42
 
 # Scheduler — ODE (required for diffusion-opd trainer)
