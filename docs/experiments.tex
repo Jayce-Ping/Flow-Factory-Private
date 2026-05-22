@@ -10,7 +10,7 @@
 
 \title{Flow-Factory OPD \& Ensemble Eval Experiments}
 \author{Flow-Factory}
-\date{Generated 2026-05-22 09:31 UTC from W\&B project \texttt{Flow-Factory-OPD-Experiments}}
+\date{Generated 2026-05-22 12:29 UTC from W\&B project \texttt{Flow-Factory-OPD-Experiments}}
 
 \begin{document}
 \maketitle
@@ -28,6 +28,7 @@ Multi-teacher rows use \textsc{Avg} unless marked \textsc{PCGrad}.
 Table~1: \textbf{bold} = single-teacher in-domain; gray = multi-teacher
 in-domain; red/blue = change vs.\ max single-teacher baseline in that row.
 OPD rows (\textit{peak}) use the maximum eval logged so far.
+Route: $\checkmark$ = \texttt{teacher\_route\_by\_source}; $\times$ = off or not teacher-specific (e.g.\ \texttt{pw-avg}).
 \end{sloppypar}
 
 \section{Main Results}
@@ -39,29 +40,29 @@ OPD rows (\textit{peak}) use the maximum eval logged so far.
 \label{tab:main-results}
 \footnotesize
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{@{}ll|cc|c|cc@{}}
+\begin{tabular}{@{}llc|cc|c|cc@{}}
 \toprule
- &  & \multicolumn{2}{c}{GenEval benchmark} & \multicolumn{1}{c}{PickScore benchmark} & \multicolumn{2}{c}{OCR benchmark} \\
-\cmidrule(lr){3-4} \cmidrule(lr){5-5} \cmidrule(lr){6-7}
-Config. & Agg. & GenEval & PickScore & PickScore & OCR & PickScore \\
+ &  &  & \multicolumn{2}{c}{GenEval benchmark} & \multicolumn{1}{c}{PickScore benchmark} & \multicolumn{2}{c}{OCR benchmark} \\
+\cmidrule(lr){4-5} \cmidrule(lr){6-6} \cmidrule(lr){7-8}
+Config. & Route & Agg. & GenEval & PickScore & PickScore & OCR & PickScore \\
 \midrule
-\multicolumn{7}{@{}l}{\textit{Ensemble eval (offline, last eval)}} \\
-SD3.5 (base) & --- & 0.657 & 0.875 & 0.835 & 0.574 & 0.866 \\
-geneval & --- & \textbf{0.937} & 0.888 & 0.829 & 0.656 & 0.862 \\
-ocr & --- & 0.685 & 0.876 & 0.837 & \textbf{0.931} & 0.869 \\
-pickscore & --- & 0.641 & 0.918 & \textbf{0.895} & 0.690 & 0.915 \\
-geneval+ocr & \textsc{Avg} & \cellcolor{gray!20}0.850{\footnotesize\textcolor{red}{-0.087}} & 0.888{\footnotesize\textcolor{red}{-0.000}} & 0.837{\footnotesize\textcolor{blue}{+0.000}} & \cellcolor{gray!20}0.875{\footnotesize\textcolor{red}{-0.055}} & 0.874{\footnotesize\textcolor{blue}{+0.005}} \\
-geneval+pickscore & \textsc{Avg} & \cellcolor{gray!20}0.830{\footnotesize\textcolor{red}{-0.107}} & 0.908{\footnotesize\textcolor{red}{-0.010}} & \cellcolor{gray!20}0.873{\footnotesize\textcolor{red}{-0.021}} & 0.675{\footnotesize\textcolor{red}{-0.015}} & 0.899{\footnotesize\textcolor{red}{-0.017}} \\
-ocr+pickscore & \textsc{Avg} & 0.680{\footnotesize\textcolor{red}{-0.005}} & 0.901{\footnotesize\textcolor{red}{-0.017}} & \cellcolor{gray!20}0.873{\footnotesize\textcolor{red}{-0.022}} & \cellcolor{gray!20}0.865{\footnotesize\textcolor{red}{-0.066}} & 0.899{\footnotesize\textcolor{red}{-0.016}} \\
-geneval+ocr+pickscore & \textsc{PCGrad} & \cellcolor{gray!20}0.794{\footnotesize\textcolor{red}{-0.143}} & 0.901{\footnotesize\textcolor{red}{-0.017}} & \cellcolor{gray!20}0.864{\footnotesize\textcolor{red}{-0.031}} & \cellcolor{gray!20}0.844{\footnotesize\textcolor{red}{-0.087}} & 0.894{\footnotesize\textcolor{red}{-0.022}} \\
+\multicolumn{8}{@{}l}{\textit{Ensemble eval (offline, last eval)}} \\
+SD3.5 (base) & --- & --- & 0.657 & 0.875 & 0.835 & 0.574 & 0.866 \\
+geneval & --- & --- & \textbf{0.937} & 0.888 & 0.829 & 0.656 & 0.862 \\
+ocr & --- & --- & 0.685 & 0.876 & 0.837 & \textbf{0.931} & 0.869 \\
+pickscore & --- & --- & 0.641 & 0.918 & \textbf{0.895} & 0.690 & 0.915 \\
+geneval+ocr & --- & \textsc{Avg} & \cellcolor{gray!20}0.850{\footnotesize\textcolor{red}{-0.087}} & 0.888{\footnotesize\textcolor{red}{-0.000}} & 0.837{\footnotesize\textcolor{blue}{+0.000}} & \cellcolor{gray!20}0.875{\footnotesize\textcolor{red}{-0.055}} & 0.874{\footnotesize\textcolor{blue}{+0.005}} \\
+geneval+pickscore & --- & \textsc{Avg} & \cellcolor{gray!20}0.830{\footnotesize\textcolor{red}{-0.107}} & 0.908{\footnotesize\textcolor{red}{-0.010}} & \cellcolor{gray!20}0.873{\footnotesize\textcolor{red}{-0.021}} & 0.675{\footnotesize\textcolor{red}{-0.015}} & 0.899{\footnotesize\textcolor{red}{-0.017}} \\
+ocr+pickscore & --- & \textsc{Avg} & 0.680{\footnotesize\textcolor{red}{-0.005}} & 0.901{\footnotesize\textcolor{red}{-0.017}} & \cellcolor{gray!20}0.873{\footnotesize\textcolor{red}{-0.022}} & \cellcolor{gray!20}0.865{\footnotesize\textcolor{red}{-0.066}} & 0.899{\footnotesize\textcolor{red}{-0.016}} \\
+geneval+ocr+pickscore & --- & \textsc{PCGrad} & \cellcolor{gray!20}0.794{\footnotesize\textcolor{red}{-0.143}} & 0.901{\footnotesize\textcolor{red}{-0.017}} & \cellcolor{gray!20}0.864{\footnotesize\textcolor{red}{-0.031}} & \cellcolor{gray!20}0.844{\footnotesize\textcolor{red}{-0.087}} & 0.894{\footnotesize\textcolor{red}{-0.022}} \\
 \addlinespace
-\multicolumn{7}{@{}l}{\textit{OPD training (running, peak eval)}} \\
-pw-avg & \textsc{Avg}{\footnotesize\,peak} & \cellcolor{gray!20}0.787{\footnotesize\textcolor{red}{-0.150}} & 0.898{\footnotesize\textcolor{red}{-0.020}} & \cellcolor{gray!20}0.861{\footnotesize\textcolor{red}{-0.034}} & \cellcolor{gray!20}0.830{\footnotesize\textcolor{red}{-0.101}} & 0.893{\footnotesize\textcolor{red}{-0.023}} \\
-pw-sum & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.744{\footnotesize\textcolor{red}{-0.193}} & 0.895{\footnotesize\textcolor{red}{-0.023}} & \cellcolor{gray!20}0.857{\footnotesize\textcolor{red}{-0.037}} & \cellcolor{gray!20}0.793{\footnotesize\textcolor{red}{-0.138}} & 0.891{\footnotesize\textcolor{red}{-0.025}} \\
-pw-sum-rbs & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.810{\footnotesize\textcolor{red}{-0.127}} & 0.889{\footnotesize\textcolor{red}{-0.029}} & \cellcolor{gray!20}0.874{\footnotesize\textcolor{red}{-0.020}} & \cellcolor{gray!20}0.884{\footnotesize\textcolor{red}{-0.046}} & 0.883{\footnotesize\textcolor{red}{-0.032}} \\
-v-pcgrad & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.808{\footnotesize\textcolor{red}{-0.129}} & 0.889{\footnotesize\textcolor{red}{-0.029}} & \cellcolor{gray!20}0.872{\footnotesize\textcolor{red}{-0.022}} & \cellcolor{gray!20}0.873{\footnotesize\textcolor{red}{-0.058}} & 0.884{\footnotesize\textcolor{red}{-0.032}} \\
-v-pcg-nr & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.747{\footnotesize\textcolor{red}{-0.190}} & 0.896{\footnotesize\textcolor{red}{-0.022}} & \cellcolor{gray!20}0.857{\footnotesize\textcolor{red}{-0.038}} & \cellcolor{gray!20}0.787{\footnotesize\textcolor{red}{-0.144}} & 0.890{\footnotesize\textcolor{red}{-0.025}} \\
-diff-opd-rbs & \textsc{D-OPD}{\footnotesize\,peak} & \cellcolor{gray!20}0.909{\footnotesize\textcolor{red}{-0.028}} & 0.892{\footnotesize\textcolor{red}{-0.026}} & \cellcolor{gray!20}0.886{\footnotesize\textcolor{red}{-0.008}} & \cellcolor{gray!20}0.911{\footnotesize\textcolor{red}{-0.019}} & 0.884{\footnotesize\textcolor{red}{-0.032}} \\
+\multicolumn{8}{@{}l}{\textit{OPD training (running, peak eval)}} \\
+pw-avg & $\times$ & \textsc{Avg}{\footnotesize\,peak} & \cellcolor{gray!20}0.787{\footnotesize\textcolor{red}{-0.150}} & 0.898{\footnotesize\textcolor{red}{-0.019}} & \cellcolor{gray!20}0.861{\footnotesize\textcolor{red}{-0.033}} & \cellcolor{gray!20}0.830{\footnotesize\textcolor{red}{-0.101}} & 0.893{\footnotesize\textcolor{red}{-0.023}} \\
+pw-sum & $\times$ & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.755{\footnotesize\textcolor{red}{-0.182}} & 0.897{\footnotesize\textcolor{red}{-0.021}} & \cellcolor{gray!20}0.859{\footnotesize\textcolor{red}{-0.035}} & \cellcolor{gray!20}0.808{\footnotesize\textcolor{red}{-0.122}} & 0.892{\footnotesize\textcolor{red}{-0.023}} \\
+pw-sum & $\checkmark$ & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.855{\footnotesize\textcolor{red}{-0.082}} & 0.891{\footnotesize\textcolor{red}{-0.026}} & \cellcolor{gray!20}0.878{\footnotesize\textcolor{red}{-0.016}} & \cellcolor{gray!20}0.898{\footnotesize\textcolor{red}{-0.033}} & 0.883{\footnotesize\textcolor{red}{-0.032}} \\
+v-pcgrad & $\times$ & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.756{\footnotesize\textcolor{red}{-0.181}} & 0.897{\footnotesize\textcolor{red}{-0.021}} & \cellcolor{gray!20}0.858{\footnotesize\textcolor{red}{-0.036}} & \cellcolor{gray!20}0.805{\footnotesize\textcolor{red}{-0.126}} & 0.892{\footnotesize\textcolor{red}{-0.024}} \\
+v-pcgrad & $\checkmark$ & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.834{\footnotesize\textcolor{red}{-0.103}} & 0.890{\footnotesize\textcolor{red}{-0.028}} & \cellcolor{gray!20}0.876{\footnotesize\textcolor{red}{-0.018}} & \cellcolor{gray!20}0.895{\footnotesize\textcolor{red}{-0.035}} & 0.884{\footnotesize\textcolor{red}{-0.032}} \\
+diff-opd & $\checkmark$ & \textsc{D-OPD}{\footnotesize\,peak} & \cellcolor{gray!20}0.913{\footnotesize\textcolor{red}{-0.024}} & 0.892{\footnotesize\textcolor{red}{-0.026}} & \cellcolor{gray!20}0.887{\footnotesize\textcolor{red}{-0.008}} & \cellcolor{gray!20}0.917{\footnotesize\textcolor{red}{-0.013}} & 0.884{\footnotesize\textcolor{red}{-0.032}} \\
 \bottomrule
 \end{tabular}
 }
@@ -94,12 +95,12 @@ ocr+pickscore & \textsc{Avg} & 0.387 & 0.490 & 0.711 & 0.867 & 0.550 & 0.778 & 0
 geneval+ocr+pickscore & \textsc{PCGrad} & \cellcolor{gray!20}0.338 & \cellcolor{gray!20}0.625 & \cellcolor{gray!20}0.844 & \cellcolor{gray!20}0.959 & \cellcolor{gray!20}0.650 & \cellcolor{gray!20}0.867 & \cellcolor{gray!20}0.818 & 0.041 & 0.940 & 0.899 & 0.898 & 0.898 & 0.870 & 0.900 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.259 & 0.039 \\
 \addlinespace
 \multicolumn{19}{@{}l}{\textit{OPD training (running, peak eval)}} \\
-pw-avg & \textsc{Avg}{\footnotesize\,peak} & \cellcolor{gray!20}0.393 & \cellcolor{gray!20}0.677 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.957 & \cellcolor{gray!20}0.760 & \cellcolor{gray!20}0.889 & \cellcolor{gray!20}0.873 & 0.042 & 0.938 & 0.897 & 0.900 & 0.900 & 0.869 & 0.898 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.393 & 0.040 \\
-pw-sum & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.604 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.933 & \cellcolor{gray!20}0.710 & \cellcolor{gray!20}0.867 & \cellcolor{gray!20}0.773 & 0.042 & 0.932 & 0.895 & 0.897 & 0.896 & 0.869 & 0.894 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.388 & 0.040 \\
-pw-sum-rbs & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.740 & \cellcolor{gray!20}0.889 & \cellcolor{gray!20}0.922 & \cellcolor{gray!20}0.720 & \cellcolor{gray!20}0.889 & \cellcolor{gray!20}0.827 & 0.042 & 0.923 & 0.898 & 0.893 & 0.883 & 0.864 & 0.878 & \cellcolor{gray!20}0.059 & \cellcolor{gray!20}0.388 & 0.042 \\
-v-pcgrad & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.729 & \cellcolor{gray!20}0.822 & \cellcolor{gray!20}0.913 & \cellcolor{gray!20}0.700 & \cellcolor{gray!20}0.911 & \cellcolor{gray!20}0.836 & 0.042 & 0.924 & 0.899 & 0.891 & 0.882 & 0.863 & 0.881 & \cellcolor{gray!20}0.059 & \cellcolor{gray!20}0.388 & 0.042 \\
-v-pcg-nr & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.573 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.926 & \cellcolor{gray!20}0.680 & \cellcolor{gray!20}0.844 & \cellcolor{gray!20}0.782 & 0.042 & 0.933 & 0.894 & 0.896 & 0.894 & 0.869 & 0.897 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.388 & 0.040 \\
-diff-opd-rbs & \textsc{D-OPD}{\footnotesize\,peak} & \cellcolor{gray!20}0.389 & \cellcolor{gray!20}0.833 & \cellcolor{gray!20}0.889 & \cellcolor{gray!20}0.970 & \cellcolor{gray!20}0.890 & \cellcolor{gray!20}0.956 & \cellcolor{gray!20}0.955 & 0.042 & 0.925 & 0.900 & 0.895 & 0.885 & 0.870 & 0.890 & \cellcolor{gray!20}0.059 & \cellcolor{gray!20}0.388 & 0.041 \\
+pw-avg & \textsc{Avg}{\footnotesize\,peak} & \cellcolor{gray!20}0.393 & \cellcolor{gray!20}0.677 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.957 & \cellcolor{gray!20}0.760 & \cellcolor{gray!20}0.889 & \cellcolor{gray!20}0.873 & 0.042 & 0.938 & 0.898 & 0.900 & 0.900 & 0.869 & 0.898 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.393 & 0.040 \\
+pw-sum & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.604 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.935 & \cellcolor{gray!20}0.710 & \cellcolor{gray!20}0.867 & \cellcolor{gray!20}0.836 & 0.042 & 0.935 & 0.896 & 0.898 & 0.896 & 0.869 & 0.897 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.388 & 0.040 \\
+pw-sum & \textsc{Sum}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.812 & \cellcolor{gray!20}0.889 & \cellcolor{gray!20}0.930 & \cellcolor{gray!20}0.780 & \cellcolor{gray!20}0.933 & \cellcolor{gray!20}0.873 & 0.042 & 0.923 & 0.900 & 0.893 & 0.883 & 0.867 & 0.886 & \cellcolor{gray!20}0.059 & \cellcolor{gray!20}0.388 & 0.042 \\
+v-pcgrad & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.573 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.930 & \cellcolor{gray!20}0.710 & \cellcolor{gray!20}0.844 & \cellcolor{gray!20}0.836 & 0.042 & 0.934 & 0.895 & 0.897 & 0.897 & 0.869 & 0.897 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.388 & 0.040 \\
+v-pcgrad & \textsc{PCGrad}{\footnotesize\,peak} & \cellcolor{gray!20}0.395 & \cellcolor{gray!20}0.781 & \cellcolor{gray!20}0.867 & \cellcolor{gray!20}0.913 & \cellcolor{gray!20}0.740 & \cellcolor{gray!20}0.933 & \cellcolor{gray!20}0.855 & 0.042 & 0.925 & 0.899 & 0.892 & 0.882 & 0.864 & 0.883 & \cellcolor{gray!20}0.059 & \cellcolor{gray!20}0.388 & 0.042 \\
+diff-opd & \textsc{D-OPD}{\footnotesize\,peak} & \cellcolor{gray!20}0.389 & \cellcolor{gray!20}0.833 & \cellcolor{gray!20}0.889 & \cellcolor{gray!20}0.970 & \cellcolor{gray!20}0.890 & \cellcolor{gray!20}0.956 & \cellcolor{gray!20}0.955 & 0.042 & 0.925 & 0.900 & 0.895 & 0.885 & 0.870 & 0.890 & \cellcolor{gray!20}0.059 & \cellcolor{gray!20}0.388 & 0.041 \\
 \bottomrule
 \end{tabular}
 }
