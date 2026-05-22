@@ -131,7 +131,7 @@ def teacher_indices_for_batch(
         return [global_batch % num_teachers]
     if teacher_aggregation == "average":
         return list(range(num_teachers))
-    if teacher_aggregation in ("sum", "pcgrad"):
+    if teacher_aggregation in ("sum", "pcgrad", "v_pcgrad"):
         return list(range(num_teachers))
     raise ValueError(
         f"Unknown teacher_aggregation={teacher_aggregation!r}; "
@@ -251,6 +251,64 @@ def pcgrad_project_gradients(
         result.append(combined_flat[offset : offset + numel].view_as(g))
         offset += numel
 
+    return result
+
+
+def pcgrad_project_velocities(
+    velocities: List[torch.Tensor],
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Apply PCGrad projection in velocity (prediction) space.
+
+    Resolves directional conflicts between per-teacher residual velocities
+    ``v_m = mu_T^m - mu_S.detach()`` using per-sample dot products over
+    spatial dimensions. When ``v_i · v_j < 0`` (per-sample), the conflicting
+    component of ``v_i`` along ``v_j`` is removed.
+
+    This is the velocity-space analogue of :func:`pcgrad_project_gradients`
+    and mirrors ``pcgrad_blend_noise_preds`` in
+    ``trainers/ensemble_eval/common.py``.
+
+    Args:
+        velocities: K tensors of shape ``(B, *spatial)``, each representing
+            one teacher's residual pull ``mu_T^m - mu_S.detach()``.
+        eps: Minimum ``||v_j||^2`` for denominator clamping.
+
+    Returns:
+        Fused velocity ``sum_m v_m^PC``, same shape as each input tensor.
+    """
+    K = len(velocities)
+    if K == 0:
+        raise ValueError("pcgrad_project_velocities requires at least one velocity tensor.")
+    if K == 1:
+        return velocities[0]
+
+    batch = velocities[0].shape[0]
+    broadcast_shape = (batch,) + (1,) * (velocities[0].ndim - 1)
+
+    # Flatten to (B, D) for per-sample dot products
+    flat_orig = [v.reshape(batch, -1) for v in velocities]
+    norm_sq = [
+        (f * f).sum(dim=1).clamp_min(eps).view(broadcast_shape)
+        for f in flat_orig
+    ]
+
+    # PCGrad: project away conflicting components using the *original* v_j
+    pc = [v.clone() for v in velocities]
+    for i in range(K):
+        for j in range(K):
+            if i == j:
+                continue
+            flat_pc_i = pc[i].reshape(batch, -1)
+            dot = (flat_pc_i * flat_orig[j]).sum(dim=1).view(broadcast_shape)
+            proj = (dot / norm_sq[j]) * velocities[j]
+            pc[i] = torch.where(dot < 0, pc[i] - proj, pc[i])
+
+    # Sum all projected velocities
+    result = pc[0]
+    for i in range(1, K):
+        result = result + pc[i]
     return result
 
 

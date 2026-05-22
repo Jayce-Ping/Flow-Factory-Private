@@ -59,6 +59,7 @@ from .common import (
     filter_forward_kwargs,
     load_teachers,
     pcgrad_project_gradients,
+    pcgrad_project_velocities,
     teacher_indices_for_batch,
 )
 
@@ -991,6 +992,31 @@ class OPDTrainer(BaseTrainer):
                         loss_info=loss_info,
                         batch_samples=batch_samples,
                     )
+                elif self.training_args.teacher_aggregation == "v_pcgrad":
+                    # v_pcgrad: PCGrad in velocity space, single backward per timestep
+                    d_per_teacher_list, mu_teacher_v = self._precompute_d_per_timestep_pcgrad(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        num_timesteps=num_timesteps,
+                        teacher_indices=teacher_indices,
+                        batch_samples=batch_samples,
+                    )
+
+                    r_per_k_per_teacher = self._reverse_cumulative_per_teacher(
+                        d_per_teacher_list=d_per_teacher_list,
+                        num_teachers=len(teacher_indices),
+                    )
+
+                    loss_info = self._optimize_train_pass_v_pcgrad(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        num_timesteps=num_timesteps,
+                        mu_teacher_list=mu_teacher_v,
+                        r_per_k_per_teacher=r_per_k_per_teacher,
+                        teacher_indices=teacher_indices,
+                        loss_info=loss_info,
+                        batch_samples=batch_samples,
+                    )
                 else:
                     # Standard mode: averaged teacher D_k
                     loss_info = self._optimize_train_pass(
@@ -1459,6 +1485,156 @@ class OPDTrainer(BaseTrainer):
                         self.accelerator.backward(
                             combined_loss + 0.0 * student_out.next_latents_mean.sum()
                         )
+
+                    if self.accelerator.sync_gradients:
+                        grad_norm = self.accelerator.clip_grad_norm_(
+                            self.adapter.get_trainable_parameters(),
+                            self.training_args.max_grad_norm,
+                        )
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                        loss_info = reduce_loss_info(self.accelerator, loss_info)
+                        loss_info["grad_norm"] = grad_norm
+                        self.log_data(
+                            {f"train/{k}": v for k, v in loss_info.items()},
+                            step=self.step,
+                        )
+                        self.step += 1
+                        loss_info = defaultdict(list)
+
+        return loss_info
+
+    def _optimize_train_pass_v_pcgrad(
+        self,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        num_timesteps: int,
+        mu_teacher_list: List[List[torch.Tensor]],
+        r_per_k_per_teacher: List[List[torch.Tensor]],
+        teacher_indices: List[int],
+        loss_info: Dict[str, List[torch.Tensor]],
+        batch_samples: Optional[List["BaseSample"]] = None,
+    ) -> Dict[str, List[torch.Tensor]]:
+        """v_pcgrad: PCGrad conflict resolution in velocity (prediction) space.
+
+        Instead of K backward passes + gradient projection (expensive), this mode:
+        1. Computes per-teacher residual velocities v_m = mu_T^m - mu_S.detach()
+        2. Projects conflicting residuals via PCGrad in prediction space
+        3. Fuses into a single target: mu_T_fused = mu_S.detach() + sum(v_m^PC)
+        4. Single backward per timestep (same as ``sum`` mode)
+
+        This gives similar conflict resolution at a fraction of the cost:
+        - 1 backward per timestep (vs K for pcgrad)
+        - O(K * latent_size) memory (vs K * model_params for pcgrad)
+        - Native per-timestep accumulate() (vs manual p.grad for pcgrad)
+        """
+        device = self.accelerator.device
+        K = len(teacher_indices)
+
+        # Pre-compute source routing masks once
+        teacher_masks: List[Optional[torch.Tensor]] = [
+            self._get_teacher_source_mask(teacher_indices[k], batch_samples)
+            if batch_samples is not None else None
+            for k in range(K)
+        ]
+
+        with self.autocast():
+            for k_idx, timestep_index in enumerate(
+                tqdm(
+                    self._train_timestep_indices,
+                    desc=f"Epoch {self.epoch} Timestep",
+                    position=1,
+                    leave=False,
+                    disable=not self.show_progress_bar,
+                )
+            ):
+                with self.accelerator.accumulate(*self.adapter.trainable_components):
+                    t = batch["timesteps"][:, timestep_index]
+                    t_next = (
+                        batch["timesteps"][:, timestep_index + 1]
+                        if timestep_index + 1 < num_timesteps
+                        else torch.tensor(0, device=device)
+                    )
+                    latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                    next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
+
+                    forward_kwargs = self._build_forward_kwargs(
+                        batch=batch,
+                        t=t,
+                        t_next=t_next,
+                        latents=latents,
+                        next_latents=next_latents,
+                        compute_log_prob=True,
+                        return_kwargs=self._student_return_kwargs_for_train(),
+                    )
+
+                    # Single student forward (with grad)
+                    student_out = self.adapter.forward(**forward_kwargs)
+                    if student_out.next_latents_mean is None:
+                        raise RuntimeError(
+                            "Student forward must return `next_latents_mean` for v_pcgrad."
+                        )
+
+                    mu_S = student_out.next_latents_mean
+                    mu_S_detached = mu_S.detach()
+                    mu_teachers_k = mu_teacher_list[k_idx]
+
+                    # Build per-teacher residual velocities
+                    velocities: List[torch.Tensor] = []
+                    for teacher_k in range(K):
+                        v_k = mu_teachers_k[teacher_k] - mu_S_detached
+                        # Zero out non-applicable samples if source routing
+                        mask_k = teacher_masks[teacher_k]
+                        if mask_k is not None:
+                            broadcast_mask = mask_k.float().view(
+                                -1, *([1] * (v_k.ndim - 1))
+                            )
+                            v_k = v_k * broadcast_mask
+                        velocities.append(v_k)
+
+                    # PCGrad projection in velocity space
+                    fused_velocity = pcgrad_project_velocities(
+                        velocities, eps=self.training_args.pcgrad_eps
+                    )
+
+                    # Fused target
+                    mu_T_fused = mu_S_detached + fused_velocity
+
+                    # Loss: pathwise D_k
+                    d_k = self._compute_per_step_kl(
+                        mu_student=mu_S,
+                        mu_teacher=mu_T_fused,
+                        std_dev_t=student_out.std_dev_t,
+                        dt=student_out.dt,
+                        normalize=self.normalize_d_k,
+                    )
+                    pathwise_loss = d_k.mean()
+                    loss = self.pathwise_coef * pathwise_loss
+
+                    # Optional REINFORCE term (summed across teachers)
+                    if self.reinforce_coef > 0 and student_out.log_prob is not None:
+                        log_prob_new = student_out.log_prob
+                        # Use average of per-teacher R_bar as composite signal
+                        r_bar_sum = sum(
+                            r_per_k_per_teacher[teacher_k][k_idx]
+                            for teacher_k in range(K)
+                        ) / K
+                        reinforce_loss = (r_bar_sum.detach() * log_prob_new).mean()
+                        loss = loss + self.reinforce_coef * reinforce_loss
+                        loss_info["reinforce_loss"].append(reinforce_loss.detach())
+                        loss_info["log_prob"].append(log_prob_new.mean().detach())
+
+                    # Optional KL anchor
+                    if self.enable_kl_loss:
+                        kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
+                        loss = loss + kl_loss
+                        loss_info["kl_div"].append(kl_div.detach())
+                        loss_info["kl_loss"].append(kl_loss.detach())
+
+                    loss_info["d_k"].append(pathwise_loss.detach())
+                    loss_info["loss"].append(loss.detach())
+
+                    self.accelerator.backward(loss)
 
                     if self.accelerator.sync_gradients:
                         grad_norm = self.accelerator.clip_grad_norm_(
