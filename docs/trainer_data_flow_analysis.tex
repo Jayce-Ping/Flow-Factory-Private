@@ -190,7 +190,8 @@ Strategy & Teachers/batch & Behavior \\
 \texttt{average} & All $M$ & Forward all teachers, average $\mu_T$ in latent space, single $D_k$ \\
 \texttt{sum} & All $M$ & Per-teacher losses summed into single backward \\
 \texttt{sum} + \texttt{route\_by\_source} & All $M$ & Same as sum, but each teacher only computes loss on matching-source samples via boolean mask \\
-\texttt{pcgrad} & All $M$ & Per-teacher backward, PCGrad projection, manual grad accumulation \\
+\texttt{pcgrad} & All $M$ & Per-teacher backward (DDP only), PCGrad projection, manual grad accumulation \\
+\texttt{v\_pcgrad} & All $M$ & PCGrad in velocity space: project teacher residuals, single backward (DeepSpeed OK) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -265,28 +266,56 @@ Total \texttt{accumulate()} calls: $9 \text{ batches} \times 10 \text{ timesteps
 \end{algorithmic}
 \end{algorithm}
 
-\subsubsection{Main-pass: \texttt{\_optimize\_train\_pass\_pcgrad}}
+\subsubsection{Main-pass: \texttt{\_optimize\_train\_pass\_pcgrad} (DDP only)}
 
-PCGrad uses a different GAS pattern: \emph{one} \texttt{accumulate()} per batch (not per timestep). All $T$ timesteps are accumulated internally via a manual gradient buffer.
+PCGrad bypasses \texttt{accumulate()} entirely and manages gradient accumulation via an \texttt{epoch\_grad} buffer. All $K$ backward passes run under explicit \texttt{model.no\_sync()} to prevent DDP all-reduce on individual teacher gradients.
+
+\textbf{Incompatible with DeepSpeed ZeRO} (runtime check raises \texttt{RuntimeError}).
 
 \begin{algorithm}[H]
-\caption{OPD Main-pass (PCGrad mode)}
+\caption{OPD Main-pass (PCGrad mode --- corrected)}
 \begin{algorithmic}
-\STATE \textbf{with} \texttt{accelerator.accumulate(*trainable\_components)}: \COMMENT{Once per batch}
-\STATE \quad batch\_grad $\leftarrow$ [zeros\_like($p$) for $p$ in params]
-\FOR{$k = 0, \ldots, 9$}
-    \STATE \quad student\_out $\leftarrow$ adapter.forward($x_k$)
-    \STATE \quad Compute $K$ per-teacher losses: $\ell_0, \ell_1, \ldots, \ell_{K-1}$
-    \STATE \quad $K$ backward passes (retain\_graph) $\to$ $K$ grad snapshots
-    \STATE \quad projected $\leftarrow$ pcgrad\_project(grad\_snapshots)
-    \STATE \quad batch\_grad $\mathrel{+}=$ projected
+\STATE epoch\_grad $\leftarrow$ [zeros\_like($p$) for $p$ in params] \COMMENT{Before batch loop}
+\FOR{batch $= 0, \ldots, 8$ (9 batches)}
+    \STATE batch\_grad $\leftarrow$ zeros
+    \FOR{$k = 0, \ldots, 9$ (10 timesteps)}
+        \STATE student\_out $\leftarrow$ adapter.forward($x_k$) \COMMENT{WITH grad}
+        \STATE Compute $K$ per-teacher losses: $\ell_0, \ell_1, \ldots, \ell_{K-1}$
+        \STATE \textbf{with} model.no\_sync(): \COMMENT{Suppress DDP hooks}
+        \STATE \quad $K \times$ backward(retain\_graph) $\to$ $K$ grad snapshots
+        \STATE projected $\leftarrow$ pcgrad\_project(grad\_snapshots)
+        \STATE batch\_grad $\mathrel{+}=$ projected
+    \ENDFOR
+    \STATE epoch\_grad $\mathrel{+}=$ batch\_grad / $T$
 \ENDFOR
-\STATE \quad $p.\text{grad} \leftarrow$ batch\_grad / $T$
-\STATE \textbf{if} sync\_gradients: clip $\to$ step $\to$ zero\_grad
+\STATE all\_reduce(epoch\_grad, AVG) \COMMENT{Single DDP sync point}
+\STATE $p.\text{grad} \leftarrow$ epoch\_grad / num\_batches
+\STATE clip $\to$ step $\to$ zero\_grad
 \end{algorithmic}
 \end{algorithm}
 
-PCGrad GAS = base\_GAS = 9 (NOT multiplied by $T$; internal $T$-step accumulation is manual).
+\texttt{get\_num\_train\_timesteps()} returns 1 for \texttt{pcgrad} (GAS = base\_GAS = 9, but \texttt{accumulate()} is not used). The step fires once per inner\_epoch after all batches.
+
+\subsubsection{Main-pass: \texttt{\_optimize\_train\_pass\_v\_pcgrad} (DeepSpeed OK)}
+
+Velocity-space PCGrad uses native per-timestep \texttt{accumulate()} (same as \texttt{sum} mode). Conflict resolution happens in prediction space before computing the loss.
+
+\begin{algorithm}[H]
+\caption{OPD Main-pass (v\_pcgrad mode)}
+\begin{algorithmic}
+\FOR{$k = 0, \ldots, 9$ (10 timesteps)}
+    \STATE \textbf{with} accumulate():
+    \STATE \quad $\mu_S \leftarrow$ student\_forward($x_k$) \COMMENT{WITH grad}
+    \STATE \quad $v_m \leftarrow \mu_T^m - \mu_S.\text{detach}()$ for $m = 0, \ldots, K-1$
+    \STATE \quad $\{v_m^\text{PC}\} \leftarrow$ pcgrad\_project\_velocities($\{v_m\}$)
+    \STATE \quad $\mu_T^\text{fused} \leftarrow \mu_S.\text{detach}() + \sum_m v_m^\text{PC}$
+    \STATE \quad $D_k = \alpha_\text{path} \cdot \text{mean}(\|\mu_S - \mu_T^\text{fused}\|^2)$
+    \STATE \quad accelerator.backward($D_k$) \COMMENT{Single backward}
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+v\_pcgrad GAS = base\_GAS $\times$ $T$ = $9 \times 10 = 90$ (standard per-timestep accumulate).
 
 \subsection{ODE-mode Loss Formula}
 
@@ -531,7 +560,7 @@ Peak memory & 25 GB + 1 fwd & 1 student fwd + 1 teacher fwd \\
 Supports SDE & \checkmark & $\times$ (ODE only) \\
 Supports REINFORCE & \checkmark & $\times$ (pathwise only) \\
 Supports KL anchor & \checkmark & $\times$ \\
-Teacher aggregation & 5 strategies & Fixed per-teacher isolation \\
+Teacher aggregation & 6 strategies & Fixed per-teacher isolation \\
 Source routing & Probabilistic (shuffle) & Deterministic (guaranteed) \\
 Samples/teacher/GPU & $\sim$24 (probabilistic) & 24 (exact) \\
 Total samples/GPU/epoch & 72 & 72 \\
@@ -696,9 +725,23 @@ with accelerator.accumulate(*components):  # Counter += 1 (once)
         accelerator.backward(loss)  # T backwards, but only 1 counter increment!
 \end{lstlisting}
 
-\subsection{PCGrad Exception}
+\subsection{PCGrad and v\_pcgrad Exceptions}
 
-PCGrad mode handles $T$ timesteps manually within a single \texttt{accumulate()} and sets \texttt{p.grad} directly (bypassing \texttt{accelerator.backward}). Its GAS = \texttt{base\_GAS} = 9 (not multiplied by $T$).
+\texttt{pcgrad} mode bypasses \texttt{accumulate()} entirely:
+\begin{itemize}[nosep]
+    \item All $K$ backward passes wrapped in \texttt{model.no\_sync()} (prevents DDP all-reduce per teacher)
+    \item Projected gradients accumulated into an \texttt{epoch\_grad} buffer across all batches
+    \item Single \texttt{all\_reduce(epoch\_grad, AVG)} after all batches
+    \item GAS = \texttt{base\_GAS} = 9 (\texttt{get\_num\_train\_timesteps()} returns 1 for pcgrad)
+    \item \textbf{Incompatible with DeepSpeed ZeRO} --- requires DDP (\texttt{multi\_gpu.yaml})
+\end{itemize}
+
+\texttt{v\_pcgrad} mode uses standard per-timestep \texttt{accumulate()} (same as \texttt{sum}):
+\begin{itemize}[nosep]
+    \item Single backward per timestep --- no \texttt{retain\_graph}, no \texttt{no\_sync} needed
+    \item GAS = \texttt{base\_GAS} $\times$ $T$ = $9 \times 10 = 90$
+    \item Fully compatible with both DeepSpeed ZeRO and DDP
+\end{itemize}
 
 %=============================================================================
 \section{Conclusion}
