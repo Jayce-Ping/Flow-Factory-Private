@@ -9,13 +9,30 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
+
+MetricAggregate = Literal["last", "max"]
 
 import wandb
 
 DEFAULT_PROJECT = "Flow-Factory-OPD-Experiments"
 
-DEFAULT_RUNS: Tuple[str, ...] = (
+OPD_ALL_TEACHERS: Tuple[str, ...] = ("geneval", "ocr", "pickscore")
+
+OPD_RUN_SHORT_LABELS: Dict[str, str] = {
+    "exp_pathwise_average": "pw-avg",
+    "exp_pathwise_sum": "pw-sum",
+    "exp_pathwise_sum_route_by_source": "pw-sum-rbs",
+    "exp_pathwise_round_robin": "pw-rr",
+    "exp_pathwise_pcgrad": "pw-pcgrad",
+    "exp_pathwise_pcgrad_no_route": "pw-pcg-nr",
+    "exp_pathwise_v_pcgrad": "v-pcgrad",
+    "exp_pathwise_v_pcgrad_no_route": "v-pcg-nr",
+    "exp_diffusion_opd_dedicated": "diff-opd",
+    "reproduce_diffusion_opd_via_route_by_source": "diff-opd-rbs",
+}
+
+DEFAULT_ENSEMBLE_RUNS: Tuple[str, ...] = (
     "0_sd35-baseline",
     "1_geneval-baseline",
     "1_ocr-baseline",
@@ -35,6 +52,8 @@ MAIN_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
 )
 
 REQUIRED_WANDB_KEYS: Tuple[str, ...] = tuple(col[1] for col in MAIN_COLUMNS)
+
+MAIN_TABLE_NUM_COLS = 2 + len(MAIN_COLUMNS)
 
 TEACHER_IN_DOMAIN_COLUMN: Dict[str, str] = {
     "geneval": "geneval_ge",
@@ -129,9 +148,13 @@ class ParsedRun:
     num_checkpoints: int
     teachers: Tuple[str, ...]
     is_pcgrad: bool
+    agg_label_override: Optional[str] = None
+    teachers_display_override: Optional[str] = None
 
     @property
     def teachers_display(self) -> str:
+        if self.teachers_display_override is not None:
+            return self.teachers_display_override
         if self.num_checkpoints == 0:
             return "SD3.5 (base)"
         return "+".join(self.teachers)
@@ -180,11 +203,53 @@ def parse_run_name(name: str) -> ParsedRun:
 
 
 def aggregation_label(parsed: ParsedRun) -> str:
+    if parsed.agg_label_override is not None:
+        return parsed.agg_label_override
     if parsed.num_checkpoints < 2:
         return r"---"
     if parsed.is_pcgrad:
         return r"\textsc{PCGrad}"
     return r"\textsc{Avg}"
+
+
+def opd_aggregation_label(run_name: str) -> str:
+    if "v_pcgrad" in run_name or run_name in (
+        "exp_pathwise_pcgrad",
+        "exp_pathwise_pcgrad_no_route",
+    ):
+        return r"\textsc{PCGrad}"
+    if "average" in run_name:
+        return r"\textsc{Avg}"
+    if "sum" in run_name:
+        return r"\textsc{Sum}"
+    if "round_robin" in run_name:
+        return r"\textsc{RR}"
+    if "diffusion_opd" in run_name:
+        return r"\textsc{D-OPD}"
+    if "reproduce_diffusion_opd" in run_name:
+        return r"\textsc{OPD}"
+    return "---"
+
+
+def make_opd_running_run(run_name: str) -> ParsedRun:
+    agg = opd_aggregation_label(run_name) + r"{\footnotesize\,peak}"
+    if run_name in OPD_RUN_SHORT_LABELS:
+        display = OPD_RUN_SHORT_LABELS[run_name]
+    else:
+        display = run_name.removeprefix("exp_").replace("_", r"\_")
+    return ParsedRun(
+        name=run_name,
+        num_checkpoints=len(OPD_ALL_TEACHERS),
+        teachers=OPD_ALL_TEACHERS,
+        is_pcgrad=False,
+        agg_label_override=agg,
+        teachers_display_override=display,
+    )
+
+
+def discover_running_run_names(api: wandb.Api, project: str) -> List[str]:
+    names = [run.name for run in api.runs(project) if run.state == "running"]
+    return sorted(names)
 
 
 def in_domain_column_ids(parsed: ParsedRun) -> frozenset[str]:
@@ -295,10 +360,19 @@ def format_main_table_cell(
     return text
 
 
+def _aggregate_series(series: "Any", aggregate: MetricAggregate) -> float:
+    if aggregate == "last":
+        return float(series.iloc[-1])
+    return float(series.max())
+
+
 def fetch_run_metrics(
     api: wandb.Api,
     project: str,
     run_name: str,
+    *,
+    aggregate: MetricAggregate = "last",
+    require_main_columns: bool = True,
 ) -> Dict[str, float]:
     runs = [r for r in api.runs(project) if r.name == run_name]
     if not runs:
@@ -309,7 +383,7 @@ def fetch_run_metrics(
             f"{[r.id for r in runs]}"
         )
     run = runs[0]
-    history = run.history(samples=1000)
+    history = run.history(samples=5000)
     if history.empty:
         raise ValueError(f"run {run_name!r} ({run.id}) has empty history")
 
@@ -322,12 +396,15 @@ def fetch_run_metrics(
         series = history[col].dropna()
         if series.empty:
             continue
-        value = float(series.iloc[-1])
-        metrics[col] = value
+        metrics[col] = _aggregate_series(series, aggregate)
 
-    missing = [k for k in REQUIRED_WANDB_KEYS if k not in metrics]
-    if missing:
-        raise ValueError(f"run {run_name!r} missing required eval metrics: {missing}")
+    if require_main_columns:
+        missing = [k for k in REQUIRED_WANDB_KEYS if k not in metrics]
+        if missing:
+            raise ValueError(
+                f"run {run_name!r} missing required eval metrics "
+                f"(aggregate={aggregate!r}): {missing}"
+            )
     return metrics
 
 
@@ -398,7 +475,7 @@ def build_appendix_header_rows(
     """Return (row1, row2, row3, benchmark_cmidrules, reward_cmidrules) LaTeX lines."""
     first_data_col = setup_cols + 1
 
-    row1 = [r"\multirow{3}{*}{Teachers}", r"\multirow{3}{*}{Agg.}"]
+    row1 = [r"\multirow{3}{*}{Config.}", r"\multirow{3}{*}{Agg.}"]
     row2 = ["", ""]
     row3 = ["", ""]
 
@@ -446,13 +523,15 @@ def build_main_table_rows(
     runs: Sequence[str],
     metrics_by_run: Mapping[str, Dict[str, float]],
     single_baselines: Mapping[str, Dict[str, float]],
+    *,
+    row_parser: Callable[[str], ParsedRun] = parse_run_name,
 ) -> List[str]:
     rows: List[str] = []
     for run_name in runs:
-        parsed = parse_run_name(run_name)
+        parsed = row_parser(run_name)
         metrics = metrics_by_run[run_name]
         cells = [
-            parsed.teachers_display.replace("_", r"\_"),
+            parsed.teachers_display,
             aggregation_label(parsed),
         ]
         for col_id, wandb_key, _ in MAIN_COLUMNS:
@@ -469,17 +548,86 @@ def build_main_table_rows(
     return rows
 
 
+def _table_group_header_row(label: str, num_cols: int) -> str:
+    return rf"\multicolumn{{{num_cols}}}{{@{{}}l}}{{\textit{{{label}}}}} \\"
+
+
+def build_merged_main_table_rows(
+    ensemble_runs: Sequence[str],
+    opd_running_runs: Sequence[str],
+    metrics_by_run: Mapping[str, Dict[str, float]],
+    single_baselines: Mapping[str, Dict[str, float]],
+) -> List[str]:
+    rows: List[str] = []
+    if ensemble_runs:
+        rows.append(
+            _table_group_header_row("Ensemble eval (offline, last eval)", MAIN_TABLE_NUM_COLS)
+        )
+        rows.extend(
+            build_main_table_rows(ensemble_runs, metrics_by_run, single_baselines)
+        )
+    if opd_running_runs:
+        if rows:
+            rows.append(r"\addlinespace")
+        rows.append(
+            _table_group_header_row("OPD training (running, peak eval)", MAIN_TABLE_NUM_COLS)
+        )
+        rows.extend(
+            build_main_table_rows(
+                opd_running_runs,
+                metrics_by_run,
+                single_baselines,
+                row_parser=make_opd_running_run,
+            )
+        )
+    return rows
+
+
+def build_merged_appendix_table_rows(
+    ensemble_runs: Sequence[str],
+    opd_running_runs: Sequence[str],
+    metrics_by_run: Mapping[str, Dict[str, float]],
+    appendix_columns: Sequence[AppendixColumn],
+) -> List[str]:
+    num_cols = 2 + len(appendix_columns)
+    rows: List[str] = []
+    if ensemble_runs:
+        rows.append(
+            _table_group_header_row("Ensemble eval (offline, last eval)", num_cols)
+        )
+        rows.extend(
+            build_appendix_table_rows(ensemble_runs, metrics_by_run, appendix_columns)
+        )
+    if opd_running_runs:
+        if rows:
+            rows.append(r"\addlinespace")
+        rows.append(
+            _table_group_header_row("OPD training (running, peak eval)", num_cols)
+        )
+        rows.extend(
+            build_appendix_table_rows(
+                opd_running_runs,
+                metrics_by_run,
+                appendix_columns,
+                row_parser=make_opd_running_run,
+            )
+        )
+    return rows
+
+
 def build_appendix_table_rows(
     runs: Sequence[str],
     metrics_by_run: Mapping[str, Dict[str, float]],
     appendix_columns: Sequence[AppendixColumn],
+    *,
+    row_parser: Callable[[str], ParsedRun] = parse_run_name,
 ) -> List[str]:
     rows: List[str] = []
     for run_name in runs:
-        parsed = parse_run_name(run_name)
+        parsed = row_parser(run_name)
         metrics = metrics_by_run[run_name]
         cells = [
-            parsed.teachers_display.replace("_", r"\_"),
+            parsed.teachers_display,
             aggregation_label(parsed),
         ]
         for column in appendix_columns:
@@ -500,15 +648,26 @@ def build_appendix_table_rows(
 def generate_experiments_tex(
     *,
     project: str,
-    runs: Sequence[str],
+    ensemble_runs: Sequence[str],
+    opd_running_runs: Sequence[str],
     metrics_by_run: Mapping[str, Dict[str, float]],
     fetched_at: str,
 ) -> str:
     all_keys = sorted({k for m in metrics_by_run.values() for k in m})
     appendix_columns = build_appendix_columns(all_keys)
     single_baselines = build_single_teacher_baselines(metrics_by_run)
-    main_rows = build_main_table_rows(runs, metrics_by_run, single_baselines)
-    appendix_rows = build_appendix_table_rows(runs, metrics_by_run, appendix_columns)
+    main_rows = build_merged_main_table_rows(
+        ensemble_runs,
+        opd_running_runs,
+        metrics_by_run,
+        single_baselines,
+    )
+    appendix_rows = build_merged_appendix_table_rows(
+        ensemble_runs,
+        opd_running_runs,
+        metrics_by_run,
+        appendix_columns,
+    )
     (
         appendix_row1,
         appendix_row2,
@@ -530,7 +689,7 @@ def generate_experiments_tex(
         r"\usepackage{caption}",
         r"\usepackage[table]{xcolor}",
         "",
-        r"\title{Ensemble Eval Experiments}",
+        r"\title{Flow-Factory OPD \& Ensemble Eval Experiments}",
         r"\author{Flow-Factory}",
         rf"\date{{Generated {fetched_at} from W\&B project \texttt{{{project}}}}}",
         "",
@@ -539,48 +698,51 @@ def generate_experiments_tex(
         "",
         r"\section{Experimental Setup}",
         "",
-        r"Offline \texttt{ensemble-eval} on Stable Diffusion 3.5 Medium: multiple",
-        r"FlowGRPO LoRA checkpoints are fused at each denoising step, then evaluated",
-        r"on three held-out test sets (\texttt{geneval}, \texttt{pickscore}, \texttt{ocr}).",
+        r"\begin{sloppypar}",
+        r"Offline \texttt{ensemble-eval} on SD3.5 Medium: FlowGRPO LoRA checkpoints",
+        r"are fused each denoising step, then evaluated on \texttt{geneval},",
+        r"\texttt{pickscore}, and \texttt{ocr} held-out sets.",
         r"Checkpoints: \texttt{jieliu/SD3.5M-FlowGRPO-Text} (OCR),",
-        r"\texttt{jieliu/SD3.5M-FlowGRPO-PickScore}, \texttt{jieliu/SD3.5M-FlowGRPO-GenEval}.",
-        r"Rows with $n\geq 2$ teachers use uniform checkpoint averaging (\textsc{Avg})",
-        r"unless marked \textsc{PCGrad}. Table~1: \textbf{bold} = single-teacher",
-        r"in-domain metric; gray = in-domain for multi-teacher rows; red/blue",
-        r"footnotes = change vs.\ the best single-teacher baseline among teachers",
-        r"in that row (max over \texttt{1\_geneval}, \texttt{1\_ocr}, \texttt{1\_pickscore}",
-        r"present in the ensemble).",
-        r"Table~2 gray cells mark in-domain metrics (appendix).",
+        r"\texttt{jieliu/SD3.5M-FlowGRPO-PickScore},",
+        r"\texttt{jieliu/SD3.5M-FlowGRPO-GenEval}.",
+        r"Multi-teacher rows use \textsc{Avg} unless marked \textsc{PCGrad}.",
+        r"Table~1: \textbf{bold} = single-teacher in-domain; gray = multi-teacher",
+        r"in-domain; red/blue = change vs.\ max single-teacher baseline in that row.",
+        r"OPD rows (\textit{peak}) use the maximum eval logged so far.",
+        r"\end{sloppypar}",
         "",
         r"\section{Main Results}",
         "",
         r"\begin{table}[ht]",
         r"\centering",
-        r"\caption{Cross-benchmark eval metrics (mean over test set). "
-        r"\textbf{Bold}: single-teacher in-domain. "
-        r"Gray + red/blue footnotes: multi-teacher vs.\ max single-teacher in row.}",
-        r"\label{tab:ensemble-eval-main}",
-        r"\small",
-        r"\begin{tabular}{ll|cc|c|cc}",
+        r"\caption{Cross-benchmark \texttt{eval/} means. Top: offline ensemble-eval",
+        r"(last eval). Bottom: OPD training runs still \texttt{running} (peak eval). "
+        r"\textbf{Bold}: single-teacher in-domain.}",
+        r"\label{tab:main-results}",
+        r"\footnotesize",
+        rf"\resizebox{{\textwidth}}{{!}}{{%",
+        r"\begin{tabular}{@{}ll|cc|c|cc@{}}",
         r"\toprule",
         r" &  & \multicolumn{2}{c}{GenEval benchmark} "
         r"& \multicolumn{1}{c}{PickScore benchmark} "
         r"& \multicolumn{2}{c}{OCR benchmark} \\",
         r"\cmidrule(lr){3-4} \cmidrule(lr){5-5} \cmidrule(lr){6-7}",
-        r"Teachers & Agg. & GenEval & PickScore & PickScore & OCR & PickScore \\",
+        r"Config. & Agg. & GenEval & PickScore & PickScore & OCR & PickScore \\",
         r"\midrule",
-        *main_rows,
+        *(main_rows if main_rows else [rf"\multicolumn{{{MAIN_TABLE_NUM_COLS}}}{{c}}{{---}} \\"]),
         r"\bottomrule",
         r"\end{tabular}",
+        r"}",
         r"\end{table}",
         "",
         r"\section{Full Eval Metrics}",
         "",
         r"\begin{table}[ht]",
         r"\centering",
-        r"\caption{All scalar \texttt{eval/} metrics (std and GenEval per-tag breakdowns).}",
-        r"\label{tab:ensemble-eval-appendix}",
-        r"\footnotesize",
+        r"\caption{All scalar \texttt{eval/} metrics (std and GenEval per-tag). "
+        r"Ensemble: last eval; OPD: peak.}",
+        r"\label{tab:full-eval}",
+        r"\scriptsize",
         rf"\resizebox{{\textwidth}}{{!}}{{%",
         rf"\begin{{tabular}}{{{appendix_col_spec}}}",
         r"\toprule",
@@ -590,7 +752,7 @@ def generate_experiments_tex(
         appendix_reward_cmid,
         appendix_row3,
         r"\midrule",
-        *appendix_rows,
+        *(appendix_rows if appendix_rows else [rf"\multicolumn{{{2 + len(appendix_columns)}}}{{c}}{{---}} \\"]),
         r"\bottomrule",
         r"\end{tabular}",
         r"}",
@@ -606,10 +768,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", default=DEFAULT_PROJECT)
     parser.add_argument(
-        "--runs",
+        "--ensemble-runs",
         nargs="+",
-        default=list(DEFAULT_RUNS),
-        help="W&B run names in table order",
+        default=list(DEFAULT_ENSEMBLE_RUNS),
+        help="Ensemble-eval W&B run names (last eval metric)",
+    )
+    parser.add_argument(
+        "--include-running",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include W&B runs in 'running' state with peak eval metrics",
     )
     parser.add_argument(
         "--output-json",
@@ -625,14 +793,28 @@ def main() -> None:
 
     api = wandb.Api()
     metrics_by_run: Dict[str, Dict[str, float]] = {}
-    for run_name in args.runs:
-        metrics_by_run[run_name] = fetch_run_metrics(api, args.project, run_name)
+    for run_name in args.ensemble_runs:
+        metrics_by_run[run_name] = fetch_run_metrics(
+            api, args.project, run_name, aggregate="last"
+        )
+
+    opd_running_runs: List[str] = []
+    if args.include_running:
+        opd_running_runs = discover_running_run_names(api, args.project)
+        for run_name in opd_running_runs:
+            metrics_by_run[run_name] = fetch_run_metrics(
+                api,
+                args.project,
+                run_name,
+                aggregate="max",
+            )
 
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     payload: Dict[str, Any] = {
         "project": args.project,
         "fetched_at": fetched_at,
-        "runs": args.runs,
+        "ensemble_runs": list(args.ensemble_runs),
+        "opd_running_runs": opd_running_runs,
         "metrics_by_run": metrics_by_run,
     }
 
@@ -644,7 +826,8 @@ def main() -> None:
 
     tex = generate_experiments_tex(
         project=args.project,
-        runs=args.runs,
+        ensemble_runs=args.ensemble_runs,
+        opd_running_runs=opd_running_runs,
         metrics_by_run=metrics_by_run,
         fetched_at=fetched_at,
     )
@@ -653,6 +836,10 @@ def main() -> None:
 
     print(f"Wrote {args.output_json}")
     print(f"Wrote {args.write_tex}")
+    if opd_running_runs:
+        print(f"OPD running runs ({len(opd_running_runs)}): {', '.join(opd_running_runs)}")
+    else:
+        print("No W&B runs in 'running' state.")
 
 
 if __name__ == "__main__":
