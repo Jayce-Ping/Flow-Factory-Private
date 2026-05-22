@@ -1,0 +1,87 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage[table]{xcolor}
+
+\title{Ensemble Eval Experiments}
+\author{Flow-Factory}
+\date{Generated 2026-05-22 02:19 UTC from W\&B project \texttt{Flow-Factory-OPD-Experiments}}
+
+\begin{document}
+\maketitle
+
+\section{Experimental Setup}
+
+Offline \texttt{ensemble-eval} on Stable Diffusion 3.5 Medium: multiple
+FlowGRPO LoRA checkpoints are fused at each denoising step, then evaluated
+on three held-out test sets (\texttt{geneval}, \texttt{pickscore}, \texttt{ocr}).
+Checkpoints: \texttt{jieliu/SD3.5M-FlowGRPO-Text} (OCR),
+\texttt{jieliu/SD3.5M-FlowGRPO-PickScore}, \texttt{jieliu/SD3.5M-FlowGRPO-GenEval}.
+Rows with $n\geq 2$ teachers use uniform checkpoint averaging (\textsc{Avg})
+unless marked \textsc{PCGrad}. Table~1: \textbf{bold} = single-teacher
+in-domain metric; gray = in-domain for multi-teacher rows; red/blue
+footnotes = change vs.\ the best single-teacher baseline among teachers
+in that row (max over \texttt{1\_geneval}, \texttt{1\_ocr}, \texttt{1\_pickscore}
+present in the ensemble).
+Table~2 gray cells mark in-domain metrics (appendix).
+
+\section{Main Results}
+
+\begin{table}[ht]
+\centering
+\caption{Cross-benchmark eval metrics (mean over test set). \textbf{Bold}: single-teacher in-domain. Gray + red/blue footnotes: multi-teacher vs.\ max single-teacher in row.}
+\label{tab:ensemble-eval-main}
+\small
+\begin{tabular}{ll|cc|c|cc}
+\toprule
+ &  & \multicolumn{2}{c}{GenEval benchmark} & \multicolumn{1}{c}{PickScore benchmark} & \multicolumn{2}{c}{OCR benchmark} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-5} \cmidrule(lr){6-7}
+Teachers & Agg. & GenEval & PickScore & PickScore & OCR & PickScore \\
+\midrule
+SD3.5 (base) & --- & 0.657 & 0.875 & 0.835 & 0.574 & 0.866 \\
+geneval & --- & \textbf{0.937} & 0.888 & 0.829 & 0.656 & 0.862 \\
+ocr & --- & 0.685 & 0.876 & 0.837 & \textbf{0.931} & 0.869 \\
+pickscore & --- & 0.641 & 0.918 & \textbf{0.895} & 0.690 & 0.915 \\
+geneval+ocr & \textsc{Avg} & \cellcolor{gray!20}0.850{\footnotesize\textcolor{red}{-0.087}} & 0.888{\footnotesize\textcolor{red}{-0.000}} & 0.837{\footnotesize\textcolor{blue}{+0.000}} & \cellcolor{gray!20}0.875{\footnotesize\textcolor{red}{-0.055}} & 0.874{\footnotesize\textcolor{blue}{+0.005}} \\
+geneval+pickscore & \textsc{Avg} & \cellcolor{gray!20}0.830{\footnotesize\textcolor{red}{-0.107}} & 0.908{\footnotesize\textcolor{red}{-0.010}} & \cellcolor{gray!20}0.873{\footnotesize\textcolor{red}{-0.021}} & 0.675{\footnotesize\textcolor{red}{-0.015}} & 0.899{\footnotesize\textcolor{red}{-0.017}} \\
+ocr+pickscore & \textsc{Avg} & 0.680{\footnotesize\textcolor{red}{-0.005}} & 0.901{\footnotesize\textcolor{red}{-0.017}} & \cellcolor{gray!20}0.873{\footnotesize\textcolor{red}{-0.022}} & \cellcolor{gray!20}0.865{\footnotesize\textcolor{red}{-0.066}} & 0.899{\footnotesize\textcolor{red}{-0.016}} \\
+geneval+ocr+pickscore & \textsc{PCGrad} & \cellcolor{gray!20}0.794{\footnotesize\textcolor{red}{-0.143}} & 0.901{\footnotesize\textcolor{red}{-0.017}} & \cellcolor{gray!20}0.864{\footnotesize\textcolor{red}{-0.031}} & \cellcolor{gray!20}0.844{\footnotesize\textcolor{red}{-0.087}} & 0.894{\footnotesize\textcolor{red}{-0.022}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Full Eval Metrics}
+
+\begin{table}[ht]
+\centering
+\caption{All scalar \texttt{eval/} metrics (std and GenEval per-tag breakdowns).}
+\label{tab:ensemble-eval-appendix}
+\footnotesize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llccccccccccccccccc}
+\toprule
+\multirow{3}{*}{Teachers} & \multirow{3}{*}{Agg.} & \multicolumn{14}{c}{GenEval benchmark} & \multicolumn{1}{c}{PickScore benchmark} & \multicolumn{2}{c}{OCR benchmark} \\
+\cmidrule(lr){3-16} \cmidrule(lr){17-17} \cmidrule(lr){18-19}
+ &  & \multicolumn{7}{c}{GenEval} & \multicolumn{7}{c}{PickScore} & \multicolumn{1}{c}{PickScore} & \multicolumn{1}{c}{OCR} & \multicolumn{1}{c}{PickScore} \\
+\cmidrule(lr){3-9} \cmidrule(lr){10-16} \cmidrule(lr){17-17} \cmidrule(lr){18-18} \cmidrule(lr){19-19}
+ &  & Std & Color attr & Colors & Counting & Position & Single obj & Two obj & Std & Color attr & Colors & Counting & Position & Single obj & Two obj & Std & Std & Std \\
+\midrule
+SD3.5 (base) & --- & 0.395 & 0.521 & 0.711 & 0.761 & 0.450 & 0.844 & 0.636 & 0.042 & 0.900 & 0.879 & 0.875 & 0.866 & 0.855 & 0.873 & 0.057 & 0.393 & 0.039 \\
+geneval & --- & \cellcolor{gray!20}0.205 & \cellcolor{gray!20}0.854 & \cellcolor{gray!20}0.867 & \cellcolor{gray!20}0.994 & \cellcolor{gray!20}0.950 & \cellcolor{gray!20}1.000 & \cellcolor{gray!20}0.982 & 0.038 & 0.920 & 0.890 & 0.890 & 0.869 & 0.864 & 0.887 & 0.056 & 0.346 & 0.038 \\
+ocr & --- & 0.375 & 0.531 & 0.689 & 0.802 & 0.490 & 0.867 & 0.664 & 0.042 & 0.902 & 0.882 & 0.879 & 0.874 & 0.856 & 0.874 & 0.057 & \cellcolor{gray!20}0.173 & 0.041 \\
+pickscore & --- & 0.407 & 0.479 & 0.622 & 0.913 & 0.440 & 0.800 & 0.655 & 0.043 & 0.949 & 0.919 & 0.917 & 0.926 & 0.881 & 0.921 & \cellcolor{gray!20}0.058 & 0.350 & 0.039 \\
+geneval+ocr & \textsc{Avg} & \cellcolor{gray!20}0.307 & \cellcolor{gray!20}0.719 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.898 & \cellcolor{gray!20}0.730 & \cellcolor{gray!20}0.911 & \cellcolor{gray!20}0.945 & 0.040 & 0.921 & 0.886 & 0.889 & 0.880 & 0.867 & 0.884 & 0.056 & \cellcolor{gray!20}0.231 & 0.040 \\
+geneval+pickscore & \textsc{Avg} & \cellcolor{gray!20}0.319 & \cellcolor{gray!20}0.740 & \cellcolor{gray!20}0.800 & \cellcolor{gray!20}0.904 & \cellcolor{gray!20}0.770 & \cellcolor{gray!20}0.933 & \cellcolor{gray!20}0.873 & 0.041 & 0.947 & 0.907 & 0.907 & 0.906 & 0.875 & 0.909 & \cellcolor{gray!20}0.057 & 0.349 & 0.038 \\
+ocr+pickscore & \textsc{Avg} & 0.387 & 0.490 & 0.711 & 0.867 & 0.550 & 0.778 & 0.682 & 0.042 & 0.935 & 0.897 & 0.903 & 0.905 & 0.869 & 0.900 & \cellcolor{gray!20}0.057 & \cellcolor{gray!20}0.253 & 0.040 \\
+geneval+ocr+pickscore & \textsc{PCGrad} & \cellcolor{gray!20}0.338 & \cellcolor{gray!20}0.625 & \cellcolor{gray!20}0.844 & \cellcolor{gray!20}0.959 & \cellcolor{gray!20}0.650 & \cellcolor{gray!20}0.867 & \cellcolor{gray!20}0.818 & 0.041 & 0.940 & 0.899 & 0.898 & 0.898 & 0.870 & 0.900 & \cellcolor{gray!20}0.058 & \cellcolor{gray!20}0.259 & 0.039 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\end{document}
