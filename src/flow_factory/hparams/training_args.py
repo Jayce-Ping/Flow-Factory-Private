@@ -1462,7 +1462,11 @@ class OPDTrainingArguments(TrainingArguments):
             )
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        # All modes: GAS is multiplied by T (number of training timesteps).
+        # PCGrad manages T-step accumulation internally (single accumulate()
+        # per batch), so GAS should NOT be multiplied by T.
+        if self.teacher_aggregation == "pcgrad":
+            return 1
+        # All other modes: GAS is multiplied by T (number of training timesteps).
         # Each timestep enters accumulate() independently for correct
         # DeepSpeed gradient accumulation boundary tracking.
         if args.scheduler_args.dynamics_type == "ODE":
