@@ -1,9 +1,10 @@
 # Experiment: OPD Pathwise-Only — pcgrad + route_by_source=false
 #
 # Gradient-space PCGrad WITHOUT source routing. All M teachers compute
-# loss on ALL samples regardless of source. This tests whether PCGrad's
-# conflict resolution works when teachers are forced to distill on
-# out-of-distribution prompts (e.g., text-teacher on geneval prompts).
+# loss on ALL samples regardless of source.
+#
+# ⚠️ REQUIRES DDP (not DeepSpeed ZeRO). See pathwise_pcgrad.yaml header.
+# For DeepSpeed, use pathwise_v_pcgrad_no_route.yaml instead.
 #
 # Ablation: compare with pathwise_pcgrad.yaml (route=true) to measure
 # whether source isolation helps or hurts when combined with PCGrad.
