@@ -905,21 +905,18 @@ class MoFTrainer(BaseTrainer):
 
         # ====================================================================
         # Log raw rewards (before any normalization)
+        # Format: train/{source_name}/raw_{reward_name}
         # ====================================================================
         log_data: Dict[str, Any] = {}
-        for rname in reward_names:
-            r_vals = gathered_rewards[rname]
-            valid = ~np.isnan(r_vals)
-            if valid.any():
-                log_data[f"train/raw_reward_{rname}_mean"] = float(np.nanmean(r_vals))
-                log_data[f"train/raw_reward_{rname}_std"] = float(np.nanstd(r_vals))
-            # Per-source raw reward breakdown
-            for src_name, src_id in self._source_to_set_id.items():
-                src_mask = (gathered_source_ids == src_id) & valid
-                if src_mask.any():
-                    log_data[f"train/raw_reward_{rname}/{src_name}_mean"] = float(
-                        np.mean(r_vals[src_mask])
-                    )
+        for src_name, src_id in self._source_to_set_id.items():
+            src_mask = gathered_source_ids == src_id
+            if not src_mask.any():
+                continue
+            for rname in reward_names:
+                r_vals = gathered_rewards[rname]
+                valid = src_mask & ~np.isnan(r_vals)
+                if valid.any():
+                    log_data[f"train/{src_name}/raw_{rname}"] = float(np.mean(r_vals[valid]))
 
         # ====================================================================
         # Step 1: Per-Reward, Per-Group Normalization
@@ -955,11 +952,6 @@ class MoFTrainer(BaseTrainer):
                 a_vals[mask] = group_a
 
             per_reward_advantages[rname] = a_vals
-            # Log per-reward stats (non-NaN only)
-            valid_a = a_vals[~np.isnan(a_vals)]
-            if len(valid_a) > 0:
-                log_data[f"train/adv_{rname}_mean"] = float(np.mean(valid_a))
-                log_data[f"train/adv_{rname}_std"] = float(np.std(valid_a))
 
         # ====================================================================
         # Step 2: Per-Set Advantage Aggregation
@@ -1020,29 +1012,20 @@ class MoFTrainer(BaseTrainer):
         for sample, adv in zip(samples, local_advantages):
             sample.extra_kwargs["advantage"] = float(adv)
 
-        # Log designed reward (Step 2 output: combined per-set advantages before global-std)
-        log_data["train/designed_reward_mean"] = float(np.mean(combined_advantages))
-        log_data["train/designed_reward_std"] = float(np.std(combined_advantages))
+        # Log per-source: designed_reward and advantage
+        # Format: train/{source_name}/designed_reward, train/{source_name}/advantage
         for src_name, src_id in self._source_to_set_id.items():
             src_mask = gathered_source_ids == src_id
             if src_mask.any():
-                log_data[f"train/designed_reward_{src_name}_mean"] = float(
+                log_data[f"train/{src_name}/designed_reward"] = float(
                     np.mean(combined_advantages[src_mask])
                 )
-                log_data[f"train/designed_reward_{src_name}_std"] = float(
-                    np.std(combined_advantages[src_mask])
-                )
-
-        # Log final advantage stats (after global-std normalization + clipping)
-        log_data["train/advantage_global_std"] = global_std
-        log_data["train/advantage_final_mean"] = float(np.mean(final_advantages))
-        log_data["train/advantage_final_std"] = float(np.std(final_advantages))
-        for src_name, src_id in self._source_to_set_id.items():
-            src_mask = gathered_source_ids == src_id
-            if src_mask.any():
-                log_data[f"train/advantage_{src_name}_mean"] = float(
+                log_data[f"train/{src_name}/advantage"] = float(
                     np.mean(final_advantages[src_mask])
                 )
+
+        # Global advantage stats
+        log_data["train/advantage_global_std"] = global_std
 
         # Log training samples (images) for qualitative inspection
         log_data["train_samples"] = samples[:30]
