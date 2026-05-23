@@ -83,6 +83,7 @@ train:
   ema_device: "cuda"                        # Device to store EMA model
 
   # ---- Per-set reward design ----
+  eval_teachers_at_start: true              # Evaluate each teacher baseline at epoch 0
   ood_bonus_gamma: 0.2                      # OOD bonus: reward_s = R_s + 0.2 * mean(R_j, j!=s)
                                             # 0 = pure in-domain, >0 encourages cross-teacher exploration
 

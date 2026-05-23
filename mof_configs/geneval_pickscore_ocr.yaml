@@ -92,6 +92,7 @@ train:
   # ---- Per-set reward design ----
   # For prompt set s: reward = R_s(x) + gamma * mean(R_j(x) for j != s)
   # This encourages discovering cross-teacher benefits while prioritizing in-domain.
+  eval_teachers_at_start: true              # Evaluate each teacher baseline at epoch 0
   ood_bonus_gamma: 0.2                      # OOD bonus coefficient (0=pure in-domain, 0.2=recommended)
 
   # ---- Advantage computation ----
