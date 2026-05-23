@@ -1325,12 +1325,8 @@ class MoFTrainer(BaseTrainer):
 
         self.adapter.eval()
         for k, teacher_name in enumerate(self._teacher_names):
-            teacher_sources = self._teacher_sources[k]
-            # Determine which test sets this teacher applies to
-            applicable_test_sets = []
-            for ts_name in sorted(self.test_dataloaders.keys()):
-                if teacher_sources is None or ts_name in teacher_sources:
-                    applicable_test_sets.append(ts_name)
+            # Evaluate every teacher on ALL test sets (full cross-table)
+            applicable_test_sets = sorted(self.test_dataloaders.keys())
 
             if not applicable_test_sets:
                 continue
