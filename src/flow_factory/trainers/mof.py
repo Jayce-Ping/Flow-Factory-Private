@@ -906,7 +906,7 @@ class MoFTrainer(BaseTrainer):
         # ====================================================================
         # Log raw rewards (before any normalization)
         # ====================================================================
-        log_data: Dict[str, float] = {}
+        log_data: Dict[str, Any] = {}
         for rname in reward_names:
             r_vals = gathered_rewards[rname]
             valid = ~np.isnan(r_vals)
@@ -1043,6 +1043,9 @@ class MoFTrainer(BaseTrainer):
                 log_data[f"train/advantage_{src_name}_mean"] = float(
                     np.mean(final_advantages[src_mask])
                 )
+
+        # Log training samples (images) for qualitative inspection
+        log_data["train_samples"] = samples[:30]
         self.log_data(log_data, step=self.step)
 
     # =========================================================================
@@ -1261,11 +1264,29 @@ class MoFTrainer(BaseTrainer):
     # Evaluation
     # =========================================================================
 
-    @contextmanager
-    def _eval_inference_context(self):
-        """Override: use MoF inference for evaluation (default to set 0)."""
-        with self._mof_inference_context(set_id=0):
-            yield
+    def _evaluate_test_set(self, test_set_name: str) -> None:
+        """Override: use per-test-set lambda weights for evaluation.
+
+        Maps test_set_name → set_id so each eval dataset uses its own
+        learned teacher mixing strategy (e.g., geneval test uses geneval
+        lambda weights, not a default set_id=0).
+        """
+        set_id = self._source_to_set_id.get(test_set_name, 0)
+
+        self.eval_reward_buffer = RewardBuffer(
+            self._eval_reward_processor_for_test_set(test_set_name),
+            self.training_args.group_size,
+        )
+        merged_eval = self._merged_eval_args_for_test_set_name(test_set_name)
+        log_pfx = self._eval_log_prefix(test_set_name)
+        eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
+
+        with torch.no_grad(), self.autocast(), self._mof_inference_context(set_id):
+            all_samples = self._run_eval_inference_batches(test_set_name, merged_eval, eval_seed)
+            gathered_rewards = self._gather_eval_rewards()
+            if self.accelerator.is_main_process:
+                self._log_eval_reward_metrics(gathered_rewards, log_pfx, all_samples)
+        self.accelerator.wait_for_everyone()
 
     # =========================================================================
     # Checkpointing
