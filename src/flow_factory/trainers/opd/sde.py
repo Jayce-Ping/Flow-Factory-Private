@@ -1044,8 +1044,11 @@ class OPDTrainer(BaseTrainer):
                     for g in pcgrad_epoch_grad:
                         torch.distributed.all_reduce(g, op=torch.distributed.ReduceOp.AVG)
 
-                # Set p.grad and step
-                self.optimizer.zero_grad()
+                # Set p.grad and step (use unwrapped optimizer to bypass
+                # AcceleratedOptimizer's sync_gradients guard which is never
+                # set to True since pcgrad doesn't use accumulate())
+                raw_optimizer = self.optimizer.optimizer
+                raw_optimizer.zero_grad(set_to_none=True)
                 for p, g in zip(trainable_params, pcgrad_epoch_grad):
                     p.grad = g / num_batches  # Average over batches
 
@@ -1053,8 +1056,8 @@ class OPDTrainer(BaseTrainer):
                     trainable_params,
                     self.training_args.max_grad_norm,
                 )
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                raw_optimizer.step()
+                raw_optimizer.zero_grad(set_to_none=True)
                 loss_info = reduce_loss_info(self.accelerator, loss_info)
                 loss_info["grad_norm"] = grad_norm
                 self.log_data(
@@ -1845,7 +1848,7 @@ class OPDTrainer(BaseTrainer):
 
                 with backward_ctx:
                     for pos, teacher_k in enumerate(active_indices):
-                        self.optimizer.zero_grad()
+                        self.optimizer.optimizer.zero_grad(set_to_none=True)
                         is_last_active = (pos == len(active_indices) - 1)
                         retain = (not is_last_active) or self.enable_kl_loss
                         per_teacher_losses[teacher_k].backward(retain_graph=retain)
@@ -1856,7 +1859,7 @@ class OPDTrainer(BaseTrainer):
                         per_teacher_grads.append(grad_snapshot)
 
                     if self.enable_kl_loss:
-                        self.optimizer.zero_grad()
+                        self.optimizer.optimizer.zero_grad(set_to_none=True)
                         kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
                         kl_loss.backward()
                         kl_grad = [
