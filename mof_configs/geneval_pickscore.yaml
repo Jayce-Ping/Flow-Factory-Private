@@ -57,9 +57,11 @@ train:
   # The teacher's velocity is used for samples from its assigned source.
   teachers:
     - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
-      sources: [geneval]                    # This teacher's in-domain set → provides velocity for geneval prompts
+      sources: [geneval]                    # This teacher's in-domain set
+      reward_name: "geneval"                # In-domain reward for this source
     - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
-      sources: [pickscore]                  # This teacher's in-domain set → provides velocity for pickscore prompts
+      sources: [pickscore]                  # This teacher's in-domain set
+      reward_name: "pick_score"             # In-domain reward for this source
 
   teacher_route_by_source: true             # Enable per-set independent lambda weights (S > 1)
   teacher_param_device: 'cuda'              # Store teacher LoRA snapshots on GPU for fast swapping
@@ -76,8 +78,6 @@ train:
   # ---- Per-set reward design ----
   ood_bonus_gamma: 0.2                      # OOD bonus: reward_s = R_s + 0.2 * mean(R_j, j!=s)
                                             # 0 = pure in-domain, >0 encourages cross-teacher exploration
-  reward_normalization: "zscore"            # Normalize rewards to comparable scale before combining
-  reward_ema_alpha: 0.01                    # EMA alpha for running reward mean/var (z-score update speed)
 
   # ---- Advantage computation ----
   advantage_aggregation: "gdpo"             # GDPO-style per-group advantage normalization
@@ -90,7 +90,7 @@ train:
   num_inference_steps: 10                   # T = number of denoising steps (determines logits T dimension)
 
   # ---- Optimization ----
-  per_device_batch_size: 4                  # Micro-batch size per GPU
+  per_device_batch_size: 8                  # Micro-batch size per GPU
   group_size: 16                             # Number of samples per prompt for advantage computation
   unique_sample_num_per_epoch: 32           # Total unique prompts sampled per epoch
   num_inner_epochs: 1                       # Inner training epochs per sampling round
@@ -116,7 +116,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512
-  per_device_batch_size: 32
+  per_device_batch_size: 16
   guidance_scale: 1.0                       # NFT: no CFG during eval either
   num_inference_steps: 40                   # Match training timesteps for consistent eval
   eval_freq: 10                             # Evaluate every N epochs
@@ -131,7 +131,8 @@ eval:
       split: test
       eval_reward_names: [pick_score]
 
-# Training rewards (computed on every generated sample during sampling)
+# Training rewards — each reward specifies which sources it applies to.
+# Samples from non-applicable sources get NaN (skipped in per-set reward computation).
 rewards:
   - name: "geneval"                         # GenEval: composition accuracy (counting, spatial, color)
     reward_model: "geneval"
@@ -139,12 +140,14 @@ rewards:
     device: "cuda"
     dtype: float32
     async_reward: false
+    applicable_sources: [geneval]            # Only compute on geneval samples (requires 'include' field)
   - name: "pick_score"                      # PickScore: overall aesthetic quality
     reward_model: "PickScore"
     batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+    applicable_sources: [geneval, pickscore] # Compute on all sources (no special fields needed)
 
 # Evaluation rewards (may include additional metrics not used in training)
 eval_rewards:
@@ -154,6 +157,7 @@ eval_rewards:
     device: "cuda"
     dtype: float32
     async_reward: false
+    applicable_sources: [geneval]
   - name: "pick_score"
     reward_model: "PickScore"
     batch_size: 64

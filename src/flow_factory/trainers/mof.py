@@ -37,6 +37,7 @@ from typing import List, Dict, Any, Optional, Set
 from functools import partial
 from collections import defaultdict
 from contextlib import contextmanager
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -175,8 +176,8 @@ class MoFTrainer(BaseTrainer):
         self._sched_cache = cache_scheduler_step_signature(self.adapter.scheduler.step)
 
         # ---- Reward normalization running stats ----
-        self._reward_running_mean: Dict[str, float] = {}
-        self._reward_running_var: Dict[str, float] = {}
+        self._reward_running_mean: Dict[str, float] = {}  # Reserved for future use
+        self._reward_running_var: Dict[str, float] = {}   # Reserved for future use
 
     # =========================================================================
     # Initialization (called by super().__init__ → _initialization)
@@ -298,7 +299,10 @@ class MoFTrainer(BaseTrainer):
           - self._teacher_sources: per-teacher set of allowed sources
           - self._source_to_set_id: source name → integer set index
           - self._set_id_to_source: inverse mapping
+          - self._source_to_reward_name: source → in-domain reward name (from TeacherConfig.reward_name)
         """
+        self._source_to_reward_name: Dict[str, str] = {}
+
         if (
             self.training_args.teachers is not None
             and self.training_args.teacher_route_by_source
@@ -310,6 +314,10 @@ class MoFTrainer(BaseTrainer):
                 )
                 if tc.sources:
                     all_sources.update(tc.sources)
+                    # Map each source to its in-domain reward name
+                    if tc.reward_name:
+                        for src in tc.sources:
+                            self._source_to_reward_name[src] = tc.reward_name
             # Assign set IDs in sorted order for determinism
             for idx, src in enumerate(sorted(all_sources)):
                 self._source_to_set_id[src] = idx
@@ -319,6 +327,9 @@ class MoFTrainer(BaseTrainer):
             self._teacher_sources = [None] * self.K
             self._source_to_set_id = {"default": 0}
             self._set_id_to_source = {0: "default"}
+
+        if self._source_to_reward_name:
+            logger.info(f"MoF source→reward mapping: {self._source_to_reward_name}")
 
     def _init_lambda_logits(self) -> nn.Parameter:
         """Create MoFMixingModule and return its logits parameter.
@@ -701,70 +712,52 @@ class MoFTrainer(BaseTrainer):
     ) -> Dict[str, torch.Tensor]:
         """Compute per-set composite rewards with OOD bonus.
 
-        For each sample in set s:
-            reward_s = normalize(R_s) + gamma * mean(normalize(R_j) for j != s)
+        Aggregation only (no normalization): for each sample in set s,
+            composite = R_in_domain + gamma * mean(R_ood for applicable j != s)
+
+        Normalization is delegated to GDPO advantage computation downstream
+        (group mean subtraction + global std division).
+
+        NaN values (from applicable_sources filtering) are gracefully skipped.
 
         Returns:
             Dict with single key "mof_reward" → tensor of per-sample rewards.
         """
         gamma = self.training_args.ood_bonus_gamma
-        alpha = self.training_args.reward_ema_alpha
-        use_zscore = self.training_args.reward_normalization == "zscore"
-
-        # Update running stats and normalize
-        normalized: Dict[str, torch.Tensor] = {}
-        for name, values in raw_rewards.items():
-            if use_zscore:
-                batch_mean = values.mean().item()
-                batch_var = values.var().item() if len(values) > 1 else 1.0
-                # EMA update
-                if name not in self._reward_running_mean:
-                    self._reward_running_mean[name] = batch_mean
-                    self._reward_running_var[name] = max(batch_var, 1e-8)
-                else:
-                    self._reward_running_mean[name] = (
-                        (1 - alpha) * self._reward_running_mean[name] + alpha * batch_mean
-                    )
-                    self._reward_running_var[name] = (
-                        (1 - alpha) * self._reward_running_var[name] + alpha * batch_var
-                    )
-                mu = self._reward_running_mean[name]
-                sigma = max(self._reward_running_var[name] ** 0.5, 1e-8)
-                normalized[name] = (values - mu) / sigma
-            else:
-                normalized[name] = values
-
-        # Build per-sample composite reward
-        reward_names = list(normalized.keys())
+        reward_names = list(raw_rewards.keys())
         composite = torch.zeros(len(samples), device=self.accelerator.device)
 
         for i, sample in enumerate(samples):
             source = sample.extra_kwargs.get("__source__", "default")
-            # Find in-domain reward: the reward whose name matches the source
-            # Convention: reward name contains source name (e.g. "geneval", "pickscore", "ocr")
             in_domain_name = self._find_in_domain_reward(source, reward_names)
 
-            if in_domain_name is not None:
-                composite[i] = normalized[in_domain_name][i]
-                if gamma > 0 and len(reward_names) > 1:
-                    ood_sum = sum(
-                        normalized[rn][i] for rn in reward_names if rn != in_domain_name
-                    )
-                    composite[i] += gamma * ood_sum / (len(reward_names) - 1)
-            else:
-                # Fallback: average all rewards
-                composite[i] = sum(normalized[rn][i] for rn in reward_names) / len(reward_names)
+            # Collect applicable (non-NaN) raw rewards for this sample
+            applicable: Dict[str, float] = {}
+            for rn in reward_names:
+                val = raw_rewards[rn][i]
+                if not torch.isnan(val):
+                    applicable[rn] = val.item()
+
+            if in_domain_name and in_domain_name in applicable:
+                composite[i] = applicable[in_domain_name]
+                if gamma > 0:
+                    ood_vals = [v for k, v in applicable.items() if k != in_domain_name]
+                    if ood_vals:
+                        composite[i] += gamma * sum(ood_vals) / len(ood_vals)
+            elif applicable:
+                # Fallback: average all applicable rewards
+                composite[i] = sum(applicable.values()) / len(applicable)
 
         return {"mof_reward": composite}
 
     def _find_in_domain_reward(self, source: str, reward_names: List[str]) -> Optional[str]:
         """Find the in-domain reward name for a given source.
 
-        Uses substring matching: source "geneval" matches reward name "geneval".
+        Uses explicit mapping from TeacherConfig.reward_name (populated in _init_source_routing).
         """
-        for rn in reward_names:
-            if source in rn or rn in source:
-                return rn
+        reward_name = self._source_to_reward_name.get(source)
+        if reward_name and reward_name in reward_names:
+            return reward_name
         return None
 
     # =========================================================================
@@ -861,17 +854,54 @@ class MoFTrainer(BaseTrainer):
     # =========================================================================
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Finalize rewards, compute per-set composite reward, then advantages."""
+        """Finalize rewards, compute per-set composite reward, then advantages.
+
+        Uses group-mean + global-std normalization on the composite reward.
+        Handles distributed training via AdvantageProcessor's gather/scatter
+        infrastructure (correctly accounts for groups split across ranks).
+        """
         raw_rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
 
-        # Compute per-set composite reward
+        # Compute per-set composite reward (single scalar per sample)
         composite_rewards = self._compute_per_set_rewards(samples, raw_rewards)
 
-        # Compute advantages using the composite reward
-        self.compute_advantages(samples, composite_rewards, store_to_samples=True)
-        adv_metrics = self.advantage_processor.pop_advantage_metrics()
-        if adv_metrics:
-            self.log_data(adv_metrics, step=self.step)
+        # Use AdvantageProcessor's distributed gather to collect rewards + group IDs
+        # across all ranks. This handles the case where a group's K samples are
+        # spread across different ranks (distributed_k_repeat sampler).
+        gathered_rewards, group_indices = self.advantage_processor.collect_group_rewards(
+            samples, composite_rewards
+        )
+        reward_array = gathered_rewards["mof_reward"]  # (global_N,) numpy
+
+        # Per-group mean subtraction (GDPO-style)
+        advantages = np.zeros_like(reward_array, dtype=np.float64)
+        for group_id in np.unique(group_indices):
+            mask = group_indices == group_id
+            group_vals = reward_array[mask]
+            mean = np.mean(group_vals)
+            std = max(np.std(group_vals), 1e-6)
+            advantages[mask] = (group_vals - mean) / std
+
+        # Global-std normalization
+        global_std = max(float(np.std(advantages)), 1e-6)
+        advantages = advantages / global_std
+
+        # Scatter back to local rank and move to CPU for storage
+        local_advantages = self.advantage_processor._to_local(advantages)
+        if isinstance(local_advantages, torch.Tensor):
+            local_advantages = local_advantages.cpu().numpy()
+
+        # Store to samples
+        for sample, adv in zip(samples, local_advantages):
+            sample.extra_kwargs["advantage"] = float(adv)
+
+        # Log metrics
+        log_data = {
+            "train/mof_reward_mean": float(np.mean(reward_array)),
+            "train/mof_reward_std": float(np.std(reward_array)),
+            "train/advantage_global_std": global_std,
+        }
+        self.log_data(log_data, step=self.step)
 
     # =========================================================================
     # Optimization
@@ -982,7 +1012,9 @@ class MoFTrainer(BaseTrainer):
                         )
 
                         # NFT loss computation
-                        adv = batch['advantage']
+                        adv = torch.as_tensor(
+                            batch['advantage'], dtype=torch.float32, device=device
+                        )
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
 
