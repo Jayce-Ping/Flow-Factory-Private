@@ -780,7 +780,7 @@ r_{\mathrm{composite}}(x, s) = R_{\mathrm{in}(s)}(x) + \gamma \cdot \mathrm{mean
 
 \item \textbf{Group-Std vs.\ Global-Std 的语义差异}（低风险但需注意）
 
-当前实现做了两层 normalization：先 group-std（eq.~\ref{eq:group_norm}），再 global-std（eq.~\ref{eq:global_norm}）。这等价于：
+当前实现做了两层 normalization：先 group-std（eq.~\ref{eq:per_reward_norm}），再 global-std（eq.~\ref{eq:final_norm}）。这等价于：
 \begin{equation}
 \mathcal{A}_i = \frac{r_i - \mu_g}{\sigma_g \cdot \sigma_{\mathrm{global}}}
 \end{equation}
@@ -826,5 +826,165 @@ r_{\mathrm{composite}}(x, s) = R_{\mathrm{in}(s)}(x) + \gamma \cdot \mathrm{mean
 \item \textbf{monitoring}: 添加 per-source advantage mean 的 logging，确认各 source 的 advantage 分布是否平衡（不应有某个 source 的 advantage 系统性偏高或偏低）。
 \end{enumerate}
 \end{tcolorbox}
+
+%% ============================================================
+\section{Batch-Level Normalization 时机分析}
+\label{sec:norm_timing}
+%% ============================================================
+
+核心问题：在 MoF 的 3-step advantage pipeline 中，batch-level normalization（$\sigma_{\mathrm{global}}$ 除法）应放在\textbf{per-reward advantage 聚合之前}还是\textbf{之后}？
+
+\subsection{两种方案定义}
+
+\begin{definition}[Option A: Batch-Level Normalization \textbf{Before} Aggregation]
+\label{def:norm_before}
+\begin{align}
+&\text{Step 1:}\quad a_k(x_i) = \frac{R_k(x_i) - \mu_{k,g}}{\max(\sigma_{k,g}, \epsilon)} \quad\text{(per-reward, per-group)} \\
+&\text{Step 1.5:}\quad \hat{a}_k(x_i) = \frac{a_k(x_i)}{\max(\sigma_{k,\mathrm{batch}}, \epsilon)}, \quad \sigma_{k,\mathrm{batch}} = \mathrm{std}(\{a_k(x_j)\}_{j=1}^N) \\
+&\text{Step 2:}\quad \mathcal{A}_{\mathrm{final}}(x_i) = \hat{a}_{\mathrm{in}(s)}(x_i) + \gamma \cdot \frac{1}{|\mathcal{R}_{\mathrm{ood}}|}\sum_{j \in \mathcal{R}_{\mathrm{ood}}} \hat{a}_j(x_i)
+\end{align}
+特点：每个 reward 的 advantage 被独立归一化为 batch-level unit variance，然后直接聚合。\textbf{聚合后不再做额外 normalization}。
+\end{definition}
+
+\begin{definition}[Option B: Batch-Level Normalization \textbf{After} Aggregation]
+\label{def:norm_after}
+\begin{align}
+&\text{Step 1:}\quad a_k(x_i) = \frac{R_k(x_i) - \mu_{k,g}}{\max(\sigma_{k,g}, \epsilon)} \quad\text{(per-reward, per-group)} \\
+&\text{Step 2:}\quad \mathcal{A}_{\mathrm{combined}}(x_i) = a_{\mathrm{in}(s)}(x_i) + \gamma \cdot \frac{1}{|\mathcal{R}_{\mathrm{ood}}|}\sum_{j \in \mathcal{R}_{\mathrm{ood}}} a_j(x_i) \\
+&\text{Step 3:}\quad \mathcal{A}_{\mathrm{final}}(x_i) = \frac{\mathcal{A}_{\mathrm{combined}}(x_i)}{\max(\sigma_{\mathrm{global}}, \epsilon)}, \quad \sigma_{\mathrm{global}} = \mathrm{std}(\{\mathcal{A}_{\mathrm{combined}}(x_j)\}_{j=1}^N)
+\end{align}
+特点：先在 advantage 空间做 in-domain + OOD 聚合，然后对聚合后的 combined advantage 做统一的 batch-level normalization。
+\end{definition}
+
+\subsection{数学等价性分析}
+
+\begin{proposition}[Group-Std 后 Batch-Std 近似为恒等]
+\label{prop:batch_std_identity}
+设 Step 1 的 group normalization 正确工作（即各 group 内 sample 数量 $\geq 4$），则：
+\begin{equation}
+\sigma_{k,\mathrm{batch}} = \mathrm{std}\left(\left\{\frac{R_k(x_j) - \mu_{k,g_j}}{\sigma_{k,g_j}}\right\}_{j=1}^N\right) \approx 1
+\end{equation}
+\textbf{原因}：各 group 独立贡献 zero-mean, unit-variance 的 $a_k$ 值。跨 group 拼接后的 batch-level std 仍为 $\approx 1$（除非 group 数量极少或 group 间 reward 分布高度非平稳）。
+
+因此 Option A 的 Step 1.5 近似为恒等操作：$\hat{a}_k \approx a_k$。
+\end{proposition}
+
+\begin{corollary}[两种方案的差异来源]
+\label{cor:diff_source}
+Option A 与 Option B 的实质差异不在于``是否消除 per-reward scale 差异''（Step 1 的 group-std 已经做了），而在于：
+\begin{itemize}[leftmargin=1.5em]
+\item Option A：\textbf{聚合后不再 normalize}。$\mathcal{A}_{\mathrm{final}}$ 的 variance 取决于 source $s$ 的 OOD reward 数量：
+\begin{align}
+\mathrm{Var}(\mathcal{A}^A_{\mathrm{final}}) &= 1 + \frac{\gamma^2}{|\mathcal{R}_{\mathrm{ood}}|} \quad\text{（假设各 $a_k$ 独立）}
+\end{align}
+对 geneval ($|\mathcal{R}_{\mathrm{ood}}| = 1$): $\mathrm{Var} = 1 + 0.04 = 1.04$\\
+对 pickscore ($|\mathcal{R}_{\mathrm{ood}}| = 0$): $\mathrm{Var} = 1$\\
+对 ocr ($|\mathcal{R}_{\mathrm{ood}}| = 1$): $\mathrm{Var} = 1.04$
+
+$\Rightarrow$ 不同 source 的 final advantage 有微小的 variance 差异。
+
+\item Option B：$\sigma_{\mathrm{global}}$ 统一 rescale 所有 sample，确保 $\mathrm{Var}(\mathcal{A}^B_{\mathrm{final}}) \approx 1$ 对所有 sample。
+\end{itemize}
+\end{corollary}
+
+\subsection{对 NFT Loss 的影响}
+
+\begin{proposition}[NFT Loss 对 Advantage Scale 的敏感性]
+\label{prop:nft_sensitivity}
+回顾 NFT loss 中 advantage 的作用（eq.~\ref{eq:normalized_adv}）：
+\begin{equation}
+r_s = \frac{\adv_s + A_{\max}}{2A_{\max}} \in [0, 1]
+\end{equation}
+其中 $A_{\max} = \max(|\mathrm{adv\_clip\_range}|)$（配置中为 5.0）。
+
+\begin{itemize}[leftmargin=1.5em]
+\item $A_{\max}$ 起到 normalization 的作用：将 advantage 映射到 $[0,1]$ 区间。
+\item 若 $\mathcal{A}_{\mathrm{final}}$ 的实际 std $\ll A_{\max}$（如 std $\approx 1$ vs $A_{\max} = 5$），则 $r_s \approx 0.5 \pm 0.1$——advantage 的有效信号强度较弱。
+\item 若 $\mathcal{A}_{\mathrm{final}}$ 的 std 变动较大，则不同 training epoch 的 $r_s$ 分布不稳定。
+\end{itemize}
+
+\textbf{结论}：NFT loss 对 advantage 的 absolute scale 敏感度较低（通过 $A_{\max}$ 缓冲），但对\textbf{不同 sample 间的相对大小}高度敏感。因此 Option A 和 B 在 NFT loss 下的行为差异很小（$\gamma = 0.2$ 导致的 variance 差异仅 4\%）。
+\end{proposition}
+
+\subsection{对比总结}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{@{}p{4cm} p{5.5cm} p{5.5cm}@{}}
+\toprule
+& \textbf{Option A (Before)} & \textbf{Option B (After)} \\
+\midrule
+Per-reward scale 消除 & \ding{51} 由 Step 1 group-std 完成（Step 1.5 近似恒等） & \ding{51} 同样由 Step 1 完成 \\
+\midrule
+Final advantage variance & 依赖于 source 的 OOD reward 数量 & 统一 $\approx 1$ \\
+\midrule
+$\gamma$ 语义 & 精确：OOD 贡献 $\gamma$ 比例的信号 & 精确（同上，$\sigma_{\mathrm{global}}$ 只做 global rescale） \\
+\midrule
+对 NFT loss 的稳定性 & 轻微不一致（variance 差 $\sim$ 4\%） & 更稳定（统一 scale） \\
+\midrule
+鲁棒性 & group-std 不精确时可能残留 scale 差异 & $\sigma_{\mathrm{global}}$ 提供额外保险 \\
+\midrule
+计算开销 & 需要 per-reward 的 batch-std（$K$ 次 std） & 需要 combined 的 batch-std（1 次 std） \\
+\midrule
+标准实践 & 非标准（GRPO/GDPO 不使用此模式） & GDPO 的标准做法 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{推荐方案与理论依据}
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!50, title=推荐：Option B（After Aggregation）]
+\textbf{推荐 batch-level normalization 放在 advantage 聚合\textbf{之后}}，理由如下：
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Scale 消除已由 Step 1 完成}：Per-reward group-std 已将各 reward 归一化到 $\sim N(0,1)$。Pre-aggregation batch-std 近似为恒等操作（Proposition~\ref{prop:batch_std_identity}），增加计算但无实质收益。
+
+\item \textbf{Post-aggregation $\sigma_{\mathrm{global}}$ 提供 robustness}：当 group size 较小（如 $K = 4$）时，per-group std 估计可能不精确，导致聚合后的 advantage 的 batch-level std 偏离 1。$\sigma_{\mathrm{global}}$ 除法提供了一个``safety net''，确保最终 advantage 的 scale 稳定。
+
+\item \textbf{统一 scale 对 NFT loss 友好}：虽然 NFT loss 对 absolute scale 不太敏感（有 $A_{\max}$ 缓冲），但统一的 advantage scale 使 learning rate 的选择更稳定——不需要根据 OOD reward 数量调整 lr。
+
+\item \textbf{与 GRPO/GDPO 一致}：标准 GRPO 使用 ``group-mean → global-std'' 的两层结构，MoF 的 ``per-reward group-norm → aggregate → global-std'' 是其自然扩展。
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{remark}[何时 Option A 可能更好]
+若未来引入 reward 间的\textbf{非独立性}（如 geneval reward 与 pickscore reward 高度相关），则 $\mathrm{Var}(\mathcal{A}_{\mathrm{combined}})$ 可能显著偏离 $1 + \gamma^2/|\mathcal{R}_{\mathrm{ood}}|$ 的独立假设。此时 pre-aggregation normalization 可以消除相关性导致的 variance inflation。但在当前配置下（rewards 相对独立），Option B 更简洁有效。
+\end{remark}
+
+\subsection{最终 Pipeline 伪代码}
+
+\begin{algorithm}[H]
+\caption{MoF Advantage Pipeline (Recommended: Option B)}
+\label{alg:advantage_pipeline}
+\begin{algorithmic}[1]
+\Require Raw rewards $\{R_k(x_i)\}_{k,i}$, group indices $\{g_i\}$, source labels $\{s_i\}$, gamma $\gamma$
+\Ensure Per-sample advantage $\{\mathcal{A}_i\}$
+\Statex
+\Statex \textbf{// Step 1: Per-Reward Group Normalization}
+\For{each reward $k$}
+    \For{each group $g$}
+        \State $\mu_{k,g} \gets \mathrm{mean}(\{R_k(x_j) : g_j = g, R_k(x_j) \neq \mathrm{NaN}\})$
+        \State $\sigma_{k,g} \gets \mathrm{std}(\{R_k(x_j) : g_j = g, R_k(x_j) \neq \mathrm{NaN}\})$
+        \For{$x_j$ in group $g$ where $R_k(x_j) \neq \mathrm{NaN}$}
+            \State $a_k(x_j) \gets (R_k(x_j) - \mu_{k,g}) / \max(\sigma_{k,g}, \epsilon)$
+        \EndFor
+    \EndFor
+\EndFor
+\Statex
+\Statex \textbf{// Step 2: Per-Set Advantage Aggregation}
+\For{each sample $x_i$ from source $s$}
+    \State $\mathrm{in} \gets$ in-domain reward for source $s$
+    \State $\mathcal{R}_{\mathrm{ood}} \gets$ applicable non-in-domain rewards for $x_i$ (non-NaN)
+    \State $\mathcal{A}_{\mathrm{combined}}(x_i) \gets a_{\mathrm{in}}(x_i) + \gamma \cdot \mathrm{mean}(\{a_j(x_i)\}_{j \in \mathcal{R}_{\mathrm{ood}}})$
+\EndFor
+\Statex
+\Statex \textbf{// Step 3: Global-Std Normalization}
+\State $\sigma_{\mathrm{global}} \gets \mathrm{std}(\{\mathcal{A}_{\mathrm{combined}}(x_j)\}_{j=1}^N)$
+\For{each sample $x_i$}
+    \State $\mathcal{A}_{\mathrm{final}}(x_i) \gets \mathcal{A}_{\mathrm{combined}}(x_i) / \max(\sigma_{\mathrm{global}}, \epsilon)$
+    \State $\mathcal{A}_{\mathrm{final}}(x_i) \gets \mathrm{clip}(\mathcal{A}_{\mathrm{final}}(x_i),\, \mathrm{adv\_clip\_min},\, \mathrm{adv\_clip\_max})$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
 
 \end{document}
