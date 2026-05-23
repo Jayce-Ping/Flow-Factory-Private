@@ -156,7 +156,7 @@ class MoFTrainer(BaseTrainer):
         self.time_sampling_strategy = self.training_args.time_sampling_strategy
         self.time_shift = self.training_args.time_shift
         self.timestep_range = self.training_args.timestep_range
-        self.num_train_timesteps = self.training_args.num_inference_steps
+        self.num_train_timesteps = self.training_args.num_train_timesteps
 
         # ---- EMA for logits (off-policy old policy) ----
         self._logits_ema = EMAModuleWrapper(
@@ -710,7 +710,12 @@ class MoFTrainer(BaseTrainer):
         samples: List[BaseSample],
         raw_rewards: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Compute per-set composite rewards with OOD bonus.
+        """[DEPRECATED] Compute per-set composite rewards with OOD bonus.
+
+        NOTE: This method is superseded by the per-reward normalization pipeline
+        in prepare_feedback() (Step 1→2→3). Kept for backward compatibility and
+        potential use in evaluation/debugging contexts where raw-space aggregation
+        is acceptable.
 
         Aggregation only (no normalization): for each sample in set s,
             composite = R_in_domain + gamma * mean(R_ood for applicable j != s)
@@ -854,40 +859,136 @@ class MoFTrainer(BaseTrainer):
     # =========================================================================
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Finalize rewards, compute per-set composite reward, then advantages.
+        """Finalize rewards and compute per-set advantages.
 
-        Uses group-mean + global-std normalization on the composite reward.
+        Implements the correct 3-step pipeline (see Section 9 of analysis doc):
+          Step 1: Per-reward, per-group normalization → per-reward advantages
+          Step 2: Per-set aggregation in advantage space (a_in + γ * mean(a_ood))
+          Step 3: Global-std normalization on the combined advantage
+
+        This ensures γ has consistent semantic meaning regardless of raw reward
+        scales (e.g. GenEval ∈ [0,1] vs PickScore ∈ [0.8, 0.95]).
+
         Handles distributed training via AdvantageProcessor's gather/scatter
         infrastructure (correctly accounts for groups split across ranks).
         """
+        device = self.accelerator.device
         raw_rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
 
-        # Compute per-set composite reward (single scalar per sample)
-        composite_rewards = self._compute_per_set_rewards(samples, raw_rewards)
-
-        # Use AdvantageProcessor's distributed gather to collect rewards + group IDs
-        # across all ranks. This handles the case where a group's K samples are
-        # spread across different ranks (distributed_k_repeat sampler).
-        gathered_rewards, group_indices = self.advantage_processor.collect_group_rewards(
-            samples, composite_rewards
+        # Pack source_id as pseudo-reward for cross-rank gathering.
+        # All samples in a group share the same source, so this is consistent.
+        source_ids = torch.tensor(
+            [self._source_to_set_id.get(
+                s.extra_kwargs.get("__source__", "default"), 0
+            ) for s in samples],
+            dtype=torch.float32,
+            device=device,
         )
-        reward_array = gathered_rewards["mof_reward"]  # (global_N,) numpy
+        rewards_with_meta = {**raw_rewards, "__source_id__": source_ids}
 
-        # Per-group mean subtraction (GDPO-style)
-        advantages = np.zeros_like(reward_array, dtype=np.float64)
-        for group_id in np.unique(group_indices):
-            mask = group_indices == group_id
-            group_vals = reward_array[mask]
-            mean = np.mean(group_vals)
-            std = max(np.std(group_vals), 1e-6)
-            advantages[mask] = (group_vals - mean) / std
+        # Gather all per-reward values + source_ids + group indices across ranks
+        gathered_rewards, group_indices = self.advantage_processor.collect_group_rewards(
+            samples, rewards_with_meta
+        )
 
-        # Global-std normalization
-        global_std = max(float(np.std(advantages)), 1e-6)
-        advantages = advantages / global_std
+        # Extract source IDs (rounded to int) and remove from reward dict
+        gathered_source_ids = gathered_rewards.pop("__source_id__").astype(np.int64)
+        reward_names = list(gathered_rewards.keys())
+        N = len(group_indices)
 
-        # Scatter back to local rank and move to CPU for storage
-        local_advantages = self.advantage_processor._to_local(advantages)
+        # ====================================================================
+        # Step 1: Per-Reward, Per-Group Normalization
+        # Each reward is independently normalized to ~N(0,1) within each group.
+        # NaN values (non-applicable samples) are skipped.
+        # ====================================================================
+        per_reward_advantages: Dict[str, np.ndarray] = {}
+        log_data: Dict[str, float] = {}
+
+        for rname in reward_names:
+            r_vals = gathered_rewards[rname]  # (N,) numpy, may contain NaN
+            a_vals = np.full(N, np.nan, dtype=np.float64)
+
+            for group_id in np.unique(group_indices):
+                mask = group_indices == group_id
+                group_r = r_vals[mask]
+
+                # Skip NaN values (non-applicable samples for this reward)
+                valid = ~np.isnan(group_r)
+                if valid.sum() < 2:
+                    # Not enough valid samples for meaningful normalization
+                    if valid.sum() == 1:
+                        a_vals[mask] = np.where(valid, 0.0, np.nan)
+                    continue
+
+                valid_r = group_r[valid]
+                mu = np.mean(valid_r)
+                sigma = max(np.std(valid_r), 1e-8)
+                normalized = (valid_r - mu) / sigma
+
+                # Write back only to valid positions within this group
+                group_a = np.full(mask.sum(), np.nan)
+                group_a[valid] = normalized
+                a_vals[mask] = group_a
+
+            per_reward_advantages[rname] = a_vals
+            # Log per-reward stats (non-NaN only)
+            valid_a = a_vals[~np.isnan(a_vals)]
+            if len(valid_a) > 0:
+                log_data[f"train/adv_{rname}_mean"] = float(np.mean(valid_a))
+                log_data[f"train/adv_{rname}_std"] = float(np.std(valid_a))
+
+        # ====================================================================
+        # Step 2: Per-Set Advantage Aggregation
+        # For sample from source s: A = a_in(s) + γ * mean(a_ood)
+        # Aggregation in advantage space (all a_k already ~N(0,1)).
+        # ====================================================================
+        gamma = self.training_args.ood_bonus_gamma
+        combined_advantages = np.zeros(N, dtype=np.float64)
+
+        for i in range(N):
+            source_id = int(gathered_source_ids[i])
+            source_name = self._set_id_to_source.get(source_id, "default")
+            in_domain_reward = self._source_to_reward_name.get(source_name)
+
+            # Get in-domain advantage
+            if in_domain_reward and in_domain_reward in per_reward_advantages:
+                in_domain_a = per_reward_advantages[in_domain_reward][i]
+                if np.isnan(in_domain_a):
+                    in_domain_a = 0.0
+            else:
+                in_domain_a = 0.0
+
+            # Get OOD advantages (non-NaN, non-in-domain)
+            ood_vals = []
+            for rname, a_vals in per_reward_advantages.items():
+                if rname == in_domain_reward:
+                    continue
+                val = a_vals[i]
+                if not np.isnan(val):
+                    ood_vals.append(val)
+
+            # Combine: in-domain + gamma * mean(ood)
+            combined = in_domain_a
+            if gamma > 0 and ood_vals:
+                combined += gamma * np.mean(ood_vals)
+
+            combined_advantages[i] = combined
+
+        # ====================================================================
+        # Step 3: Global-Std Normalization (Option B from analysis)
+        # Ensures final advantage has consistent scale for NFT loss.
+        # ====================================================================
+        global_std = max(float(np.std(combined_advantages)), 1e-8)
+        final_advantages = combined_advantages / global_std
+
+        # Apply clipping if configured
+        adv_clip = getattr(self.training_args, 'adv_clip_range', None)
+        if adv_clip is not None:
+            clip_min, clip_max = adv_clip[0], adv_clip[1]
+            final_advantages = np.clip(final_advantages, clip_min, clip_max)
+
+        # Scatter back to local rank
+        local_advantages = self.advantage_processor._to_local(final_advantages)
         if isinstance(local_advantages, torch.Tensor):
             local_advantages = local_advantages.cpu().numpy()
 
@@ -896,11 +997,19 @@ class MoFTrainer(BaseTrainer):
             sample.extra_kwargs["advantage"] = float(adv)
 
         # Log metrics
-        log_data = {
-            "train/mof_reward_mean": float(np.mean(reward_array)),
-            "train/mof_reward_std": float(np.std(reward_array)),
+        log_data.update({
+            "train/advantage_combined_mean": float(np.mean(combined_advantages)),
+            "train/advantage_combined_std": float(np.std(combined_advantages)),
             "train/advantage_global_std": global_std,
-        }
+            "train/advantage_final_std": float(np.std(final_advantages)),
+        })
+        # Per-source advantage mean (monitor balance across sources)
+        for src_name, src_id in self._source_to_set_id.items():
+            src_mask = gathered_source_ids == src_id
+            if src_mask.any():
+                log_data[f"train/advantage_{src_name}_mean"] = float(
+                    np.mean(final_advantages[src_mask])
+                )
         self.log_data(log_data, step=self.step)
 
     # =========================================================================
@@ -990,8 +1099,11 @@ class MoFTrainer(BaseTrainer):
                         old_v_pred_list.append(old_v.detach())
 
                 # ---- Phase 2: Train with current logits ----
-                current_weights = self._get_lambda_weights(self._lambda_logits)
-
+                # Follows NFT trainer pattern: accelerator.accumulate() handles
+                # DDP no_sync + auto loss scaling by gradient_accumulation_steps.
+                # get_num_train_timesteps() returns num_inference_steps, so
+                # gradient_accumulation_steps already includes the T factor.
+                self.adapter.train()
                 with self.autocast():
                     for t_idx in tqdm(
                         range(self.num_train_timesteps),
@@ -1000,107 +1112,117 @@ class MoFTrainer(BaseTrainer):
                         leave=False,
                         disable=not self.show_progress_bar,
                     ):
-                        t_flat = all_timesteps[t_idx]
-                        sigma_broadcast = all_sigma_broadcast[t_idx]
-                        noised_latents = all_noised_latents[t_idx]
-                        old_v_pred = old_v_pred_list[t_idx]
-                        teacher_velocities = all_teacher_velocities[t_idx]
+                        with self.accelerator.accumulate(self._mixing_module):
+                            t_flat = all_timesteps[t_idx]
+                            sigma_broadcast = all_sigma_broadcast[t_idx]
+                            noised_latents = all_noised_latents[t_idx]
+                            old_v_pred = old_v_pred_list[t_idx]
+                            teacher_velocities = all_teacher_velocities[t_idx]
 
-                        # Per-sample combination with current weights
-                        new_v_pred = self._combine_velocities_per_sample(
-                            teacher_velocities, t_idx, current_weights, set_ids
-                        )
+                            # Recompute weights INSIDE the loop to create a fresh
+                            # computation graph each iteration. Avoids "backward
+                            # through graph a second time" since each iteration
+                            # independently builds: _lambda_logits → softmax →
+                            # weights → new_v_pred → loss, and backward frees
+                            # only that iteration's graph.
+                            current_weights = self._get_lambda_weights(self._lambda_logits)
 
-                        # NFT loss computation
-                        adv = torch.as_tensor(
-                            batch['advantage'], dtype=torch.float32, device=device
-                        )
-                        adv_clip_range = self.training_args.adv_clip_range
-                        adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
+                            # Per-sample combination with current weights
+                            new_v_pred = self._combine_velocities_per_sample(
+                                teacher_velocities, t_idx, current_weights, set_ids
+                            )
 
-                        normalized_adv = (adv / max(adv_clip_range)) / 2.0 + 0.5
-                        r = torch.clamp(normalized_adv, 0, 1).view(
-                            -1, *([1] * (new_v_pred.dim() - 1))
-                        )
+                            # NFT loss computation
+                            adv = torch.as_tensor(
+                                batch['advantage'], dtype=torch.float32, device=device
+                            )
+                            adv_clip_range = self.training_args.adv_clip_range
+                            adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
 
-                        # Positive/negative predictions
-                        positive_pred = (
-                            self.nft_beta * new_v_pred
-                            + (1 - self.nft_beta) * old_v_pred
-                        )
-                        negative_pred = (
-                            (1.0 + self.nft_beta) * old_v_pred
-                            - self.nft_beta * new_v_pred
-                        )
+                            normalized_adv = (adv / max(adv_clip_range)) / 2.0 + 0.5
+                            r = torch.clamp(normalized_adv, 0, 1).view(
+                                -1, *([1] * (new_v_pred.dim() - 1))
+                            )
 
-                        # NFT self-normalized MSE losses
-                        positive_loss = self._nft_weighted_mse(
-                            positive_pred, noised_latents, sigma_broadcast, clean_latents
-                        )
-                        negative_loss = self._nft_weighted_mse(
-                            negative_pred, noised_latents, sigma_broadcast, clean_latents
-                        )
+                            # Positive/negative predictions
+                            positive_pred = (
+                                self.nft_beta * new_v_pred
+                                + (1 - self.nft_beta) * old_v_pred
+                            )
+                            negative_pred = (
+                                (1.0 + self.nft_beta) * old_v_pred
+                                - self.nft_beta * new_v_pred
+                            )
 
-                        # Combined loss
-                        ori_policy_loss = (
-                            r.squeeze() * positive_loss
-                            + (1.0 - r.squeeze()) * negative_loss
-                        ) / self.nft_beta
-                        policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
-                        loss = policy_loss
+                            # NFT self-normalized MSE losses
+                            positive_loss = self._nft_weighted_mse(
+                                positive_pred, noised_latents, sigma_broadcast, clean_latents
+                            )
+                            negative_loss = self._nft_weighted_mse(
+                                negative_pred, noised_latents, sigma_broadcast, clean_latents
+                            )
 
-                        # Optional KL penalty
-                        if self.enable_kl_loss:
-                            with torch.no_grad(), self.adapter.use_ref_parameters():
-                                ref_forward_kwargs = self._build_forward_kwargs(
-                                    batch, t_flat, noised_latents
+                            # Combined loss
+                            ori_policy_loss = (
+                                r.squeeze() * positive_loss
+                                + (1.0 - r.squeeze()) * negative_loss
+                            ) / self.nft_beta
+                            policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
+                            loss = policy_loss
+
+                            # Optional KL penalty
+                            if self.enable_kl_loss:
+                                with torch.no_grad(), self.adapter.use_ref_parameters():
+                                    ref_forward_kwargs = self._build_forward_kwargs(
+                                        batch, t_flat, noised_latents
+                                    )
+                                    ref_output = self.adapter.forward(**ref_forward_kwargs)
+                                kl_div = torch.mean(
+                                    (new_v_pred - ref_output.noise_pred) ** 2,
+                                    dim=tuple(range(1, new_v_pred.ndim)),
                                 )
-                                ref_output = self.adapter.forward(**ref_forward_kwargs)
-                            kl_div = torch.mean(
-                                (new_v_pred - ref_output.noise_pred) ** 2,
-                                dim=tuple(range(1, new_v_pred.ndim)),
+                                kl_loss = self.training_args.kl_beta * kl_div.mean()
+                                loss = loss + kl_loss
+                                loss_info['kl_div'].append(kl_div.detach())
+                                loss_info['kl_loss'].append(kl_loss.detach())
+
+                            loss_info['policy_loss'].append(policy_loss.detach())
+                            loss_info['unweighted_policy_loss'].append(
+                                ori_policy_loss.mean().detach()
                             )
-                            kl_loss = self.training_args.kl_beta * kl_div.mean()
-                            loss = loss + kl_loss
-                            loss_info['kl_div'].append(kl_div.detach())
-                            loss_info['kl_loss'].append(kl_loss.detach())
+                            loss_info['loss'].append(loss.detach())
 
-                        loss_info['policy_loss'].append(policy_loss.detach())
-                        loss_info['unweighted_policy_loss'].append(
-                            ori_policy_loss.mean().detach()
-                        )
-                        loss_info['loss'].append(loss.detach())
+                            # Backward (accumulate handles loss scaling + DDP sync)
+                            self.accelerator.backward(loss)
 
-                        # Accumulate gradients
-                        (loss / self.num_train_timesteps).backward()
+                            # Optimizer step only when gradients are synced
+                            # (after all T accumulation steps complete)
+                            if self.accelerator.sync_gradients:
+                                grad_norm = self.accelerator.clip_grad_norm_(
+                                    self._mixing_module.parameters(),
+                                    self.training_args.max_grad_norm,
+                                )
+                                self.optimizer.step()
+                                self.optimizer.zero_grad()
 
-                # Single optimizer step per batch
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self._mixing_module.parameters(),
-                    self.training_args.max_grad_norm,
-                )
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
-                # Log batch-level metrics
-                loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
-                loss_info_reduced['grad_norm'] = grad_norm
-                with torch.no_grad():
-                    log_weights = self._get_lambda_weights(self._lambda_logits)
-                    # Batch mean over T dimension: (K, S) on GPU, then transfer
-                    mean_weights = log_weights.mean(dim=1)  # (K, S)
-                    for k in range(self.K):
-                        for s in range(self.S):
-                            src_name = self._set_id_to_source.get(s, str(s))
-                            loss_info_reduced[f'lambda_t{k}_{src_name}_mean'] = (
-                                mean_weights[k, s].item()
-                            )
-                self.log_data(
-                    {f'train/{k}': v for k, v in loss_info_reduced.items()},
-                    step=self.step,
-                )
-                self.step += 1
-                loss_info = defaultdict(list)
+                                # Log batch-level metrics
+                                loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
+                                loss_info_reduced['grad_norm'] = grad_norm
+                                with torch.no_grad():
+                                    log_weights = self._get_lambda_weights(self._lambda_logits)
+                                    mean_weights = log_weights.mean(dim=1)  # (K, S)
+                                    for k in range(self.K):
+                                        for s in range(self.S):
+                                            src_name = self._set_id_to_source.get(s, str(s))
+                                            loss_info_reduced[f'lambda_t{k}_{src_name}_mean'] = (
+                                                mean_weights[k, s].item()
+                                            )
+                                self.log_data(
+                                    {f'train/{k}': v for k, v in loss_info_reduced.items()},
+                                    step=self.step,
+                                )
+                                self.step += 1
+                                loss_info = defaultdict(list)
 
     # =========================================================================
     # Evaluation

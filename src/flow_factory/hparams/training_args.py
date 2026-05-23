@@ -835,6 +835,17 @@ class MoFTrainingArguments(TrainingArguments):
     )
 
     # ---- Timestep control ----
+    num_train_timesteps: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of training timesteps (T dimension of logits). "
+                "0 or None defaults to num_inference_steps. "
+                "Aligned with NFT: controls how many discrete timestep "
+                "slots to iterate over during optimization."
+            )
+        },
+    )
     time_sampling_strategy: Literal[
         "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
     ] = field(
@@ -866,6 +877,14 @@ class MoFTrainingArguments(TrainingArguments):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+
+        # num_train_timesteps: defaults to num_inference_steps.
+        # MoF iterates over all inference steps because logits shape is
+        # (K, T, S) where T = num_inference_steps. The timestep_range is
+        # handled by TimeSampler (selects which scheduler timesteps to use),
+        # not by reducing T.
+        if not self.num_train_timesteps or self.num_train_timesteps <= 0:
+            self.num_train_timesteps = self.num_inference_steps
 
         # Resolve teacher_paths from teachers if needed
         if self.teachers is not None:
@@ -899,6 +918,16 @@ class MoFTrainingArguments(TrainingArguments):
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid: ['v-based'].")
         if self.ood_bonus_gamma < 0:
             raise ValueError(f"ood_bonus_gamma must be >= 0, got {self.ood_bonus_gamma}.")
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        """Return num_train_timesteps for gradient accumulation computation.
+
+        Used by _adjust_gradient_accumulation() to set:
+            gradient_accumulation_steps *= get_num_train_timesteps()
+        so that accelerator.accumulate() correctly handles the T timestep
+        iterations as gradient accumulation steps.
+        """
+        return self.num_train_timesteps
 
 
 # Backward compatibility alias
