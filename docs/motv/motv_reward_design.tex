@@ -1,0 +1,531 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\reward}{R}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\Conv}{\mathrm{Conv}}
+\newcommand{\Pareto}{\mathrm{Pareto}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{example}{Example}
+\newtheorem{strategy}{Strategy}
+
+\title{\textbf{MoTV Reward 设计分析}\\[0.3em]
+\large 如何设计 Reward 以实现/超越 Single-Teacher Performance}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文分析 MoTV 框架中 reward function 的设计策略。MoTV 通过 DiffusionNFT 算法优化 per-timestep 的 teacher 混合权重 $\lambda_{k,i}$，reward 函数直接决定了优化方向和最终性能上界。我们分析三种 reward 设计方案：(1) 等权加权所有指标；(2) 基于 prompt 类型的条件 reward；(3) 多阶段自适应 reward。并给出理论分析和实践建议，特别关注超越 single-teacher 的可能性。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{问题定义}
+%% ============================================================
+
+\subsection{背景回顾}
+
+我们有 $K=3$ 个 teacher flow model：
+\begin{itemize}[leftmargin=1.5em]
+\item Teacher 1 (GenEval)：在 GenEval 评测集（composition, counting, spatial relations）上表现最优。
+\item Teacher 2 (PickScore)：在 PickScore 评测集（overall aesthetics）上表现最优。
+\item Teacher 3 (OCR)：在 OCR 评测集（text rendering accuracy）上表现最优。
+\end{itemize}
+
+三个评测集对应三个 prompt set：
+\begin{itemize}[leftmargin=1.5em]
+\item $\mathcal{P}_{\mathrm{gen}}$：GenEval prompts（涉及数量、空间关系、颜色属性）
+\item $\mathcal{P}_{\mathrm{pick}}$：PickScore prompts（通用美学 prompts）
+\item $\mathcal{P}_{\mathrm{ocr}}$：OCR prompts（含文字渲染要求的 prompts）
+\end{itemize}
+
+三个 reward function：
+\begin{align}
+R_{\mathrm{gen}}(x) &: \text{GenEval accuracy (per-image composition score)} \in [0, 1] \\
+R_{\mathrm{pick}}(x) &: \text{PickScore} \in \R \\
+R_{\mathrm{ocr}}(x) &: \text{OCR accuracy} \in [0, 1]
+\end{align}
+
+\subsection{核心问题}
+
+MoTV 优化的是：
+\begin{equation}
+\ell^* = \arg\max_{\ell \in \R^{K \times T}} \E_{p \sim \mathcal{D}}\left[\reward\!\left(\mathrm{ODE}(v_\lambda; x_T, p)\right)\right]
+\end{equation}
+
+\textbf{$\reward$ 如何设计}直接决定了 MoTV 能否超越 single teacher。
+
+\subsection{目标层次}
+
+我们区分两个不同层次的目标：
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!40]
+\textbf{Level 1（保守目标）}：在每个 prompt set 上至少\textbf{达到}对应 single teacher 的 in-domain performance，同时提升 OOD performance。即：
+\begin{equation}
+R_j(v_\lambda \,|\, p \in \mathcal{P}_j) \geq R_j(v^{(j)} \,|\, p \in \mathcal{P}_j), \quad \forall j
+\end{equation}
+
+\textbf{Level 2（雄心目标）}：在某些 prompt set 上\textbf{超越}最优 single teacher。即：
+\begin{equation}
+\exists\, j: \quad R_j(v_\lambda \,|\, p \in \mathcal{P}_j) > R_j(v^{(j)} \,|\, p \in \mathcal{P}_j)
+\end{equation}
+\end{tcolorbox}
+
+%% ============================================================
+\section{方案一：等权加权（Naive GDPO）}
+\label{sec:equal_weight}
+%% ============================================================
+
+\subsection{定义}
+
+最直接的做法：对所有 reward 等权平均：
+\begin{equation}
+\reward^{\mathrm{equal}}(x, p) = \frac{1}{3}\left[R_{\mathrm{gen}}(x) + R_{\mathrm{pick}}(x) + R_{\mathrm{ocr}}(x)\right]
+\label{eq:equal_reward}
+\end{equation}
+
+在 GDPO（Grouped DPO-style advantage computation）框架中，advantage 为：
+\begin{equation}
+\adv(x, p) = \reward^{\mathrm{equal}}(x, p) - \E_{x' \sim \pi_{\mathrm{old}}(\cdot|p)}\left[\reward^{\mathrm{equal}}(x', p)\right]
+\end{equation}
+
+\subsection{梯度分析}
+
+将~\eqref{eq:equal_reward} 代入 MoTV 的梯度公式（Theorem~2.1 of motv\_gradient\_analysis.tex）：
+\begin{equation}
+\frac{\partial \loss_i}{\partial \ell_{k,i}} \propto \lambda_{k,i}\left[v_k - v^{\mathrm{new}}\right]^\top \left(\text{error signal weighted by } \adv^{\mathrm{equal}}\right)
+\end{equation}
+
+\subsection{问题分析}
+
+\begin{proposition}[等权加权的潜在问题]
+\label{prop:equal_weight_issues}
+等权 reward 存在以下问题：
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Scale 不匹配}：$R_{\mathrm{pick}}$ 的绝对值范围（$\sim 0.8$--$0.95$）与 $R_{\mathrm{gen}}$（$\sim 0.6$--$0.95$）和 $R_{\mathrm{ocr}}$（$\sim 0.5$--$0.93$）不同。直接等权平均导致 PickScore 的 variance 较小，在 advantage 计算中贡献不足。
+
+\item \textbf{Reward 冲突的平滑效应}：当某个 sample 在一个 metric 上好但在另一个上差时，等权 advantage 接近于零——无法给出明确的优化方向。
+
+\item \textbf{Prompt-Type 不敏感}：对 OCR prompt，$R_{\mathrm{gen}}$ 和 $R_{\mathrm{pick}}$ 的信号可能与 OCR accuracy 无关甚至矛盾（美学好的文字渲染不一定 OCR 准确）。等权加权将无关 reward 的噪声引入了 advantage。
+\end{enumerate}
+\end{proposition}
+
+\subsection{等权加权的理论最优解}
+
+\begin{proposition}[等权最优解的性质]
+在等权 reward 下，MoTV 的最优 $\lambda^*$ 最大化所有 prompt 上的平均综合 reward：
+\begin{equation}
+\lambda^* = \arg\max_\lambda \E_p\!\left[\frac{1}{3}\sum_j R_j(v_\lambda \,|\, p)\right]
+\end{equation}
+
+这\textbf{不保证}在单个 metric 上超越对应 teacher——因为最优解是在三个 metric 之间做 trade-off。具体来说，如果 teacher $j$ 已经在 $R_j$ 上接近最优，等权优化可能牺牲 $R_j$ 来提升 $R_{j'}$（$j' \neq j$）。
+\end{proposition}
+
+\begin{remark}[适用场景]
+等权加权适合``不在乎单个 metric 的 in-domain 性能，只要综合提升''的场景。对 Level~1 目标不理想。
+\end{remark}
+
+%% ============================================================
+\section{方案二：Prompt-Conditional Reward}
+\label{sec:conditional}
+%% ============================================================
+
+\subsection{动机}
+
+核心观察：每个 prompt 有其``主要关注的 reward 维度''。OCR prompt 最关心文字准确性；GenEval prompt 最关心 composition；通用 prompt 最关心 aesthetics。
+
+\subsection{定义}
+
+\begin{strategy}[Prompt-Conditional Reward]
+\label{strat:conditional}
+定义 per-prompt reward 为：
+\begin{equation}
+\reward^{\mathrm{cond}}(x, p) = \begin{cases}
+w_{\mathrm{in}} R_{\mathrm{gen}}(x) + w_{\mathrm{ood}} \left[R_{\mathrm{pick}}(x) + R_{\mathrm{ocr}}(x)\right] & \text{if } p \in \mathcal{P}_{\mathrm{gen}} \\
+w_{\mathrm{in}} R_{\mathrm{pick}}(x) + w_{\mathrm{ood}} \left[R_{\mathrm{gen}}(x) + R_{\mathrm{ocr}}(x)\right] & \text{if } p \in \mathcal{P}_{\mathrm{pick}} \\
+w_{\mathrm{in}} R_{\mathrm{ocr}}(x) + w_{\mathrm{ood}} \left[R_{\mathrm{gen}}(x) + R_{\mathrm{pick}}(x)\right] & \text{if } p \in \mathcal{P}_{\mathrm{ocr}}
+\end{cases}
+\label{eq:cond_reward}
+\end{equation}
+其中 $w_{\mathrm{in}} \gg w_{\mathrm{ood}}$（如 $w_{\mathrm{in}} = 0.7$, $w_{\mathrm{ood}} = 0.15$）。
+\end{strategy}
+
+\subsection{梯度分析}
+
+\begin{proposition}[Conditional Reward 的梯度方向]
+在 prompt-conditional reward 下，对 $p \in \mathcal{P}_j$：
+\begin{equation}
+\adv(x, p \in \mathcal{P}_j) \approx w_{\mathrm{in}}\left[R_j(x) - \bar{R}_j\right] + w_{\mathrm{ood}}\sum_{j' \neq j}\left[R_{j'}(x) - \bar{R}_{j'}\right]
+\end{equation}
+
+\textbf{主导信号}为 $R_j$：在 prompt set $\mathcal{P}_j$ 上，梯度主要由对应 reward $R_j$ 驱动，确保 in-domain performance 被优先优化。OOD reward 提供辅助信号但不干扰主方向。
+\end{proposition}
+
+\subsection{Level~1 目标的保证}
+
+\begin{theorem}[Conditional Reward 趋向 Level~1]
+\label{thm:level1}
+在 $w_{\mathrm{in}} \to 1$, $w_{\mathrm{ood}} \to 0$ 的极限下，prompt-conditional reward 退化为``route\_by\_source''的 reward 版本：
+\begin{equation}
+\lim_{w_{\mathrm{ood}} \to 0} \reward^{\mathrm{cond}}(x, p \in \mathcal{P}_j) = R_j(x)
+\end{equation}
+
+此时 MoTV 在每个 prompt set 上独立优化对应 reward，最优解为：
+\begin{equation}
+\lambda^*_{k,i}(\mathcal{P}_j) = \begin{cases} 1 & \text{if teacher $k$ at timestep $i$ maximizes $R_j$} \\ 0 & \text{otherwise} \end{cases}
+\end{equation}
+
+由于 teacher $j$ 专门为 $R_j$ 训练，大概率 $\lambda^*_{j,i}(\mathcal{P}_j) \approx 1$ 对多数 $i$——但\textbf{不排除}在某些 timestep 上其他 teacher 贡献更大（实现 Level~2）。
+\end{theorem}
+
+\subsection{问题}
+
+\begin{remark}[Conditional Reward 的局限]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{需要 prompt set 标注}：必须知道每个 prompt 属于哪个 set。对混合 prompt（如``a cat with the word `hello' on a beautiful beach''）归类模糊。
+\item \textbf{共享 $\lambda$}：当前 MoTV 实现使用\textbf{全局共享}的 $\lambda_{k,i}$（不依赖 prompt），因此 conditional reward 实际上要求 $\lambda$ 在不同 prompt set 上做 weighted average——可能导致折衷。
+\end{enumerate}
+\end{remark}
+
+\begin{tcolorbox}[colback=orange!5, colframe=orange!50, title=关键洞察：全局 $\lambda$ 的限制]
+当前 MoTV 的 $\lambda_{k,i}$ 对所有 prompt 共享。如果不同 prompt set 需要不同的 $\lambda$ 分配（如 OCR prompts 偏向 OCR teacher，GenEval prompts 偏向 GenEval teacher），则单一 $\lambda$ 无法同时满足所有 prompt set。
+
+\textbf{解决方案}：
+\begin{enumerate}
+\item 扩展 $\lambda$ 为 prompt-conditioned：$\lambda_{k,i}(p)$（增加参数量但更灵活）
+\item 或者：接受全局 $\lambda$ 的折衷，设计 reward 使得全局最优 $\lambda$ 恰好在每个 prompt set 上表现良好
+\end{enumerate}
+\end{tcolorbox}
+
+%% ============================================================
+\section{方案三：分阶段自适应 Reward（推荐）}
+\label{sec:adaptive}
+%% ============================================================
+
+\subsection{核心理念}
+
+结合方案一和方案二的优点，设计一个\textbf{自适应}的 reward 策略：
+
+\begin{strategy}[Two-Phase Adaptive Reward]
+\label{strat:adaptive}
+分两个阶段设计 reward：
+
+\textbf{Phase 1（In-Domain Recovery，前 N/2 epochs）}：使用高 $w_{\mathrm{in}}$ 的 conditional reward，优先确保 in-domain performance 不退化。
+
+\textbf{Phase 2（OOD Enhancement，后 N/2 epochs）}：逐步降低 $w_{\mathrm{in}}$ 并提升 $w_{\mathrm{ood}}$，鼓励 OOD improvement。
+
+具体 schedule：
+\begin{equation}
+w_{\mathrm{in}}(t) = w_{\mathrm{in}}^{\max} - (w_{\mathrm{in}}^{\max} - w_{\mathrm{in}}^{\min})\cdot \frac{\max(0, t - T_{\mathrm{warmup}})}{T_{\mathrm{total}} - T_{\mathrm{warmup}}}
+\end{equation}
+\end{strategy}
+
+\subsection{分析}
+
+Phase 1 确保 $\lambda$ 首先学到``在 OCR set 上偏向 OCR teacher''等基础模式（达到 Level~1）。Phase 2 在此基础上探索时间互补性，寻找能同时提升多个 metric 的 $\lambda$ 配置。
+
+%% ============================================================
+\section{方案四：Per-Prompt-Set 独立 $\lambda$（最强理论保证）}
+\label{sec:per_set_lambda}
+%% ============================================================
+
+\subsection{扩展 MoTV 架构}
+
+\begin{strategy}[Per-Set Lambda]
+\label{strat:per_set}
+将 logits 扩展为 $\ell \in \R^{K \times T \times S}$（$S$ = prompt set 数量），每个 prompt set 有独立的 $\lambda$ 配置：
+\begin{equation}
+v_\lambda(x, t_i, p \in \mathcal{P}_s) = \sum_k \lambda_{k,i,s}\, v_k(x, t_i), \quad
+\lambda_{k,i,s} = \softmax_k(\ell_{:,i,s} / \tau)
+\end{equation}
+\end{strategy}
+
+\subsection{理论优势}
+
+\begin{theorem}[Per-Set Lambda 的 Level~1 保证]
+\label{thm:per_set_level1}
+在 per-set lambda 下，对每个 prompt set $\mathcal{P}_s$：
+\begin{equation}
+\max_{\ell_{:,:,s}} \E_{p \in \mathcal{P}_s}\left[R_s(v_{\lambda_s})\right] \geq R_s(v_k), \quad \forall k
+\end{equation}
+其中不等式至少弱成立（因为 $\lambda_{k,i,s} = \delta_{k,s}$ 是可行解，对应 teacher $s$ 本身）。
+\end{theorem}
+
+\begin{proof}
+Teacher $s$ 对应的 $\lambda_{k,i,s} = \delta_{k,s}$（第 $s$ 个 teacher 恒取权重 1）是搜索空间中的一个可行点。其 reward 恰为 $R_s(v_s)$——即 single teacher $s$ 的 performance。优化只能找到不差于此的解。
+\end{proof}
+
+\subsection{Reward 设计}
+
+在 per-set lambda 架构下，reward 设计大幅简化：
+
+\begin{equation}
+\reward^{\mathrm{per\text{-}set}}(x, p \in \mathcal{P}_s) = R_s(x) + \gamma \sum_{j \neq s} R_j(x)
+\label{eq:per_set_reward}
+\end{equation}
+
+其中 $\gamma \geq 0$ 是 OOD bonus 系数（推荐 $\gamma \in [0.1, 0.3]$）。
+
+\begin{remark}[为什么 $\gamma > 0$ 有助于超越 single teacher]
+当 $\gamma = 0$ 时，每个 prompt set 独立优化自己的 in-domain reward，最优解就是对应 single teacher（或略好——如果时间互补性允许通过混合其他 teacher 在某些 timestep 上获得额外增益）。
+
+当 $\gamma > 0$ 时，优化会倾向于``在不显著损害 in-domain 的前提下提升 OOD''。这正是时间互补性发挥作用的场景：如果在某些 timestep 上引入少量其他 teacher 权重能提升 OOD reward 而不损害 in-domain，optimizer 会找到这样的配置。
+\end{remark}
+
+\subsection{参数量与开销}
+
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{方案} & \textbf{Learnable Parameters} & \textbf{Reward Evaluations/Sample} \\
+\midrule
+Global $\lambda$ + equal reward & $K \times T = 3 \times 28 = 84$ & 3 \\
+Global $\lambda$ + conditional reward & $K \times T = 84$ & 3 \\
+Per-set $\lambda$ + per-set reward & $K \times T \times S = 84 \times 3 = 252$ & 3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+即使是 per-set 方案，参数量也仅为 252——相比 model-weight training 微不足道。
+
+%% ============================================================
+\section{理论分析：哪种 Reward 设计最可能超越 Single Teacher}
+\label{sec:theory}
+%% ============================================================
+
+\subsection{超越 Single Teacher 的必要条件}
+
+\begin{theorem}[超越的必要条件]
+\label{thm:necessary}
+$v_\lambda$ 在 metric $R_j$、prompt set $\mathcal{P}_j$ 上超越 teacher $j$，当且仅当：
+\begin{equation}
+\exists\, \text{timestep } i^* \text{ 和 teacher } k \neq j: \quad
+\text{在 } t_{i^*} \text{ 处使用 teacher } k \text{ 的 velocity 能提升} R_j \text{ 的最终输出}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+如果对所有 timestep，teacher $j$ 都是 $R_j$ 的最优选择，则 $\lambda^*_{j,i} = 1, \forall i$ 即为最优——等价于 teacher $j$ 本身，无法超越。超越的必要条件是存在至少一个 timestep 上，某个其他 teacher 对 $R_j$ 有正向贡献。
+\end{proof}
+
+\subsection{时间互补性的来源}
+
+\begin{proposition}[为什么其他 Teacher 可能在某些 Timestep 帮助 In-Domain]
+\label{prop:complementarity}
+考虑具体场景：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{GenEval teacher 帮助 OCR}：GenEval teacher 擅长空间布局（positioning），这对文字的正确放置有帮助。在\textbf{早期 timestep}（全局 layout 阶段），GenEval teacher 的 velocity 可能比 OCR teacher 更好地确保文字区域的位置正确。
+
+\item \textbf{PickScore teacher 帮助 GenEval}：PickScore teacher 学到了一般性的``图像质量''信号，这包括清晰度和对比度。在\textbf{晚期 timestep}（细化阶段），清晰的渲染可能帮助 GenEval 的属性识别（如颜色更准确）。
+
+\item \textbf{OCR teacher 帮助 PickScore}：OCR teacher 在文字清晰度上有优势，而含文字的图像如果文字模糊反而会降低 aesthetics。在有文字的 prompt 上，OCR teacher 在中期 timestep 的贡献可能提升整体美感。
+\end{enumerate}
+\end{proposition}
+
+\subsection{Reward 设计对超越概率的影响}
+
+\begin{theorem}[Reward 与超越概率的关系]
+\label{thm:reward_design}
+设 $\lambda^*(\reward)$ 为 reward function $\reward$ 下的 MoTV 最优解。
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Equal reward}（$\reward = \frac{1}{3}\sum R_j$）：$\lambda^*$ 最大化综合 reward，对单个 $R_j$ 无保证。可能在某些 $R_j$ 上下降以换取综合提升。\textbf{超越单 teacher 的概率低}（因为优化方向分散）。
+
+\item \textbf{Per-set 独立 reward}（$\reward_s = R_s$，per-set $\lambda$）：每个 set 独立优化，$\lambda^*_s$ 直接最大化 $R_s$。由 Theorem~\ref{thm:per_set_level1}，\textbf{必然 $\geq$ single teacher}。当时间互补性存在时，\textbf{严格超越}。
+
+\item \textbf{Per-set + OOD bonus}（$\reward_s = R_s + \gamma \sum_{j\neq s} R_j$）：鼓励探索 OOD 方向的 $\lambda$ 配置。由于 OOD bonus 的正向激励，optimizer 更倾向于``尝试在某些 timestep 引入其他 teacher''——如果这增加了总 reward，就会被保留。\textbf{增大了发现时间互补性的概率}。
+\end{enumerate}
+\end{theorem}
+
+%% ============================================================
+\section{实践方案推荐}
+\label{sec:recommendation}
+%% ============================================================
+
+\subsection{推荐方案：Per-Set Lambda + Dominant-Reward-with-OOD-Bonus}
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50!black, title=推荐方案]
+\textbf{架构}：Per-set $\lambda \in \R^{K \times T \times S}$（$S=3$）
+
+\textbf{Reward for prompt set $\mathcal{P}_s$}：
+\begin{equation}
+\boxed{
+\reward_s(x) = R_s(x) + \gamma \cdot \frac{1}{K-1}\sum_{j \neq s} R_j(x), \quad \gamma = 0.2
+}
+\end{equation}
+
+\textbf{Advantage computation}：GDPO within each prompt set independently.
+
+\textbf{训练}：三组 $\lambda$ 同时训练，每个 mini-batch 混合三个 prompt set 的 sample。
+\end{tcolorbox}
+
+\subsection{理论保证}
+
+\begin{corollary}[推荐方案的性质]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Level~1 保证}（$\geq$ single teacher in-domain）：由 Theorem~\ref{thm:per_set_level1} 直接得到。即使学到的 $\lambda$ 退化为对应 teacher，也不会更差。
+
+\item \textbf{Level~2 可能性}（$>$ single teacher）：由 OOD bonus 的正向激励 + 时间互补性（Proposition~\ref{prop:complementarity}），optimizer 有动力探索混合配置。
+
+\item \textbf{稳定性}：$\gamma = 0.2$ 确保 in-domain reward 仍然是 dominant signal（$R_s$ 的系数为 1，OOD 的总系数为 $\gamma = 0.2$），不会因 OOD bonus 而牺牲 in-domain。
+\end{enumerate}
+\end{corollary}
+
+\subsection{备选方案（全局 $\lambda$ 不改架构）}
+
+如果不修改 MoTV 架构（保持全局 $\lambda \in \R^{K \times T}$），推荐使用 conditional reward：
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!40, title=备选方案（全局 $\lambda$）]
+\begin{equation}
+\reward(x, p) = \begin{cases}
+R_{\mathrm{gen}}(x) + 0.15[R_{\mathrm{pick}}(x) + R_{\mathrm{ocr}}(x)] & p \in \mathcal{P}_{\mathrm{gen}} \\
+R_{\mathrm{pick}}(x) + 0.15[R_{\mathrm{gen}}(x) + R_{\mathrm{ocr}}(x)] & p \in \mathcal{P}_{\mathrm{pick}} \\
+R_{\mathrm{ocr}}(x) + 0.15[R_{\mathrm{gen}}(x) + R_{\mathrm{pick}}(x)] & p \in \mathcal{P}_{\mathrm{ocr}}
+\end{cases}
+\end{equation}
+
+\textbf{注意}：全局 $\lambda$ 下，optimizer 需要在三个 prompt set 之间做折衷。最终 $\lambda$ 是三个 set 的``平均最优''——可能在某些 set 上略差于 single teacher。但由于 in-domain reward 权重大（$1.0$ vs $0.30$），退化幅度应该很小。
+\end{tcolorbox}
+
+%% ============================================================
+\section{Reward Scale Normalization}
+\label{sec:normalization}
+%% ============================================================
+
+\subsection{问题}
+
+$R_{\mathrm{gen}} \in [0, 1]$, $R_{\mathrm{pick}} \sim [0.83, 0.95]$, $R_{\mathrm{ocr}} \in [0, 1]$。Scale 和 range 不同导致 advantage 中各 reward 的有效贡献不均衡。
+
+\subsection{推荐 Normalization}
+
+\begin{strategy}[Per-Reward Z-Score Normalization]
+\label{strat:normalize}
+在 advantage 计算前，对每个 reward 做 running z-score normalization：
+\begin{equation}
+\tilde{R}_j(x) = \frac{R_j(x) - \mu_j}{\sigma_j + \epsilon}
+\end{equation}
+其中 $\mu_j, \sigma_j$ 是 running mean/std（across recent batches）。
+
+然后定义 normalized reward：
+\begin{equation}
+\reward_s(x) = \tilde{R}_s(x) + \gamma \cdot \frac{1}{K-1}\sum_{j \neq s} \tilde{R}_j(x)
+\end{equation}
+\end{strategy}
+
+\begin{remark}[Z-score vs.\ Min-Max]
+Z-score 优于 min-max：(1) 不需要预设 range 边界；(2) 对 outlier 更鲁棒；(3) 在 RL 中 advantage 本身就是 centered 的，z-score 与 GDPO advantage 的结构兼容。
+\end{remark}
+
+%% ============================================================
+\section{Reward Shaping for Timestep Discovery}
+\label{sec:shaping}
+%% ============================================================
+
+\subsection{动机}
+
+标准 DiffusionNFT 的 reward 是 trajectory-level 的：只在最终 image 上评估。这给 $\lambda$ 在每个 timestep 上的 credit assignment 带来困难——需要大量 sample 来发现``哪个 timestep 上哪个 teacher 好''。
+
+\subsection{可选的 Timestep-Level Reward Shaping}
+
+\begin{strategy}[KL-based Shaping Bonus]
+\label{strat:kl_shaping}
+为每个 timestep 提供一个``与当前 dominant teacher 对齐''的 bonus：
+\begin{equation}
+\reward_{\mathrm{shaped},i} = \reward_{\mathrm{final}} - \alpha\sum_i \KL(v_\lambda(\cdot, t_i) \,\|\, v_{\mathrm{dominant}}(\cdot, t_i))
+\end{equation}
+其中 $v_{\mathrm{dominant}}$ 是 per-prompt-set 的 in-domain teacher velocity。
+
+\textbf{效果}：鼓励 $\lambda$ 默认偏向 in-domain teacher（减小 KL），只有在 final reward 明确优于时才偏离。相当于 reward shaping 的``conservative prior''。
+\end{strategy}
+
+\begin{remark}[是否推荐]
+KL shaping 增加了计算开销（需要额外的 per-timestep KL 计算），且可能限制探索。在前期实验中\textbf{不推荐使用}——先用纯 final reward 看 MoTV 的自然行为。如果发现 $\lambda$ 收敛慢或 variance 大，再考虑引入 shaping。
+\end{remark}
+
+%% ============================================================
+\section{总结：方案对比与实验规划}
+\label{sec:conclusion}
+%% ============================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.6}
+\begin{tabular}{@{}p{3.5cm} c c c c@{}}
+\toprule
+\textbf{方案} & \textbf{Level~1 保证} & \textbf{Level~2 可能} & \textbf{需改架构} & \textbf{推荐优先级} \\
+\midrule
+等权加权 & \ding{55} & 低 & \ding{55} & 4（对照组） \\
+Conditional reward (global $\lambda$) & 弱$^\dagger$ & 中 & \ding{55} & 2 \\
+Per-set $\lambda$ + $R_s$ only & \ding{51} & 低 & \ding{51}$^*$ & 3 \\
+\textbf{Per-set $\lambda$ + $R_s + \gamma\sum R_j$} & \textbf{\ding{51}} & \textbf{高} & \ding{51}$^*$ & \textbf{1} \\
+\bottomrule
+\end{tabular}
+\end{center}
+{\footnotesize $^\dagger$弱保证：全局 $\lambda$ 做折衷，可能略低于 single teacher。\\
+$^*$架构改动极小：仅将 $\ell$ 从 $(K, T)$ 扩展为 $(K, T, S)$。}
+
+\bigskip
+
+\begin{tcolorbox}[colback=yellow!5, colframe=yellow!60!black, title=核心结论]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{不要使用等权加权}作为最终方案——它无法保证 in-domain performance，且超越 single teacher 的概率低。可作为 baseline 对照。
+
+\item \textbf{Per-set $\lambda$} 是理论最优架构——它解耦了不同 prompt set 的优化，给予每个 set 独立的``teacher 调度权''。
+
+\item \textbf{OOD bonus}（$\gamma > 0$）是发现时间互补性的关键——纯 in-domain reward 倾向于退化为 single teacher（因为这已经是一个很强的局部最优）。OOD bonus 提供了``探索''的激励。
+
+\item \textbf{Reward normalization}（z-score）是必要的前处理——确保不同 scale 的 reward 有公平的梯度贡献。
+
+\item \textbf{分阶段}（先 in-domain 恢复、后 OOD 探索）可以加速收敛，但如果用 per-set $\lambda$（有 Level~1 保证），则不是必须的。
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{建议的实验顺序}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Exp 1}（验证 MoTV 基础）：等权 reward + global $\lambda$。确认 MoTV 训练正常运行，$\lambda$ 有合理的变化趋势。
+\item \textbf{Exp 2}（conditional reward）：prompt-conditional reward + global $\lambda$。对比 Exp 1，验证 conditional reward 是否更好。
+\item \textbf{Exp 3}（per-set $\lambda$）：per-set $\lambda$ + per-set reward ($\gamma = 0$)。验证 Level~1 保证。
+\item \textbf{Exp 4}（完整推荐方案）：per-set $\lambda$ + per-set reward with OOD bonus ($\gamma = 0.2$)。验证 Level~2（超越 single teacher）。
+\item \textbf{Exp 5}（消融）：调整 $\gamma \in \{0.1, 0.3, 0.5\}$ 观察 in-domain vs OOD 的 trade-off。
+\end{enumerate}
+
+\end{document}

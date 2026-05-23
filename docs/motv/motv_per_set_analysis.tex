@@ -1,0 +1,689 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\reward}{R}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\sg}{\mathrm{sg}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{example}{Example}
+\newtheorem{strategy}{Strategy}
+
+\title{\textbf{MoTV Phase 2: Per-Prompt-Set $\lambda$ 架构分析}\\[0.3em]
+\large $\ell \in \R^{K \times T \times S}$ 的 Loss、梯度与 Reward 设计}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+基于 Phase~1 的分析结论，本文正式采用 per-prompt-set 扩展的 MoTV 架构：logits $\ell \in \R^{K \times T \times S}$，其中 $K$ = teacher 数量，$T$ = 推理 timesteps，$S$ = prompt set 数量。每个 prompt set 拥有独立的 teacher 混合策略。本文给出完整的 loss 推导、梯度公式、收敛性分析，并详细设计 per-set reward 策略——包括 reward normalization、advantage computation、OOD bonus 的精确公式和实现细节。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{架构定义}
+\label{sec:architecture}
+%% ============================================================
+
+\subsection{符号表}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{cl}
+\toprule
+\textbf{符号} & \textbf{含义} \\
+\midrule
+$K$ & Teacher 数量（= 3: GenEval, PickScore, OCR） \\
+$T$ & 推理 timesteps 数量（= \texttt{num\_inference\_steps}） \\
+$S$ & Prompt set 数量（= 3: $\mathcal{P}_{\mathrm{gen}}, \mathcal{P}_{\mathrm{pick}}, \mathcal{P}_{\mathrm{ocr}}$） \\
+$B$ & Batch size \\
+$d$ & Latent 维度 $= C \times H \times W$ \\
+$\ell \in \R^{K \times T \times S}$ & 可学习 logits（总参数量 $= K \times T \times S$） \\
+$\tau$ & Softmax temperature \\
+$\lambda_{k,i,s}$ & Teacher $k$ 在 timestep $i$、prompt set $s$ 上的权重 \\
+$v^{(k)}(x, t)$ & Teacher $k$ 的 frozen velocity field \\
+$v_{\lambda_s}(x, t_i)$ & Prompt set $s$ 上的 combined velocity \\
+$R_j(x)$ & 第 $j$ 个 reward function（GenEval / PickScore / OCR） \\
+$\adv_s$ & Prompt set $s$ 上的 advantage \\
+$\beta$ & NFT beta（positive/negative interpolation） \\
+$\gamma$ & OOD bonus 系数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Per-Set Velocity Field}
+
+\begin{definition}[Per-Set Combined Velocity]
+对 prompt $p \in \mathcal{P}_s$（属于 prompt set $s$），定义：
+\begin{equation}
+\boxed{
+v_{\lambda_s}(x, t_i) = \sum_{k=1}^K \lambda_{k,i,s}\, v^{(k)}(x, t_i), \quad
+\lambda_{k,i,s} = \frac{\exp(\ell_{k,i,s}/\tau)}{\sum_{k'=1}^K \exp(\ell_{k',i,s}/\tau)}
+}
+\label{eq:per_set_velocity}
+\end{equation}
+其中权重满足 $\lambda_{k,i,s} \geq 0$, $\sum_{k=1}^K \lambda_{k,i,s} = 1$, $\forall\, i, s$。
+\end{definition}
+
+\begin{remark}[与 Phase~1 Global $\lambda$ 的关系]
+Global $\lambda$ 是 per-set $\lambda$ 的特例：当 $\ell_{k,i,s} = \ell_{k,i}$ 对所有 $s$ 相同时，退化为 Phase~1 的 global 版本。Per-set 扩展引入了 $S$ 倍的参数，但仍然极小（$K \times T \times S = 3 \times 28 \times 3 = 252$ 参数）。
+\end{remark}
+
+\subsection{参数空间几何}
+
+\begin{proposition}[搜索空间结构]
+Per-set MoTV 的搜索空间为 $S$ 个独立的乘积 simplex：
+\begin{equation}
+\Omega = \prod_{s=1}^S \prod_{i=1}^T \Delta^K = \left(\Delta^K\right)^{T \times S}
+\end{equation}
+其中 $\Delta^K = \{\lambda \in \R^K_+ : \sum_k \lambda_k = 1\}$ 是 $K$-simplex。
+
+\textbf{关键性质}：不同 prompt set $s$ 和 $s'$ 的参数 $\ell_{:,:,s}$ 和 $\ell_{:,:,s'}$ 完全独立——梯度不交叉，优化完全解耦。
+\end{proposition}
+
+\subsection{Inference 流程}
+
+\begin{algorithm}[H]
+\caption{Per-Set MoTV Inference}
+\label{alg:inference}
+\begin{algorithmic}[1]
+\Require Prompt $p$, noise $x_T \sim \N(0, I)$, logits $\ell \in \R^{K \times T \times S}$
+\Ensure Generated image $x_0$
+\State Determine prompt set: $s \gets \mathrm{classify}(p)$
+\State Compute weights: $\lambda_{:,:,s} \gets \softmax_k(\ell_{:,:,s} / \tau)$ \Comment{shape $(K, T)$}
+\State $x \gets x_T$
+\For{$i = 1, \ldots, T$}
+    \For{$k = 1, \ldots, K$}
+        \State $v^{(k)}_i \gets v^{(k)}(x, t_i)$ \Comment{Frozen teacher forward}
+    \EndFor
+    \State $v_{\mathrm{combined}} \gets \sum_k \lambda_{k,i,s} \cdot v^{(k)}_i$ \Comment{Weighted combination}
+    \State $x \gets \mathrm{scheduler\_step}(x, v_{\mathrm{combined}}, t_i)$ \Comment{ODE step}
+\EndFor
+\State \Return $x$
+\end{algorithmic}
+\end{algorithm}
+
+%% ============================================================
+\section{Loss 函数}
+\label{sec:loss}
+%% ============================================================
+
+\subsection{Per-Set DiffusionNFT Loss}
+
+对每个 prompt set $s$ 独立定义 NFT loss。设 batch 中 prompt $p \in \mathcal{P}_s$：
+
+\begin{definition}[Per-Set NFT Loss (single timestep)]
+\begin{equation}
+\boxed{
+\loss_{i,s}(\ell_{:,:,s}) = \frac{1}{\beta}\left[
+r_s \cdot L^+_{i,s} + (1 - r_s) \cdot L^-_{i,s}
+\right]
+}
+\label{eq:per_set_nft_loss}
+\end{equation}
+其中：
+\begin{align}
+r_s &= \frac{\adv_s + A_{\max}}{2 A_{\max}} \in [0, 1] \label{eq:normalized_adv} \\
+v^{\mathrm{new}}_{i,s} &= \sum_k \lambda_{k,i,s}\, v^{(k)}(x_{t_i}, t_i) \quad\text{(current policy for set $s$)} \label{eq:v_new_s} \\
+v^{\mathrm{old}}_{i,s} &= \sum_k \bar{\lambda}_{k,i,s}\, v^{(k)}(x_{t_i}, t_i) \quad\text{(EMA policy for set $s$)} \label{eq:v_old_s} \\
+v^+_{i,s} &= \beta\, v^{\mathrm{new}}_{i,s} + (1-\beta)\, v^{\mathrm{old}}_{i,s} \label{eq:v_plus} \\
+v^-_{i,s} &= (1+\beta)\, v^{\mathrm{old}}_{i,s} - \beta\, v^{\mathrm{new}}_{i,s} \label{eq:v_minus}
+\end{align}
+\begin{align}
+x^+_{0,s} &= x_{t_i} - \sigma_i\, v^+_{i,s} \label{eq:x0_plus} \\
+x^-_{0,s} &= x_{t_i} - \sigma_i\, v^-_{i,s} \label{eq:x0_minus} \\
+L^+_{i,s} &= \frac{\|x^+_{0,s} - x_0\|^2}{(w^+_s)^2}, \quad
+L^-_{i,s} = \frac{\|x^-_{0,s} - x_0\|^2}{(w^-_s)^2} \label{eq:L_plus_minus}
+\end{align}
+$w^+_s, w^-_s$ 为 detached mean absolute error（per-sample normalization）。
+\end{definition}
+
+\subsection{Full Training Loss}
+
+累积所有 timestep 和 batch samples：
+\begin{equation}
+\loss_s(\ell_{:,:,s}) = \frac{1}{B_s \cdot T}\sum_{b \in \mathcal{B}_s}\sum_{i=1}^T \loss^{(b)}_{i,s}(\ell_{:,:,s})
+\label{eq:full_loss}
+\end{equation}
+其中 $\mathcal{B}_s$ 为当前 batch 中属于 prompt set $s$ 的 sample 子集，$B_s = |\mathcal{B}_s|$。
+
+\begin{remark}[Per-Set 独立性]
+总 loss 为各 set 的 loss 之和：
+\begin{equation}
+\loss_{\mathrm{total}}(\ell) = \sum_{s=1}^S \loss_s(\ell_{:,:,s})
+\end{equation}
+由于 $\ell_{:,:,s}$ 只出现在 $\loss_s$ 中，$\frac{\partial \loss_{\mathrm{total}}}{\partial \ell_{:,:,s}} = \frac{\partial \loss_s}{\partial \ell_{:,:,s}}$。各 prompt set 的优化完全独立——如同并行训练 $S$ 个独立的 global-$\lambda$ MoTV。
+\end{remark}
+
+%% ============================================================
+\section{梯度推导}
+\label{sec:gradient}
+%% ============================================================
+
+\subsection{Main Theorem}
+
+\begin{theorem}[Per-Set MoTV Gradient]
+\label{thm:per_set_gradient}
+对 prompt set $s$，single sample，single timestep $i$：
+\begin{equation}
+\boxed{
+\frac{\partial \loss_{i,s}}{\partial \ell_{k,i,s}} =
+\frac{2}{\tau}\,\lambda_{k,i,s}\left[v^{(k)}_i - v^{\mathrm{new}}_{i,s}\right]^\top
+\underbrace{\left[\frac{r_s\,(x^+_{0,s} - x_0)}{(w^+_s)^2} - \frac{(1-r_s)\,(x^-_{0,s} - x_0)}{(w^-_s)^2}\right]}_{\triangleq\; \mathbf{e}_{i,s} \;\in\; \R^d}\cdot(-\sigma_i)
+}
+\label{eq:per_set_gradient}
+\end{equation}
+
+且 $\frac{\partial \loss_{i,s}}{\partial \ell_{k,j,s'}} = 0$ 当 $j \neq i$ 或 $s' \neq s$。
+\end{theorem}
+
+\begin{proof}
+推导与 Phase~1 Theorem~2.1 完全相同，仅将 global $\lambda_{k,i}$ 替换为 per-set $\lambda_{k,i,s}$。各 set 的 sample 只对自己的 $\ell_{:,:,s}$ 产生梯度，跨 set 梯度为零。
+\end{proof}
+
+\subsection{三重解耦性}
+
+\begin{corollary}[Triple Decoupling]
+\label{cor:triple_decouple}
+Per-set MoTV 的梯度具有三重解耦：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Timestep 解耦}：$\frac{\partial \loss_{i,s}}{\partial \ell_{k,j,s}} = 0$ for $j \neq i$
+\item \textbf{Prompt-set 解耦}：$\frac{\partial \loss_{i,s}}{\partial \ell_{k,i,s'}} = 0$ for $s' \neq s$
+\item \textbf{Orthogonal teacher competition}：在每个 $(i, s)$ 固定的 slice 上，$K$ 个 teacher 通过 softmax 竞争。增大 $\ell_{k,i,s}$ 必然减小 $\ell_{k',i,s}$ ($k' \neq k$) 的有效权重。
+\end{enumerate}
+
+\textbf{含义}：每个 $(\text{timestep}, \text{prompt set})$ pair 是一个完全独立的 $K$-way 选择问题。优化 252 个参数等价于并行优化 $T \times S = 84$ 个独立的 $K$-simplex 选择。
+\end{corollary}
+
+\subsection{Gradient 的分量分析}
+
+将梯度~\eqref{eq:per_set_gradient} 分解为三个语义明确的因子：
+
+\begin{equation}
+\frac{\partial \loss_{i,s}}{\partial \ell_{k,i,s}} = \underbrace{\frac{2\sigma_i}{\tau}\,\lambda_{k,i,s}}_{\text{(I) Scale}} \;\cdot\;
+\underbrace{\left[v^{(k)}_i - v^{\mathrm{new}}_{i,s}\right]}_{\text{(II) Direction}} \;\cdot\;
+\underbrace{(-\mathbf{e}_{i,s})}_{\text{(III) Reward signal}}
+\label{eq:grad_decomp}
+\end{equation}
+
+\paragraph{Factor (I): Scale.}
+\begin{itemize}[leftmargin=1.5em]
+\item $\lambda_{k,i,s} \in [0, 1]$：当前权重。权重越接近 0 或 1，梯度越小（softmax 饱和效应）。最大梯度在 $\lambda = 1/K$ 处（均匀分布时，各 teacher 梯度最灵敏）。
+\item $\sigma_i$：noise level at timestep $i$。高噪声区域（早期 timestep，$\sigma \approx 1$）梯度较大；低噪声区域（晚期，$\sigma \to 0$）梯度较小——这意味着\textbf{早期 timestep 的权重学习更快}。
+\end{itemize}
+
+\paragraph{Factor (II): Direction $[v^{(k)}_i - v^{\mathrm{new}}_{i,s}]$.}
+\begin{itemize}[leftmargin=1.5em]
+\item Teacher $k$ 相对于当前 combined velocity 的``偏差方向''。
+\item 若 $\lambda_{k,i,s} = 1$（已选中 teacher $k$），则 $v^{\mathrm{new}}_{i,s} = v^{(k)}_i$，此项为 0——\textbf{已确定的选择不再变化}。
+\item 若 $\lambda_{k,i,s} \ll 1$，则 $v^{(k)}_i - v^{\mathrm{new}}_{i,s} \approx v^{(k)}_i - \sum_{k'\neq k}\lambda_{k'} v^{(k')}_i$——teacher $k$ 与其他 teacher 混合的差异。
+\end{itemize}
+
+\paragraph{Factor (III): Reward signal $\mathbf{e}_{i,s}$.}
+\begin{itemize}[leftmargin=1.5em]
+\item 由 advantage $r_s$ 加权的 prediction error。
+\item 当 $r_s > 0.5$（正 advantage，当前 sample 好）：$\mathbf{e}_{i,s}$ 主要由 $L^+$ 方向决定。
+\item 当 $r_s < 0.5$（负 advantage，当前 sample 差）：$\mathbf{e}_{i,s}$ 主要由 $-L^-$ 方向决定。
+\end{itemize}
+
+\subsection{简化梯度（$\beta = 1$, $w = 1$, $v^{\mathrm{old}} \approx v^{\mathrm{new}}$）}
+
+在标准设定下（$\beta = 1$, 忽略 normalization weight，small off-policy gap）：
+\begin{equation}
+\boxed{
+\frac{\partial \loss_{i,s}}{\partial \ell_{k,i,s}} \approx \frac{2\sigma_i^2}{\tau}\,\lambda_{k,i,s}
+\left[v^{(k)}_i - v^{\mathrm{new}}_{i,s}\right]^\top
+\left[(2r_s - 1)(v^{\mathrm{new}}_{i,s} - v^*_i)\right]
+}
+\label{eq:simplified_grad}
+\end{equation}
+其中 $v^*_i = (x_{t_i} - x_0)/\sigma_i$ 为 ground truth velocity。
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50, title=梯度动力学解读]
+设 $\adv_s > 0$（好 sample，$r_s > 0.5$）：
+\begin{itemize}[leftmargin=1em]
+\item 若 teacher $k$ 的 velocity 比当前混合更接近 ground truth（$[v^{(k)} - v^{\mathrm{new}}]^\top(v^{\mathrm{new}} - v^*) < 0$），则梯度为负 → gradient descent 增大 $\ell_{k,i,s}$ → \textbf{增加 teacher $k$ 在 set $s$, timestep $i$ 上的权重}。
+\item 若 teacher $k$ 比混合更差，则权重减小。
+\end{itemize}
+
+设 $\adv_s < 0$（差 sample，$r_s < 0.5$）：
+\begin{itemize}[leftmargin=1em]
+\item 反向信号：惩罚当前混合方向，探索远离当前配置的方向。
+\end{itemize}
+
+\textbf{Per-set 的额外优势}：set $s$ 的梯度只看 set $s$ 的 reward 信号——GenEval set 上的 reward 只影响 $\ell_{:,:,\mathrm{gen}}$，OCR set 上的 reward 只影响 $\ell_{:,:,\mathrm{ocr}}$。不同 set 的 reward 信号\textbf{完全互不干扰}。
+\end{tcolorbox}
+
+%% ============================================================
+\section{收敛性与最优解分析}
+\label{sec:convergence}
+%% ============================================================
+
+\subsection{Per-Set 最优解}
+
+\begin{theorem}[Per-Set 最优解的形式]
+\label{thm:optimal}
+对 prompt set $s$，optimal logits $\ell^*_{:,:,s}$ 满足：
+\begin{equation}
+\ell^*_{:,:,s} = \arg\max_{\ell_{:,:,s}} \E_{p \in \mathcal{P}_s}\left[\reward_s\!\left(\mathrm{ODE}(v_{\lambda_s}; x_T, p)\right)\right]
+\label{eq:per_set_optimal}
+\end{equation}
+其中 $\reward_s$ 是 prompt set $s$ 的 reward function（定义见 Section~\ref{sec:reward}）。
+\end{theorem}
+
+\subsection{Level~1 保证（$\geq$ Single Teacher）}
+
+\begin{theorem}[Guaranteed Non-Degradation]
+\label{thm:non_degrade}
+对任意 prompt set $s$ 和 teacher $k$：
+\begin{equation}
+\max_{\ell_{:,:,s}} \E_{p \in \mathcal{P}_s}\left[\reward_s(v_{\lambda_s})\right] \geq \reward_s(v^{(k)}), \quad \forall k = 1,\ldots,K
+\end{equation}
+
+特别地，取 $k = s$（in-domain teacher）：
+\begin{equation}
+\boxed{
+\E[\reward_s(v_{\lambda^*_s})] \geq \E[\reward_s(v^{(s)})] \quad\text{(in-domain performance $\geq$ single teacher)}
+}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+$\lambda_{k,i,s} = \delta_{k,s}$（teacher $s$ 恒取权重 1）是可行解，对应 $v_{\lambda_s} = v^{(s)}$。优化在包含此点的搜索空间上进行，最优解不劣于此。对任意其他 teacher $k$ 同理（$\delta_{k,\cdot}$ 也是可行解）。
+\end{proof}
+
+\begin{remark}[与 OPD 的对比]
+这是 MoTV per-set 架构相比 OPD-Average 的根本优势。OPD-Average 的最优解是 teacher 均值，由 Jensen 不等式必然在 in-domain 上退化。Per-set MoTV 则有\textbf{构造性的下界保证}。
+\end{remark}
+
+\subsection{Level~2 条件（$>$ Single Teacher）}
+
+\begin{theorem}[Strict Improvement Condition]
+\label{thm:strict_improve}
+Per-set MoTV 严格超越 teacher $s$ on set $s$ 的充分条件为：存在 timestep $i^*$ 和 teacher $k^* \neq s$ 使得：
+\begin{equation}
+\E_{p \in \mathcal{P}_s}\left[\reward_s\!\left(\mathrm{ODE}(v_{\lambda'}; x_T, p)\right)\right] > \E_{p \in \mathcal{P}_s}\left[\reward_s\!\left(\mathrm{ODE}(v^{(s)}; x_T, p)\right)\right]
+\end{equation}
+其中 $\lambda'$ 仅在 timestep $i^*$ 处与 $\delta_{k,s}$ 不同：$\lambda'_{k^*,i^*,s} = \epsilon > 0$, $\lambda'_{s,i^*,s} = 1 - \epsilon$。
+
+\textbf{直觉}：只需存在一个 timestep，在该 timestep 上引入少量其他 teacher 的 velocity 能提升 set $s$ 的 reward。
+\end{theorem}
+
+\subsection{温度 $\tau$ 与收敛形态}
+
+\begin{proposition}[温度对收敛的影响]
+\label{prop:temperature}
+\begin{enumerate}[leftmargin=1.5em]
+\item $\tau \to 0$（低温极限）：$\lambda_{k,i,s} \to \delta_{k, \arg\max_k \ell_{k,i,s}}$。每个 $(i,s)$ 退化为 hard selection（winner-take-all）。搜索空间退化为 $\{1,\ldots,K\}^{T \times S}$——离散组合优化。
+
+\item $\tau \to \infty$（高温极限）：$\lambda_{k,i,s} \to 1/K$。所有 teacher 均匀混合，等价于 teacher velocity 的算术平均。
+
+\item $\tau$ 适中（推荐 $\tau \in [0.5, 2.0]$）：soft assignment，允许梯度流动的同时保持一定的 specialization tendency。
+\end{enumerate}
+\end{proposition}
+
+\begin{remark}[温度退火策略]
+实践建议：初始 $\tau = 1.0$（充分探索），训练后期逐步降低到 $\tau = 0.3$--$0.5$（promote specialization）。这类似 Gumbel-Softmax 的退火策略。
+\end{remark}
+
+%% ============================================================
+\section{Reward 设计（详细版）}
+\label{sec:reward}
+%% ============================================================
+
+\subsection{Per-Set Reward Definition}
+
+\begin{definition}[Per-Set Reward with OOD Bonus]
+\label{def:per_set_reward}
+对 prompt $p \in \mathcal{P}_s$ 生成的 image $x$：
+\begin{equation}
+\boxed{
+\reward_s(x) = \tilde{R}_s(x) + \gamma \cdot \frac{1}{K-1}\sum_{j \neq s} \tilde{R}_j(x)
+}
+\label{eq:reward_def}
+\end{equation}
+其中 $\tilde{R}_j$ 是 normalized reward（见 Section~\ref{sec:normalization}），$\gamma \geq 0$ 是 OOD bonus 系数。
+\end{definition}
+
+\begin{remark}[Reward 权重解读]
+\begin{itemize}[leftmargin=1.5em]
+\item In-domain reward $\tilde{R}_s$ 的有效系数为 $1$。
+\item 每个 OOD reward $\tilde{R}_j$ ($j \neq s$) 的有效系数为 $\frac{\gamma}{K-1}$。
+\item 当 $\gamma = 0$：纯 in-domain 优化（Level~1 保证最强，但可能收敛到 teacher $s$ 本身）。
+\item 当 $\gamma = 0.2$（推荐）：in-domain 占 $\frac{1}{1+\gamma} \approx 83\%$，OOD 占 $\frac{\gamma}{1+\gamma} \approx 17\%$。
+\end{itemize}
+\end{remark}
+
+\subsection{Reward Normalization}
+\label{sec:normalization}
+
+\begin{strategy}[Running Z-Score Normalization]
+\label{strat:zscore}
+对每个 reward function $R_j$，维护 running statistics $\mu_j, \sigma_j$（跨 batch 的 exponential moving average）：
+\begin{align}
+\mu_j &\leftarrow (1 - \alpha)\mu_j + \alpha \cdot \bar{R}_j^{\mathrm{batch}} \label{eq:mu_update} \\
+\sigma_j^2 &\leftarrow (1 - \alpha)\sigma_j^2 + \alpha \cdot \mathrm{Var}(R_j^{\mathrm{batch}}) \label{eq:sigma_update}
+\end{align}
+其中 $\alpha = 0.01$（EMA decay），$\bar{R}_j^{\mathrm{batch}}$ 为 batch 内 $R_j$ 的均值。
+
+Normalized reward：
+\begin{equation}
+\tilde{R}_j(x) = \frac{R_j(x) - \mu_j}{\sigma_j + \epsilon}, \quad \epsilon = 10^{-8}
+\label{eq:normalized_reward}
+\end{equation}
+\end{strategy}
+
+\begin{proposition}[Normalization 的必要性]
+\label{prop:normalization}
+三个 reward 的原始 scale：
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+& GenEval & PickScore & OCR \\
+\midrule
+Range & $[0, 1]$ & $[0.80, 0.95]$ & $[0, 1]$ \\
+Typical std & $\sim 0.3$ & $\sim 0.04$ & $\sim 0.35$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不做 normalization 时，PickScore 的 raw variance ($\sim 0.04^2$) 远小于 GenEval/OCR ($\sim 0.1$)。在 advantage 计算中，PickScore 的有效贡献会被 GenEval/OCR 淹没。Z-score normalization 将三者的有效 scale 统一为 $\sim 1$。
+\end{proposition}
+
+\subsection{Advantage Computation}
+
+\begin{definition}[Per-Set GDPO Advantage]
+\label{def:advantage}
+对 prompt set $s$ 中的 prompt $p$，设 group 中有 $G$ 个 samples $\{x_1, \ldots, x_G\}$：
+\begin{equation}
+\adv_s(x_g) = \reward_s(x_g) - \frac{1}{G}\sum_{g'=1}^G \reward_s(x_{g'})
+\label{eq:per_set_advantage}
+\end{equation}
+
+然后做 global std normalization（跨整个 batch，不分 set）：
+\begin{equation}
+\hat{\adv}_s(x_g) = \frac{\adv_s(x_g)}{\mathrm{std}(\{\adv_s(x)\}_{x \in \mathrm{batch}}) + \epsilon}
+\label{eq:adv_normalize}
+\end{equation}
+\end{definition}
+
+\begin{remark}[Per-Set Advantage 的含义]
+$\adv_s > 0$ 表示：在使用 $\reward_s$（以 in-domain reward 为主导）评价时，当前 sample 优于 group 平均。gradient update 将增大产生该 sample 的 $\lambda_{:,:,s}$ 配置对应的 logits。
+\end{remark}
+
+\subsection{OOD Bonus $\gamma$ 的梯度效应}
+
+\begin{proposition}[OOD Bonus 如何引导探索]
+\label{prop:ood_bonus}
+设当前 $\lambda^*_{:,:,s} \approx \delta_{k,s}$（已收敛到 in-domain teacher）。引入 $\gamma > 0$ 后，梯度为：
+\begin{align}
+\frac{\partial \loss_{i,s}}{\partial \ell_{k',i,s}} &\propto \lambda_{k',i,s}\left[v^{(k')}_i - v^{(s)}_i\right]^\top \mathbf{e}_{i,s}
+\end{align}
+其中 $\mathbf{e}_{i,s}$ 现在包含 OOD reward 的贡献。
+
+当 OOD teacher $k'$ 在某个 timestep $i$ 上能提升 OOD reward $\tilde{R}_{k'}$ 而不显著损害 $\tilde{R}_s$ 时：
+\begin{itemize}[leftmargin=1.5em]
+\item $\mathbf{e}_{i,s}$ 的 OOD 分量驱动 $\ell_{k',i,s}$ 增大。
+\item $\lambda_{k',i,s}$ 从 $\sim 0$ 缓慢增长，引入少量 teacher $k'$ 的 velocity。
+\item 若这确实提升了综合 reward $\reward_s$，则正向 advantage 强化这一趋势。
+\end{itemize}
+
+\textbf{本质}：$\gamma > 0$ 为已收敛的 solution 提供了``突破 single-teacher 局部最优''的梯度推力。
+\end{proposition}
+
+%% ============================================================
+\section{$\gamma$ 的理论选择}
+\label{sec:gamma_theory}
+%% ============================================================
+
+\subsection{$\gamma$ 过大的风险}
+
+\begin{proposition}[$\gamma$ Upper Bound]
+\label{prop:gamma_upper}
+若 $\gamma$ 过大（OOD reward 占主导），则最优 $\lambda^*_{:,:,s}$ 将偏离 in-domain teacher，导致 in-domain performance 退化。具体地，当：
+\begin{equation}
+\gamma > \frac{\Delta R_{\mathrm{in}}}{\Delta R_{\mathrm{ood}}}
+\end{equation}
+其中 $\Delta R_{\mathrm{in}}$ = 从 teacher $s$ 偏离时 $R_s$ 的下降量，$\Delta R_{\mathrm{ood}}$ = 同时 OOD reward 的提升量，则 in-domain 会退化。
+
+\textbf{经验估计}：从实验数据看，OPD-Average（完全均匀混合）导致 in-domain 下降 $\sim 0.1$，OOD 提升 $\sim 0.01$--$0.03$。因此 $\Delta R_{\mathrm{in}}/\Delta R_{\mathrm{ood}} \sim 3$--$10$。安全的 $\gamma$ 应远小于此。
+\end{proposition}
+
+\subsection{推荐 $\gamma$ 范围}
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!40, title=推荐配置]
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+\textbf{策略} & $\gamma$ & \textbf{预期效果} \\
+\midrule
+保守（Level~1 为主） & $0$ & 确保 $\geq$ single teacher，无 OOD bonus \\
+推荐（Level~1 + Level~2 探索） & $0.2$ & in-domain 安全，OOD 有探索空间 \\
+激进（Level~2 为主） & $0.5$ & 更强 OOD 探索，in-domain 可能微降 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{建议}：先用 $\gamma = 0$ 验证 Level~1 保证（确认 MoTV 至少达到 single teacher），再切换 $\gamma = 0.2$ 探索 Level~2。
+\end{tcolorbox}
+
+%% ============================================================
+\section{实现细节}
+\label{sec:implementation}
+%% ============================================================
+
+\subsection{Prompt Set Classification}
+
+\begin{strategy}[Prompt Set Determination]
+\label{strat:classify}
+每个 prompt 携带 metadata 标注其 source set。具体来说，dataloader 中每个 batch element 包含 field \texttt{prompt\_set\_id} $\in \{0, 1, \ldots, S-1\}$。
+
+\textbf{实现}：在 \texttt{MoTVTrainer.optimize()} 中：
+\begin{enumerate}[leftmargin=1.5em]
+\item 从 batch 中提取 \texttt{prompt\_set\_id} tensor (shape $(B,)$)
+\item 对每个 set $s$：$\mathcal{B}_s = \{b : \texttt{prompt\_set\_id}[b] = s\}$
+\item 使用 $\ell_{:,:,s}$ 对 $\mathcal{B}_s$ 中的 sample 计算 loss 和梯度
+\end{enumerate}
+\end{strategy}
+
+\subsection{Logits 初始化}
+
+\begin{strategy}[Initialization for Per-Set Logits]
+\label{strat:init}
+两种初始化策略：
+
+\textbf{Option A: Zeros}（推荐用于验证 Level~1）
+\begin{equation}
+\ell_{k,i,s} = 0, \quad \forall k, i, s
+\end{equation}
+初始权重为均匀 $\lambda_{k,i,s} = 1/K$。所有 teacher 起点平等。
+
+\textbf{Option B: Teacher-Biased}（推荐用于 Level~2 探索）
+\begin{equation}
+\ell_{k,i,s} = \begin{cases}
+C & \text{if } k = s \\
+0 & \text{otherwise}
+\end{cases}, \quad C \approx 2.0
+\end{equation}
+初始权重偏向 in-domain teacher：$\lambda_{s,i,s} \approx 0.78$（$K=3$, $C=2$），其他 teacher $\approx 0.11$。从 single teacher 出发，通过 reward-driven optimization 逐步引入其他 teacher 的贡献。
+\end{strategy}
+
+\begin{remark}[Option B 的动机]
+Option B 的初始点即为``near single-teacher'' solution，确保训练初期不退化。$\gamma > 0$ 的 OOD bonus 从此基础上驱动探索。若 teacher $k' \neq s$ 在某些 timestep 上有正贡献，gradient 会逐步提升 $\ell_{k',i,s}$。
+\end{remark}
+
+\subsection{EMA 与 Off-Policy}
+
+\begin{strategy}[Per-Set EMA]
+对整个 logits tensor $\ell \in \R^{K \times T \times S}$ 维护 EMA：
+\begin{equation}
+\bar{\ell} \leftarrow (1 - \alpha_{\mathrm{ema}})\,\bar{\ell} + \alpha_{\mathrm{ema}}\,\ell
+\end{equation}
+其中 $\alpha_{\mathrm{ema}} = 1 - \texttt{logits\_ema\_decay}$（如 decay $= 0.99$ → $\alpha = 0.01$）。
+
+Sampling 使用 $\bar{\ell}$（off-policy），training 使用 $\ell$（on-policy），产生 NFT 的 new/old policy gap。
+\end{strategy}
+
+\subsection{Training Batch 组织}
+
+\begin{strategy}[Mixed-Set Batch]
+\label{strat:batch}
+每个 training batch 包含来自\textbf{所有} $S$ 个 prompt set 的 sample（按比例混合）：
+\begin{equation}
+B = B_{\mathrm{gen}} + B_{\mathrm{pick}} + B_{\mathrm{ocr}}, \quad B_s \approx B / S
+\end{equation}
+
+\textbf{Batch 内并行}：一次 forward pass 产生所有 sample 的 teacher velocities，然后按 \texttt{prompt\_set\_id} 分组计算各 set 的 loss 和梯度。
+
+\textbf{梯度累积}：由于三个 set 的梯度作用于 $\ell$ 的不同 slice（$\ell_{:,:,0}$, $\ell_{:,:,1}$, $\ell_{:,:,2}$），可以直接 in-place 累积，无冲突。
+\end{strategy}
+
+\subsection{Optimizer 配置}
+
+\begin{strategy}[Per-Set Optimizer]
+虽然参数解耦，但实践中使用\textbf{单个 AdamW optimizer} 管理整个 $\ell \in \R^{K \times T \times S}$（因为 Adam 的 momentum/variance 是 per-parameter 的，天然支持不同 slice 的不同更新频率）。
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Learning rate}：推荐 $\texttt{logits\_lr} \in [10^{-2}, 10^{-1}]$（logits 空间需要较大 lr）。
+\item \textbf{Weight decay}：$0$（logits 不需要正则化，softmax 自带 bounded output）。
+\item \textbf{Gradient clipping}：$\texttt{max\_grad\_norm} = 1.0$（防止单个高 advantage sample 导致 logits 跳变过大）。
+\end{itemize}
+\end{strategy}
+
+%% ============================================================
+\section{Reward 采样与评估}
+\label{sec:reward_eval}
+%% ============================================================
+
+\subsection{Sampling 阶段}
+
+\begin{algorithm}[H]
+\caption{Per-Set MoTV Sampling}
+\label{alg:sampling}
+\begin{algorithmic}[1]
+\Require EMA logits $\bar{\ell}$, dataloader (mixed prompt sets)
+\Ensure Samples with rewards and prompt set labels
+\For{each batch from dataloader}
+    \For{each sample $b$ in batch}
+        \State $s_b \gets \texttt{prompt\_set\_id}[b]$
+        \State Generate $x_b$ using $\bar{\ell}_{:,:,s_b}$ (Algorithm~\ref{alg:inference})
+    \EndFor
+    \State Compute rewards: $R_{\mathrm{gen}}(x_b)$, $R_{\mathrm{pick}}(x_b)$, $R_{\mathrm{ocr}}(x_b)$ for all $b$
+    \State Compute per-set reward: $\reward_{s_b}(x_b)$ using eq.~\eqref{eq:reward_def}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Reward Evaluation 开销}
+
+\begin{remark}[三倍 Reward 计算]
+每个 sample 需要计算\textbf{所有三个} reward function（不仅是自己 set 的），因为 OOD bonus 需要跨 set reward。对于仅 inference-based rewards（如 PickScore, GenEval），这是轻量级的 forward pass。OCR reward 需要 OCR model inference。总 reward 评估开销 $\approx 3\times$ 单 reward 成本。
+\end{remark}
+
+%% ============================================================
+\section{理论对比与实验预期}
+\label{sec:expected}
+%% ============================================================
+
+\subsection{对比总表}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm} c c c c c@{}}
+\toprule
+& \textbf{OPD-Avg} & \textbf{OPD-Route} & \textbf{MoTV (global)} & \textbf{MoTV (per-set)} \\
+\midrule
+Parameters & $\sim 10^7$ & $\sim 10^7$ & $K \times T$ & $K \times T \times S$ \\
+In-domain 保证 & \ding{55} $< $ single & $\approx$ single & 弱（折衷） & \ding{51} $\geq$ single \\
+Level~2 可能 & \ding{55} & \ding{55} & 中（受折衷限制） & \ding{51} 高 \\
+Cross-set 干扰 & 强（共享 $\theta$） & 无（分离） & 有（共享 $\lambda$） & \textbf{无} \\
+Reward needed & \ding{55} & \ding{55} & \ding{51} & \ding{51} \\
+Optimal obj. & KL min & KL min & Reward max & Reward max \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{预期的 $\lambda$ 收敛模式}
+
+\begin{tcolorbox}[colback=yellow!5, colframe=yellow!60!black, title=预期实验结果]
+训练收敛后，我们预期看到以下 $\lambda$ pattern：
+
+\textbf{Set = GenEval}（$\ell_{:,:,\mathrm{gen}}$）：
+\begin{itemize}[leftmargin=1em]
+\item 早期 timestep ($t_1$--$t_8$)：GenEval teacher 占主导（$\lambda_{\mathrm{gen}} \sim 0.8$--$0.9$），因为 layout/composition 在早期确定。
+\item 晚期 timestep ($t_{20}$--$t_{28}$)：可能少量 PickScore teacher 贡献（$\lambda_{\mathrm{pick}} \sim 0.1$--$0.2$），因为清晰的 rendering 有助于 GenEval 的属性判断。
+\end{itemize}
+
+\textbf{Set = OCR}（$\ell_{:,:,\mathrm{ocr}}$）：
+\begin{itemize}[leftmargin=1em]
+\item 早期 timestep：可能 GenEval teacher 有贡献（文字 spatial positioning）。
+\item 中期 timestep ($t_8$--$t_{18}$)：OCR teacher 占主导（笔画形成阶段）。
+\item 晚期 timestep：OCR teacher 仍主导，可能少量 PickScore 提升非文字区域美感。
+\end{itemize}
+
+\textbf{Set = PickScore}（$\ell_{:,:,\mathrm{pick}}$）：
+\begin{itemize}[leftmargin=1em]
+\item 全程 PickScore teacher 占主导（$\lambda_{\mathrm{pick}} \sim 0.7$--$0.9$），因为 aesthetics 是全局属性。
+\item 早期 timestep 可能少量 GenEval teacher 贡献（正确的 composition 本身提升美感）。
+\end{itemize}
+\end{tcolorbox}
+
+%% ============================================================
+\section{总结}
+\label{sec:summary}
+%% ============================================================
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50!black, title=Phase 2 核心设计总结]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{架构}：$\ell \in \R^{K \times T \times S}$（252 个参数），每个 prompt set 独立的 teacher 混合策略。
+
+\item \textbf{Loss}：Per-set DiffusionNFT loss，各 set 完全解耦。梯度具有三重正交性（timestep × prompt-set × teacher-softmax）。
+
+\item \textbf{Reward}：$\reward_s(x) = \tilde{R}_s(x) + 0.2 \cdot \frac{1}{2}\sum_{j \neq s}\tilde{R}_j(x)$，with running z-score normalization。
+
+\item \textbf{Initialization}：Teacher-biased（$C=2$）从 near-single-teacher 出发，保证初始不退化。
+
+\item \textbf{保证}：Level~1（$\geq$ single teacher）有构造性证明。Level~2（$>$ single teacher）由 OOD bonus 驱动探索。
+
+\item \textbf{Expected outcome}：每个 prompt set 上至少匹配 single teacher in-domain performance，同时在 timestep 维度上发现 cross-teacher 互补性，实现 OOD 提升甚至 in-domain 超越。
+\end{enumerate}
+\end{tcolorbox}
+
+\end{document}
