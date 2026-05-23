@@ -72,8 +72,15 @@ train:
   logits_init: "teacher_biased"             # Init lambda biased toward in-domain teacher per set
   logits_init_bias: 2.0                     # Bias strength: softmax(2.0, 0) ≈ (0.88, 0.12) for K=2
   learning_rate: 0.05                       # Learning rate for lambda logits (larger than typical model lr)
-  ema_decay: 0.99                           # EMA decay for off-policy logits (old policy smoothing)
   temperature: 1.0                          # Softmax temperature: lower → sharper selection, higher → softer mixing
+
+  # ---- EMA schedule (aligned with NFT default) ----
+  ema_decay_schedule: "piecewise_linear"    # Decay schedule: constant, power, linear, piecewise_linear, cosine
+  flat_steps: 0                             # Steps before ramp begins
+  ramp_rate: 0.001                          # Ramp rate for piecewise_linear schedule
+  ema_decay: 0.5                            # EMA decay rate (0 to disable)
+  ema_update_interval: 1                    # EMA update interval (in epochs)
+  ema_device: "cuda"                        # Device to store EMA model
 
   # ---- Per-set reward design ----
   ood_bonus_gamma: 0.2                      # OOD bonus: reward_s = R_s + 0.2 * mean(R_j, j!=s)
@@ -94,6 +101,8 @@ train:
   group_size: 16                             # Number of samples per prompt for advantage computation
   unique_sample_num_per_epoch: 32           # Total unique prompts sampled per epoch
   num_inner_epochs: 1                       # Inner training epochs per sampling round
+  gradient_step_per_epoch: 1                # Gradient steps per epoch (aligned with NFT)
+  gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts (NFT pattern)
   max_grad_norm: 1.0                        # Gradient clipping for lambda logits
   max_epochs: 300                           # Total training epochs
   seed: 42

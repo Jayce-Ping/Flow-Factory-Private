@@ -158,13 +158,20 @@ class MoFTrainer(BaseTrainer):
         self.timestep_range = self.training_args.timestep_range
         self.num_train_timesteps = self.training_args.num_train_timesteps
 
-        # ---- EMA for logits (off-policy old policy) ----
+        # ---- EMA for logits (off-policy old policy, aligned with NFT schedule) ----
+        ema_device = (
+            self.accelerator.device
+            if self.training_args.ema_device == "cuda"
+            else torch.device("cpu")
+        )
         self._logits_ema = EMAModuleWrapper(
             parameters=[self._lambda_logits],
             decay=self.training_args.ema_decay,
-            update_step_interval=1,
-            device=self.accelerator.device,
-            decay_schedule="power",
+            update_step_interval=self.training_args.ema_update_interval,
+            device=ema_device,
+            decay_schedule=self.training_args.ema_decay_schedule,
+            # Pass schedule-specific params (flat_steps, ramp_rate, etc.) from training_args
+            **self.training_args
         )
 
         # ---- Cache forward signature for cheap kwarg filtering ----
@@ -897,12 +904,29 @@ class MoFTrainer(BaseTrainer):
         N = len(group_indices)
 
         # ====================================================================
+        # Log raw rewards (before any normalization)
+        # ====================================================================
+        log_data: Dict[str, float] = {}
+        for rname in reward_names:
+            r_vals = gathered_rewards[rname]
+            valid = ~np.isnan(r_vals)
+            if valid.any():
+                log_data[f"train/raw_reward_{rname}_mean"] = float(np.nanmean(r_vals))
+                log_data[f"train/raw_reward_{rname}_std"] = float(np.nanstd(r_vals))
+            # Per-source raw reward breakdown
+            for src_name, src_id in self._source_to_set_id.items():
+                src_mask = (gathered_source_ids == src_id) & valid
+                if src_mask.any():
+                    log_data[f"train/raw_reward_{rname}/{src_name}_mean"] = float(
+                        np.mean(r_vals[src_mask])
+                    )
+
+        # ====================================================================
         # Step 1: Per-Reward, Per-Group Normalization
         # Each reward is independently normalized to ~N(0,1) within each group.
         # NaN values (non-applicable samples) are skipped.
         # ====================================================================
         per_reward_advantages: Dict[str, np.ndarray] = {}
-        log_data: Dict[str, float] = {}
 
         for rname in reward_names:
             r_vals = gathered_rewards[rname]  # (N,) numpy, may contain NaN
@@ -996,14 +1020,23 @@ class MoFTrainer(BaseTrainer):
         for sample, adv in zip(samples, local_advantages):
             sample.extra_kwargs["advantage"] = float(adv)
 
-        # Log metrics
-        log_data.update({
-            "train/advantage_combined_mean": float(np.mean(combined_advantages)),
-            "train/advantage_combined_std": float(np.std(combined_advantages)),
-            "train/advantage_global_std": global_std,
-            "train/advantage_final_std": float(np.std(final_advantages)),
-        })
-        # Per-source advantage mean (monitor balance across sources)
+        # Log designed reward (Step 2 output: combined per-set advantages before global-std)
+        log_data["train/designed_reward_mean"] = float(np.mean(combined_advantages))
+        log_data["train/designed_reward_std"] = float(np.std(combined_advantages))
+        for src_name, src_id in self._source_to_set_id.items():
+            src_mask = gathered_source_ids == src_id
+            if src_mask.any():
+                log_data[f"train/designed_reward_{src_name}_mean"] = float(
+                    np.mean(combined_advantages[src_mask])
+                )
+                log_data[f"train/designed_reward_{src_name}_std"] = float(
+                    np.std(combined_advantages[src_mask])
+                )
+
+        # Log final advantage stats (after global-std normalization + clipping)
+        log_data["train/advantage_global_std"] = global_std
+        log_data["train/advantage_final_mean"] = float(np.mean(final_advantages))
+        log_data["train/advantage_final_std"] = float(np.std(final_advantages))
         for src_name, src_id in self._source_to_set_id.items():
             src_mask = gathered_source_ids == src_id
             if src_mask.any():
