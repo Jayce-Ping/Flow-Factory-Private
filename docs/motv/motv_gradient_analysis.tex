@@ -1,0 +1,551 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\vtheta}{v_\theta}
+\newcommand{\vphi}{v_\phi}
+\newcommand{\mutheta}{\mu_\theta}
+\newcommand{\muphi}{\mu_\phi}
+\newcommand{\mubar}{\bar{\mu}_\phi}
+\newcommand{\sigbar}{\bar{\sigma}}
+\newcommand{\lpath}{\lambda_{\mathrm{path}}}
+\newcommand{\lrf}{\lambda_{\mathrm{rf}}}
+\newcommand{\detach}{\mathrm{det}}
+\newcommand{\PC}{\mathrm{PCGrad}}
+\newcommand{\tr}{\mathrm{tr}}
+\newcommand{\diag}{\mathrm{diag}}
+\newcommand{\Conv}{\mathrm{Conv}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\adv}{\mathcal{A}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{example}{Example}
+
+\title{\textbf{MoTV 梯度分析：与 OPD Aggregation 范式的对比}\\[0.3em]
+\large 理论最优解、梯度方向与超越单 Teacher 的可能性}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文分析 MoTV (Mixture of Temporal Velocities) 的 loss 结构和梯度方向，与 OPD 中已有的 average、route\_by\_source、pcgrad 范式做严格对比。MoTV 通过 DiffusionNFT 算法在\textbf{reward 空间}中优化 per-timestep 的 teacher 混合权重 $\lambda_{k,i}$，其优化目标根本不同于 OPD 的 KL distillation。我们证明：(1) MoTV 的有效参数空间与梯度方向与 OPD 各模式本质不同；(2) 在理论上存在\textbf{严格超越最优单 teacher} 的充分条件——当不同 teacher 在不同 timestep 上各有优势时。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{问题设定回顾}
+%% ============================================================
+
+\subsection{已有的 OPD 范式及其局限}
+
+设有 $K$ 个 teacher flow-model $\vphi^{(1)}, \ldots, \vphi^{(K)}$ 和一个 student model $\vtheta$。OPD trainer 通过如下 pathwise KL loss 训练 student：
+\begin{equation}
+\loss^{\mathrm{OPD}}(\theta) = \sum_{i=0}^{T-1} \E_{\tau \sim q_\theta}\!\left[\frac{1}{2\sigbar_i^2}\left\|\mutheta^i - \mu_T^i\right\|^2\right]
+\label{eq:opd_loss}
+\end{equation}
+其中 $\mu_T^i$ 是各模式下由 teacher velocities 构造的 target（average、PCGrad、route\_by\_source 等）。
+
+\paragraph{核心观察：}从实验结果（Table~1 of experiments.tex）可看到：
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{route\_by\_source}：student 在每个 prompt set 上达到对应 teacher 的 in-domain 性能（如 OCR teacher 在 OCR set 上的 score），但也继承了该 teacher 的 out-of-domain 性能（如 OCR teacher 在 PickScore set 上的表现）。本质上等价于分别训练 $K$ 个 student，再按 source 路由。
+\item \textbf{average/sum/pcgrad（不 route）}：student 拟合所有 teacher 的``共识方向''。根据 Jensen 不等式和 Bias-Variance 分解，in-domain 性能必然低于对应 single teacher（梯度方向是 $\frac{1}{K}\sum_m \delta_m$ 的方向，最优解是 teacher velocity 的均值）。
+\end{itemize}
+
+\begin{tcolorbox}[colback=red!5, colframe=red!50, title=OPD 的根本限制]
+无论选择哪种 aggregation，OPD 的最优 student velocity 在每个 $(x, t)$ 点上都被锁定为 teacher velocities 的某种（可能投影后的）组合。Student 的 velocity field 被 teacher 的``当前点信息''直接约束——\textbf{无法利用 trajectory-level 的全局 reward 信号来选择性地在不同 timestep 偏向不同 teacher}。
+\end{tcolorbox}
+
+\subsection{MoTV 的基本设定}
+
+MoTV 定义一个新的 velocity field 为 teacher velocities 的 per-timestep 凸组合：
+\begin{equation}
+v_{\lambda}(x, t_i) = \sum_{k=1}^K \lambda_{k,i}\, \vphi^{(k)}(x, t_i), \quad
+\lambda_{k,i} = \frac{\exp(\ell_{k,i}/\tau)}{\sum_{k'}\exp(\ell_{k',i}/\tau)} \geq 0, \quad \sum_{k=1}^K \lambda_{k,i} = 1
+\label{eq:motv_velocity}
+\end{equation}
+其中 $\ell \in \R^{K \times T}$ 是可学习的 logits，$\tau$ 是 temperature。
+
+\begin{proposition}[Flow Model 有效性]
+\label{prop:convex_flow}
+若 $\vphi^{(1)}, \ldots, \vphi^{(K)}$ 都是有效的 flow-matching velocity field（即各自的 ODE 将标准高斯 $p_0 = \N(0, I)$ 映射到各自的 data distribution），则对任意凸系数 $\lambda_{k,i} \geq 0$, $\sum_k \lambda_{k,i} = 1$：
+\begin{equation}
+v_\lambda(x, t_i) = \sum_k \lambda_{k,i}\, \vphi^{(k)}(x, t_i)
+\end{equation}
+是一个有效的 velocity field，其对应的 ODE 解定义了一个合法的概率流。
+\end{proposition}
+
+\begin{proof}
+Flow-matching velocity 满足 $\partial_t p_t + \nabla \cdot (p_t v) = 0$（连续性方程）。凸组合下的概率流可视为 teacher 概率流的 mixture：$p_t^\lambda = \sum_k \lambda_{k,i} p_t^{(k)}$（当 $\lambda$ 不随 $x$ 变化时）。严格来说，per-timestep 凸组合在 ODE 离散化框架下生成的分布是各 teacher 分布在该 timestep 步上的``分段凸组合''，每段内是有效概率流的凸组合，仍是有效概率流。
+\end{proof}
+
+\begin{remark}
+不同于 model-level interpolation（在 weight space 上做凸组合，需要满足模型 linearity 条件），MoTV 在 \textbf{velocity output space} 上做凸组合——这对任何参数化的网络都成立，不依赖于网络架构。
+\end{remark}
+
+%% ============================================================
+\section{MoTV Loss 与梯度的严格推导}
+\label{sec:motv_loss}
+%% ============================================================
+
+\subsection{DiffusionNFT Loss 回顾}
+
+DiffusionNFT 的核心 loss 为（对单个 timestep $t_i$，单个 sample）：
+\begin{equation}
+\loss^{\mathrm{NFT}}_i(\ell) = \frac{1}{\beta}\left[
+r \cdot L^+_i + (1-r) \cdot L^-_i
+\right]
+\label{eq:nft_loss}
+\end{equation}
+其中：
+\begin{align}
+r &= \frac{\adv + A_{\max}}{2 A_{\max}} \in [0, 1] \quad\text{(normalized advantage)} \\
+v^{\mathrm{new}}_i &= \sum_k \lambda_{k,i}\, \vphi^{(k)}(x_{t_i}, t_i) \quad\text{(current policy)} \\
+v^{\mathrm{old}}_i &= \sum_k \bar{\lambda}_{k,i}\, \vphi^{(k)}(x_{t_i}, t_i) \quad\text{(EMA/old policy)} \\
+v^+_i &= \beta\, v^{\mathrm{new}}_i + (1-\beta)\, v^{\mathrm{old}}_i \\
+v^-_i &= (1+\beta)\, v^{\mathrm{old}}_i - \beta\, v^{\mathrm{new}}_i \\
+L^+_i &= \left\|\frac{x_{t_i} - \sigma_i v^+_i - x_0}{w^+}\right\|^2, \quad
+L^-_i = \left\|\frac{x_{t_i} - \sigma_i v^-_i - x_0}{w^-}\right\|^2
+\end{align}
+$w^+, w^-$ 是 detached 的归一化权重（mean absolute error），$\bar{\lambda}$ 是 EMA logits 对应的权重。
+
+\subsection{关于 $\ell$ 的梯度}
+
+\begin{theorem}[MoTV Gradient]
+\label{thm:motv_grad}
+设 $\Phi_i = [\vphi^{(1)}(x_{t_i}), \ldots, \vphi^{(K)}(x_{t_i})]^\top \in \R^{K \times d}$ 为 teacher velocity matrix（frozen, detached），则 MoTV 关于 logits $\ell$ 的梯度为：
+\begin{equation}
+\boxed{
+\frac{\partial \loss^{\mathrm{NFT}}_i}{\partial \ell_{k,i}} =
+\frac{2}{\tau} \cdot \lambda_{k,i}\left[\vphi^{(k)} - v^{\mathrm{new}}_i\right]^\top
+\left[\frac{r\,(x_0^+ - x_0)}{(w^+)^2} - \frac{(1-r)\,(x_0^- - x_0)}{(w^-)^2}\right] \cdot (-\sigma_i)
+}
+\label{eq:motv_gradient}
+\end{equation}
+其中 $x_0^+ = x_{t_i} - \sigma_i v^+_i$，$x_0^- = x_{t_i} - \sigma_i v^-_i$。
+
+对于 $j \neq i$（不同 timestep），$\frac{\partial \loss^{\mathrm{NFT}}_i}{\partial \ell_{k,j}} = 0$——\textbf{timestep 间完全解耦}。
+\end{theorem}
+
+\begin{proof}
+链式法则：
+\begin{align}
+\frac{\partial \loss}{\partial \ell_{k,i}}
+&= \frac{\partial \loss}{\partial v^{\mathrm{new}}_i} \cdot \frac{\partial v^{\mathrm{new}}_i}{\partial \lambda_{k,i}} \cdot \frac{\partial \lambda_{k,i}}{\partial \ell_{k,i}}
+\end{align}
+
+第一项（loss 对 $v^{\mathrm{new}}$ 的梯度）：
+
+注意 $\frac{\partial v^+}{\partial v^{\mathrm{new}}} = \beta$，$\frac{\partial v^-}{\partial v^{\mathrm{new}}} = -\beta$，且 $\frac{\partial x_0^+}{\partial v^+} = -\sigma_i$，$\frac{\partial x_0^-}{\partial v^-} = -\sigma_i$（两者形式相同）。
+\begin{align}
+\frac{\partial \loss}{\partial v^{\mathrm{new}}_i} &= \frac{1}{\beta}\left[r \cdot \frac{\partial L^+}{\partial v^+}\cdot \beta + (1-r)\cdot \frac{\partial L^-}{\partial v^-}\cdot (-\beta)\right] \\
+&= r \cdot \frac{\partial L^+}{\partial v^+} - (1-r)\cdot \frac{\partial L^-}{\partial v^-} \\
+&= r \cdot \frac{2(x_0^+ - x_0) \cdot (-\sigma_i)}{(w^+)^2} - (1-r)\cdot \frac{2(x_0^- - x_0)\cdot(-\sigma_i)}{(w^-)^2}
+\end{align}
+
+第二项（$v^{\mathrm{new}}$ 对 $\lambda_{k,i}$ 的梯度）：
+\begin{equation}
+\frac{\partial v^{\mathrm{new}}_i}{\partial \lambda_{k,i}} = \vphi^{(k)}(x_{t_i}, t_i)
+\end{equation}
+
+第三项（softmax 的 Jacobian）：
+\begin{equation}
+\frac{\partial \lambda_{k,i}}{\partial \ell_{k,i}} = \frac{1}{\tau}\lambda_{k,i}(1 - \lambda_{k,i}), \quad
+\frac{\partial \lambda_{j,i}}{\partial \ell_{k,i}} = -\frac{1}{\tau}\lambda_{j,i}\lambda_{k,i} \;\;(j \neq k)
+\end{equation}
+
+综合（利用 $\sum_j \lambda_j \vphi^{(j)} = v^{\mathrm{new}}$）：
+\begin{equation}
+\sum_j \frac{\partial v^{\mathrm{new}}}{\partial \ell_{k,i}} = \frac{\lambda_{k,i}}{\tau}\left[\vphi^{(k)} - v^{\mathrm{new}}\right]
+\end{equation}
+组合即得~\eqref{eq:motv_gradient}。
+\end{proof}
+
+\subsection{梯度的直观解释}
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!40, title=MoTV 梯度的物理含义]
+$\frac{\partial \loss}{\partial \ell_{k,i}}$ 由三个因子决定：
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{偏离方向} $[\vphi^{(k)} - v^{\mathrm{new}}_i]$：teacher $k$ 相对于当前混合 velocity 的``差异方向''。若 $\lambda_{k,i}$ 已经为 1，此项为 0（该 teacher 已被完全采用）。
+
+\item \textbf{Reward signal}：包含 advantage $r$ 的加权误差方向。正 advantage ($r > 0.5$) 时，梯度推动 policy 向减小 $L^+$（让 $v^+$ 更准确）的方向移动；负 advantage 时推动减小 $L^-$。
+
+\item \textbf{当前权重} $\lambda_{k,i}$：softmax 的梯度天然包含 $\lambda_{k,i}(1-\lambda_{k,i})$ 项，确保已经很高权重的 teacher 梯度减小（趋于饱和），而中间权重的 teacher 梯度最大。
+\end{enumerate}
+\end{tcolorbox}
+
+%% ============================================================
+\section{与 OPD 各模式的对比}
+\label{sec:comparison}
+%% ============================================================
+
+\subsection{核心差异总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.6}
+\begin{tabular}{@{}p{2.5cm} p{3.5cm} p{3.5cm} p{4cm}@{}}
+\toprule
+\textbf{维度} & \textbf{OPD (avg/sum)} & \textbf{OPD (route)} & \textbf{MoTV} \\
+\midrule
+可训练参数 & Model weights $\theta \in \R^P$ & Model weights $\theta \in \R^P$ & Logits $\ell \in \R^{K \times T}$ \\
+参数量 & $P \sim 10^7$--$10^9$ & $P$ & $K \times T \sim 60$ \\
+优化目标 & KL distillation & KL distillation & Reward maximization \\
+Target 构造 & $\bar{\mu} = \frac{1}{K}\sum_k \mu_k$ & $\mu_{m^*}$ (matched source) & 无显式 target；reward 驱动 \\
+梯度方向 & 指向 teacher 均值 & 指向 matched teacher & 指向 reward 提升方向 \\
+Timestep 耦合 & 通过共享 $\theta$ 耦合 & 通过共享 $\theta$ 耦合 & \textbf{完全解耦}（$\ell_{:,i}$ 独立） \\
+Trajectory awareness & 弱（仅 REINFORCE 项） & 弱 & \textbf{强}（reward 直接反馈） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{梯度方向对比}
+
+设第 $i$ 个 timestep 的 teacher velocity 为 $v^{(k)}_i \in \R^d$，student velocity 为 $v_{\theta,i}$。
+
+\paragraph{OPD-Average 的梯度方向（在 velocity space 中的投影）：}
+\begin{equation}
+g^{\mathrm{avg}}_i \propto \left(v_{\theta,i} - \frac{1}{K}\sum_k v^{(k)}_i\right)^\top J_i
+\end{equation}
+\textbf{方向}：将 student 拉向 teacher velocity 的算术均值。与 reward 无关。
+
+\paragraph{OPD-Route 的梯度方向：}
+\begin{equation}
+g^{\mathrm{route}}_i \propto \left(v_{\theta,i} - v^{(m^*)}_i\right)^\top J_i
+\end{equation}
+\textbf{方向}：将 student 拉向 source-matched teacher。与 reward 无关。
+
+\paragraph{MoTV 的梯度方向（在 logit space 中）：}
+\begin{equation}
+\frac{\partial \loss}{\partial \ell_{k,i}} \propto \lambda_{k,i}\left[v^{(k)}_i - v^{\mathrm{new}}_i\right]^\top \cdot \underbrace{\left(\text{reward-dependent error signal}\right)}_{\text{depends on } \adv}
+\end{equation}
+\textbf{方向}：由 reward signal 决定。若当前 trajectory 的 reward 高，梯度方向鼓励保持当前 $\lambda$ 分布；若 reward 低，梯度方向调整 $\lambda$ 使 velocity 远离当前组合。
+
+\subsection{最优解对比}
+
+\begin{proposition}[OPD-Average 的最优解]
+\label{prop:opd_avg_opt}
+在 OPD pathwise loss 下，最优 student velocity 为：
+\begin{equation}
+v^*_{\theta,i}(x) = \frac{1}{K}\sum_{k=1}^K v^{(k)}_i(x), \quad \forall x, i
+\end{equation}
+即所有 teacher 在每个 $(x, t)$ 的 velocity 均值。
+\end{proposition}
+
+\begin{proposition}[OPD-Route 的最优解]
+\label{prop:opd_route_opt}
+当 route\_by\_source 时，对 prompt set $\mathcal{P}_m$ 中的 prompt：
+\begin{equation}
+\vtheta^*(x, t_i \,|\, p \in \mathcal{P}_m) = v^{(m)}_i(x)
+\end{equation}
+即 student 在每个 prompt set 上完美复制对应 teacher。
+\end{proposition}
+
+\begin{theorem}[MoTV 的最优解]
+\label{thm:motv_opt}
+MoTV 的最优 logits $\ell^*$ 满足：
+\begin{equation}
+\ell^* = \arg\max_{\ell \in \R^{K \times T}} \E_{p \sim \mathcal{D}}\left[R\!\left(\mathrm{ODE}(v_\lambda; x_T, p)\right)\right]
+\label{eq:motv_optimal}
+\end{equation}
+其中 $R(\cdot)$ 是外部 reward function，$\mathrm{ODE}(v_\lambda; x_T, p)$ 是以 $v_\lambda$ 为 velocity 的 ODE 从 noise $x_T$ 生成的 image。
+
+\textbf{关键差异}：MoTV 的最优解由 \textbf{end-to-end reward} 决定，而非由逐点 KL 决定。
+\end{theorem}
+
+\subsection{Timestep 解耦的意义}
+
+\begin{proposition}[Per-timestep 独立性]
+\label{prop:timestep_decouple}
+MoTV 中，$\frac{\partial \loss_i}{\partial \ell_{k,j}} = 0$ 对 $j \neq i$ 成立。即：
+\begin{itemize}
+\item 每个 timestep 的权重可以独立于其他 timestep 优化。
+\item 不存在``通过共享参数传播''的 timestep 间串扰。
+\end{itemize}
+
+而在 OPD 中，$\frac{\partial \loss_i}{\partial \theta}$ 和 $\frac{\partial \loss_j}{\partial \theta}$ 作用于\textbf{同一个} $\theta$，导致不同 timestep 的梯度在参数空间中竞争和折衷。
+\end{proposition}
+
+\begin{corollary}[无跨 timestep 冲突]
+MoTV 中不存在跨 timestep 的梯度冲突。PCGrad 在 OPD 中存在的意义（解决 teacher 间梯度冲突）在 MoTV 中\textbf{不需要}——因为每个 timestep 的梯度作用于不同的参数维度 $\ell_{:,i}$。
+\end{corollary}
+
+%% ============================================================
+\section{MoTV 能否超越单 Teacher？}
+\label{sec:beyond_single}
+%% ============================================================
+
+\subsection{OPD 中超越单 Teacher 的不可能性}
+
+\begin{proposition}[OPD 的 In-Domain 上界]
+在 OPD-Average 模式下，设 reward $R_m$ 为 teacher $m$ 的 in-domain metric（如 OCR score on OCR set），则：
+\begin{equation}
+R_m\!\left(v^*_{\mathrm{avg}}\right) \leq R_m\!\left(\vphi^{(m)}\right)
+\end{equation}
+等号成立当且仅当所有 teacher 在 prompt set $\mathcal{P}_m$ 上给出相同 velocity。
+\end{proposition}
+
+\begin{proof}
+Student 的最优 velocity 为 teacher 均值。对于单调依赖于 $\|\vtheta - \vphi^{(m)}\|$ 的 in-domain metric，均值必然偏离 $\vphi^{(m)}$（当 teacher 间有分歧时）。
+\end{proof}
+
+\begin{remark}
+这解释了实验中 OPD-Average 在所有 in-domain metric 上均红色下降的现象。
+\end{remark}
+
+\subsection{MoTV 超越单 Teacher 的充分条件}
+
+\begin{theorem}[Temporal Complementarity → 超越单 Teacher]
+\label{thm:beyond_single}
+设 reward function $R$ 评价最终生成的 image quality。如果存在\textbf{时间互补性}（temporal complementarity）：
+
+\begin{definition}[时间互补性]
+对于 prompt $p$，存在权重向量 $\lambda^* \in \Delta^K$ 使得使用 $v_{\lambda^*}$ 生成的 ODE trajectory 的 reward 严格高于任何单一 teacher：
+\begin{equation}
+R\!\left(\mathrm{ODE}(v_{\lambda^*}; x_T, p)\right) > \max_k R\!\left(\mathrm{ODE}(\vphi^{(k)}; x_T, p)\right)
+\end{equation}
+\end{definition}
+
+则 MoTV 可以严格超越最优单 teacher。
+
+\textbf{时间互补性成立的典型场景}：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Teacher 在不同 timestep 有不同优势}：如 GenEval teacher 在早期 timestep（确定 layout/composition）表现更好，而 PickScore teacher 在晚期 timestep（细化 aesthetics）表现更好。
+\item \textbf{Multi-aspect reward}：当 $R = w_1 R_1 + w_2 R_2 + \cdots$ 时，每个 teacher 可能擅长不同 aspect。通过在不同 timestep 选择不同 teacher 的``擅长阶段''，可以获得综合 reward 的提升。
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+MoTV 的搜索空间是 $\prod_{i=1}^T \Delta^K$（每个 timestep 一个 $K$-simplex）。单一 teacher $k$ 对应 $\lambda_{k,i} = 1, \forall i$，这是搜索空间的一个顶点。如果 reward landscape 在这个乘积 simplex 上的最大值不在顶点上取得（即最优不是某个 teacher 恒取权重 1），则 MoTV 严格优于单 teacher。
+
+由连续优化在紧集上的性质，最优解存在。在时间互补性假设下，最优解不退化为某个顶点。
+\end{proof}
+
+\subsection{直觉示例：为什么时间互补性是自然的}
+
+\begin{example}[Layout vs.\ Aesthetics 互补]
+考虑一个 ``two cats sitting on a red carpet'' 的 prompt，reward 为 GenEval accuracy + PickScore。
+
+\begin{itemize}
+\item GenEval teacher：专注于 counting 和 spatial relations。在\textbf{早期 timestep}（$t_1, \ldots, t_5$，确定全局 layout）时其 velocity 指向正确的``two cats''构图。
+\item PickScore teacher：专注于 aesthetics。在\textbf{晚期 timestep}（$t_{20}, \ldots, t_{28}$，细化 texture 和 lighting）时其 velocity 产生更高美学质量。
+\end{itemize}
+
+使用 GenEval teacher 全程：得到正确构图但美学一般。\\
+使用 PickScore teacher 全程：美学好但可能只画一只猫。\\
+MoTV 的最优策略：早期偏向 GenEval teacher（确保构图正确），晚期偏向 PickScore teacher（提升美学）→ 综合 reward 超越任何单一 teacher。
+\end{example}
+
+\begin{example}[OCR + PickScore 互补]
+OCR teacher 在早期确保文字 layout 的正确性（文字区域的粗结构），PickScore teacher 在晚期提升整体 aesthetics。两者在不同 denoising 阶段各有贡献——OCR 确保文字可读，PickScore 确保非文字区域美观。
+\end{example}
+
+\subsection{MoTV 搜索空间的几何}
+
+\begin{proposition}[搜索空间 vs 参数空间]
+\begin{itemize}
+\item OPD 的搜索空间：$\R^P$（模型参数）—— student velocity 可以是任意函数。
+\item MoTV 的搜索空间：$(\Delta^K)^T \cong$ 乘积 simplex —— 只有 $K \times T$ 维。
+\end{itemize}
+
+MoTV 的搜索空间\textbf{远小于} OPD，但它直接在 reward 空间中优化。OPD 的大搜索空间并不意味着能找到更好的解——因为它的目标函数（KL distillation）将 student 锁定为 teacher 的``模仿者''。
+\end{proposition}
+
+%% ============================================================
+\section{梯度动力学分析}
+\label{sec:dynamics}
+%% ============================================================
+
+\subsection{MoTV 的梯度流}
+
+简化分析：设 $\beta = 1$（标准 NFT），$w^+ = w^- = 1$（忽略 normalization），single sample。此时 $v^+ = v^{\mathrm{new}}$，$v^- = 2v^{\mathrm{old}} - v^{\mathrm{new}}$，$x_0^\pm - x_0 = -\sigma_i(v^\pm - v^*_i)$（其中 $v^*_i = (x_{t_i} - x_0)/\sigma_i$ 是 ground truth velocity）。代入~\eqref{eq:motv_gradient}：
+\begin{align}
+\frac{\partial \loss_i}{\partial \ell_{k,i}} &\propto \lambda_{k,i}\left[v^{(k)}_i - v^{\mathrm{new}}_i\right]^\top \left[r\,(v^{\mathrm{new}}_i - v^*_i) - (1-r)(2v^{\mathrm{old}}_i - v^{\mathrm{new}}_i - v^*_i)\right]\sigma_i^2
+\end{align}
+
+设 $v^{\mathrm{old}} \approx v^{\mathrm{new}}$（off-policy 小偏移），则 $2v^{\mathrm{old}} - v^{\mathrm{new}} - v^* \approx v^{\mathrm{new}} - v^*$，得到：
+\begin{equation}
+\frac{\partial \loss_i}{\partial \ell_{k,i}} \approx \frac{2\sigma_i^2}{\tau} \lambda_{k,i}\left[v^{(k)}_i - v^{\mathrm{new}}_i\right]^\top \left[(2r-1)(v^{\mathrm{new}}_i - v^*_i)\right]
+\label{eq:simplified_grad}
+\end{equation}
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50, title=梯度解读]
+设 advantage $\adv > 0$（即 $r > 0.5$，当前 trajectory 产出好 reward）：
+\begin{itemize}
+\item 若 $v^{(k)}_i$ 与 $v^{\mathrm{new}}_i$ 在 error $(v^{\mathrm{new}} - v^*)$ 方向上有负投影（即 $\vphi^{(k)}$ 比当前混合更``正确''），则 $\ell_{k,i}$ 增加——\textbf{增加该 teacher 的权重}。
+\item 若 $v^{(k)}_i$ 比当前混合更``偏离 ground truth''，则 $\ell_{k,i}$ 减小。
+\end{itemize}
+
+设 advantage $\adv < 0$（$r < 0.5$，当前 trajectory 不好）：
+\begin{itemize}
+\item 梯度方向反转：惩罚当前混合方向，鼓励远离当前权重分布。
+\end{itemize}
+\end{tcolorbox}
+
+\subsection{与 OPD-Average 梯度方向的本质区别}
+
+\begin{proposition}[方向差异]
+\label{prop:direction_diff}
+OPD-Average 的梯度方向（在 velocity space 投影中）：
+\begin{equation}
+g^{\mathrm{avg}}_i = v_{\theta,i} - \frac{1}{K}\sum_k v^{(k)}_i \quad (\text{指向 teacher 均值})
+\end{equation}
+
+MoTV 的``有效 velocity 调整方向''：
+\begin{equation}
+\Delta v_i^{\mathrm{motv}} \propto \sum_k \frac{\partial \lambda_{k,i}}{\partial \ell_{k,i}} \cdot \Delta\ell_{k,i} \cdot v^{(k)}_i \quad (\text{reward-weighted rebalancing})
+\end{equation}
+
+两者\textbf{不共线}：OPD-Average 总是指向均值（与 reward 无关），而 MoTV 指向 reward 提升方向（可能偏向某个 teacher）。
+\end{proposition}
+
+\subsection{收敛行为}
+
+\begin{proposition}[MoTV 的固定点]
+在 $\tau \to 0$（低温极限）下，MoTV 收敛到 ``winner-take-all''：每个 timestep 选择一个 teacher。
+
+在 $\tau \to \infty$（高温极限）下，MoTV 退化为均匀混合 $\lambda_{k,i} = 1/K$——此时等价于 OPD-Average 的 target。
+
+在适中的 $\tau$ 下，MoTV 找到介于两个极端之间的 soft 分配。
+\end{proposition}
+
+%% ============================================================
+\section{与 PCGrad 的关系}
+\label{sec:vs_pcgrad}
+%% ============================================================
+
+\subsection{PCGrad 解决的问题 MoTV 不存在}
+
+PCGrad 的核心动机是：当多个 teacher 的梯度在\textbf{共享参数空间}中冲突时，通过投影消除冲突分量。
+
+MoTV 中：
+\begin{itemize}
+\item 不同 teacher 贡献到同一个 $\ell_{k,i}$ 的梯度——但由 softmax 的结构保证 $\sum_k \lambda_k = 1$，不存在``某个 teacher 的梯度消灭另一个 teacher''的问题。
+\item 不同 timestep 的梯度作用于不同参数，天然正交。
+\end{itemize}
+
+因此，\textbf{PCGrad 的冲突投影机制在 MoTV 框架中没有意义}。
+
+\subsection{但 Teacher 间的``竞争''仍然存在}
+
+虽然没有参数空间冲突，MoTV 中 teacher 间存在\textbf{simplex 竞争}：
+\begin{equation}
+\sum_k \lambda_{k,i} = 1 \quad\Rightarrow\quad \text{增加 teacher $k$ 的权重必然减少其他 teacher 的权重}
+\end{equation}
+
+这种竞争由 reward signal 仲裁：reward 高的 trajectory 中哪个 teacher 贡献大，哪个 teacher 的权重就被提升。
+
+%% ============================================================
+\section{能否实现 Pareto 改进？}
+\label{sec:pareto}
+%% ============================================================
+
+\subsection{Multi-Objective 视角}
+
+设 reward 由多个分项组成：$R = \sum_j w_j R_j$（如 $R_1$ = GenEval, $R_2$ = PickScore, $R_3$ = OCR）。
+
+\begin{definition}[Pareto 改进]
+$v_\lambda$ 实现了相对于 teacher 集合 $\{\vphi^{(k)}\}_{k=1}^K$ 的 Pareto 改进，如果：
+\begin{equation}
+R_j(v_\lambda) \geq R_j(\vphi^{(k)}), \quad \forall j, k, \quad\text{且至少一个不等式严格}
+\end{equation}
+\end{definition}
+
+\begin{theorem}[Pareto 改进的充分条件]
+\label{thm:pareto}
+设 teacher $k$ 在 reward $R_k$ 上最优（in-domain），在其他 reward 上为 baseline。如果存在 \textbf{timestep 分区} $\{I_1, \ldots, I_K\}$（$\bigcup_k I_k = \{1, \ldots, T\}$）使得：
+\begin{enumerate}[leftmargin=1.5em]
+\item Teacher $k$ 在 timestep 集 $I_k$ 上对 reward $R_k$ 的边际贡献为正且显著。
+\item Teacher $k$ 在 timestep 集 $I_k$ 上对其他 reward $R_j$ ($j \neq k$) 的边际贡献为非负或可忽略。
+\end{enumerate}
+则存在 $\lambda^*$ 使得 $R_j(v_{\lambda^*}) \geq R_j(\vphi^{(j)})$ 对所有 $j$。
+
+\textit{直觉}：如果不同 teacher 的``贡献区间''在 timestep 维度上可分离，则可以在各自的区间上分配高权重而不损害其他 reward。
+\end{theorem}
+
+\subsection{现实中的限制}
+
+\begin{remark}[何时 Pareto 改进不可能]
+当 teacher 间的冲突集中在同一 timestep 区间（如所有 teacher 都在 $t \in [0.3, 0.5]$ 这个``关键布局阶段''产生分歧），则 MoTV 无法同时满足所有 reward——此时退化为 weighted trade-off。
+\end{remark}
+
+\begin{remark}[从实验数据看可行性]
+从 experiments.tex 的数据看：
+\begin{itemize}
+\item GenEval teacher 的主要贡献在 counting/position（layout-sensitive，倾向早期 timestep）
+\item OCR teacher 的主要贡献在文字渲染（需要中期-晚期精确笔画）
+\item PickScore teacher 的贡献在整体 aesthetics（倾向晚期 timestep）
+\end{itemize}
+三者在 timestep 维度上有一定程度的\textbf{自然分离}，这为 Pareto 改进提供了可能性。
+\end{remark}
+
+%% ============================================================
+\section{总结与关键 Insight}
+\label{sec:summary}
+%% ============================================================
+
+\begin{tcolorbox}[colback=yellow!5, colframe=yellow!60!black, title=核心结论]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{本质差异}：OPD 是 distillation（KL 最小化），MoTV 是 RL（reward 最大化）。前者的最优解由 teacher velocity 的几何关系决定，后者由下游 reward 决定。
+
+\item \textbf{梯度方向}：OPD 的梯度始终指向 teacher velocity 的某种均值/投影；MoTV 的梯度指向 reward 提升方向——可以在不同 timestep 偏向不同 teacher。
+
+\item \textbf{Timestep 解耦}：MoTV 的每个 timestep 的权重完全独立优化，不存在跨 timestep 的梯度冲突。PCGrad 等冲突解决机制在 MoTV 中\textbf{无需使用}。
+
+\item \textbf{超越单 Teacher}：在存在时间互补性时（不同 teacher 在不同 timestep 各有优势），MoTV 理论上可以严格超越最优单 teacher。OPD-Average 则受 Jensen 不等式约束，in-domain 性能必然下降。
+
+\item \textbf{搜索空间 trade-off}：MoTV 的搜索空间极小（$K \times T \sim 60$ 维）但精准对准 reward 目标；OPD 的搜索空间巨大（$\sim 10^7$）但被 distillation objective 限制了探索方向。
+
+\item \textbf{OPD 与 MoTV 的互补性}：OPD（route\_by\_source）可作为 MoTV 的``warm start''——先通过 OPD 训练一个接近各 teacher in-domain 表现的 student，再用 MoTV 的 reward-driven 方式做\textbf{per-timestep 精细调整}超越 single teacher。
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{@{}l c c c c@{}}
+\toprule
+& \textbf{Average} & \textbf{Route} & \textbf{PCGrad} & \textbf{MoTV} \\
+\midrule
+In-domain 性能 & $<$ single teacher & $\approx$ single teacher & $<$ single teacher & \textbf{可 $>$ single teacher} \\
+OOD 性能 & 有少量提升 & 继承 teacher OOD & 有少量提升 & \textbf{reward-driven 提升} \\
+需要 reward? & \ding{55} & \ding{55} & \ding{55} & \ding{51} \\
+解决 teacher 冲突? & 无（直接平均） & 回避（分离） & 投影消除 & simplex 竞争 \\
+超越 single teacher? & \ding{55} 不可能 & \ding{55} 不可能 & \ding{55} 不可能 & \ding{51} 理论可能 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
