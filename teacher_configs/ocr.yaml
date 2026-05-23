@@ -10,7 +10,7 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/geneval"  # Path to dataset folder
+  dataset_dir: "dataset/ocr"  # Path to dataset folder
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
@@ -31,7 +31,7 @@ model:
   # attn_backend: '_flash_3_hub' # Attention backend for training.
 
 log:
-  run_name: "geneval_teacher"  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  run_name: "ocr_teacher"  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "/apdcephfs_zwfy8/share_305110755/hunyuan/bowenping/checkpoints/MOF"  # Directory to save model checkpoints and logs

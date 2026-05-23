@@ -1,0 +1,162 @@
+# MoF (Mixture-of-Flow): 2-teacher validation config.
+#
+# GenEval + PickScore teachers, each routed to its own prompt set.
+# Used for quick validation of the per-set lambda mechanism.
+#
+# Learnable params: K=2 x T=28 x S=2 = 112 logits.
+#
+# Expected behavior:
+#   - geneval set: lambda biases toward GenEval teacher
+#   - pickscore set: lambda biases toward PickScore teacher
+#   - OOD bonus (gamma=0.2) allows cross-teacher complementarity discovery
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source
+data:
+  dataset_dir: "dataset/geneval"            # Fallback single-source (used by eval/test if no dataset_dirs)
+  dataset_dirs:                             # Multi-source: each dir becomes a prompt set (source name = basename)
+    - "dataset/geneval"                     # Source name: "geneval" → prompt set 0
+    - "dataset/pickscore"                   # Source name: "pickscore" → prompt set 1
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32                             # LoRA rank (must match teacher checkpoints)
+  lora_alpha: 64                            # LoRA alpha scaling
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null                         # Set to checkpoint path to resume training
+  resume_type: null
+
+log:
+  run_name: "sd3-5_mof_geneval_pickscore"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20                             # Save checkpoint every N epochs
+  save_model_only: false                    # Save full MoF state (logits + EMA + reward stats)
+
+# Training Configuration
+train:
+  trainer_type: 'mof'                       # Mixture-of-Flow trainer
+
+  # Per-source teacher configuration: each teacher is paired with a dataset source.
+  # The teacher's velocity is used for samples from its assigned source.
+  teachers:
+    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+      sources: [geneval]                    # This teacher's in-domain set → provides velocity for geneval prompts
+    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+      sources: [pickscore]                  # This teacher's in-domain set → provides velocity for pickscore prompts
+
+  teacher_route_by_source: true             # Enable per-set independent lambda weights (S > 1)
+  teacher_param_device: 'cuda'              # Store teacher LoRA snapshots on GPU for fast swapping
+
+  # ---- MoF core hyperparameters ----
+  nft_beta: 1.0                             # NFT loss interpolation strength (1.0 = standard DiffusionNFT)
+  off_policy: true                          # Use EMA logits for sampling (stabilizes training)
+  logits_init: "teacher_biased"             # Init lambda biased toward in-domain teacher per set
+  logits_init_bias: 2.0                     # Bias strength: softmax(2.0, 0) ≈ (0.88, 0.12) for K=2
+  learning_rate: 0.05                       # Learning rate for lambda logits (larger than typical model lr)
+  ema_decay: 0.99                           # EMA decay for off-policy logits (old policy smoothing)
+  temperature: 1.0                          # Softmax temperature: lower → sharper selection, higher → softer mixing
+
+  # ---- Per-set reward design ----
+  ood_bonus_gamma: 0.2                      # OOD bonus: reward_s = R_s + 0.2 * mean(R_j, j!=s)
+                                            # 0 = pure in-domain, >0 encourages cross-teacher exploration
+  reward_normalization: "zscore"            # Normalize rewards to comparable scale before combining
+  reward_ema_alpha: 0.01                    # EMA alpha for running reward mean/var (z-score update speed)
+
+  # ---- Advantage computation ----
+  advantage_aggregation: "gdpo"             # GDPO-style per-group advantage normalization
+  adv_clip_range: [-5.0, 5.0]              # Clip extreme advantages for training stability
+  global_std: true                          # Normalize advantage by global std across all samples
+
+  # ---- Timestep control ----
+  time_sampling_strategy: "discrete"        # Use scheduler's discrete timestep grid (1:1 with logits T dim)
+  timestep_range: 0.9                       # Train on timesteps covering 90% of the denoising trajectory
+  num_inference_steps: 10                   # T = number of denoising steps (determines logits T dimension)
+
+  # ---- Optimization ----
+  per_device_batch_size: 4                  # Micro-batch size per GPU
+  group_size: 16                             # Number of samples per prompt for advantage computation
+  unique_sample_num_per_epoch: 32           # Total unique prompts sampled per epoch
+  num_inner_epochs: 1                       # Inner training epochs per sampling round
+  max_grad_norm: 1.0                        # Gradient clipping for lambda logits
+  max_epochs: 300                           # Total training epochs
+  seed: 42
+
+  # ---- KL penalty (disabled) ----
+  kl_beta: 0.0                              # Set > 0 to anchor combined velocity toward base model
+  kl_type: 'v-based'                        # KL computed as MSE in velocity space
+
+  # ---- Generation settings ----
+  resolution: 512                           # Image resolution for sampling
+  guidance_scale: 1.0                       # NFT requires no CFG (guidance_scale=1.0)
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"                        # NFT requires ODE dynamics (no SDE noise)
+  noise_level: 0.0                          # No noise injection
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 32
+  guidance_scale: 1.0                       # NFT: no CFG during eval either
+  num_inference_steps: 40                   # Match training timesteps for consistent eval
+  eval_freq: 10                             # Evaluate every N epochs
+  seed: 42
+  test_sets:
+    - name: geneval                         # Evaluate GenEval accuracy on geneval prompts
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore                       # Evaluate PickScore on pickscore prompts
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+
+# Training rewards (computed on every generated sample during sampling)
+rewards:
+  - name: "geneval"                         # GenEval: composition accuracy (counting, spatial, color)
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"                      # PickScore: overall aesthetic quality
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+
+# Evaluation rewards (may include additional metrics not used in training)
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false

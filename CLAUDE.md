@@ -25,4 +25,4 @@ finally:
 
 **Safe paths (no `.data.copy_()`):** `use_ref_parameters` in LoRA mode uses `PeftModel.disable_adapter()` which does not overwrite weight data, so autocast cache is not a concern there.
 
-**Reference:** `trainers/ensemble_eval/trainer.py` line 144–149, `trainers/motv.py:_compute_teacher_velocities`, `trainers/motv.py:_motv_inference_context`.
+**Reference:** `trainers/ensemble_eval/trainer.py` line 144–149, `trainers/mof.py:_compute_teacher_velocities`, `trainers/mof.py:_mof_inference_context`.

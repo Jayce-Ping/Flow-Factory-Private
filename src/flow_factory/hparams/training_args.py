@@ -699,25 +699,40 @@ class NFTTrainingArguments(TrainingArguments):
 
 
 @dataclass
-class MoTVTrainingArguments(TrainingArguments):
-    r"""Training arguments for MoTV (Mixture of Temporal Velocities).
+class MoFTrainingArguments(TrainingArguments):
+    r"""Training arguments for MoF (Mixture-of-Flow).
 
-    Learns optimal per-timestep softmax mixing weights (lambda_k_i) over K
-    frozen teacher flow-matching velocities.  The combined velocity
-    ``v_combined_i = sum_k softmax(logits[:, i]) * v_k_i`` is a valid
-    flow-matching velocity (ODE linearity).  DiffusionNFT optimizes
-    these weights via external reward feedback.
+    Learns per-timestep, per-prompt-set softmax mixing weights over K frozen
+    teacher flow-matching velocities.  The combined velocity
+    ``v_combined(x, t_i, s) = sum_k softmax(logits[:, i, s]) * v_k(x, t_i)``
+    is optimized via DiffusionNFT with external reward feedback.
 
-    Total learnable parameters: K × num_inference_steps (1:1 mapping).
+    Total learnable parameters: K × T × S, where S is the number of prompt
+    sets (determined automatically from ``teachers[*].sources``).
+
+    Key extension over MoTV: each prompt set has independent lambda weights,
+    enabling per-set optimization that guarantees >= single-teacher in-domain
+    performance (Level-1) and enables potential improvement (Level-2).
     """
 
-    # ---- Teacher administration (reuse OPD pattern) ----
+    # ---- Teacher administration (reuse TeacherConfig for source routing) ----
+    teachers: Optional[List[TeacherConfig]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Rich teacher config list. Each entry specifies a LoRA "
+                "checkpoint path and the dataset source names it applies to. "
+                "When set, takes priority over teacher_paths."
+            )
+        },
+    )
     teacher_paths: List[str] = field(
         default_factory=list,
         metadata={
             "help": (
-                "List of K teacher LoRA checkpoint paths.  Must contain at "
-                "least one entry.  Paths can be local or HF Hub repo ids."
+                "Legacy flat list of teacher LoRA checkpoint paths. "
+                "Ignored when 'teachers' is set. All teachers broadcast to "
+                "all samples (single prompt set mode)."
             )
         },
     )
@@ -730,8 +745,19 @@ class MoTVTrainingArguments(TrainingArguments):
             )
         },
     )
+    teacher_route_by_source: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Enable per-source lambda routing. When True and teachers "
+                "have sources assigned, each source gets independent lambda "
+                "weights (S > 1). When False, all sources share a single "
+                "set of lambda weights (S = 1)."
+            )
+        },
+    )
 
-    # ---- MoTV core ----
+    # ---- MoF core ----
     nft_beta: float = field(
         default=1.0,
         metadata={"help": "Beta parameter for NFT loss (positive/negative interpolation)."},
@@ -740,27 +766,56 @@ class MoTVTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Use EMA of logits for sampling (off-policy NFT)."},
     )
-    logits_init: Literal["zeros", "random"] = field(
-        default="zeros",
+    logits_init: Literal["zeros", "random", "teacher_biased"] = field(
+        default="teacher_biased",
         metadata={
             "help": (
-                "Initialization for lambda logits. 'zeros' gives exactly uniform "
-                "softmax (1/K per teacher); 'random' uses small Gaussian noise "
-                "(std=0.01) to break symmetry while staying near-uniform."
+                "Initialization for lambda logits. "
+                "'zeros': uniform softmax (1/K per teacher). "
+                "'random': small Gaussian noise (std=0.01). "
+                "'teacher_biased': each set biased toward its in-domain teacher "
+                "with strength logits_init_bias."
             )
         },
     )
-    logits_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Learning rate for lambda logits. None = use global learning_rate."},
-    )
-    logits_ema_decay: float = field(
-        default=0.99,
-        metadata={"help": "EMA decay for lambda logits (old-policy in off-policy NFT)."},
+    logits_init_bias: float = field(
+        default=2.0,
+        metadata={
+            "help": (
+                "Bias strength for 'teacher_biased' init. Higher values give "
+                "stronger initial preference for the in-domain teacher. "
+                "E.g., bias=2.0 with K=3 gives in-domain teacher ~78%% weight."
+            )
+        },
     )
     temperature: float = field(
         default=1.0,
-        metadata={"help": "Softmax temperature: weights_i = softmax(logits[:, i] / temperature)."},
+        metadata={"help": "Softmax temperature: weights = softmax(logits / temperature, dim=0)."},
+    )
+
+    # ---- Per-set reward ----
+    ood_bonus_gamma: float = field(
+        default=0.2,
+        metadata={
+            "help": (
+                "OOD reward bonus coefficient. Final reward for set s: "
+                "R_s(x) + gamma * mean(R_j(x) for j != s). "
+                "0 = pure in-domain optimization."
+            )
+        },
+    )
+    reward_normalization: Literal["zscore", "none"] = field(
+        default="zscore",
+        metadata={
+            "help": (
+                "Reward normalization strategy. 'zscore' uses running mean/std "
+                "to normalize all rewards to similar scale before combining."
+            )
+        },
+    )
+    reward_ema_alpha: float = field(
+        default=0.01,
+        metadata={"help": "EMA alpha for running reward statistics (zscore normalization)."},
     )
 
     # ---- Advantage & clipping ----
@@ -780,7 +835,6 @@ class MoTVTrainingArguments(TrainingArguments):
     )
 
     # ---- Timestep control ----
-    # T always equals num_inference_steps (1:1 mapping).
     time_sampling_strategy: Literal[
         "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
     ] = field(
@@ -794,15 +848,14 @@ class MoTVTrainingArguments(TrainingArguments):
     timestep_range: Union[float, Tuple[float, float]] = field(
         default=0.9,
         metadata={
-            "help": "Fraction range along denoise axis 1000→0; maps to scheduler times "
-            "[1000*(1-end), 1000*(1-start)]. Float means [0, value]."
+            "help": "Fraction range along denoise axis 1000->0; maps to scheduler times."
         },
     )
 
     # ---- Optional KL (anchor to base model) ----
     kl_type: Literal["v-based"] = field(
         default="v-based",
-        metadata={"help": "Type of KL divergence. MoTV supports 'v-based' only."},
+        metadata={"help": "Type of KL divergence. MoF supports 'v-based' only."},
     )
     kl_beta: float = field(
         default=0,
@@ -813,25 +866,43 @@ class MoTVTrainingArguments(TrainingArguments):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+
+        # Resolve teacher_paths from teachers if needed
+        if self.teachers is not None:
+            # Coerce raw dicts (from YAML) to TeacherConfig objects
+            coerced: List[TeacherConfig] = []
+            for item in self.teachers:
+                if isinstance(item, TeacherConfig):
+                    coerced.append(item)
+                elif isinstance(item, dict):
+                    coerced.append(TeacherConfig.from_dict(item))
+                else:
+                    raise ValueError(
+                        f"teachers entries must be dicts or TeacherConfig, got {type(item).__name__}"
+                    )
+            self.teachers = coerced
+            if not self.teacher_paths:
+                self.teacher_paths = [tc.path for tc in self.teachers]
         if not self.teacher_paths:
-            raise ValueError("MoTVTrainingArguments requires at least one teacher_paths entry.")
-        if self.logits_lr is None:
-            self.logits_lr = self.learning_rate
-        if self.logits_init not in ["zeros", "random"]:
+            raise ValueError("MoFTrainingArguments requires at least one teacher (via 'teachers' or 'teacher_paths').")
+
+        if self.logits_init not in ["zeros", "random", "teacher_biased"]:
             raise ValueError(
                 f"Invalid logits_init: {self.logits_init!r}. "
-                f"Valid options are: ['zeros', 'random']."
-            )
-        if not (0 < self.logits_ema_decay < 1):
-            raise ValueError(
-                f"logits_ema_decay must be in (0, 1), got {self.logits_ema_decay}."
+                f"Valid options are: ['zeros', 'random', 'teacher_biased']."
             )
         if self.nft_beta <= 0:
             raise ValueError(f"nft_beta must be > 0, got {self.nft_beta}.")
         if self.temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {self.temperature}")
         if self.kl_type not in ["v-based"]:
-            raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
+            raise ValueError(f"Invalid KL type: {self.kl_type}. Valid: ['v-based'].")
+        if self.ood_bonus_gamma < 0:
+            raise ValueError(f"ood_bonus_gamma must be >= 0, got {self.ood_bonus_gamma}.")
+
+
+# Backward compatibility alias
+MoTVTrainingArguments = MoFTrainingArguments
 
 
 @dataclass
@@ -1869,7 +1940,8 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "grpo": GRPOTrainingArguments,
     "grpo-guard": GRPOTrainingArguments,
     "nft": NFTTrainingArguments,
-    "motv": MoTVTrainingArguments,
+    "mof": MoFTrainingArguments,
+    "motv": MoFTrainingArguments,  # backward compat alias
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,
