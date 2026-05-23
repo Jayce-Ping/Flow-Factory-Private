@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
@@ -19,17 +20,18 @@ DEFAULT_PROJECT = "Flow-Factory-OPD-Experiments"
 
 OPD_ALL_TEACHERS: Tuple[str, ...] = ("geneval", "ocr", "pickscore")
 
-OPD_RUN_SHORT_LABELS: Dict[str, str] = {
-    "exp_pathwise_average": "pw-avg",
-    "exp_pathwise_sum": "pw-sum",
-    "exp_pathwise_sum_route_by_source": "pw-sum-rbs",
-    "exp_pathwise_round_robin": "pw-rr",
-    "exp_pathwise_pcgrad": "pw-pcgrad",
-    "exp_pathwise_pcgrad_no_route": "pw-pcg-nr",
-    "exp_pathwise_v_pcgrad": "v-pcgrad",
-    "exp_pathwise_v_pcgrad_no_route": "v-pcg-nr",
-    "exp_diffusion_opd_dedicated": "diff-opd",
-    "reproduce_diffusion_opd_via_route_by_source": "diff-opd-rbs",
+# run_name -> (base_label, apply_route_suffix from train.teacher_route_by_source)
+OPD_RUN_BASE_LABELS: Dict[str, Tuple[str, bool]] = {
+    "exp_pathwise_average": ("pw-avg", False),
+    "exp_pathwise_round_robin": ("pw-rr", False),
+    "exp_pathwise_sum": ("pw-sum", True),
+    "exp_pathwise_sum_route_by_source": ("pw-sum", True),
+    "exp_pathwise_pcgrad": ("pw-pcgrad", True),
+    "exp_pathwise_pcgrad_no_route": ("pw-pcgrad", True),
+    "exp_pathwise_v_pcgrad": ("v-pcgrad", True),
+    "exp_pathwise_v_pcgrad_no_route": ("v-pcgrad", True),
+    "exp_diffusion_opd_dedicated": ("diff-opd", True),
+    "reproduce_diffusion_opd_via_route_by_source": ("diff-opd", True),
 }
 
 DEFAULT_ENSEMBLE_RUNS: Tuple[str, ...] = (
@@ -53,7 +55,21 @@ MAIN_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
 
 REQUIRED_WANDB_KEYS: Tuple[str, ...] = tuple(col[1] for col in MAIN_COLUMNS)
 
-MAIN_TABLE_NUM_COLS = 2 + len(MAIN_COLUMNS)
+MAIN_TABLE_NUM_COLS = 3 + len(MAIN_COLUMNS)
+
+ROUTE_NA = r"---"
+ROUTE_CHECK = r"$\checkmark$"
+ROUTE_CROSS = r"$\times$"
+
+# Primary row order for OPD Config. column (unknown labels sort last).
+OPD_DISPLAY_LABEL_ORDER: Tuple[str, ...] = (
+    "pw-avg",
+    "pw-sum",
+    "pw-pcgrad",
+    "v-pcgrad",
+    "pw-rr",
+    "diff-opd",
+)
 
 TEACHER_IN_DOMAIN_COLUMN: Dict[str, str] = {
     "geneval": "geneval_ge",
@@ -150,6 +166,7 @@ class ParsedRun:
     is_pcgrad: bool
     agg_label_override: Optional[str] = None
     teachers_display_override: Optional[str] = None
+    route_display_override: Optional[str] = None
 
     @property
     def teachers_display(self) -> str:
@@ -158,6 +175,19 @@ class ParsedRun:
         if self.num_checkpoints == 0:
             return "SD3.5 (base)"
         return "+".join(self.teachers)
+
+    @property
+    def route_display(self) -> str:
+        if self.route_display_override is not None:
+            return self.route_display_override
+        return ROUTE_NA
+
+
+def format_route_cell(apply_route_suffix: bool, route_by_source: bool) -> str:
+    """Check = per-source routing on; cross = off or not teacher-specific."""
+    if not apply_route_suffix:
+        return ROUTE_CROSS
+    return ROUTE_CHECK if route_by_source else ROUTE_CROSS
 
 
 def parse_run_name(name: str) -> ParsedRun:
@@ -231,12 +261,35 @@ def opd_aggregation_label(run_name: str) -> str:
     return "---"
 
 
-def make_opd_running_run(run_name: str) -> ParsedRun:
+def format_opd_display_label(
+    run_name: str,
+    *,
+    base_labels: Mapping[str, Tuple[str, bool]] = OPD_RUN_BASE_LABELS,
+) -> str:
+    if run_name not in base_labels:
+        raise ValueError(
+            f"unknown OPD run {run_name!r} for display label; add an entry to "
+            f"OPD_RUN_BASE_LABELS (known runs: {sorted(base_labels)})"
+        )
+    base, _apply_route_suffix = base_labels[run_name]
+    return base
+
+
+def make_opd_running_run(
+    run_name: str,
+    *,
+    route_by_source: bool,
+    display_label: Optional[str] = None,
+    route_display: Optional[str] = None,
+) -> ParsedRun:
     agg = opd_aggregation_label(run_name) + r"{\footnotesize\,peak}"
-    if run_name in OPD_RUN_SHORT_LABELS:
-        display = OPD_RUN_SHORT_LABELS[run_name]
-    else:
-        display = run_name.removeprefix("exp_").replace("_", r"\_")
+    base_label, apply_route_suffix = OPD_RUN_BASE_LABELS[run_name]
+    display = display_label if display_label is not None else base_label
+    route_cell = (
+        route_display
+        if route_display is not None
+        else format_route_cell(apply_route_suffix, route_by_source)
+    )
     return ParsedRun(
         name=run_name,
         num_checkpoints=len(OPD_ALL_TEACHERS),
@@ -244,12 +297,109 @@ def make_opd_running_run(run_name: str) -> ParsedRun:
         is_pcgrad=False,
         agg_label_override=agg,
         teachers_display_override=display,
+        route_display_override=route_cell,
     )
+
+
+def resolve_wandb_run(api: wandb.Api, project: str, run_name: str) -> Any:
+    runs = [r for r in api.runs(project) if r.name == run_name]
+    if not runs:
+        raise ValueError(f"no W&B run named {run_name!r} in project {project!r}")
+    if len(runs) > 1:
+        raise ValueError(
+            f"multiple W&B runs named {run_name!r} in project {project!r}: "
+            f"{[r.id for r in runs]}"
+        )
+    return runs[0]
+
+
+def _coerce_bool_config(value: Any, *, field: str, run: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+    raise TypeError(
+        f"expected bool for {field} on W&B run {run.name!r} ({run.id}), "
+        f"got {type(value).__name__}: {value!r}"
+    )
+
+
+def _training_config_section(config: Mapping[str, Any], run: Any) -> Mapping[str, Any]:
+    """W&B logs training_args as config['training']; YAML uses 'train'."""
+    for key in ("training", "train"):
+        section = config.get(key)
+        if section is None:
+            continue
+        if not isinstance(section, Mapping):
+            raise TypeError(
+                f"W&B run {run.name!r} ({run.id}) config[{key!r}] expected mapping, "
+                f"got {type(section).__name__}"
+            )
+        return section
+    raise ValueError(
+        f"W&B run {run.name!r} ({run.id}) config missing 'training' or 'train' "
+        f"section; cannot read teacher_route_by_source"
+    )
+
+
+def read_teacher_route_by_source(run: Any) -> bool:
+    config = dict(run.config)
+    training = _training_config_section(config, run)
+    if "teacher_route_by_source" not in training:
+        raise ValueError(
+            f"W&B run {run.name!r} ({run.id}) training config missing " f"'teacher_route_by_source'"
+        )
+    return _coerce_bool_config(
+        training["teacher_route_by_source"],
+        field="training.teacher_route_by_source",
+        run=run,
+    )
+
+
+def build_opd_run_meta(run: Any) -> Dict[str, Any]:
+    route_by_source = read_teacher_route_by_source(run)
+    base_label, apply_route_suffix = OPD_RUN_BASE_LABELS[run.name]
+    return {
+        "base_label": base_label,
+        "apply_route_suffix": apply_route_suffix,
+        "teacher_route_by_source": route_by_source,
+        "display_label": format_opd_display_label(run.name),
+        "route_display": format_route_cell(apply_route_suffix, route_by_source),
+    }
 
 
 def discover_running_run_names(api: wandb.Api, project: str) -> List[str]:
     names = [run.name for run in api.runs(project) if run.state == "running"]
     return sorted(names)
+
+
+def _opd_display_label_rank(display_label: str) -> int:
+    try:
+        return OPD_DISPLAY_LABEL_ORDER.index(display_label)
+    except ValueError:
+        return len(OPD_DISPLAY_LABEL_ORDER)
+
+
+def sort_opd_running_runs(
+    run_names: Sequence[str],
+    opd_run_meta: Mapping[str, Mapping[str, Any]],
+) -> List[str]:
+    """Same Config. label: Route $\\times$ before $\\checkmark$; then label order."""
+
+    def sort_key(run_name: str) -> Tuple[int, int, str]:
+        meta = opd_run_meta[run_name]
+        route_rank = 0 if meta["route_display"] == ROUTE_CROSS else 1
+        return (
+            _opd_display_label_rank(meta["display_label"]),
+            route_rank,
+            run_name,
+        )
+
+    return sorted(run_names, key=sort_key)
 
 
 def in_domain_column_ids(parsed: ParsedRun) -> frozenset[str]:
@@ -373,16 +523,10 @@ def fetch_run_metrics(
     *,
     aggregate: MetricAggregate = "last",
     require_main_columns: bool = True,
+    run: Any = None,
 ) -> Dict[str, float]:
-    runs = [r for r in api.runs(project) if r.name == run_name]
-    if not runs:
-        raise ValueError(f"no W&B run named {run_name!r} in project {project!r}")
-    if len(runs) > 1:
-        raise ValueError(
-            f"multiple W&B runs named {run_name!r} in project {project!r}: "
-            f"{[r.id for r in runs]}"
-        )
-    run = runs[0]
+    if run is None:
+        run = resolve_wandb_run(api, project, run_name)
     history = run.history(samples=5000)
     if history.empty:
         raise ValueError(f"run {run_name!r} ({run.id}) has empty history")
@@ -525,13 +669,16 @@ def build_main_table_rows(
     single_baselines: Mapping[str, Dict[str, float]],
     *,
     row_parser: Callable[[str], ParsedRun] = parse_run_name,
+    row_parser_by_run: Optional[Mapping[str, Callable[[str], ParsedRun]]] = None,
 ) -> List[str]:
     rows: List[str] = []
     for run_name in runs:
-        parsed = row_parser(run_name)
+        parser = row_parser_by_run[run_name] if row_parser_by_run is not None else row_parser
+        parsed = parser(run_name)
         metrics = metrics_by_run[run_name]
         cells = [
             parsed.teachers_display,
+            parsed.route_display,
             aggregation_label(parsed),
         ]
         for col_id, wandb_key, _ in MAIN_COLUMNS:
@@ -557,15 +704,15 @@ def build_merged_main_table_rows(
     opd_running_runs: Sequence[str],
     metrics_by_run: Mapping[str, Dict[str, float]],
     single_baselines: Mapping[str, Dict[str, float]],
+    *,
+    opd_row_parser_by_run: Optional[Mapping[str, Callable[[str], ParsedRun]]] = None,
 ) -> List[str]:
     rows: List[str] = []
     if ensemble_runs:
         rows.append(
             _table_group_header_row("Ensemble eval (offline, last eval)", MAIN_TABLE_NUM_COLS)
         )
-        rows.extend(
-            build_main_table_rows(ensemble_runs, metrics_by_run, single_baselines)
-        )
+        rows.extend(build_main_table_rows(ensemble_runs, metrics_by_run, single_baselines))
     if opd_running_runs:
         if rows:
             rows.append(r"\addlinespace")
@@ -577,7 +724,7 @@ def build_merged_main_table_rows(
                 opd_running_runs,
                 metrics_by_run,
                 single_baselines,
-                row_parser=make_opd_running_run,
+                row_parser_by_run=opd_row_parser_by_run,
             )
         )
     return rows
@@ -588,28 +735,24 @@ def build_merged_appendix_table_rows(
     opd_running_runs: Sequence[str],
     metrics_by_run: Mapping[str, Dict[str, float]],
     appendix_columns: Sequence[AppendixColumn],
+    *,
+    opd_row_parser_by_run: Optional[Mapping[str, Callable[[str], ParsedRun]]] = None,
 ) -> List[str]:
     num_cols = 2 + len(appendix_columns)
     rows: List[str] = []
     if ensemble_runs:
-        rows.append(
-            _table_group_header_row("Ensemble eval (offline, last eval)", num_cols)
-        )
-        rows.extend(
-            build_appendix_table_rows(ensemble_runs, metrics_by_run, appendix_columns)
-        )
+        rows.append(_table_group_header_row("Ensemble eval (offline, last eval)", num_cols))
+        rows.extend(build_appendix_table_rows(ensemble_runs, metrics_by_run, appendix_columns))
     if opd_running_runs:
         if rows:
             rows.append(r"\addlinespace")
-        rows.append(
-            _table_group_header_row("OPD training (running, peak eval)", num_cols)
-        )
+        rows.append(_table_group_header_row("OPD training (running, peak eval)", num_cols))
         rows.extend(
             build_appendix_table_rows(
                 opd_running_runs,
                 metrics_by_run,
                 appendix_columns,
-                row_parser=make_opd_running_run,
+                row_parser_by_run=opd_row_parser_by_run,
             )
         )
     return rows
@@ -621,10 +764,12 @@ def build_appendix_table_rows(
     appendix_columns: Sequence[AppendixColumn],
     *,
     row_parser: Callable[[str], ParsedRun] = parse_run_name,
+    row_parser_by_run: Optional[Mapping[str, Callable[[str], ParsedRun]]] = None,
 ) -> List[str]:
     rows: List[str] = []
     for run_name in runs:
-        parsed = row_parser(run_name)
+        parser = row_parser_by_run[run_name] if row_parser_by_run is not None else row_parser
+        parsed = parser(run_name)
         metrics = metrics_by_run[run_name]
         cells = [
             parsed.teachers_display,
@@ -652,6 +797,7 @@ def generate_experiments_tex(
     opd_running_runs: Sequence[str],
     metrics_by_run: Mapping[str, Dict[str, float]],
     fetched_at: str,
+    opd_row_parser_by_run: Optional[Mapping[str, Callable[[str], ParsedRun]]] = None,
 ) -> str:
     all_keys = sorted({k for m in metrics_by_run.values() for k in m})
     appendix_columns = build_appendix_columns(all_keys)
@@ -661,12 +807,14 @@ def generate_experiments_tex(
         opd_running_runs,
         metrics_by_run,
         single_baselines,
+        opd_row_parser_by_run=opd_row_parser_by_run,
     )
     appendix_rows = build_merged_appendix_table_rows(
         ensemble_runs,
         opd_running_runs,
         metrics_by_run,
         appendix_columns,
+        opd_row_parser_by_run=opd_row_parser_by_run,
     )
     (
         appendix_row1,
@@ -709,6 +857,8 @@ def generate_experiments_tex(
         r"Table~1: \textbf{bold} = single-teacher in-domain; gray = multi-teacher",
         r"in-domain; red/blue = change vs.\ max single-teacher baseline in that row.",
         r"OPD rows (\textit{peak}) use the maximum eval logged so far.",
+        r"Route: $\checkmark$ = \texttt{teacher\_route\_by\_source}; "
+        r"$\times$ = off or not teacher-specific (e.g.\ \texttt{pw-avg}).",
         r"\end{sloppypar}",
         "",
         r"\section{Main Results}",
@@ -721,13 +871,13 @@ def generate_experiments_tex(
         r"\label{tab:main-results}",
         r"\footnotesize",
         rf"\resizebox{{\textwidth}}{{!}}{{%",
-        r"\begin{tabular}{@{}ll|cc|c|cc@{}}",
+        r"\begin{tabular}{@{}llc|cc|c|cc@{}}",
         r"\toprule",
-        r" &  & \multicolumn{2}{c}{GenEval benchmark} "
+        r" &  &  & \multicolumn{2}{c}{GenEval benchmark} "
         r"& \multicolumn{1}{c}{PickScore benchmark} "
         r"& \multicolumn{2}{c}{OCR benchmark} \\",
-        r"\cmidrule(lr){3-4} \cmidrule(lr){5-5} \cmidrule(lr){6-7}",
-        r"Config. & Agg. & GenEval & PickScore & PickScore & OCR & PickScore \\",
+        r"\cmidrule(lr){4-5} \cmidrule(lr){6-6} \cmidrule(lr){7-8}",
+        r"Config. & Route & Agg. & GenEval & PickScore & PickScore & OCR & PickScore \\",
         r"\midrule",
         *(main_rows if main_rows else [rf"\multicolumn{{{MAIN_TABLE_NUM_COLS}}}{{c}}{{---}} \\"]),
         r"\bottomrule",
@@ -752,7 +902,11 @@ def generate_experiments_tex(
         appendix_reward_cmid,
         appendix_row3,
         r"\midrule",
-        *(appendix_rows if appendix_rows else [rf"\multicolumn{{{2 + len(appendix_columns)}}}{{c}}{{---}} \\"]),
+        *(
+            appendix_rows
+            if appendix_rows
+            else [rf"\multicolumn{{{2 + len(appendix_columns)}}}{{c}}{{---}} \\"]
+        ),
         r"\bottomrule",
         r"\end{tabular}",
         r"}",
@@ -794,20 +948,31 @@ def main() -> None:
     api = wandb.Api()
     metrics_by_run: Dict[str, Dict[str, float]] = {}
     for run_name in args.ensemble_runs:
-        metrics_by_run[run_name] = fetch_run_metrics(
-            api, args.project, run_name, aggregate="last"
-        )
+        metrics_by_run[run_name] = fetch_run_metrics(api, args.project, run_name, aggregate="last")
 
     opd_running_runs: List[str] = []
+    opd_run_meta: Dict[str, Dict[str, Any]] = {}
+    opd_row_parser_by_run: Dict[str, Callable[[str], ParsedRun]] = {}
     if args.include_running:
         opd_running_runs = discover_running_run_names(api, args.project)
         for run_name in opd_running_runs:
+            run = resolve_wandb_run(api, args.project, run_name)
+            opd_run_meta[run_name] = build_opd_run_meta(run)
             metrics_by_run[run_name] = fetch_run_metrics(
                 api,
                 args.project,
                 run_name,
                 aggregate="max",
+                run=run,
             )
+            meta = opd_run_meta[run_name]
+            opd_row_parser_by_run[run_name] = partial(
+                make_opd_running_run,
+                route_by_source=meta["teacher_route_by_source"],
+                display_label=meta["display_label"],
+                route_display=meta["route_display"],
+            )
+        opd_running_runs = sort_opd_running_runs(opd_running_runs, opd_run_meta)
 
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     payload: Dict[str, Any] = {
@@ -815,6 +980,7 @@ def main() -> None:
         "fetched_at": fetched_at,
         "ensemble_runs": list(args.ensemble_runs),
         "opd_running_runs": opd_running_runs,
+        "opd_run_meta": opd_run_meta,
         "metrics_by_run": metrics_by_run,
     }
 
@@ -830,6 +996,7 @@ def main() -> None:
         opd_running_runs=opd_running_runs,
         metrics_by_run=metrics_by_run,
         fetched_at=fetched_at,
+        opd_row_parser_by_run=opd_row_parser_by_run or None,
     )
     args.write_tex.parent.mkdir(parents=True, exist_ok=True)
     args.write_tex.write_text(tex, encoding="utf-8")
@@ -838,6 +1005,13 @@ def main() -> None:
     print(f"Wrote {args.write_tex}")
     if opd_running_runs:
         print(f"OPD running runs ({len(opd_running_runs)}): {', '.join(opd_running_runs)}")
+        for run_name in opd_running_runs:
+            meta = opd_run_meta[run_name]
+            print(
+                f"  {run_name}: display={meta['display_label']!r} "
+                f"route={meta['route_display']!r} "
+                f"teacher_route_by_source={meta['teacher_route_by_source']}"
+            )
     else:
         print("No W&B runs in 'running' state.")
 
