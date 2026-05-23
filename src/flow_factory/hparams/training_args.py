@@ -1247,6 +1247,17 @@ class TeacherConfig(ArgABC):
             )
         },
     )
+    reward_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Name of the in-domain reward for this teacher's sources. "
+                "Used by MoF to determine which reward is the primary signal "
+                "for samples from this teacher's source. Must match one of the "
+                "reward names in the rewards config. Example: 'geneval'."
+            )
+        },
+    )
 
 
 @dataclass

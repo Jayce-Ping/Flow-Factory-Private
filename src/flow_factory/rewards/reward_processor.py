@@ -154,9 +154,9 @@ class RewardProcessor:
         """Compute pointwise rewards for a single batch. Returns (batch_size,) tensor."""
         filtered_fields = filter_kwargs(model.__call__, **batch_samples[0])
         batch_input: Dict[str, List[Any]] = {
-            k: [getattr(s, k) for s in batch_samples]
+            k: [getattr(s, k, None) for s in batch_samples]
             for k in filtered_fields
-            if all(getattr(s, k) is not None for s in batch_samples)
+            if all(getattr(s, k, None) is not None for s in batch_samples)
         }
         batch_input = self._convert_media_format(batch_input, model)
         # Move tensor leaves onto the reward model's device (no-op when samples

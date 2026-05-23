@@ -62,10 +62,13 @@ train:
   teachers:
     - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
       sources: [geneval]                    # In-domain for composition/counting tasks
+      reward_name: "geneval"                # In-domain reward for geneval source
     - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
       sources: [pickscore]                  # In-domain for aesthetic quality
+      reward_name: "pick_score"             # In-domain reward for pickscore source
     - path: "jieliu/SD3.5M-FlowGRPO-Text"
       sources: [ocr]                        # In-domain for text rendering accuracy
+      reward_name: "ocr"                    # In-domain reward for ocr source
 
   teacher_route_by_source: true             # Enable per-set independent lambda (S=3)
   teacher_param_device: 'cuda'              # GPU storage for fast weight swapping (~1-2ms per teacher)
@@ -83,8 +86,6 @@ train:
   # For prompt set s: reward = R_s(x) + gamma * mean(R_j(x) for j != s)
   # This encourages discovering cross-teacher benefits while prioritizing in-domain.
   ood_bonus_gamma: 0.2                      # OOD bonus coefficient (0=pure in-domain, 0.2=recommended)
-  reward_normalization: "zscore"            # Z-score normalize each reward to comparable scale
-  reward_ema_alpha: 0.01                    # EMA smoothing for running reward statistics
 
   # ---- Advantage computation ----
   advantage_aggregation: "gdpo"             # GDPO: per-group centered, globally std-normalized
@@ -97,7 +98,7 @@ train:
   num_inference_steps: 10                   # T=28 denoising steps (logits shape: 3 x 28 x 3 = 252)
 
   # ---- Optimization ----
-  per_device_batch_size: 4                  # Micro-batch per GPU (small due to K teacher forwards per step)
+  per_device_batch_size: 8                  # Micro-batch per GPU (small due to K teacher forwards per step)
   group_size: 16                             # Samples per prompt for within-group advantage
   unique_sample_num_per_epoch: 32           # 32 prompts x 16 samples = 512 total per epoch (round-robin sources)
   num_inner_epochs: 1                       # Single pass over samples per epoch
@@ -123,7 +124,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512
-  per_device_batch_size: 32
+  per_device_batch_size: 16
   guidance_scale: 1.0                       # NFT: no CFG during eval
   num_inference_steps: 40                   # Same T as training for fair evaluation
   eval_freq: 10                             # Eval every 10 epochs
@@ -142,7 +143,13 @@ eval:
       split: test
       eval_reward_names: [ocr, pick_score]
 
-# Training rewards (ALL rewards computed on every sample for per-set composite)
+# Training rewards — each reward specifies which sources it applies to.
+# Samples from non-applicable sources get NaN (skipped in per-set reward computation).
+#
+# Mapping:
+#   geneval dataset  → learns from: geneval + pick_score
+#   pickscore dataset → learns from: pick_score
+#   ocr dataset      → learns from: ocr + pick_score
 rewards:
   - name: "geneval"                         # GenEval accuracy: counting, spatial, color attributes
     reward_model: "geneval"
@@ -150,20 +157,23 @@ rewards:
     device: "cuda"
     dtype: float32                          # GenEval needs float32 for accuracy
     async_reward: false
+    applicable_sources: [geneval]           # Only geneval samples have 'include' metadata
   - name: "pick_score"                      # PickScore: learned aesthetic preference model
     reward_model: "PickScore"
     batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]  # Universal: works on all sources
   - name: "ocr"                             # OCR: text rendering accuracy via OCR model
     reward_model: "ocr"
     batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+    applicable_sources: [ocr]              # Only ocr samples have text-rendering content
 
-# Evaluation rewards (same set, used during eval only)
+# Evaluation rewards (used during eval only)
 eval_rewards:
   - name: "geneval"
     reward_model: "geneval"
@@ -171,6 +181,7 @@ eval_rewards:
     device: "cuda"
     dtype: float32
     async_reward: false
+    applicable_sources: [geneval]
   - name: "pick_score"
     reward_model: "PickScore"
     batch_size: 64
@@ -183,3 +194,4 @@ eval_rewards:
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+    applicable_sources: [ocr]
