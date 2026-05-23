@@ -54,6 +54,7 @@ from ..ema import EMAModuleWrapper
 from ..utils.base import (
     filter_kwargs,
     create_generator,
+    create_generator_by_prompt,
     to_broadcast_tensor,
     stitch_batch_metadata,
 )
@@ -1308,6 +1309,48 @@ class MoFTrainer(BaseTrainer):
             if self.accelerator.is_main_process:
                 self._log_eval_reward_metrics(gathered_rewards, log_pfx, all_samples)
         self.accelerator.wait_for_everyone()
+
+    def _run_eval_inference_batches(
+        self,
+        test_set_name: str,
+        merged_eval,
+        eval_seed: int,
+    ) -> List[BaseSample]:
+        """Override: tag each eval batch with __source__ = test_set_name.
+
+        This ensures eval_rewards with applicable_sources filtering (e.g.,
+        geneval reward requiring __source__='geneval') can correctly match
+        samples from the corresponding test set.
+        """
+        all_samples: List[BaseSample] = []
+        for batch in tqdm(
+            self.test_dataloaders[test_set_name],
+            desc=self._eval_progress_desc(test_set_name),
+            disable=not self.show_progress_bar,
+        ):
+            # Tag batch with __source__ so stitch_batch_metadata propagates it
+            batch["__source__"] = test_set_name
+            if "metadata" in batch:
+                for meta in batch["metadata"]:
+                    if isinstance(meta, dict):
+                        meta["__source__"] = test_set_name
+
+            generator = create_generator_by_prompt(batch["prompt"], eval_seed)
+            inference_kwargs = {
+                "compute_log_prob": False,
+                "generator": generator,
+                "trajectory_indices": None,
+                **merged_eval,
+            }
+            inference_kwargs.update(**batch)
+            inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
+            samples = self.adapter.inference(**inference_kwargs)
+
+            stitch_batch_metadata(batch, samples)
+
+            all_samples.extend(samples)
+            self.eval_reward_buffer.add_samples(samples)
+        return all_samples
 
     def evaluate_teachers(self) -> None:
         """Evaluate each teacher independently on its applicable test sets.
