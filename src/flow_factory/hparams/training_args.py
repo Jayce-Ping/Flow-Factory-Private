@@ -794,6 +794,16 @@ class MoFTrainingArguments(TrainingArguments):
     )
 
     # ---- Per-set reward ----
+    eval_teachers_at_start: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to evaluate each teacher independently on applicable "
+                "test sets at epoch 0 (before training begins). Establishes "
+                "per-teacher baselines for comparison with MoF student."
+            )
+        },
+    )
     ood_bonus_gamma: float = field(
         default=0.2,
         metadata={

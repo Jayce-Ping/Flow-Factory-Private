@@ -554,6 +554,40 @@ class MoFTrainer(BaseTrainer):
             torch.set_autocast_cache_enabled(prev_cache)
             self.adapter.forward = original_forward  # type: ignore[method-assign]
 
+    @contextmanager
+    def _single_teacher_inference_context(self, teacher_idx: int):
+        """Patch adapter.forward to use a single teacher's velocity (one-hot weights).
+
+        Used for baseline evaluation: measures each teacher's standalone performance
+        on its applicable datasets before training begins.
+        """
+        original_forward = self.adapter.forward
+        step_counter = [0]
+        teacher_name = self._teacher_names[teacher_idx]
+
+        def patched_forward(**kwargs):
+            step_counter[0] += 1
+            noise_only_kwargs = dict(kwargs)
+            noise_only_kwargs["return_kwargs"] = ["noise_pred"]
+
+            with self.adapter.use_named_parameters(teacher_name):
+                out = original_forward(**noise_only_kwargs)
+
+            scheduler_kwargs = _build_scheduler_step_kwargs(
+                kwargs, out.noise_pred, self._sched_cache
+            )
+            return self.adapter.scheduler.step(**scheduler_kwargs)
+
+        self.adapter.forward = patched_forward  # type: ignore[method-assign]
+        prev_cache = torch.is_autocast_cache_enabled()
+        torch.set_autocast_cache_enabled(False)
+        try:
+            step_counter[0] = 0
+            yield
+        finally:
+            torch.set_autocast_cache_enabled(prev_cache)
+            self.adapter.forward = original_forward  # type: ignore[method-assign]
+
     # =========================================================================
     # Teacher Velocity Computation
     # =========================================================================
@@ -778,6 +812,10 @@ class MoFTrainer(BaseTrainer):
 
     def start(self):
         """Main training loop."""
+        # Evaluate each teacher at epoch 0 to establish baselines
+        if self.epoch == 0 and self.training_args.eval_teachers_at_start:
+            self.evaluate_teachers()
+
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
 
@@ -1270,6 +1308,62 @@ class MoFTrainer(BaseTrainer):
             if self.accelerator.is_main_process:
                 self._log_eval_reward_metrics(gathered_rewards, log_pfx, all_samples)
         self.accelerator.wait_for_everyone()
+
+    def evaluate_teachers(self) -> None:
+        """Evaluate each teacher independently on its applicable test sets.
+
+        For each teacher k, runs inference using only that teacher's velocity
+        (single-teacher context) on every test set that matches its configured
+        sources. Results are logged under:
+            teacher/{teacher_name}/{test_set_name}/reward_{metric}_mean
+
+        This establishes per-teacher baselines for comparison with the MoF
+        student's performance after training.
+        """
+        if not self.test_dataloaders:
+            return
+
+        self.adapter.eval()
+        for k, teacher_name in enumerate(self._teacher_names):
+            teacher_sources = self._teacher_sources[k]
+            # Determine which test sets this teacher applies to
+            applicable_test_sets = []
+            for ts_name in sorted(self.test_dataloaders.keys()):
+                if teacher_sources is None or ts_name in teacher_sources:
+                    applicable_test_sets.append(ts_name)
+
+            if not applicable_test_sets:
+                continue
+
+            logger.info(
+                f"Evaluating teacher '{teacher_name}' on test sets: {applicable_test_sets}"
+            )
+
+            for ts_name in applicable_test_sets:
+                self.eval_reward_buffer = RewardBuffer(
+                    self._eval_reward_processor_for_test_set(ts_name),
+                    self.training_args.group_size,
+                )
+                merged_eval = self._merged_eval_args_for_test_set_name(ts_name)
+                eval_seed = (
+                    merged_eval.seed
+                    if merged_eval.seed is not None
+                    else self.training_args.seed
+                )
+
+                with torch.no_grad(), self.autocast(), \
+                        self._single_teacher_inference_context(k):
+                    all_samples = self._run_eval_inference_batches(
+                        ts_name, merged_eval, eval_seed
+                    )
+                    gathered_rewards = self._gather_eval_rewards()
+
+                    if self.accelerator.is_main_process:
+                        log_pfx = f"teacher/{teacher_name}/{ts_name}"
+                        self._log_eval_reward_metrics(
+                            gathered_rewards, log_pfx, all_samples
+                        )
+                self.accelerator.wait_for_everyone()
 
     # =========================================================================
     # Checkpointing
