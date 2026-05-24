@@ -101,7 +101,7 @@ train:
   # ---- Optimization ----
   per_device_batch_size: 8                  # Micro-batch size per GPU
   group_size: 16                             # Number of samples per prompt for advantage computation
-  unique_sample_num_per_epoch: 32           # Total unique prompts sampled per epoch
+  unique_sample_num_per_epoch: 96           # Total unique prompts sampled per epoch. 2 teachers * 48 samples per teacher
   num_inner_epochs: 1                       # Inner training epochs per sampling round
   gradient_step_per_epoch: 1                # Gradient steps per epoch (aligned with NFT)
   gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts (NFT pattern)

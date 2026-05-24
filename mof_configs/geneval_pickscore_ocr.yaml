@@ -108,8 +108,8 @@ train:
 
   # ---- Optimization ----
   per_device_batch_size: 8                  # Micro-batch per GPU (small due to K teacher forwards per step)
-  group_size: 16                             # Samples per prompt for within-group advantage
-  unique_sample_num_per_epoch: 32           # 32 prompts x 16 samples = 512 total per epoch (round-robin sources)
+  group_size: 16                            # Samples per prompt for within-group advantage
+  unique_sample_num_per_epoch: 144          # 3 teachers * 48 samples per teacher = 144 total per epoch
   num_inner_epochs: 1                       # Single pass over samples per epoch
   gradient_step_per_epoch: 1                # Gradient steps per epoch (aligned with NFT)
   gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts (NFT pattern)
