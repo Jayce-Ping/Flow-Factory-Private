@@ -592,6 +592,14 @@ class MoFTrainer(BaseTrainer):
             # Extract (K, T) slice for this set
             set_weights = weights[:, :, set_id]  # (K, T)
 
+        # Diagnostic: log set weights at context entry for debugging
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"_mof_inference_context(set_id={set_id}): "
+                f"weights[:, 0, {set_id}] = {weights[:, 0, set_id].tolist()}, "
+                f"logits[:, 0, {set_id}] = {self._lambda_logits[:, 0, set_id].tolist()}"
+            )
+
         def patched_forward(**kwargs):
             t_idx = min(step_counter[0], self.num_train_timesteps - 1)
             step_counter[0] += 1
@@ -1377,6 +1385,10 @@ class MoFTrainer(BaseTrainer):
         lambda weights, not a default set_id=0).
         """
         set_id = self._source_to_set_id.get(test_set_name, 0)
+        logger.info(
+            f"_evaluate_test_set('{test_set_name}'): set_id={set_id}, "
+            f"source_to_set_id={self._source_to_set_id}"
+        )
 
         self.eval_reward_buffer = RewardBuffer(
             self._eval_reward_processor_for_test_set(test_set_name),
