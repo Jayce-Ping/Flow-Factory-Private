@@ -30,34 +30,36 @@ from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
-ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True) # Fix issue that Qwen-Image uses different cache context for CFG forwards
 
 def load_trainer(config: Arguments) -> BaseTrainer:
     """
     Factory function to instantiate trainer based on algorithm type.
-    
+
     Uses registry pattern for automatic trainer discovery and loading.
     Supports both built-in trainers and custom algorithms via python paths.
-    
+
     Args:
         config: Configuration containing trainer_type and all hyperparameters
-    
+
     Returns:
         An instance of a BaseTrainer subclass
-    
+
     Raises:
         ImportError: If the trainer is not registered or cannot be imported
-    
+
     Examples:
         # Using built-in trainer
         config.training_args.trainer_type = "grpo"
         trainer = load_trainer(config)
-        
+
         # Using custom trainer
         config.training_args.trainer_type = "my_package.trainers.PPOTrainer"
         trainer = load_trainer(config)
     """
     # Initialize Accelerator
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=config.training_args.ddp_find_unused_parameters,
+    )
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.log_args.save_dir, config.log_args.run_name),
     )
