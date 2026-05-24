@@ -653,12 +653,20 @@ class MoFTrainer(BaseTrainer):
         # Disable autocast cache (weight swaps via .data.copy_)
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
+        # Bypass DDP wrapper for inference: use_named_parameters swaps weights
+        # on the underlying module, but DDP may use internal parameter buffers
+        # that don't reflect .data.copy_() changes. Temporarily point the
+        # adapter's component to the unwrapped module.
+        unwrapped_transformer = self.adapter.get_component_unwrapped('transformer')
+        wrapped_transformer = self.adapter.get_component('transformer')
+        self.adapter.set_component('transformer', unwrapped_transformer)
         try:
             step_counter[0] = 0
             yield
         finally:
             torch.set_autocast_cache_enabled(prev_cache)
             self.adapter.forward = original_forward  # type: ignore[method-assign]
+            self.adapter.set_component('transformer', wrapped_transformer)
 
     @contextmanager
     def _single_teacher_inference_context(self, teacher_idx: int):
