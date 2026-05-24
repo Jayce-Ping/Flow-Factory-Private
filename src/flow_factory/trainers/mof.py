@@ -571,6 +571,30 @@ class MoFTrainer(BaseTrainer):
             yield
 
     @contextmanager
+    def _bypass_ddp_for_weight_swap(self):
+        """Temporarily replace DDP-wrapped transformer with unwrapped module.
+
+        DDP's internal parameter buffers (used for gradient bucketing and
+        find_unused_parameters tracking) are NOT updated by .data.copy_()
+        which use_named_parameters relies on. In inference mode (no_grad),
+        calling the DDP-wrapped module still reads from these stale buffers,
+        causing all teacher forwards to produce identical outputs.
+
+        This context manager temporarily points the adapter's transformer
+        component to the raw unwrapped module, bypassing DDP's forward path.
+        Safe during inference since DDP's gradient sync is not needed.
+        """
+        unwrapped = self.adapter.get_component_unwrapped('transformer')
+        wrapped = self.adapter.get_component('transformer')
+        if unwrapped is not wrapped:
+            self.adapter.set_component('transformer', unwrapped)
+        try:
+            yield
+        finally:
+            if unwrapped is not wrapped:
+                self.adapter.set_component('transformer', wrapped)
+
+    @contextmanager
     def _mof_inference_context(self, set_id: int = 0):
         """Patch adapter.forward to return lambda-combined teacher velocity.
 
@@ -592,14 +616,6 @@ class MoFTrainer(BaseTrainer):
             # Extract (K, T) slice for this set
             set_weights = weights[:, :, set_id]  # (K, T)
 
-        # Diagnostic: log set weights at context entry for debugging
-        if self.accelerator.is_main_process:
-            logger.info(
-                f"_mof_inference_context(set_id={set_id}): "
-                f"weights[:, 0, {set_id}] = {weights[:, 0, set_id].tolist()}, "
-                f"logits[:, 0, {set_id}] = {self._lambda_logits[:, 0, set_id].tolist()}"
-            )
-
         def patched_forward(**kwargs):
             t_idx = min(step_counter[0], self.num_train_timesteps - 1)
             step_counter[0] += 1
@@ -609,33 +625,10 @@ class MoFTrainer(BaseTrainer):
             noise_only_kwargs["return_kwargs"] = ["noise_pred"]
 
             velocities = []
-            for idx, name in enumerate(self._teacher_names):
-                # Diagnostic: check param BEFORE and INSIDE use_named_parameters
-                if step_counter[0] <= 1 and self.accelerator.is_main_process:
-                    params_before = list(p for p in self.adapter.transformer.parameters() if p.requires_grad)
-                    snap_before = params_before[0].data.flatten()[:3].tolist() if params_before else []
-
+            for name in self._teacher_names:
                 with self.adapter.use_named_parameters(name):
-                    if step_counter[0] <= 1 and self.accelerator.is_main_process:
-                        params_inside = list(p for p in self.adapter.transformer.parameters() if p.requires_grad)
-                        snap_inside = params_inside[0].data.flatten()[:3].tolist() if params_inside else []
-                        logger.info(
-                            f"  step={step_counter[0]-1} teacher={name}: "
-                            f"param_before={snap_before}, param_inside={snap_inside}, "
-                            f"same={snap_before == snap_inside}"
-                        )
                     out = original_forward(**noise_only_kwargs)
                 velocities.append(out.noise_pred)
-
-            # Diagnostic: check if teacher velocities actually differ
-            if step_counter[0] <= 2 and self.accelerator.is_main_process:
-                v_norms = [v.norm().item() for v in velocities]
-                v_diff = (velocities[0] - velocities[1]).norm().item() if len(velocities) > 1 else 0
-                logger.info(
-                    f"patched_forward step={step_counter[0]-1} t_idx={t_idx}: "
-                    f"v_norms={v_norms}, v_diff_norm={v_diff:.6f}, "
-                    f"w_i={set_weights[:, t_idx].tolist()}"
-                )
 
             # Combine using lambda weights for this set at this timestep
             stacked = torch.stack(velocities, dim=0)  # (K, B, ...)
@@ -650,23 +643,15 @@ class MoFTrainer(BaseTrainer):
             return self.adapter.scheduler.step(**scheduler_kwargs)
 
         self.adapter.forward = patched_forward  # type: ignore[method-assign]
-        # Disable autocast cache (weight swaps via .data.copy_)
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        # Bypass DDP wrapper for inference: use_named_parameters swaps weights
-        # on the underlying module, but DDP may use internal parameter buffers
-        # that don't reflect .data.copy_() changes. Temporarily point the
-        # adapter's component to the unwrapped module.
-        unwrapped_transformer = self.adapter.get_component_unwrapped('transformer')
-        wrapped_transformer = self.adapter.get_component('transformer')
-        self.adapter.set_component('transformer', unwrapped_transformer)
-        try:
-            step_counter[0] = 0
-            yield
-        finally:
-            torch.set_autocast_cache_enabled(prev_cache)
-            self.adapter.forward = original_forward  # type: ignore[method-assign]
-            self.adapter.set_component('transformer', wrapped_transformer)
+        with self._bypass_ddp_for_weight_swap():
+            try:
+                step_counter[0] = 0
+                yield
+            finally:
+                torch.set_autocast_cache_enabled(prev_cache)
+                self.adapter.forward = original_forward  # type: ignore[method-assign]
 
     @contextmanager
     def _single_teacher_inference_context(self, teacher_idx: int):
@@ -695,16 +680,13 @@ class MoFTrainer(BaseTrainer):
         self.adapter.forward = patched_forward  # type: ignore[method-assign]
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        try:
-            step_counter[0] = 0
-            yield
-        finally:
-            torch.set_autocast_cache_enabled(prev_cache)
-            self.adapter.forward = original_forward  # type: ignore[method-assign]
-
-    # =========================================================================
-    # Teacher Velocity Computation
-    # =========================================================================
+        with self._bypass_ddp_for_weight_swap():
+            try:
+                step_counter[0] = 0
+                yield
+            finally:
+                torch.set_autocast_cache_enabled(prev_cache)
+                self.adapter.forward = original_forward  # type: ignore[method-assign]
 
     def _compute_teacher_velocities(
         self,
@@ -714,7 +696,8 @@ class MoFTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Forward each teacher and return stacked velocities (all detached).
 
-        Disables autocast weight cache during the loop (see CLAUDE.md invariant).
+        Disables autocast weight cache and bypasses DDP during the loop
+        (see CLAUDE.md invariant and _bypass_ddp_for_weight_swap docstring).
 
         Returns:
             Tensor of shape (K, B, *latent_dims) with all teacher predictions.
@@ -724,13 +707,14 @@ class MoFTrainer(BaseTrainer):
 
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        try:
-            for name in self._teacher_names:
-                with self.adapter.use_named_parameters(name):
-                    output = self.adapter.forward(**forward_kwargs)
-                velocities.append(output.noise_pred.detach())
-        finally:
-            torch.set_autocast_cache_enabled(prev_cache)
+        with self._bypass_ddp_for_weight_swap():
+            try:
+                for name in self._teacher_names:
+                    with self.adapter.use_named_parameters(name):
+                        output = self.adapter.forward(**forward_kwargs)
+                    velocities.append(output.noise_pred.detach())
+            finally:
+                torch.set_autocast_cache_enabled(prev_cache)
 
         return torch.stack(velocities, dim=0)
 
@@ -1416,10 +1400,6 @@ class MoFTrainer(BaseTrainer):
         lambda weights, not a default set_id=0).
         """
         set_id = self._source_to_set_id.get(test_set_name, 0)
-        logger.info(
-            f"_evaluate_test_set('{test_set_name}'): set_id={set_id}, "
-            f"source_to_set_id={self._source_to_set_id}"
-        )
 
         self.eval_reward_buffer = RewardBuffer(
             self._eval_reward_processor_for_test_set(test_set_name),
