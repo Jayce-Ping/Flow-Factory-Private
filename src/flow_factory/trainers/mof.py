@@ -1372,11 +1372,8 @@ class MoFTrainer(BaseTrainer):
         with torch.no_grad(), self.autocast(), self._mof_inference_context(set_id):
             all_samples = self._run_eval_inference_batches(test_set_name, merged_eval, eval_seed)
             gathered_rewards = self._gather_eval_rewards()
-            gathered_tags = self._gather_eval_tags(all_samples)
             if self.accelerator.is_main_process:
-                self._log_eval_reward_metrics(
-                    gathered_rewards, log_pfx, all_samples, gathered_tags=gathered_tags
-                )
+                self._log_eval_reward_metrics(gathered_rewards, log_pfx, all_samples)
         self.accelerator.wait_for_everyone()
 
     def _run_eval_inference_batches(
@@ -1465,13 +1462,11 @@ class MoFTrainer(BaseTrainer):
                         ts_name, merged_eval, eval_seed
                     )
                     gathered_rewards = self._gather_eval_rewards()
-                    gathered_tags = self._gather_eval_tags(all_samples)
 
                     if self.accelerator.is_main_process:
                         log_pfx = f"teacher/{teacher_name}/{ts_name}"
                         self._log_eval_reward_metrics(
-                            gathered_rewards, log_pfx, all_samples,
-                            gathered_tags=gathered_tags,
+                            gathered_rewards, log_pfx, all_samples
                         )
                 self.accelerator.wait_for_everyone()
 
