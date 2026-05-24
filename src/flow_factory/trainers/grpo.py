@@ -30,7 +30,7 @@ from .abc import BaseTrainer
 from ..hparams import GRPOTrainingArguments
 from ..rewards import RewardBuffer
 from ..samples import BaseSample
-from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt
+from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt, stitch_batch_metadata
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
 from ..utils.dist import reduce_loss_info
@@ -118,6 +118,9 @@ class GRPOTrainer(BaseTrainer):
                 }
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)
+                # Stitch dataset metadata (e.g. include, tag, __source__) onto
+                # generated samples for downstream reward routing.
+                stitch_batch_metadata(batch, sample_batch)
                 # Deterministic D2H so reward_buffer sees CPU-resident samples
                 # (no-op when offload_samples_to_cpu is False).
                 self._maybe_offload_samples_to_cpu(sample_batch)
@@ -487,6 +490,9 @@ class GRPOGuardTrainer(GRPOTrainer):
                 }
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)
+                # Stitch dataset metadata (e.g. include, tag, __source__) onto
+                # generated samples for downstream reward routing.
+                stitch_batch_metadata(batch, sample_batch)
                 # Deterministic D2H so reward_buffer sees CPU-resident samples
                 # (no-op when offload_samples_to_cpu is False).
                 self._maybe_offload_samples_to_cpu(sample_batch)
