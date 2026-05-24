@@ -80,6 +80,7 @@ train:
   logits_init_bias: 2.0                     # Bias strength: softmax(2,0,0) ≈ (0.78, 0.11, 0.11) for K=3
   learning_rate: 0.05                       # Learning rate for lambda logits (large: only 252 params)
   temperature: 1.0                          # Softmax temp: 1.0=standard, <1=sharper, >1=softer mixing
+  normalize_weights: false                  # Disable softmax: use raw logits as weights (avoids gradient vanishing)
 
   # ---- EMA schedule (aligned with NFT default) ----
   ema_decay_schedule: "piecewise_linear"    # Decay schedule: constant, power, linear, piecewise_linear, cosine
