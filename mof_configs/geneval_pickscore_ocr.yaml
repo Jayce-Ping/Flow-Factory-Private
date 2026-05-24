@@ -116,6 +116,7 @@ train:
   max_grad_norm: 1.0                        # Gradient clipping on (K,T,S) logits tensor
   adam_weight_decay: 1.0e-4                 # Weight decay (only effective when normalize_weights=false; ignored under softmax)
   adam_epsilon: 1.0e-8                      # Adam epsilon for numerical stability
+  ddp_find_unused_parameters: false         # MoF only trains logits; no conditional branches need tracking
   max_epochs: 300                           # More epochs for 3-set convergence
   seed: 42
 

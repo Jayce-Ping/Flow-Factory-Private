@@ -328,6 +328,17 @@ class TrainingArguments(ArgABC):
         default=False,
         metadata={"help": "Whether to enable gradient checkpointing."},
     )
+    ddp_find_unused_parameters: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "DDP find_unused_parameters flag. True is required for models "
+                "with conditional branches (e.g. CFG in Qwen-Image). "
+                "False reduces DDP overhead and avoids internal parameter buffer "
+                "staleness issues with .data.copy_() weight swaps."
+            ),
+        },
+    )
     offload_samples_to_cpu: bool = field(
         default=False,
         metadata={
