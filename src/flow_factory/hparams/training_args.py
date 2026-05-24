@@ -749,13 +749,13 @@ class MoFTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Use EMA of logits for sampling (off-policy NFT)."},
     )
-    logits_init: Literal["zeros", "random", "teacher_biased"] = field(
+    logits_init: Literal["uniform", "random", "teacher_biased"] = field(
         default="teacher_biased",
         metadata={
             "help": (
                 "Initialization for lambda logits. "
-                "'zeros': uniform softmax (1/K per teacher). "
-                "'random': small Gaussian noise (std=0.01). "
+                "'uniform': equal weight 1/K per teacher. "
+                "'random': small Gaussian noise around uniform (std=0.01). "
                 "'teacher_biased': each set biased toward its in-domain teacher "
                 "with strength logits_init_bias."
             )
@@ -774,6 +774,19 @@ class MoFTrainingArguments(TrainingArguments):
     temperature: float = field(
         default=1.0,
         metadata={"help": "Softmax temperature: weights = softmax(logits / temperature, dim=0)."},
+    )
+    normalize_weights: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to apply softmax normalization to mixing weights. "
+                "True (default): weights = softmax(logits/τ) — normalized, sum=1. "
+                "False: weights = logits directly (unnormalized additive mixing). "
+                "Unnormalized mode avoids gradient vanishing from softmax's "
+                "mean-subtraction Jacobian when teachers share a base model. "
+                "Init adjusts automatically: 'zeros'→1/K, 'teacher_biased'→softmax values."
+            )
+        },
     )
 
     # ---- Per-set reward ----
@@ -898,10 +911,10 @@ class MoFTrainingArguments(TrainingArguments):
         if not self.teacher_paths:
             raise ValueError("MoFTrainingArguments requires at least one teacher (via 'teachers' or 'teacher_paths').")
 
-        if self.logits_init not in ["zeros", "random", "teacher_biased"]:
+        if self.logits_init not in ["uniform", "random", "teacher_biased"]:
             raise ValueError(
                 f"Invalid logits_init: {self.logits_init!r}. "
-                f"Valid options are: ['zeros', 'random', 'teacher_biased']."
+                f"Valid options are: ['uniform', 'random', 'teacher_biased']."
             )
         if self.nft_beta <= 0:
             raise ValueError(f"nft_beta must be > 0, got {self.nft_beta}.")

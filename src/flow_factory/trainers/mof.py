@@ -93,6 +93,7 @@ class MoFMixingModule(nn.Module):
         T: int,
         S: int,
         temperature: float = 1.0,
+        normalize_weights: bool = True,
         init_mode: str = "teacher_biased",
         init_bias: float = 2.0,
         teacher_set_mapping: Optional[Dict[int, int]] = None,
@@ -102,29 +103,82 @@ class MoFMixingModule(nn.Module):
         self.T = T
         self.S = S
         self.temperature = temperature
+        self.normalize_weights = normalize_weights
 
         # Initialize logits
-        if init_mode == "zeros":
-            data = torch.zeros(K, T, S)
-        elif init_mode == "random":
-            data = torch.randn(K, T, S) * 0.01
-        elif init_mode == "teacher_biased":
-            data = torch.zeros(K, T, S)
-            if teacher_set_mapping:
-                for s_id, k_idx in teacher_set_mapping.items():
-                    data[k_idx, :, s_id] = init_bias
+        if normalize_weights:
+            # Softmax mode: logits are in log-space, softmax produces weights
+            if init_mode == "uniform":
+                data = torch.zeros(K, T, S)
+            elif init_mode == "random":
+                data = torch.randn(K, T, S) * 0.01
+            elif init_mode == "teacher_biased":
+                data = torch.zeros(K, T, S)
+                if teacher_set_mapping:
+                    for s_id, k_idx in teacher_set_mapping.items():
+                        data[k_idx, :, s_id] = init_bias
+            else:
+                raise ValueError(f"Invalid logits_init: {init_mode!r}")
         else:
-            raise ValueError(f"Invalid logits_init: {init_mode!r}")
+            # Unnormalized mode: logits ARE the weights directly.
+            # Init to produce same effective weights as softmax mode would.
+            if init_mode == "uniform":
+                # Uniform: each teacher gets 1/K
+                data = torch.full((K, T, S), 1.0 / K)
+            elif init_mode == "random":
+                data = torch.full((K, T, S), 1.0 / K) + torch.randn(K, T, S) * 0.01
+            elif init_mode == "teacher_biased":
+                # Compute softmax([bias, 0, ...]) to get the target weights
+                logit_init = torch.zeros(K)
+                if teacher_set_mapping:
+                    # Use first mapping to determine bias structure
+                    for s_id, k_idx in teacher_set_mapping.items():
+                        logit_init[k_idx] = init_bias
+                target_weights = F.softmax(logit_init / temperature, dim=0)
+                data = target_weights.view(K, 1, 1).expand(K, T, S).clone()
+                # For per-set biased init: adjust per set
+                if teacher_set_mapping:
+                    data.fill_(0.0)
+                    for s_id, k_idx in teacher_set_mapping.items():
+                        logit_s = torch.zeros(K)
+                        logit_s[k_idx] = init_bias
+                        w_s = F.softmax(logit_s / temperature, dim=0)
+                        data[:, :, s_id] = w_s.unsqueeze(1).expand(K, T)
+            else:
+                raise ValueError(f"Invalid logits_init: {init_mode!r}")
 
         self.logits = nn.Parameter(data)
 
     def forward(self) -> torch.Tensor:
-        """Compute softmax mixing weights from logits.
+        """Compute mixing weights from logits.
 
         Returns:
-            Tensor of shape (K, T, S) normalized over K (dim=0) per (timestep, set).
+            Tensor of shape (K, T, S).
+            If normalize_weights=True: softmax over K (dim=0).
+            If normalize_weights=False: raw logits (unnormalized).
         """
-        return F.softmax(self.logits / self.temperature, dim=0)
+        if self.normalize_weights:
+            return F.softmax(self.logits / self.temperature, dim=0)
+        else:
+            return self.logits
+
+    def get_weights(self, logits: torch.Tensor) -> torch.Tensor:
+        """Compute mixing weights from an arbitrary logits tensor.
+
+        Used by the trainer to compute weights from EMA-swapped logits
+        (which share the same Parameter but may hold different values
+        during use_ema_parameters context).
+
+        Args:
+            logits: Tensor of shape (K, T, S) — may be self.logits or EMA shadow.
+
+        Returns:
+            Tensor of shape (K, T, S) with the same normalization as forward().
+        """
+        if self.normalize_weights:
+            return F.softmax(logits / self.temperature, dim=0)
+        else:
+            return logits
 
     def get_weights_for_set(self, set_id: int) -> torch.Tensor:
         """Get (K, T) weights for a specific prompt set."""
@@ -153,7 +207,6 @@ class MoFTrainer(BaseTrainer):
         # ---- Unpack config shortcuts ----
         self.nft_beta = self.training_args.nft_beta
         self.off_policy = self.training_args.off_policy
-        self.temperature = self.training_args.temperature
         self.time_sampling_strategy = self.training_args.time_sampling_strategy
         self.time_shift = self.training_args.time_shift
         self.timestep_range = self.training_args.timestep_range
@@ -257,6 +310,8 @@ class MoFTrainer(BaseTrainer):
         # and the original module is at self._mixing_module.module. But
         # _lambda_logits is the same tensor object regardless of wrapping.
         self._lambda_logits = self._mixing_module.logits
+        # Store unwrapped module for direct method access (avoids DDP/DeepSpeed wrapper checks)
+        self._mixing_module_unwrapped = self._mixing_module
 
         # ---- Step 4: accelerator.prepare ----
         # Adapter modules are frozen (inference only) — prepare them for device placement.
@@ -358,6 +413,7 @@ class MoFTrainer(BaseTrainer):
             T=self.training_args.num_inference_steps,
             S=self.S,
             temperature=self.training_args.temperature,
+            normalize_weights=self.training_args.normalize_weights,
             init_mode=self.training_args.logits_init,
             init_bias=self.training_args.logits_init_bias,
             teacher_set_mapping=teacher_set_mapping,
@@ -370,11 +426,12 @@ class MoFTrainer(BaseTrainer):
     # =========================================================================
 
     def _get_lambda_weights(self, logits: torch.Tensor) -> torch.Tensor:
-        """Compute softmax weights from logits: (K, T, S) → (K, T, S).
+        """Compute mixing weights — delegates to MoFMixingModule.get_weights().
 
-        Softmax applied over K (dim=0), independently per (timestep, set).
+        Uses the unwrapped module reference (stored before accelerator.prepare)
+        to avoid DDP/DeepSpeed wrapper differences.
         """
-        return F.softmax(logits / self.temperature, dim=0)
+        return self._mixing_module_unwrapped.get_weights(logits)
 
     @property
     def enable_kl_loss(self) -> bool:
