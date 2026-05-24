@@ -29,6 +29,7 @@ Dependencies:
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -509,6 +510,11 @@ class GenEvalRewardModel(PointwiseRewardModel):
             for i in range(batch_size):
                 inc = include[i] if include else []
                 exc = exclude[i] if exclude and i < len(exclude) else None
+                # Support JSON-stringified include/exclude (Arrow-safe dataset format)
+                if isinstance(inc, str):
+                    inc = json.loads(inc)
+                if isinstance(exc, str):
+                    exc = json.loads(exc) or None
                 reward = self._evaluate_single(image[i], inc, exc)
                 rewards.append(reward)
 
