@@ -488,8 +488,11 @@ class BaseTrainer(ABC):
         with torch.no_grad(), self.autocast(), self._eval_inference_context():
             all_samples = self._run_eval_inference_batches(test_set_name, merged_eval, eval_seed)
             gathered_rewards = self._gather_eval_rewards()
+            gathered_tags = self._gather_eval_tags(all_samples)
             if self.accelerator.is_main_process:
-                self._log_eval_reward_metrics(gathered_rewards, log_pfx, all_samples)
+                self._log_eval_reward_metrics(
+                    gathered_rewards, log_pfx, all_samples, gathered_tags=gathered_tags
+                )
         self.accelerator.wait_for_everyone()
 
     @contextmanager
@@ -535,11 +538,46 @@ class BaseTrainer(ABC):
         }
         return {key: self.accelerator.gather(value).cpu().numpy() for key, value in rewards.items()}
 
+    def _gather_eval_tags(self, all_samples: List[BaseSample]) -> Optional[List[Optional[str]]]:
+        """Gather per-sample tags across all ranks for correct per-tag metric aggregation.
+
+        In distributed evaluation, each rank only holds a shard of samples.
+        This method gathers tags globally so that ``_log_eval_reward_metrics``
+        can correctly pair each reward value with its tag.
+
+        Returns:
+            Globally gathered tag list (length = total eval samples across ranks),
+            or None if samples have no 'tag' field.
+        """
+        if not all_samples or not hasattr(all_samples[0], "tag"):
+            return None
+
+        local_tags = [getattr(s, "tag", None) for s in all_samples]
+        if not any(t is not None for t in local_tags):
+            return None
+
+        if self.accelerator.num_processes <= 1:
+            return local_tags
+
+        # Use object-level all_gather for string tags (avoids vocabulary sync issues)
+        all_tags_nested = [None] * self.accelerator.num_processes
+        dist.all_gather_object(all_tags_nested, local_tags)
+        # Flatten: interleave by rank to match accelerator.gather() tensor ordering.
+        # accelerator.gather() concatenates [rank0_tensor, rank1_tensor, ...],
+        # but with padding to equal length. DistributedSampler pads the dataset
+        # so all ranks have equal-length shards.
+        # The gather order is: all of rank0, then all of rank1, etc.
+        gathered_tags = []
+        for rank_tags in all_tags_nested:
+            gathered_tags.extend(rank_tags)
+        return gathered_tags
+
     def _log_eval_reward_metrics(
         self,
         gathered_rewards: Dict[str, np.ndarray],
         log_pfx: str,
         all_samples: List[BaseSample],
+        gathered_tags: Optional[List[Optional[str]]] = None,
     ) -> None:
         log_data: Dict[str, Any] = {
             f"{log_pfx}/reward_{key}_mean": np.mean(value)
@@ -554,18 +592,22 @@ class BaseTrainer(ABC):
 
         # Per-tag sub-metrics: if samples carry a 'tag' field (e.g. GenEval),
         # compute per-tag reward breakdowns for each reward model.
-        if all_samples and hasattr(all_samples[0], "tag"):
+        # Use gathered_tags (globally collected) when available to avoid
+        # local-vs-global length mismatch in distributed evaluation.
+        tags = gathered_tags
+        if tags is None and all_samples and hasattr(all_samples[0], "tag"):
             tags = [getattr(s, "tag", None) for s in all_samples]
-            if any(t is not None for t in tags):
-                for reward_name, reward_values in gathered_rewards.items():
-                    tag_groups: Dict[str, List[float]] = {}
-                    for tag, val in zip(tags, reward_values):
-                        if tag is not None:
-                            tag_groups.setdefault(tag, []).append(float(val))
-                    for tag_name, tag_vals in tag_groups.items():
-                        log_data[f"{log_pfx}/reward_{reward_name}/{tag_name}_mean"] = (
-                            np.mean(tag_vals)
-                        )
+
+        if tags and any(t is not None for t in tags):
+            for reward_name, reward_values in gathered_rewards.items():
+                tag_groups: Dict[str, List[float]] = {}
+                for tag, val in zip(tags, reward_values):
+                    if tag is not None:
+                        tag_groups.setdefault(tag, []).append(float(val))
+                for tag_name, tag_vals in tag_groups.items():
+                    log_data[f"{log_pfx}/reward_{reward_name}/{tag_name}_mean"] = (
+                        np.mean(tag_vals)
+                    )
 
         samples_key = "eval_samples" if log_pfx == "eval" else f"{log_pfx}/eval_samples"
         log_data[samples_key] = all_samples
