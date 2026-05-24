@@ -609,8 +609,21 @@ class MoFTrainer(BaseTrainer):
             noise_only_kwargs["return_kwargs"] = ["noise_pred"]
 
             velocities = []
-            for name in self._teacher_names:
+            for idx, name in enumerate(self._teacher_names):
+                # Diagnostic: check param BEFORE and INSIDE use_named_parameters
+                if step_counter[0] <= 1 and self.accelerator.is_main_process:
+                    params_before = list(p for p in self.adapter.transformer.parameters() if p.requires_grad)
+                    snap_before = params_before[0].data.flatten()[:3].tolist() if params_before else []
+
                 with self.adapter.use_named_parameters(name):
+                    if step_counter[0] <= 1 and self.accelerator.is_main_process:
+                        params_inside = list(p for p in self.adapter.transformer.parameters() if p.requires_grad)
+                        snap_inside = params_inside[0].data.flatten()[:3].tolist() if params_inside else []
+                        logger.info(
+                            f"  step={step_counter[0]-1} teacher={name}: "
+                            f"param_before={snap_before}, param_inside={snap_inside}, "
+                            f"same={snap_before == snap_inside}"
+                        )
                     out = original_forward(**noise_only_kwargs)
                 velocities.append(out.noise_pred)
 
