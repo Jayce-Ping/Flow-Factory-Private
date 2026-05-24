@@ -614,6 +614,16 @@ class MoFTrainer(BaseTrainer):
                     out = original_forward(**noise_only_kwargs)
                 velocities.append(out.noise_pred)
 
+            # Diagnostic: check if teacher velocities actually differ
+            if step_counter[0] <= 2 and self.accelerator.is_main_process:
+                v_norms = [v.norm().item() for v in velocities]
+                v_diff = (velocities[0] - velocities[1]).norm().item() if len(velocities) > 1 else 0
+                logger.info(
+                    f"patched_forward step={step_counter[0]-1} t_idx={t_idx}: "
+                    f"v_norms={v_norms}, v_diff_norm={v_diff:.6f}, "
+                    f"w_i={set_weights[:, t_idx].tolist()}"
+                )
+
             # Combine using lambda weights for this set at this timestep
             stacked = torch.stack(velocities, dim=0)  # (K, B, ...)
             w_i = set_weights[:, t_idx]  # (K,)
