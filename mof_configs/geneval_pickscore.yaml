@@ -106,6 +106,8 @@ train:
   gradient_step_per_epoch: 1                # Gradient steps per epoch (aligned with NFT)
   gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts (NFT pattern)
   max_grad_norm: 1.0                        # Gradient clipping for lambda logits
+  adam_weight_decay: 1.0e-4                 # Weight decay (only effective when normalize_weights=false; ignored under softmax)
+  adam_epsilon: 1.0e-8                      # Adam epsilon for numerical stability
   max_epochs: 300                           # Total training epochs
   seed: 42
 

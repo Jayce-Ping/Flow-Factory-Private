@@ -252,12 +252,29 @@ class MoFTrainer(BaseTrainer):
         by requires_grad) can correctly swap teacher weights during inference.
         Since teacher velocities are always .detach()'ed, no gradient will
         flow to adapter params regardless.
+
+        Weight decay policy:
+        - normalize_weights=True (softmax): weight_decay forced to 0 because
+          softmax already bounds outputs to [0,1]. L2 penalty on logits would
+          push toward uniform mixing, counteracting teacher-biased init.
+        - normalize_weights=False (unnormalized): weight_decay applied as
+          configured to prevent unbounded weight drift.
         """
+        weight_decay = self.training_args.adam_weight_decay
+        if self.training_args.normalize_weights:
+            if weight_decay > 0:
+                logger.info(
+                    f"normalize_weights=True: overriding adam_weight_decay={weight_decay} → 0.0 "
+                    f"(softmax bounds output, weight decay would push logits toward uniform)."
+                )
+            weight_decay = 0.0
+
         self.optimizer = torch.optim.AdamW(
             self._mixing_module.parameters(),
             lr=self.training_args.learning_rate,
             betas=self.training_args.adam_betas,
-            weight_decay=0.0,
+            weight_decay=weight_decay,
+            eps=self.training_args.adam_epsilon,
         )
         return self.optimizer
 
