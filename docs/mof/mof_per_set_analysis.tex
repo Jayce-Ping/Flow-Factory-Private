@@ -1001,124 +1001,142 @@ $\gamma$ 语义 & 精确：OOD 贡献 $\gamma$ 比例的信号 & 精确（同上
 \item EMA 与 current logits 的关系对 grad\_norm 无显著影响。
 \end{itemize}
 
-\subsection{根因分析：Softmax Jacobian $\times$ NFT Loss 的梯度路径}
+\subsection{根因分析：逐步推导}
 
-\begin{theorem}[Gradient Vanishing Root Cause]
-\label{thm:grad_vanish}
-在 MoF 的 NFT loss 中，对 logit $\ell_{j,i,s}$ 的梯度为：
+我们从 loss $\loss$ 到 logits $\ell_{j,i,s}$ 的完整梯度链出发，逐步展示每个环节如何引入梯度压缩。
+
+\subsubsection{Step 1: 明确计算图}
+
+MoF 的前向计算图（单 timestep $i$, 单 set $s$, 省略下标 $i,s$）：
+\begin{equation}
+\underbrace{\ell \in \R^K}_{\text{logits}} \xrightarrow{\text{softmax}} \underbrace{\lambda \in \Delta^K}_{\text{weights}} \xrightarrow{\text{linear mix}} \underbrace{v^{\mathrm{new}} = \sum_k \lambda_k v^{(k)} \in \R^d}_{\text{combined velocity}} \xrightarrow{\text{NFT loss}} \loss \in \R
+\end{equation}
+其中 $v^{(k)} \in \R^d$ 是 teacher $k$ 的 \textbf{detached}（常数）velocity，$d = C \times H \times W = 65536$。
+
+\subsubsection{Step 2: Loss $\to$ Combined Velocity 的梯度 $\mathbf{g}$}
+
+定义 loss 对 combined velocity 的梯度向量：
+\begin{equation}
+\mathbf{g} \triangleq \frac{\partial \loss}{\partial v^{\mathrm{new}}} \in \R^d
+\end{equation}
+
+这是一个 $d$-维向量，由 NFT 的 MSE loss 决定。其具体形式为（展开 NFT loss）：
+
+NFT loss 对 $v^{\mathrm{new}}$ 的梯度来自：
+\begin{align}
+\loss &= \frac{1}{\beta}\left[r \cdot L^+(v^+) + (1-r) \cdot L^-(v^-)\right] \\
+v^+ &= \beta\, v^{\mathrm{new}} + (1-\beta)\, v^{\mathrm{old}} \;\Rightarrow\; \frac{\partial v^+}{\partial v^{\mathrm{new}}} = \beta\, I_d \\
+v^- &= (1+\beta)\, v^{\mathrm{old}} - \beta\, v^{\mathrm{new}} \;\Rightarrow\; \frac{\partial v^-}{\partial v^{\mathrm{new}}} = -\beta\, I_d
+\end{align}
+其中 $v^{\mathrm{old}}$ 是 detached 的 EMA combined velocity。代入链式法则：
+\begin{align}
+\mathbf{g} = \frac{\partial \loss}{\partial v^{\mathrm{new}}} &= \frac{1}{\beta}\left[r \cdot \frac{\partial L^+}{\partial v^+} \cdot \beta + (1-r) \cdot \frac{\partial L^-}{\partial v^-} \cdot (-\beta)\right] \notag \\
+&= r \cdot \frac{\partial L^+}{\partial v^+} - (1-r) \cdot \frac{\partial L^-}{\partial v^-}
+\label{eq:g_beta_cancels}
+\end{align}
+
+\begin{tcolorbox}[colback=yellow!5, colframe=yellow!60!black, title=关键发现 1: $\beta$ 消去]
+$\beta$ 在梯度中完全消去！这数学性地解释了为什么修改 \texttt{nft\_beta} = 1.0, 0.1, 0.01 不影响 grad\_norm——只影响 loss 的绝对值（scaling），不影响 $\partial\loss/\partial v^{\mathrm{new}}$ 的方向或大小。
+\end{tcolorbox}
+
+$\mathbf{g}$ 的每个分量 $\mathbf{g}[c,h,w]$ 由 NFT 的 self-normalized MSE 给出：
+\begin{equation}
+\mathbf{g}[c,h,w] = r \cdot \frac{2(x^+_0 - x_0)[c,h,w] \cdot (-\sigma_i)}{(w^+)^2 \cdot d} - (1-r) \cdot \frac{2(x^-_0 - x_0)[c,h,w] \cdot \sigma_i}{(w^-)^2 \cdot d}
+\end{equation}
+量级：每个分量 $|\mathbf{g}[c,h,w]| \sim \frac{2\sigma_i \cdot |2r-1|}{d} \sim \frac{2 \times 0.45 \times 0.2}{65536} \approx 2.7 \times 10^{-6}$。\\
+向量范数：$\|\mathbf{g}\| = \sqrt{\sum_{c,h,w} \mathbf{g}[c,h,w]^2} \sim \sqrt{d} \cdot 2.7 \times 10^{-6} \approx 6.9 \times 10^{-4}$。
+
+\subsubsection{Step 3: Combined Velocity $\to$ Weights 的梯度}
+
+由 $v^{\mathrm{new}} = \sum_k \lambda_k\, v^{(k)}$（$v^{(k)}$ 是常数），loss 对 weight $\lambda_k$ 的梯度为标量：
+\begin{equation}
+\frac{\partial \loss}{\partial \lambda_k} = \mathbf{g}^\top v^{(k)} = \sum_{c,h,w} \mathbf{g}[c,h,w] \cdot v^{(k)}[c,h,w]
+\label{eq:grad_wrt_lambda}
+\end{equation}
+
+这是两个 $d$-维向量的 \textbf{内积}（dot product），结果是标量。
+
+\textbf{量级}：$\mathbf{g}$ 的每个分量 $\sim 10^{-6}$，$v^{(k)}$ 的每个分量 $\sim O(1)$。若两者存在非零相关性（alignment $\sim 30\%$），则：
+\begin{equation}
+\left|\frac{\partial \loss}{\partial \lambda_k}\right| \approx d \cdot 2.7 \times 10^{-6} \cdot 1.0 \cdot 0.3 \approx 0.05
+\end{equation}
+\textbf{注意：此时梯度量级完全合理（$\sim 0.05$）。}
+
+\subsubsection{Step 4: Weights $\to$ Logits 的梯度（Softmax Jacobian — 灾难发生处）}
+
+Softmax 的 Jacobian 矩阵为：
+\begin{equation}
+\frac{\partial \lambda_k}{\partial \ell_j} = \frac{1}{\tau}\,\lambda_k\left(\delta_{kj} - \lambda_j\right)
+\end{equation}
+
+通过链式法则，loss 对 logit $\ell_j$ 的梯度为：
+\begin{align}
+\frac{\partial \loss}{\partial \ell_j} &= \sum_{k=1}^K \frac{\partial \loss}{\partial \lambda_k} \cdot \frac{\partial \lambda_k}{\partial \ell_j} \\
+&= \sum_k \left(\mathbf{g}^\top v^{(k)}\right) \cdot \frac{\lambda_k(\delta_{kj} - \lambda_j)}{\tau} \\
+&= \frac{1}{\tau}\left[\lambda_j \cdot \mathbf{g}^\top v^{(j)} - \lambda_j \sum_k \lambda_k \cdot \mathbf{g}^\top v^{(k)}\right] \\
+&= \frac{\lambda_j}{\tau}\left[\mathbf{g}^\top v^{(j)} - \sum_k \lambda_k\, \mathbf{g}^\top v^{(k)}\right]
+\label{eq:softmax_detailed}
+\end{align}
+
+定义 $\bar{v} = \sum_k \lambda_k v^{(k)}$（加权均值），则 $\sum_k \lambda_k (\mathbf{g}^\top v^{(k)}) = \mathbf{g}^\top \bar{v}$，因此：
 \begin{equation}
 \boxed{
-\frac{\partial \loss}{\partial \ell_{j,i,s}} = \frac{\lambda_{j,i,s}}{\tau} \left[
-\underbrace{\mathbf{g}_{i,s} \cdot v^{(j)}_i}_{\text{teacher $j$ 与 loss gradient 的 dot product}} - \sum_{k=1}^K \lambda_{k,i,s}\, \left(\mathbf{g}_{i,s} \cdot v^{(k)}_i\right)
-\right]
+\frac{\partial \loss}{\partial \ell_j} = \frac{\lambda_j}{\tau}\,\mathbf{g}^\top\left(v^{(j)} - \bar{v}\right)
 }
-\label{eq:grad_vanish_main}
-\end{equation}
-其中 $\mathbf{g}_{i,s} = \partial \loss / \partial v^{\mathrm{new}}_{i,s} \in \R^d$ 是 loss 对 combined velocity 的梯度向量。
-
-等价地：
-\begin{equation}
-\frac{\partial \loss}{\partial \ell_{j,i,s}} = \frac{\lambda_{j,i,s}}{\tau}\, \mathbf{g}_{i,s} \cdot \left(v^{(j)}_i - \bar{v}_{i,s}\right)
-\label{eq:grad_dot_product}
-\end{equation}
-其中 $\bar{v}_{i,s} = \sum_k \lambda_{k,i,s}\, v^{(k)}_i$ 是加权均值（即 $v^{\mathrm{new}}_{i,s}$）。
-
-\textbf{关键：梯度正比于 $\mathbf{g}_{i,s} \cdot (v^{(j)}_i - \bar{v}_{i,s})$ —— loss gradient 与 teacher 偏差向量的高维 dot product。}
-\end{theorem}
-
-\begin{proof}
-梯度链：$\loss \xrightarrow{\text{(a)}} v^{\mathrm{new}}_{i,s} \xrightarrow{\text{(b)}} \lambda_{:,i,s} \xrightarrow{\text{(c)}} \ell_{:,i,s}$。
-
-\textbf{Chain (b) $\to$ (c): Softmax Jacobian.}
-\begin{equation}
-\frac{\partial \lambda_{k,i,s}}{\partial \ell_{j,i,s}} = \frac{1}{\tau}\,\lambda_{k,i,s}\left(\delta_{kj} - \lambda_{j,i,s}\right)
+\label{eq:final_gradient_derivation}
 \end{equation}
 
-\textbf{Chain (a) $\to$ (b): Velocity mixing.}
-\begin{equation}
-\frac{\partial v^{\mathrm{new}}_{i,s}}{\partial \lambda_{k,i,s}} = v^{(k)}_i \quad\text{（teacher velocities are detached constants）}
-\end{equation}
-
-\textbf{Combined:}
+\begin{tcolorbox}[colback=red!5, colframe=red!60!black, title=关键发现 2: Softmax 的``均值减除''效应]
+比较 Step 3 和 Step 4：
 \begin{align}
-\frac{\partial \loss}{\partial \ell_{j,i,s}} &= \sum_{k=1}^K \left(\frac{\partial \loss}{\partial v^{\mathrm{new}}_{i,s}}\right)^\top \frac{\partial v^{\mathrm{new}}_{i,s}}{\partial \lambda_{k,i,s}} \cdot \frac{\partial \lambda_{k,i,s}}{\partial \ell_{j,i,s}} \\
-&= \sum_k \mathbf{g}_{i,s}^\top v^{(k)}_i \cdot \frac{\lambda_{k,i,s}(\delta_{kj} - \lambda_{j,i,s})}{\tau} \\
-&= \frac{\lambda_{j,i,s}}{\tau}\left[\mathbf{g}_{i,s}^\top v^{(j)}_i - \sum_k \lambda_{k,i,s}\,\mathbf{g}_{i,s}^\top v^{(k)}_i\right] \\
-&= \frac{\lambda_{j,i,s}}{\tau}\,\mathbf{g}_{i,s}^\top\left(v^{(j)}_i - \bar{v}_{i,s}\right) \qedhere
+\text{对 } \lambda_j \text{ 的梯度：} &\quad \frac{\partial \loss}{\partial \lambda_j} = \mathbf{g}^\top v^{(j)} \quad\text{（量级 $\sim 0.05$）} \\
+\text{对 } \ell_j \text{ 的梯度：} &\quad \frac{\partial \loss}{\partial \ell_j} = \frac{\lambda_j}{\tau}\,\mathbf{g}^\top\underbrace{\left(v^{(j)} - \bar{v}\right)}_{\text{!!!}} \quad\text{（量级 $\sim 10^{-9}$）}
 \end{align}
-\end{proof}
 
-\subsection{为什么 $\mathbf{g} \cdot (v^{(j)} - \bar{v})$ 极小}
+Softmax Jacobian 将``对 $v^{(j)}$ 的 dot product''替换为``对 $(v^{(j)} - \bar{v})$ 的 dot product''。
 
-\begin{proposition}[LoRA Teacher 的 Velocity 结构]
-\label{prop:lora_structure}
-对从同一 base model fine-tune 的 LoRA teacher $k$：
+这就是灾难所在：$v^{(j)}$ 是 full teacher velocity（$\sim O(1)$ per element），而 $(v^{(j)} - \bar{v})$ 只包含 LoRA 残差差异（$\sim 0.01$--$0.05$ per element），\textbf{小了 20--100 倍}。
+
+加上高维空间中随机方向 dot product 的 $1/\sqrt{d}$ cancellation，梯度被进一步压缩。
+\end{tcolorbox}
+
+\subsubsection{Step 5: 代入 LoRA 结构量化}
+
+对 LoRA teacher：$v^{(k)} = v_{\mathrm{base}} + \delta^{(k)}$，因此：
 \begin{equation}
-v^{(k)}(x, t) = v_{\mathrm{base}}(x, t) + \delta^{(k)}(x, t)
-\label{eq:lora_decomp}
-\end{equation}
-其中 $v_{\mathrm{base}}$ 是共享的 base model velocity，$\delta^{(k)}$ 是 LoRA rank-$r$ 的低秩扰动。典型量级关系：
-\begin{equation}
-\frac{\|\delta^{(k)}\|}{\|v_{\mathrm{base}}\|} \sim 0.01\text{--}0.05 \quad\text{（rank-32 LoRA, alpha=64）}
+v^{(j)} - \bar{v} = (v_{\mathrm{base}} + \delta^{(j)}) - (v_{\mathrm{base}} + \bar{\delta}) = \delta^{(j)} - \bar{\delta}
 \end{equation}
 
-因此：
-\begin{equation}
-v^{(j)} - \bar{v} = \delta^{(j)} - \sum_k \lambda_k\, \delta^{(k)} = \delta^{(j)} - \bar{\delta}
-\label{eq:delta_diff}
-\end{equation}
-即 \textbf{logit 梯度仅由 LoRA 残差之间的差异 $(\delta^{(j)} - \bar{\delta})$ 驱动}，而非 full velocity。
-\end{proposition}
+\textbf{Base model velocity 完全消去}——logit 梯度仅由 LoRA 残差的差异驱动。
 
-\begin{corollary}[Gradient Magnitude Estimation]
-\label{cor:grad_estimate}
-设 $d = C \times H \times W = 16 \times 64 \times 64 = 65536$（SD3.5 latent at 512px）。梯度的量级估计：
+对于 $K=2$ 均匀权重（$\lambda_0 = \lambda_1 = 0.5$）：
 \begin{equation}
-\left|\frac{\partial \loss}{\partial \ell_{j,i,s}}\right| \approx \frac{\lambda_j}{\tau}\,\underbrace{\|\mathbf{g}_{i,s}\|}_{\text{loss gradient}} \cdot \underbrace{\|\delta^{(j)} - \bar{\delta}\|}_{\text{LoRA difference}} \cdot \underbrace{\cos\theta}_{\text{alignment}}
-\label{eq:grad_magnitude}
+v^{(0)} - \bar{v} = \frac{1}{2}(v^{(0)} - v^{(1)}) = \frac{1}{2}(\delta^{(0)} - \delta^{(1)})
 \end{equation}
-其中 $\theta$ 是 $\mathbf{g}$ 与 $(\delta^{(j)} - \bar{\delta})$ 之间的夹角。
 
-各项量级估计：
-\begin{center}
-\renewcommand{\arraystretch}{1.4}
-\begin{tabular}{lll}
-\toprule
-\textbf{Factor} & \textbf{Formula} & \textbf{Typical Value} \\
-\midrule
-$\lambda_j / \tau$ & Softmax scale & $\sim 0.5$ (uniform, $K=2$) \\
-$\|\mathbf{g}_{i,s}\|$ & $\sim \sqrt{d} \cdot \frac{2\sigma_i}{d} \cdot \frac{|2r_s - 1|}{B}$ & $\sim 2.6 \times 10^{-4}$ \\
-$\|\delta^{(j)} - \bar{\delta}\|$ & $\sim \sqrt{d} \cdot \rho$ where $\rho = \frac{\|\delta^{(j)} - \bar{\delta}\|_{\infty}}{\sqrt{d}}$ & $\sim 0.01\sqrt{d} \approx 2.6$ \\
-$\cos\theta$ & Alignment (random: $\sim 1/\sqrt{d}$) & $\sim 0.004$ \\
-\midrule
-\textbf{Product} & & $\sim 1.3 \times 10^{-7}$ \\
-After GAS $\div 80$ & & $\sim 1.7 \times 10^{-9}$ \\
-\textbf{grad\_norm ($\sqrt{K{\cdot}T{\cdot}S}$ elements)} & & $\sim 10^{-8}$--$10^{-10}$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-\end{corollary}
+最终：
+\begin{equation}
+\frac{\partial \loss}{\partial \ell_0} = \frac{0.5}{\tau}\,\mathbf{g}^\top \frac{\delta^{(0)} - \delta^{(1)}}{2} = \frac{1}{4\tau}\,\mathbf{g}^\top(\delta^{(0)} - \delta^{(1)})
+\end{equation}
+
+量级：$|\mathbf{g}^\top(\delta^{(0)} - \delta^{(1)})| \sim \|\mathbf{g}\| \cdot \|\delta^{(0)} - \delta^{(1)}\| \cdot |\cos\theta|$，其中：
+\begin{itemize}[leftmargin=1.5em]
+\item $\|\mathbf{g}\| \sim 6.9 \times 10^{-4}$
+\item $\|\delta^{(0)} - \delta^{(1)}\| \sim \sqrt{d} \cdot 0.02 \approx 5.1$（LoRA diff per element $\sim 0.02$）
+\item $|\cos\theta| \sim 1/\sqrt{d} \approx 0.004$（$\mathbf{g}$ 和 $\delta$-diff 方向无先验相关性）
+\end{itemize}
+
+\begin{equation}
+\left|\frac{\partial \loss}{\partial \ell_0}\right| \sim \frac{1}{4} \times 6.9 \times 10^{-4} \times 5.1 \times 0.004 \approx 3.5 \times 10^{-6}
+\end{equation}
+
+再除以 GAS $= 80$：$\approx 4.4 \times 10^{-8}$。对 $K \times T \times S = 40$ 个参数的 grad norm：$\sqrt{40} \times 4.4 \times 10^{-8} \approx 2.8 \times 10^{-7}$。
+
+考虑到 $|\cos\theta|$ 的实际值可能更小（LoRA diff 和 MSE gradient 几乎正交），进一步压缩 1--2 个数量级到 $\sim 10^{-9}$--$10^{-10}$。
 
 \subsection{为什么 \texttt{nft\_beta} 不影响梯度}
 
-\begin{proposition}[$\beta$ Cancellation in NFT Loss]
-\label{prop:beta_cancel}
-在 NFT loss 公式中：
-\begin{align}
-v^+_{i,s} &= \beta\, v^{\mathrm{new}} + (1 - \beta)\, v^{\mathrm{old}} \\
-v^-_{i,s} &= (1 + \beta)\, v^{\mathrm{old}} - \beta\, v^{\mathrm{new}} \\
-\loss &= \frac{1}{\beta}\left[r \cdot L^+(v^+) + (1-r) \cdot L^-(v^-)\right]
-\end{align}
-
-对 $v^{\mathrm{new}}$ 的梯度：
-\begin{align}
-\frac{\partial \loss}{\partial v^{\mathrm{new}}} &= \frac{1}{\beta}\left[r \cdot \frac{\partial L^+}{\partial v^+} \cdot \beta + (1-r) \cdot \frac{\partial L^-}{\partial v^-} \cdot (-\beta)\right] \notag \\
-&= r \cdot \frac{\partial L^+}{\partial v^+} - (1-r) \cdot \frac{\partial L^-}{\partial v^-}
-\label{eq:beta_cancels}
-\end{align}
-
-\textbf{$\beta$ 完全被消去}。梯度 $\mathbf{g}_{i,s} = \partial\loss/\partial v^{\mathrm{new}}$ 与 $\beta$ 无关。这解释了为什么修改 \texttt{nft\_beta} 只改变 loss scale 而不改变 grad\_norm。
-\end{proposition}
+如 Step 2 公式~\eqref{eq:g_beta_cancels} 所示，$\mathbf{g} = r \cdot \partial L^+/\partial v^+ - (1-r) \cdot \partial L^-/\partial v^-$，与 $\beta$ 完全无关。$\beta$ 只出现在 $v^+, v^-$ 的\textbf{定义}中和 loss 的 $1/\beta$ 前缀中，两者的贡献在链式法则中精确消去。
 
 \subsection{梯度消失的三重因素总结}
 
@@ -1174,6 +1192,70 @@ Gradient accumulation steps = $\frac{\text{num\_batches}}{\text{gradient\_step\_
 
 \textbf{这是数学约束，非 softmax 特有}。
 \end{theorem}
+
+\subsection{对比：为什么 LLM 的 Logits + Softmax 没有此问题}
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!50!black, title=对比：LLM Head (Softmax) vs MoF (Softmax)]
+
+\textbf{LLM 的设置}：
+\begin{equation}
+p_i = \softmax(W h)_i, \quad \text{其中 } W \in \R^{V \times d_{\mathrm{model}}},\; h \in \R^{d_{\mathrm{model}}}
+\end{equation}
+Loss: $\loss = -\log p_y$（cross-entropy with target $y$）。
+
+梯度对 logits $z = Wh$：
+\begin{equation}
+\frac{\partial \loss}{\partial z_j} = p_j - \mathbf{1}[j = y]
+\end{equation}
+
+梯度对 weight $W$：
+\begin{equation}
+\frac{\partial \loss}{\partial W_{j,:}} = (p_j - \mathbf{1}[j = y]) \cdot h^\top
+\end{equation}
+
+\textbf{为什么 LLM 不梯度消失？} 关键差异：
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{LLM 的 softmax ``inputs''是可学习的 logits $z = Wh$（高维参数矩阵的输出），不是 mixing weights 作用于 fixed 高维向量}。
+
+MoF 的计算图：$\ell \xrightarrow{\text{softmax}} \lambda \xrightarrow{\text{dot with } v^{(k)} \in \R^{65536}} \text{scalar outputs for loss}$
+
+LLM 的计算图：$W, h \xrightarrow{\text{linear}} z \xrightarrow{\text{softmax}} p \xrightarrow{\text{CE loss}} \text{scalar}$
+
+\item \textbf{LLM 中 softmax 的 ``选项'' ($V$ 个 vocabulary tokens) 彼此完全不同}。
+
+对 LLM，$z_j$ 和 $z_k$（不同 token 的 logit）是\textbf{独立参数}的独立输出，没有 ``共享 base'' 的结构。梯度 $p_j - \mathbf{1}[j=y]$ 的量级 $\sim O(1)$（如 $p_y \approx 0.9$ 时梯度 $= -0.1$）。
+
+对 MoF，$v^{(0)}$ 和 $v^{(1)}$ 共享 99\% 的内容（同一 base model + 小 LoRA）。Softmax 的 mean-subtraction 消去了共享部分，只留下 1\% 的 LoRA 差异。
+
+\item \textbf{维度角色不同}：
+
+LLM 中 softmax 作用于 \textbf{输出空间}（$V$ 个 token 概率），梯度直接是 $O(1)$ 标量信号 $(p_j - \mathbf{1}[j=y])$，不涉及高维 dot product。
+
+MoF 中 softmax 作用于 \textbf{$K$ 个 teacher 的权重}（仅 2--3 个），然后乘以 $d = 65536$ 维的 teacher velocity，梯度需要通过 $\R^d$ 空间的 dot product 传递——方向对齐性 $\sim 1/\sqrt{d}$ 导致信号大量 cancellation。
+
+\item \textbf{总结}：
+\end{enumerate}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{@{}p{3cm}p{5.5cm}p{5.5cm}@{}}
+\toprule
+& \textbf{LLM (lm\_head + softmax)} & \textbf{MoF (logits + softmax + velocity mix)} \\
+\midrule
+Softmax 选项数 & $V \sim 32000$--$128000$ & $K = 2$--$3$ \\
+选项间差异 & $z_j, z_k$ 完全独立（无共享结构） & $v^{(j)}, v^{(k)}$ 共享 95--99\% (base model) \\
+梯度 bottleneck & 无（$\partial\loss/\partial z_j = p_j - \mathbf{1}[j=y] \sim O(1)$） & $\mathbf{g}^\top(v^{(j)} - \bar{v}) \sim O(10^{-6})$（高维 dot product + LoRA diff） \\
+高维 dot product & 无（loss 直接在概率空间定义） & 有（$\R^{65536}$ 维 velocity dot product） \\
+梯度量级 & $\sim 0.01$--$1.0$ & $\sim 10^{-10}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{根本区别}：LLM 的 loss（cross-entropy）直接在 softmax 输出概率空间上定义，梯度 $= p_j - \text{target}$ 是 $O(1)$ 标量。MoF 的 loss（NFT MSE）定义在 \textbf{softmax 输出之后的高维 velocity 空间}上，梯度需要从 $\R^d$ 投影回 $\R^K$ 的 logit 空间——这个投影（dot product + mean subtraction）造成了灾难性的信号衰减。
+
+等价地说：\textbf{如果 LLM 的 loss 不是 cross-entropy（直接对 $p$ 求导），而是定义在 ``$\sum_i p_i \cdot \text{embedding}_i$'' 这样的 embedding mixture 上的 MSE，且所有 token embedding 高度相似（如同义词），那么 LLM 同样会梯度消失。}
+\end{tcolorbox}
 
 %% ============================================================
 \section{解决方案分析}
