@@ -45,7 +45,7 @@ train:
 
   # ---- DPPO (mask_type='kl_adv') ----
   mask_type: 'kl_adv'             # DPPO: KL-advantage masking
-  kl_mask_threshold: 1.0e-5       # KL threshold for new-vs-old policy divergence
+  kl_mask_threshold: 1.0e-6       # KL threshold for new-vs-old policy divergence.
   add_kl_coefficient: true        # Scale KL by sigma (for x-based only)
 
   # ---- Clipping / KL ----

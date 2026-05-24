@@ -591,6 +591,27 @@ class GRPOTrainingArguments(TrainingArguments):
         metadata={"help": "Device to store reference model parameters."},
     )
 
+    # ---- Mask / DPPO ----
+    mask_type: Literal["kl", "kl_adv", "clip", "none"] = field(
+        default="none",
+        metadata={
+            "help": "Policy loss variant. 'none'=standard GRPO clipping, 'clip'=PPO clipping (alias), "
+                    "'kl'=KL-only mask, 'kl_adv'=DPPO (KL-advantage masking)."
+        },
+    )
+    kl_mask_threshold: float = field(
+        default=1.0e-5,
+        metadata={
+            "help": "Threshold for new-vs-old KL mask. Samples with KL < threshold are kept unconditionally."
+        },
+    )
+    add_kl_coefficient: bool = field(
+        default=True,
+        metadata={
+            "help": "Scale KL terms with scheduler sigma (std_dev_t * sqrt(-dt)). Only for x-based KL."
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
@@ -598,6 +619,10 @@ class GRPOTrainingArguments(TrainingArguments):
         if self.kl_type not in ["v-based", "x-based"]:
             raise ValueError(
                 f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based']."
+            )
+        if self.mask_type not in ["kl", "kl_adv", "clip", "none"]:
+            raise ValueError(
+                f"Invalid mask_type: {self.mask_type}. Valid options are: ['kl', 'kl_adv', 'clip', 'none']."
             )
 
 

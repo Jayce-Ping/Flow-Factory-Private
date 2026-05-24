@@ -67,6 +67,39 @@ def _rng_device(
     return generator.device if generator is not None else fallback
 
 
+def compute_transition_sigma(
+    std_dev_t: torch.Tensor,
+    dt: torch.Tensor,
+    dynamics_type: str,
+) -> torch.Tensor:
+    """Compute per-timestep transition standard deviation (noise scale) for KL computation.
+
+    Different dynamics types define the transition distribution differently:
+        - Flow-SDE / Dance-SDE: next_latents = mean + std_dev_t * sqrt(-dt) * noise
+          → sigma_bar = std_dev_t * sqrt(-dt)
+        - CPS: next_latents = mean + std_dev_t * noise  (no dt factor)
+          → sigma_bar = std_dev_t
+        - ODE: deterministic, no noise
+          → sigma_bar = 1.0 (fallback, should not be used for KL)
+
+    Args:
+        std_dev_t: Per-sample noise scale from scheduler (shape varies by dynamics).
+        dt: Per-sample timestep delta (negative for reverse-time).
+        dynamics_type: One of "ODE", "Flow-SDE", "Dance-SDE", "CPS".
+
+    Returns:
+        Transition sigma (same shape as std_dev_t), suitable as denominator in
+        KL divergence: kl = (diff^2) / (2 * sigma_bar^2).
+    """
+    if dynamics_type in ("Flow-SDE", "Dance-SDE"):
+        return std_dev_t * torch.sqrt(-dt)
+    elif dynamics_type == "CPS":
+        return std_dev_t
+    else:
+        # ODE or unknown: return ones (no scaling, treat as unit variance)
+        return torch.ones_like(std_dev_t)
+
+
 def _normalize_timestep_range(
     timestep_range: Union[float, Tuple[float, float]],
 ) -> Tuple[float, float]:
