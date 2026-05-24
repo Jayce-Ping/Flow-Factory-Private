@@ -1065,6 +1065,15 @@ class MoFTrainer(BaseTrainer):
 
         # Global advantage stats
         log_data["train/advantage_global_std"] = global_std
+        # Advantage magnitude diagnostics (before and after normalization)
+        abs_combined = np.abs(combined_advantages)
+        log_data["train/advantage_pre_norm_abs_mean"] = float(np.mean(abs_combined))
+        log_data["train/advantage_pre_norm_abs_min"] = float(np.min(abs_combined))
+        log_data["train/advantage_pre_norm_abs_max"] = float(np.max(abs_combined))
+        abs_final = np.abs(final_advantages)
+        log_data["train/advantage_post_norm_abs_mean"] = float(np.mean(abs_final))
+        log_data["train/advantage_post_norm_abs_min"] = float(np.min(abs_final))
+        log_data["train/advantage_post_norm_abs_max"] = float(np.max(abs_final))
 
         # Log training samples (images) for qualitative inspection
         log_data["train_samples"] = samples[:30]
