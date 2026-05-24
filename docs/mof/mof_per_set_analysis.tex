@@ -1068,23 +1068,56 @@ Softmax 的 Jacobian 矩阵为：
 \begin{equation}
 \frac{\partial \lambda_k}{\partial \ell_j} = \frac{1}{\tau}\,\lambda_k\left(\delta_{kj} - \lambda_j\right)
 \end{equation}
+其中：
+\begin{itemize}[leftmargin=1.5em]
+\item $\lambda_k = \softmax(\ell / \tau)_k$ 是 teacher $k$ 的当前 mixing weight（softmax 输出的第 $k$ 个分量）
+\item $\ell_j$ 是 teacher $j$ 对应的 logit 参数（我们要求梯度的目标参数）
+\item $\delta_{kj}$ 是 Kronecker delta：$\delta_{kj} = 1$ if $k = j$, else $0$
+\item $\tau$ 是 softmax temperature
+\end{itemize}
 
 通过链式法则，loss 对 logit $\ell_j$ 的梯度为：
 \begin{align}
 \frac{\partial \loss}{\partial \ell_j} &= \sum_{k=1}^K \frac{\partial \loss}{\partial \lambda_k} \cdot \frac{\partial \lambda_k}{\partial \ell_j} \\
-&= \sum_k \left(\mathbf{g}^\top v^{(k)}\right) \cdot \frac{\lambda_k(\delta_{kj} - \lambda_j)}{\tau} \\
-&= \frac{1}{\tau}\left[\lambda_j \cdot \mathbf{g}^\top v^{(j)} - \lambda_j \sum_k \lambda_k \cdot \mathbf{g}^\top v^{(k)}\right] \\
-&= \frac{\lambda_j}{\tau}\left[\mathbf{g}^\top v^{(j)} - \sum_k \lambda_k\, \mathbf{g}^\top v^{(k)}\right]
+&= \sum_k \underbrace{\left(\mathbf{g}^\top v^{(k)}\right)}_{\text{Step 3 的结果}} \cdot \underbrace{\frac{\lambda_k(\delta_{kj} - \lambda_j)}{\tau}}_{\text{softmax Jacobian}}
+\label{eq:step4_chain}
+\end{align}
+其中 $\mathbf{g}^\top v^{(k)}$ 是 Step 3 中得到的 loss 对 $\lambda_k$ 的梯度（标量），表示``如果增加 teacher $k$ 的权重，loss 会如何变化''。
+
+展开求和（将 $k = j$ 和 $k \neq j$ 的项分别处理）：
+\begin{align}
+\frac{\partial \loss}{\partial \ell_j} &= \frac{1}{\tau}\sum_k \left(\mathbf{g}^\top v^{(k)}\right) \lambda_k(\delta_{kj} - \lambda_j) \notag \\
+&= \frac{1}{\tau}\left[\underbrace{\left(\mathbf{g}^\top v^{(j)}\right) \lambda_j(1 - \lambda_j)}_{k = j \text{ 的贡献}} + \underbrace{\sum_{k \neq j}\left(\mathbf{g}^\top v^{(k)}\right) \lambda_k(0 - \lambda_j)}_{k \neq j \text{ 的贡献}}\right] \notag \\
+&= \frac{\lambda_j}{\tau}\left[\left(\mathbf{g}^\top v^{(j)}\right)(1 - \lambda_j) - \sum_{k \neq j} \lambda_k \left(\mathbf{g}^\top v^{(k)}\right)\right] \notag \\
+&= \frac{\lambda_j}{\tau}\left[\mathbf{g}^\top v^{(j)} - \lambda_j\,\mathbf{g}^\top v^{(j)} - \sum_{k \neq j} \lambda_k\, \mathbf{g}^\top v^{(k)}\right] \notag \\
+&= \frac{\lambda_j}{\tau}\left[\mathbf{g}^\top v^{(j)} - \sum_{k=1}^K \lambda_k\, \mathbf{g}^\top v^{(k)}\right]
 \label{eq:softmax_detailed}
 \end{align}
+其中最后一步利用了 $\lambda_j\,\mathbf{g}^\top v^{(j)} + \sum_{k \neq j} \lambda_k\, \mathbf{g}^\top v^{(k)} = \sum_k \lambda_k\, \mathbf{g}^\top v^{(k)}$。
 
-定义 $\bar{v} = \sum_k \lambda_k v^{(k)}$（加权均值），则 $\sum_k \lambda_k (\mathbf{g}^\top v^{(k)}) = \mathbf{g}^\top \bar{v}$，因此：
+定义加权均值 velocity $\bar{v} = \sum_k \lambda_k v^{(k)}$（即 combined velocity $v^{\mathrm{new}}$ 本身），注意到：
+\begin{equation}
+\sum_k \lambda_k\, \mathbf{g}^\top v^{(k)} = \mathbf{g}^\top \left(\sum_k \lambda_k\, v^{(k)}\right) = \mathbf{g}^\top \bar{v}
+\end{equation}
+
+代入得最终结果：
 \begin{equation}
 \boxed{
 \frac{\partial \loss}{\partial \ell_j} = \frac{\lambda_j}{\tau}\,\mathbf{g}^\top\left(v^{(j)} - \bar{v}\right)
 }
 \label{eq:final_gradient_derivation}
 \end{equation}
+其中：
+\begin{itemize}[leftmargin=1.5em]
+\item $\ell_j$：teacher $j$ 的 logit 参数（可学习标量）
+\item $\lambda_j$：teacher $j$ 当前的 softmax 权重（$\in [0, 1]$, 由 $\ell$ 决定）
+\item $\tau$：softmax temperature（超参数）
+\item $\mathbf{g} = \partial\loss / \partial v^{\mathrm{new}} \in \R^d$：loss 对 combined velocity 的梯度向量（由 NFT loss 的 MSE 决定）
+\item $v^{(j)} \in \R^d$：teacher $j$ 的 velocity 输出（frozen, detached 常数向量）
+\item $\bar{v} = \sum_k \lambda_k v^{(k)} \in \R^d$：所有 teacher 的加权均值 velocity（= combined velocity $v^{\mathrm{new}}$）
+\item $v^{(j)} - \bar{v} \in \R^d$：teacher $j$ 偏离当前混合均值的``差异方向''
+\item $\mathbf{g}^\top(v^{(j)} - \bar{v})$：$d$-维向量的\textbf{内积}（标量），衡量 loss gradient 方向与 teacher 差异方向的对齐程度
+\end{itemize}
 
 \begin{tcolorbox}[colback=red!5, colframe=red!60!black, title=关键发现 2: Softmax 的``均值减除''效应]
 比较 Step 3 和 Step 4：
@@ -1093,11 +1126,11 @@ Softmax 的 Jacobian 矩阵为：
 \text{对 } \ell_j \text{ 的梯度：} &\quad \frac{\partial \loss}{\partial \ell_j} = \frac{\lambda_j}{\tau}\,\mathbf{g}^\top\underbrace{\left(v^{(j)} - \bar{v}\right)}_{\text{!!!}} \quad\text{（量级 $\sim 10^{-9}$）}
 \end{align}
 
-Softmax Jacobian 将``对 $v^{(j)}$ 的 dot product''替换为``对 $(v^{(j)} - \bar{v})$ 的 dot product''。
+Softmax Jacobian 将``$\mathbf{g}$ 对 $v^{(j)}$ 的 dot product''替换为``$\mathbf{g}$ 对 $(v^{(j)} - \bar{v})$ 的 dot product''。
 
-这就是灾难所在：$v^{(j)}$ 是 full teacher velocity（$\sim O(1)$ per element），而 $(v^{(j)} - \bar{v})$ 只包含 LoRA 残差差异（$\sim 0.01$--$0.05$ per element），\textbf{小了 20--100 倍}。
+\textbf{直觉理解}：Softmax 的归一化约束（$\sum_k \lambda_k = 1$）意味着增大 $\ell_j$ 必须同时减小其他 $\ell_k$ 的有效权重。梯度必须衡量``teacher $j$ 比\textbf{当前混合}好多少''，而非``teacher $j$ 绝对好不好''。这个\textbf{相对比较}就是 $(v^{(j)} - \bar{v})$ 项的来源。
 
-加上高维空间中随机方向 dot product 的 $1/\sqrt{d}$ cancellation，梯度被进一步压缩。
+当所有 teacher 都来自同一 base model 时：$v^{(j)} \approx \bar{v} \approx v_{\mathrm{base}}$（因为 LoRA perturbation 很小），所以 $(v^{(j)} - \bar{v})$ 的量级仅为 full velocity 的 1--5\%。这就是灾难所在。
 \end{tcolorbox}
 
 \subsubsection{Step 5: 代入 LoRA 结构量化}
