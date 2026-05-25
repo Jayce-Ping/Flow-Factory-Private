@@ -1,0 +1,241 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{tikz}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\sg}{\mathrm{sg}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+
+\title{\textbf{DiffusionNFT: $\beta$ 参数的作用机制分析}\\[0.3em]
+\large 为什么梯度与 $\beta$ 无关，但 $\beta$ 仍然影响训练？}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+DiffusionNFT 的 loss 公式中 $\beta$ 同时出现在正负 prediction 的系数和分母中，导致一阶梯度 $\partial\loss/\partial\theta$ 与 $\beta$ 无关。然而，$\beta$ 通过影响 loss landscape 的曲率（Hessian）、loss 的绝对值（影响 optimizer state）、以及 positive/negative prediction 的几何位置来间接影响训练动态。本文给出完整分析。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{NFT Loss 回顾}
+%% ============================================================
+
+\subsection{公式定义}
+
+给定当前 velocity $v_{\text{new}}$ 和旧 velocity $v_{\text{old}}$（EMA or sampling-time），NFT 定义：
+\begin{align}
+v^+ &= \beta \cdot v_{\text{new}} + (1-\beta) \cdot v_{\text{old}} \label{eq:vplus}\\
+v^- &= (1+\beta) \cdot v_{\text{old}} - \beta \cdot v_{\text{new}} \label{eq:vminus}
+\end{align}
+
+Self-normalized MSE:
+\begin{equation}
+\mathcal{M}(v) = \frac{\|x_t - \sigma v - x_0\|^2}{\sg(\|x_t - \sigma v - x_0\|_1 / d)}
+\end{equation}
+
+Loss（per sample, per timestep）:
+\begin{equation}
+\loss = \frac{r \cdot \mathcal{M}(v^+) + (1-r)\cdot \mathcal{M}(v^-)}{\beta} \cdot A_{\max}
+\label{eq:nft_loss}
+\end{equation}
+其中 $r = \text{clamp}(A/(2A_{\max}) + 0.5,\; 0,\; 1)$。
+
+%% ============================================================
+\section{$\beta$ 消失的数学证明}
+\label{sec:beta_cancel}
+%% ============================================================
+
+\begin{theorem}[$\beta$ cancellation in gradient]
+\label{thm:cancel}
+$\partial\loss/\partial v_{\text{new}}$ 与 $\beta$ 无关。
+\end{theorem}
+
+\begin{proof}
+由 chain rule:
+\begin{equation}
+\frac{\partial\loss}{\partial v_{\text{new}}} = \frac{A_{\max}}{\beta}\left[r \cdot \frac{\partial\mathcal{M}(v^+)}{\partial v^+}\cdot\beta + (1-r)\cdot\frac{\partial\mathcal{M}(v^-)}{\partial v^-}\cdot(-\beta)\right]
+\end{equation}
+分子中的 $\beta$（来自 $\partial v^+/\partial v_{\text{new}} = \beta$ 和 $\partial v^-/\partial v_{\text{new}} = -\beta$）与分母中的 $1/\beta$ 精确消去：
+\begin{equation}
+\frac{\partial\loss}{\partial v_{\text{new}}} = A_{\max}\left[r \cdot \frac{\partial\mathcal{M}(v^+)}{\partial v^+} - (1-r)\cdot\frac{\partial\mathcal{M}(v^-)}{\partial v^-}\right]
+\end{equation}
+右侧不含 $\beta$。由于 $v_{\text{new}}$ 到 $\theta$（logits）的 Jacobian 也不含 $\beta$，得证。
+\end{proof}
+
+\begin{corollary}
+对于 MoF logits $\ell_{k,i,s}$:
+\begin{equation}
+\frac{\partial\loss}{\partial\ell_{k,i,s}} \text{ 与 $\beta$ 无关}
+\end{equation}
+\end{corollary}
+
+%% ============================================================
+\section{$\beta$ 如何影响训练（非梯度路径）}
+\label{sec:beta_effects}
+%% ============================================================
+
+虽然一阶梯度不含 $\beta$，但 $\beta$ 仍通过以下机制影响训练：
+
+\subsection{机制 1: Loss 绝对值 $\Rightarrow$ Adam state}
+
+\begin{proposition}[Loss scaling]
+Loss 的绝对值与 $\beta$ 有关：
+\begin{equation}
+|\loss| = \frac{|r \cdot \mathcal{M}(v^+) + (1-r)\cdot\mathcal{M}(v^-)|}{\beta} \cdot A_{\max}
+\end{equation}
+$\beta \to 0$ 时 $|\loss| \to \infty$（但 $\mathcal{M}(v^{\pm}) \to \mathcal{M}(v_{\text{old}})$ 也趋于同一值）。
+\end{proposition}
+
+\textbf{影响}：虽然 SGD 不受 loss scale 影响（梯度不变），但 \textbf{Adam optimizer 的 second moment} $v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2$ 与梯度幅值有关。然而由于梯度本身与 $\beta$ 无关，Adam state 也不受 $\beta$ 影响。
+
+\begin{remark}
+这意味着对于一阶 optimizer（SGD, Adam），$\beta$ \textbf{完全不影响}参数更新方向和步长。这是 NFT 设计的特性。
+\end{remark}
+
+\subsection{机制 2: $v^+, v^-$ 的几何位置 $\Rightarrow$ Self-Normalization Weight}
+
+虽然梯度中 $\beta$ 消去了，但 $\mathcal{M}(v)$ 的 self-normalization weight $w = \sg(\|x_0^{\text{pred}} - x_0\|_1/d)$ 是在 $v^+$ 或 $v^-$ 处计算的。$\beta$ 影响 $v^+, v^-$ 的位置，从而影响 $w$。
+
+具体地：
+\begin{align}
+w^+ &= \sg\left(\frac{\|x_t - \sigma v^+ - x_0\|_1}{d}\right) = \sg\left(\frac{\|x_t - \sigma[\beta v_{\text{new}} + (1-\beta)v_{\text{old}}] - x_0\|_1}{d}\right) \\
+w^- &= \sg\left(\frac{\|x_t - \sigma v^- - x_0\|_1}{d}\right) = \sg\left(\frac{\|x_t - \sigma[(1+\beta)v_{\text{old}} - \beta v_{\text{new}}] - x_0\|_1}{d}\right)
+\end{align}
+
+\begin{proposition}[$\beta$ 对 weight 的影响]
+\leavevmode
+\begin{itemize}
+\item 当 $\beta \to 0$: $v^+ \to v_{\text{old}}$, $v^- \to v_{\text{old}}$, 因此 $w^+ = w^- = \|x_t - \sigma v_{\text{old}} - x_0\|_1/d$。
+\item 当 $\beta = 1$: $v^+ = v_{\text{new}}$, $v^- = 2v_{\text{old}} - v_{\text{new}}$（$v_{\text{new}}$ 关于 $v_{\text{old}}$ 的对称点）。
+\item 当 $\beta > 1$: $v^+$ 越过 $v_{\text{new}}$（外推），$v^-$ 离 $v_{\text{old}}$ 更远。
+\end{itemize}
+\end{proposition}
+
+\textbf{影响}：$w^{\pm}$ 出现在梯度的分母中：
+\begin{equation}
+\frac{\partial\loss}{\partial v_{\text{new}}} = A_{\max}\left[-\frac{2\sigma r}{w^+}(x_0^+ - x_0) + \frac{2\sigma(1-r)}{w^-}(x_0^- - x_0)\right]
+\end{equation}
+
+因此 $\beta$ 通过改变 $w^+$ 和 $w^-$ 的值来影响梯度的\textbf{幅值}（但不影响方向在 $v_{\text{new}} = v_{\text{old}}$ 时的极限行为）。
+
+\begin{tcolorbox}[title=关键洞察]
+$\beta$ 的消去是\textbf{精确的}（对 $\partial v^{\pm}/\partial v_{\text{new}}$ 的链式法则系数），但 self-normalization weight $w^{\pm}$ 是在 stop-gradient 后计算的，其值确实依赖 $\beta$。这创造了一个\textbf{二阶}影响：$\beta$ 改变梯度的\textbf{magnitude scaling}，但不改变\textbf{方向}。
+\end{tcolorbox}
+
+\subsection{机制 3: 训练初期 $v_{\text{new}} \approx v_{\text{old}}$ 时的 Taylor 展开}
+
+在训练初期（或 EMA 更新频繁时），$v_{\text{new}} \approx v_{\text{old}}$。令 $\Delta v = v_{\text{new}} - v_{\text{old}}$，则：
+\begin{align}
+v^+ &= v_{\text{old}} + \beta \Delta v \\
+v^- &= v_{\text{old}} - \beta \Delta v
+\end{align}
+
+此时 $x_0^+ - x_0 \approx (x_t - \sigma v_{\text{old}} - x_0) - \sigma\beta\Delta v$ 和 $x_0^- - x_0 \approx (x_t - \sigma v_{\text{old}} - x_0) + \sigma\beta\Delta v$。
+
+设 $e = x_t - \sigma v_{\text{old}} - x_0$（base reconstruction error），则：
+\begin{align}
+w^+ &\approx \|e - \sigma\beta\Delta v\|_1/d \\
+w^- &\approx \|e + \sigma\beta\Delta v\|_1/d
+\end{align}
+
+当 $\|\Delta v\| \ll \|e\|/(\sigma\beta)$ 时，$w^+ \approx w^- \approx \|e\|_1/d$，$\beta$ 的影响消失。
+
+当 $\beta$ 很大（$\sigma\beta\|\Delta v\| \sim \|e\|$）时，$w^+$ 和 $w^-$ 开始分化，梯度幅值受 $\beta$ 的二阶调制。
+
+\subsection{机制 4: 有效搜索半径}
+
+从几何角度理解 $\beta$ 的 positive/negative 构造：
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth, scale=1.2]
+\draw[->] (-0.5,0) -- (5,0) node[right] {velocity space};
+\fill (2,0) circle(2pt) node[below] {$v_{\text{old}}$};
+\fill (3,0) circle(2pt) node[below] {$v_{\text{new}}$};
+\fill[blue] (2.5,0) circle(2pt) node[above,blue] {$v^+$ ($\beta{=}0.5$)};
+\fill[red] (1.5,0) circle(2pt) node[above,red] {$v^-$ ($\beta{=}0.5$)};
+\fill[blue] (3,0.3) circle(0pt) node[above,blue] {$v^+$ ($\beta{=}1$)};
+\fill[red] (1,0) circle(2pt) node[above,red] {$v^-$ ($\beta{=}1$)};
+\draw[<->,dashed] (1,-0.5) -- (3,-0.5) node[midway,below] {$2\beta\|\Delta v\|$};
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+\item $\beta$ 控制 $v^+$ 和 $v^-$ 相对于 $v_{\text{old}}$ 的「搜索半径」
+\item 较大的 $\beta$ → positive prediction 更接近 $v_{\text{new}}$，negative prediction 更远离
+\item 这影响 NFT 对「好方向」vs「坏方向」的辨识粒度
+\end{itemize}
+
+但由于一阶梯度不变，这种几何差异仅通过 self-normalization weight 间接体现。
+
+%% ============================================================
+\section{实验预测}
+\label{sec:predictions}
+%% ============================================================
+
+基于以上分析，对 $\beta$ 的调参给出以下预测：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{cll}
+\toprule
+$\beta$ & \textbf{预期行为} & \textbf{原因} \\
+\midrule
+$\beta \ll 1$ & 与 $\beta=1$ 几乎无差异 & 梯度不变；$w^+ \approx w^-$（$\Delta v$ 小时） \\
+$\beta = 1$ & 标准行为（默认值） & $v^+ = v_{\text{new}}$, $v^- = 2v_{\text{old}} - v_{\text{new}}$ \\
+$\beta > 1$ & Self-norm weight 分化加剧 & $v^{\pm}$ 离 $v_{\text{old}}$ 更远，$w^{\pm}$ 差异更大 \\
+$\beta \gg 1$ & 可能数值不稳定 & $w^-$ 可能变得很小（clip to $10^{-5}$）\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[title=实践结论]
+\textbf{$\beta$ 对 MoF/NFT 训练的影响极小}。当使用一阶 optimizer (Adam) 且 $v_{\text{new}} \approx v_{\text{old}}$（由 EMA 或小 learning rate 保证）时，不同 $\beta$ 值产生几乎相同的训练轨迹。推荐使用默认值 $\beta = 1.0$。
+
+唯一需要注意的场景：当 policy 变化很大（$v_{\text{new}}$ 与 $v_{\text{old}}$ 差异显著）时，大 $\beta$ 可能导致 $w^-$ 非常小，触发 clip，产生梯度尖峰。此时可考虑减小 $\beta$ 或增大 EMA decay 来稳定。
+\end{tcolorbox}
+
+%% ============================================================
+\section{与原始 DiffusionNFT 论文的对比}
+\label{sec:original}
+%% ============================================================
+
+原始 DiffusionNFT 论文中，$\beta$ 的设计意图为：
+\begin{enumerate}
+\item 控制 trust region：$v^+$ 和 $v^-$ 的距离 = $2\beta\|v_{\text{new}} - v_{\text{old}}\|$
+\item 类似 PPO 的 conservative update：限制 positive prediction 不要离旧策略太远
+\item 当 $\beta \to 0$ 时退化为 pure advantage-weighted regression
+\end{enumerate}
+
+然而，由于分母的 $1/\beta$ 精确消去了系数中的 $\beta$，这些 trust region 语义在梯度层面并未体现。$\beta$ 的真正作用仅限于通过 self-normalization weight 的二阶调制。
+
+这解释了为什么实验中 $\beta \in [0.5, 2.0]$ 范围内性能差异微小。
+
+\end{document}
