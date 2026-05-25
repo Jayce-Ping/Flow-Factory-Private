@@ -40,7 +40,7 @@ log:
 
 # Training Configuration
 train:
-  max_epochs: 3000
+  max_epochs: 1000
   # Trainer settings
   trainer_type: 'grpo' # Options: 'grpo', 'nft', 'awm'
   advantage_aggregation: 'sum' # Options: 'sum', 'gdpo'
@@ -49,7 +49,7 @@ train:
   adv_clip_range: 10.0  # Advantage clipping range
   # KL div
   kl_type: 'v-based' # Options: 'x-based', 'v-based'
-  kl_beta: 0.001 # KL divergence coefficient - 0 to disable and save memory. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
+  kl_beta: 0.0 # KL divergence coefficient - 0 to disable and save memory. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
   ref_param_device: 'cuda' # Options: cpu, cuda
 
   # Sampling settings
