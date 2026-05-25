@@ -39,7 +39,7 @@ log:
 
 # Training Configuration
 train:
-  max_epochs: 3000
+  max_epochs: 1000
   trainer_type: 'grpo'
   advantage_aggregation: 'sum'
 
