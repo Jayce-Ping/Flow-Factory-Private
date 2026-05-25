@@ -286,14 +286,6 @@ $c(t,t')$ 是仅依赖于 timesteps 的标量系数。代入得：
 
 \subsection{梯度量级分析}
 
-\begin{proposition}[共同 Softmax 因子]
-两种 loss 对 logit 的梯度均包含 softmax Jacobian 因子：
-\begin{equation}
-\frac{\lambda_k}{\tau}(\delta_{kj} - \lambda_j) = O\!\left(\frac{\lambda_{\max}(1-\lambda_{\max})}{\tau}\right)
-\end{equation}
-当 $\lambda_{\max} \to 1$（某 teacher 完全占优）时，该因子 $\to 0$，产生梯度消失。这是两种算法共有的特征。
-\end{proposition}
-
 \begin{proposition}[GRPO 的 ratio 放大效应]
 GRPO 梯度中额外包含 ratio $\rho_i = \exp(\Delta \log p_i)$。当 policy 变化较大时（$\Delta \log p$ 远离 0），ratio 指数放大梯度。PPO clip 限制了这种放大：
 \begin{equation}
@@ -326,25 +318,6 @@ NFT 的 weight $w^{\pm} = \sg(\|x_0^{\pm} - x_0\|_1/d)$ 提供了自适应归一
 \section{数值稳定性}
 \label{sec:stability}
 %% ============================================================
-
-\subsection{Softmax 梯度消失缓解策略}
-
-当 logits 初始化为 teacher-biased（如 $\ell_{\mathrm{in-domain}} = 2$）时，初始权重约为 $(0.78, 0.11, 0.11)$（$K=3$）。此时 softmax Jacobian 中：
-\begin{equation}
-\lambda_1(\delta_{1j} - \lambda_j) \approx \begin{cases} 0.78 \times 0.22 = 0.17 & j=1 \\ -0.78 \times 0.11 = -0.086 & j \neq 1 \end{cases}
-\end{equation}
-梯度幅值合理。但如果训练使某个 teacher 更加占优（$\lambda_1 \to 0.99$），则：
-\begin{equation}
-\lambda_1(1 - \lambda_1) \approx 0.01 \quad \Longrightarrow \quad \text{梯度消失}
-\end{equation}
-
-\textbf{对策}：
-\begin{enumerate}
-\item 使用较高的 learning rate ($\eta = 0.05$) 补偿小梯度
-\item Temperature $\tau < 1$ 使分布更尖锐但也加速消失；$\tau > 1$ 反之
-\item EMA logits (off-policy, NFT) 保持旧策略多样性
-\item GRPO: ratio $\rho$ 的指数放大天然补偿 softmax 衰减
-\end{enumerate}
 
 \subsection{GRPO 特有的数值问题}
 
@@ -384,6 +357,6 @@ Clipping/Mask & 无 & PPO clip / DPPO mask \\
 \end{tabular}
 \end{center}
 
-两种优化目标对 MoF logits 的梯度具有相同的 softmax Jacobian 因子，但信号传递路径不同。NFT 通过 reconstruction 质量传递 reward 信号，GRPO 通过 likelihood ratio 直接传递。GRPO 的 ratio 机制天然补偿 softmax 梯度衰减，但需要 stochastic dynamics 支持。
+两种优化目标对 MoF logits 的梯度信号传递路径不同：NFT 通过 reconstruction 质量间接传递 reward 信号，GRPO 通过 likelihood ratio 直接传递。NFT 适合 ODE dynamics（确定性，无需 log-prob），GRPO 需要 stochastic dynamics（CPS/SDE）支持。
 
 \end{document}
