@@ -261,11 +261,13 @@ def encode_prompt(
     pipe,
     prompt: str,
     negative_prompt: str = "",
+    do_classifier_free_guidance: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
     """Encode prompt using pipeline's text encoders."""
     # Use pipeline's built-in encode method
+    # For CFG, an empty negative prompt ("") is valid and should still be encoded.
     (
         prompt_embeds,
         negative_prompt_embeds,
@@ -275,10 +277,10 @@ def encode_prompt(
         prompt=prompt,
         prompt_2=prompt,
         prompt_3=prompt,
-        negative_prompt=negative_prompt if negative_prompt else None,
-        negative_prompt_2=negative_prompt if negative_prompt else None,
-        negative_prompt_3=negative_prompt if negative_prompt else None,
-        do_classifier_free_guidance=(negative_prompt != ""),
+        negative_prompt=negative_prompt if do_classifier_free_guidance else None,
+        negative_prompt_2=negative_prompt if do_classifier_free_guidance else None,
+        negative_prompt_3=negative_prompt if do_classifier_free_guidance else None,
+        do_classifier_free_guidance=do_classifier_free_guidance,
         device=device,
     )
     return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
@@ -410,7 +412,8 @@ def main():
         prompt_embeds, neg_embeds, pooled_embeds, neg_pooled = encode_prompt(
             pipe,
             prompt=prompt,
-            negative_prompt=args.negative_prompt if do_cfg else "",
+            negative_prompt=args.negative_prompt,
+            do_classifier_free_guidance=do_cfg,
             device=args.device,
             dtype=dtype,
         )
