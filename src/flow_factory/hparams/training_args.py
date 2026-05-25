@@ -915,10 +915,35 @@ class MoFTrainingArguments(TrainingArguments):
         metadata={"help": "KL penalty beta. 0 to disable."},
     )
 
+    # ---- MoF-GRPO specific (only used when trainer_type='mof-grpo') ----
+    clip_range: tuple[float, float] = field(
+        default=(-1e-4, 1e-4),
+        metadata={"help": "PPO clip range for ratio (only used in MoF-GRPO mode)."},
+    )
+    mask_type: Literal["kl", "kl_adv", "clip", "none"] = field(
+        default="none",
+        metadata={
+            "help": "Policy loss masking (only used in MoF-GRPO mode). "
+                    "'none'=standard clipping, 'kl_adv'=DPPO-style masking."
+        },
+    )
+    kl_mask_threshold: float = field(
+        default=1.0e-5,
+        metadata={"help": "KL threshold for DPPO masking (only used in MoF-GRPO mode)."},
+    )
+    add_kl_coefficient: bool = field(
+        default=True,
+        metadata={
+            "help": "Scale KL denominator with transition sigma (compute_transition_sigma). "
+                    "When True, kl = diff² / (2σ²); when False, kl = diff² (unit variance)."
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
 
         # num_train_timesteps: defaults to num_inference_steps.
         # MoF iterates over all inference steps because logits shape is
@@ -960,6 +985,10 @@ class MoFTrainingArguments(TrainingArguments):
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid: ['v-based'].")
         if self.ood_bonus_gamma < 0:
             raise ValueError(f"ood_bonus_gamma must be >= 0, got {self.ood_bonus_gamma}.")
+        if self.mask_type not in ["kl", "kl_adv", "clip", "none"]:
+            raise ValueError(
+                f"Invalid mask_type: {self.mask_type}. Valid: ['kl', 'kl_adv', 'clip', 'none']."
+            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         """Return num_train_timesteps for gradient accumulation computation.
