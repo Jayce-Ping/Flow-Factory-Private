@@ -252,6 +252,7 @@ def decode_latents(pipe, latents: torch.Tensor) -> "PIL.Image.Image":
     """Decode VAE latents to PIL image."""
     latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
     image = pipe.vae.decode(latents, return_dict=False)[0]
+    image = image.detach()
     image = pipe.image_processor.postprocess(image, output_type="pil")[0]
     return image
 
