@@ -203,6 +203,18 @@ def mof_denoise(
         weight_idx = min(int(i * T_weights / num_inference_steps), T_weights - 1)
         w = mof_weights[:, weight_idx].to(device)  # (K,)
 
+        # Prepare CFG inputs (shared across teachers, done once)
+        if do_cfg:
+            latent_model_input = torch.cat([latents, latents], dim=0)
+            prompt_embeds_cfg = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            pooled_cfg = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+            timestep_input = t.expand(latent_model_input.shape[0])
+        else:
+            latent_model_input = latents
+            prompt_embeds_cfg = prompt_embeds
+            pooled_cfg = pooled_prompt_embeds
+            timestep_input = t.expand(latent_model_input.shape[0])
+
         # Get combined velocity from all teachers
         combined_noise_pred = None
 
@@ -210,22 +222,10 @@ def mof_denoise(
             # Switch to teacher k
             pipe.transformer.set_adapter(adapter_name)
 
-            # Prepare model input
-            latent_model_input = pipe.scheduler.scale_model_input(latents, t)
-
-            if do_cfg:
-                latent_model_input_cfg = torch.cat([latent_model_input] * 2)
-                prompt_embeds_cfg = torch.cat([negative_prompt_embeds, prompt_embeds])
-                pooled_cfg = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds])
-            else:
-                latent_model_input_cfg = latent_model_input
-                prompt_embeds_cfg = prompt_embeds
-                pooled_cfg = pooled_prompt_embeds
-
             # Forward pass through transformer
             noise_pred = pipe.transformer(
-                hidden_states=latent_model_input_cfg,
-                timestep=t.expand(latent_model_input_cfg.shape[0]),
+                hidden_states=latent_model_input,
+                timestep=timestep_input,
                 encoder_hidden_states=prompt_embeds_cfg,
                 pooled_projections=pooled_cfg,
                 return_dict=False,
