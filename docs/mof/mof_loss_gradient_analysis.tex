@@ -1,0 +1,389 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{pifont}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\reward}{R}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\diag}{\mathrm{diag}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+
+\title{\textbf{MoF Loss \& Gradient Analysis}\\[0.3em]
+\large NFT vs. GRPO Optimization for Mixture-of-Flow}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文对 MoF（Mixture-of-Flow）的两种优化算法——NFT（DiffusionNFT）和 GRPO（PPO-clipped ratio）——给出完整的 loss 公式和梯度推导。分析表明二者对 logits 的梯度结构具有本质差异：NFT 的梯度通过 velocity 空间的 MSE 投影间接传递，而 GRPO 通过 log-probability ratio 直接传递。我们给出两种情况下 $\partial \loss / \partial \ell_{k,i,s}$ 的闭式表达，并分析各自的梯度量级、数值稳定性及与 softmax Jacobian 的交互。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{共同基础：Per-Set Combined Velocity}
+\label{sec:foundation}
+%% ============================================================
+
+\subsection{符号回顾}
+
+\begin{itemize}[itemsep=2pt]
+\item Logits: $\ell \in \R^{K \times T \times S}$，唯一可训练参数
+\item Softmax weights: $\lambda_{k,i,s} = \softmax_k(\ell_{\cdot,i,s}/\tau)$
+\item Combined velocity: $v_s(x, t_i) = \sum_{k=1}^K \lambda_{k,i,s}\, v^{(k)}(x, t_i)$
+\item Teacher velocities: $v^{(k)}$ frozen, detached — 无梯度流经 teachers
+\end{itemize}
+
+\subsection{Softmax Jacobian}
+
+对于固定 $(i, s)$，令 $\bm{\lambda} = \softmax(\bm{\ell}/\tau) \in \R^K$。Jacobian 为：
+\begin{equation}
+\frac{\partial \lambda_k}{\partial \ell_j} = \frac{1}{\tau}\left(\lambda_k \cdot \mathbf{1}[k=j] - \lambda_k \lambda_j\right) = \frac{\lambda_k}{\tau}\left(\delta_{kj} - \lambda_j\right)
+\label{eq:softmax_jacobian}
+\end{equation}
+
+这是所有后续梯度推导的起点。
+
+%% ============================================================
+\section{NFT Loss \& Gradient}
+\label{sec:nft}
+%% ============================================================
+
+\subsection{NFT Loss 公式}
+
+给定 sample $x$ with advantage $A$, noised latents $x_t = (1-\sigma)x_0 + \sigma \epsilon$：
+
+\paragraph{Step 1: Advantage normalization.}
+\begin{equation}
+r = \mathrm{clamp}\!\left(\frac{A}{A_{\max}} \cdot \frac{1}{2} + \frac{1}{2},\; 0,\; 1\right)
+\end{equation}
+
+\paragraph{Step 2: Positive/Negative predictions.}
+\begin{align}
+v^+ &= \beta \cdot v_{\mathrm{new}} + (1-\beta) \cdot v_{\mathrm{old}} \\
+v^- &= (1+\beta) \cdot v_{\mathrm{old}} - \beta \cdot v_{\mathrm{new}}
+\end{align}
+其中 $v_{\mathrm{new}} = \sum_k \lambda_k v^{(k)}$（current logits），$v_{\mathrm{old}} = \sum_k \bar\lambda_k v^{(k)}$（EMA logits, detached）。
+
+\paragraph{Step 3: Self-normalized MSE.}
+\begin{equation}
+\mathcal{M}(v) = \frac{\|x_0^{\mathrm{pred}}(v) - x_0\|^2}{\sg\!\left(\|x_0^{\mathrm{pred}}(v) - x_0\|_1 / d\right)}, \quad x_0^{\mathrm{pred}}(v) = x_t - \sigma \cdot v
+\end{equation}
+其中 $\sg(\cdot)$ 表示 stop-gradient。
+
+\paragraph{Step 4: Combined loss.}
+\begin{equation}
+\boxed{
+\loss_{\mathrm{NFT}} = \frac{r \cdot \mathcal{M}(v^+) + (1-r) \cdot \mathcal{M}(v^-)}{\beta} \cdot A_{\max}
+}
+\label{eq:nft_loss}
+\end{equation}
+
+\subsection{NFT Gradient w.r.t. Logits}
+
+\begin{proposition}[NFT Gradient]
+对固定 timestep $i$ 和 prompt set $s$，NFT 对 logit $\ell_{j,i,s}$ 的梯度为：
+\begin{equation}
+\boxed{
+\frac{\partial \loss_{\mathrm{NFT}}}{\partial \ell_{j,i,s}} = \frac{A_{\max}}{\tau} \sum_{k=1}^K \lambda_k(\delta_{kj} - \lambda_j) \cdot \left\langle \frac{\partial \loss_{\mathrm{NFT}}}{\partial v_{\mathrm{new}}},\; v^{(k)} \right\rangle
+}
+\label{eq:nft_gradient}
+\end{equation}
+其中 $\langle \cdot, \cdot \rangle$ 为 $\R^d$ 上的内积，且：
+\begin{equation}
+\frac{\partial \loss_{\mathrm{NFT}}}{\partial v_{\mathrm{new}}} = \frac{\beta \cdot A_{\max}}{\beta} \left[r \cdot \frac{\partial \mathcal{M}(v^+)}{\partial v^+} + (1-r) \cdot \frac{\partial \mathcal{M}(v^-)}{\partial v^-} \cdot (-1)\right]
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Chain rule:
+\begin{align}
+\frac{\partial \loss}{\partial \ell_{j,i,s}} &= \sum_k \frac{\partial \loss}{\partial \lambda_k} \cdot \frac{\partial \lambda_k}{\partial \ell_j} \\
+&= \sum_k \left\langle \frac{\partial \loss}{\partial v_{\mathrm{new}}},\; v^{(k)} \right\rangle \cdot \frac{\lambda_k}{\tau}(\delta_{kj} - \lambda_j)
+\end{align}
+第一步用了 $\partial v_{\mathrm{new}} / \partial \lambda_k = v^{(k)}$（因为 teachers frozen）。
+\end{proof}
+
+\begin{remark}[NFT 梯度特征]
+\leavevmode
+\begin{enumerate}
+\item \textbf{间接传递}：梯度必须通过 $\langle \nabla_v \loss, v^{(k)} \rangle$ 这个「velocity-space projection」传递。如果 $\nabla_v \loss$ 与所有 $v^{(k)}$ 正交，则梯度为零。
+\item \textbf{$\beta$ 无关}：展开后 $\beta$ 在分子分母中消去（positive/negative 的系数 $\pm\beta$ 除以分母 $\beta$），最终梯度幅值与 $\beta$ 无关。
+\item \textbf{Softmax 缩放}：$1/\tau$ 系数 + $\lambda_k(\delta_{kj} - \lambda_j)$ 的乘积导致梯度被 $O(\lambda_{\max}(1-\lambda_{\max}))$ 缩放。当某个 teacher 占优（$\lambda_k \to 1$）时，所有梯度趋于零。
+\end{enumerate}
+\end{remark}
+
+\subsection{NFT Gradient: Expanded Form}
+
+$\mathcal{M}(v)$ 对 $v$ 的梯度为：
+\begin{equation}
+\frac{\partial \mathcal{M}(v)}{\partial v} = \frac{-2\sigma}{w} \cdot (x_0^{\mathrm{pred}} - x_0)
+\end{equation}
+其中 $w = \sg(\|x_0^{\mathrm{pred}} - x_0\|_1/d)$ 是 detached weight。因此：
+\begin{align}
+\frac{\partial \loss_{\mathrm{NFT}}}{\partial v_{\mathrm{new}}} &= A_{\max}\left[\frac{-2\sigma \cdot r}{w^+}(x_0^{+} - x_0) + \frac{2\sigma(1-r)}{w^-}(x_0^{-} - x_0)\right]
+\end{align}
+其中 $x_0^{\pm} = x_t - \sigma v^{\pm}$。
+
+最终：
+\begin{equation}
+\frac{\partial \loss_{\mathrm{NFT}}}{\partial \ell_{j,i,s}} = \frac{2\sigma A_{\max}}{\tau} \sum_k \lambda_k(\delta_{kj}-\lambda_j)\left[\frac{(1-r)}{w^-}\langle x_0^{-}-x_0, v^{(k)}\rangle - \frac{r}{w^+}\langle x_0^{+}-x_0, v^{(k)}\rangle\right]
+\label{eq:nft_full_gradient}
+\end{equation}
+
+%% ============================================================
+\section{GRPO Loss \& Gradient}
+\label{sec:grpo}
+%% ============================================================
+
+\subsection{Background: Flow Matching Transition}
+
+在 dynamics type CPS/Flow-SDE 下，denoising step 的 transition distribution 为：
+\begin{equation}
+p(x_{t+1} \mid x_t; v) = \N\!\left(x_{t+1};\; \mu(x_t, v, t),\; \sigma_{\mathrm{trans}}^2 I\right)
+\end{equation}
+其中 $\mu = f(x_t, v, t, t_{\mathrm{next}})$ 是 dynamics-dependent mean（CPS: $\mu = x_0(1-\sigma') + x_1\sqrt{\sigma'^2 - \sigma_{\mathrm{trans}}^2}$）。
+
+Log-probability per sample:
+\begin{equation}
+\log p(x_{t+1} \mid x_t; v) = -\frac{\|x_{t+1} - \mu\|^2}{2\sigma_{\mathrm{trans}}^2} - \frac{d}{2}\log(2\pi\sigma_{\mathrm{trans}}^2)
+\label{eq:log_prob}
+\end{equation}
+
+\subsection{GRPO Loss 公式}
+
+\paragraph{Ratio.}
+\begin{equation}
+\rho_i = \exp\!\left(\log p(x_{t_{i+1}} \mid x_{t_i}; v_{\mathrm{new}}) - \log p(x_{t_{i+1}} \mid x_{t_i}; v_{\mathrm{old}})\right)
+\end{equation}
+其中 $v_{\mathrm{new}} = \sum_k \lambda_k^{\mathrm{new}} v^{(k)}$，$v_{\mathrm{old}}$ = sampling-time combined velocity (detached)。
+
+由于 $x_{t_{i+1}}$ 和 $\sigma_{\mathrm{trans}}$ 相同（仅 $\mu$ 不同），ratio 简化为：
+\begin{equation}
+\log \rho_i = -\frac{\|x_{t_{i+1}} - \mu_{\mathrm{new}}\|^2 - \|x_{t_{i+1}} - \mu_{\mathrm{old}}\|^2}{2\sigma_{\mathrm{trans}}^2}
+\end{equation}
+
+\paragraph{PPO Clipped Loss.}
+\begin{equation}
+\boxed{
+\loss_{\mathrm{GRPO}} = -A \cdot \max\!\left(\rho,\; \mathrm{clamp}(\rho, 1-\epsilon, 1+\epsilon)\right)
+}
+\label{eq:grpo_loss}
+\end{equation}
+
+\paragraph{KL-Adv Mask Variant (DPPO).}
+定义 x-space KL:
+\begin{equation}
+D_i = \frac{\|\mu_{\mathrm{new}} - \mu_{\mathrm{old}}\|^2}{2\sigma_{\mathrm{trans}}^2}
+\end{equation}
+Mask:
+\begin{equation}
+m_i = \begin{cases}
+0 & \text{if } D_i \geq \theta \text{ and } (\rho_i > 1, A > 0) \text{ or } (\rho_i < 1, A < 0) \\
+1 & \text{otherwise}
+\end{cases}
+\end{equation}
+\begin{equation}
+\loss_{\mathrm{DPPO}} = -A \cdot \rho \cdot m
+\end{equation}
+
+\subsection{GRPO Gradient w.r.t. Logits}
+
+\begin{proposition}[GRPO Gradient]
+在 unclipped region（$\rho$ 未被 clip），GRPO 对 logit $\ell_{j,i,s}$ 的梯度为：
+\begin{equation}
+\boxed{
+\frac{\partial \loss_{\mathrm{GRPO}}}{\partial \ell_{j,i,s}} = \frac{-A \cdot \rho_i}{\tau \cdot \sigma_{\mathrm{trans}}^2} \sum_{k=1}^K \lambda_k(\delta_{kj} - \lambda_j) \cdot \left\langle x_{t_{i+1}} - \mu_{\mathrm{new}},\; \frac{\partial \mu_{\mathrm{new}}}{\partial v^{(k)}} \cdot v^{(k)} \right\rangle
+}
+\label{eq:grpo_gradient}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Chain rule:
+\begin{align}
+\frac{\partial \loss}{\partial \ell_j} &= -A \cdot \rho \cdot \frac{\partial \log \rho}{\partial \ell_j} \\
+\frac{\partial \log \rho}{\partial \ell_j} &= \frac{\partial}{\partial \ell_j}\left[-\frac{\|x_{t_{i+1}} - \mu_{\mathrm{new}}\|^2}{2\sigma_{\mathrm{trans}}^2}\right] \\
+&= \frac{1}{\sigma_{\mathrm{trans}}^2}\left\langle x_{t_{i+1}} - \mu_{\mathrm{new}},\; \frac{\partial \mu_{\mathrm{new}}}{\partial \ell_j}\right\rangle \\
+&= \frac{1}{\sigma_{\mathrm{trans}}^2} \sum_k \frac{\partial \lambda_k}{\partial \ell_j} \left\langle x_{t_{i+1}} - \mu_{\mathrm{new}},\; \frac{\partial \mu}{\partial \lambda_k}\right\rangle
+\end{align}
+其中 $\partial \mu / \partial \lambda_k$ 取决于 dynamics type。对 Flow-SDE: $\partial \mu / \partial v \propto dt$；对 CPS 更复杂但同样是 $v^{(k)}$ 的线性函数。
+\end{proof}
+
+\subsection{GRPO 梯度：CPS Dynamics 特化}
+
+对 CPS dynamics:
+\begin{align}
+x_0^{\mathrm{pred}} &= x_t - \sigma \cdot v \\
+x_1^{\mathrm{pred}} &= x_t + (1-\sigma) \cdot v \\
+\mu &= x_0^{\mathrm{pred}}(1-\sigma') + x_1^{\mathrm{pred}}\sqrt{\sigma'^2 - \sigma_{\mathrm{trans}}^2}
+\end{align}
+因此：
+\begin{equation}
+\frac{\partial \mu}{\partial v} = -\sigma(1-\sigma') + (1-\sigma)\sqrt{\sigma'^2 - \sigma_{\mathrm{trans}}^2} \triangleq c(t, t')
+\end{equation}
+$c(t,t')$ 是仅依赖于 timesteps 的标量系数。代入得：
+\begin{equation}
+\frac{\partial \loss_{\mathrm{GRPO}}}{\partial \ell_{j,i,s}} = \frac{-A \cdot \rho_i \cdot c(t_i, t_{i+1})}{\tau \cdot \sigma_{\mathrm{trans}}^2} \sum_{k=1}^K \lambda_k(\delta_{kj} - \lambda_j) \left\langle x_{t_{i+1}} - \mu_{\mathrm{new}},\; v^{(k)}\right\rangle
+\end{equation}
+
+%% ============================================================
+\section{比较分析}
+\label{sec:comparison}
+%% ============================================================
+
+\subsection{梯度结构对比}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{lcc}
+\toprule
+& \textbf{NFT} & \textbf{GRPO} \\
+\midrule
+\textbf{Direction} & $\langle x_0^{\pm} - x_0,\; v^{(k)}\rangle$ & $\langle x_{t_{i+1}} - \mu_{\mathrm{new}},\; v^{(k)}\rangle$ \\
+\textbf{Signal source} & $x_0$ reconstruction error & Transition residual \\
+\textbf{Scaling} & $\sigma A_{\max} / (\tau w^{\pm})$ & $A \cdot \rho \cdot c / (\tau \sigma_{\mathrm{trans}}^2)$ \\
+\textbf{Advantage role} & Weights pos/neg via $r(A)$ & Direct multiplicative $-A \cdot \rho$ \\
+\textbf{Ratio $\rho$} & 无 & $\exp(\Delta \log p)$ — adaptive step size \\
+\textbf{Clipping} & 无显式 clip & PPO clip or DPPO mask \\
+\textbf{Off-policy} & Yes (EMA for $v_{\mathrm{old}}$) & On-policy (sample = train policy) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{梯度量级分析}
+
+\begin{proposition}[共同 Softmax 因子]
+两种 loss 对 logit 的梯度均包含 softmax Jacobian 因子：
+\begin{equation}
+\frac{\lambda_k}{\tau}(\delta_{kj} - \lambda_j) = O\!\left(\frac{\lambda_{\max}(1-\lambda_{\max})}{\tau}\right)
+\end{equation}
+当 $\lambda_{\max} \to 1$（某 teacher 完全占优）时，该因子 $\to 0$，产生梯度消失。这是两种算法共有的特征。
+\end{proposition}
+
+\begin{proposition}[GRPO 的 ratio 放大效应]
+GRPO 梯度中额外包含 ratio $\rho_i = \exp(\Delta \log p_i)$。当 policy 变化较大时（$\Delta \log p$ 远离 0），ratio 指数放大梯度。PPO clip 限制了这种放大：
+\begin{equation}
+|\text{effective } \rho| \leq 1 + \epsilon
+\end{equation}
+但在 clip region 内梯度为零。DPPO mask 在高 KL 时直接置零，避免梯度爆炸。
+\end{proposition}
+
+\begin{proposition}[NFT 的自归一化]
+NFT 的 weight $w^{\pm} = \sg(\|x_0^{\pm} - x_0\|_1/d)$ 提供了自适应归一化：当 reconstruction error 大时 $w$ 大，梯度被自动缩小。这提供了数值稳定性，但也可能在训练早期抑制有用信号。
+\end{proposition}
+
+\subsection{信号传递路径}
+
+\begin{tcolorbox}[title=NFT: Velocity-Space Projection]
+\begin{equation}
+\ell \xrightarrow{\text{softmax}} \lambda \xrightarrow{\text{combine}} v_{\mathrm{new}} \xrightarrow{x_0 = x_t - \sigma v} x_0^{\mathrm{pred}} \xrightarrow{\text{MSE}} \loss
+\end{equation}
+梯度路径：$\partial \loss / \partial \ell$ 需要 $\nabla_v \loss$ 投影到 teacher basis $\{v^{(k)}\}$ 上。
+\end{tcolorbox}
+
+\begin{tcolorbox}[title=GRPO: Log-Probability Chain]
+\begin{equation}
+\ell \xrightarrow{\text{softmax}} \lambda \xrightarrow{\text{combine}} v_{\mathrm{new}} \xrightarrow{\text{dynamics}} \mu_{\mathrm{new}} \xrightarrow{-\|\cdot\|^2/(2\sigma^2)} \log p \xrightarrow{\exp} \rho \xrightarrow{-A \cdot} \loss
+\end{equation}
+梯度路径更长但每步都是标准的 differentiable operation。
+\end{tcolorbox}
+
+%% ============================================================
+\section{数值稳定性}
+\label{sec:stability}
+%% ============================================================
+
+\subsection{Softmax 梯度消失缓解策略}
+
+当 logits 初始化为 teacher-biased（如 $\ell_{\mathrm{in-domain}} = 2$）时，初始权重约为 $(0.78, 0.11, 0.11)$（$K=3$）。此时 softmax Jacobian 中：
+\begin{equation}
+\lambda_1(\delta_{1j} - \lambda_j) \approx \begin{cases} 0.78 \times 0.22 = 0.17 & j=1 \\ -0.78 \times 0.11 = -0.086 & j \neq 1 \end{cases}
+\end{equation}
+梯度幅值合理。但如果训练使某个 teacher 更加占优（$\lambda_1 \to 0.99$），则：
+\begin{equation}
+\lambda_1(1 - \lambda_1) \approx 0.01 \quad \Longrightarrow \quad \text{梯度消失}
+\end{equation}
+
+\textbf{对策}：
+\begin{enumerate}
+\item 使用较高的 learning rate ($\eta = 0.05$) 补偿小梯度
+\item Temperature $\tau < 1$ 使分布更尖锐但也加速消失；$\tau > 1$ 反之
+\item EMA logits (off-policy, NFT) 保持旧策略多样性
+\item GRPO: ratio $\rho$ 的指数放大天然补偿 softmax 衰减
+\end{enumerate}
+
+\subsection{GRPO 特有的数值问题}
+
+\paragraph{$\sigma_{\mathrm{trans}}^2$ 在分母.}
+当 $\sigma_{\mathrm{trans}} \to 0$（ODE limit），梯度 $\propto 1/\sigma_{\mathrm{trans}}^2 \to \infty$。
+因此 MoF-GRPO \textbf{必须使用 stochastic dynamics}（CPS/Flow-SDE），不能用 ODE。
+
+\paragraph{Ratio explosion.}
+当 logits 变化剧烈时，$\rho$ 可能 $\gg 1$。PPO clip 限制在 $[1-\epsilon, 1+\epsilon]$，DPPO mask 在 high-KL 时直接归零。
+对 MoF（仅 $K \times T \times S$ 个参数），logits 变化受 LR 限制，ratio explosion 风险较低。
+
+\subsection{NFT 特有的数值问题}
+
+\paragraph{Weight $w \to 0$.}
+当 $x_0^{\mathrm{pred}} \approx x_0$ 时，$w = \|x_0^{\mathrm{pred}} - x_0\|_1/d$ 趋近 0，代码中 clip 到 $10^{-5}$。这导致梯度 $\propto 1/w$ 可能瞬间放大。实际中训练后期接近收敛时才出现。
+
+%% ============================================================
+\section{总结}
+\label{sec:summary}
+%% ============================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{lcc}
+\toprule
+\textbf{特性} & \textbf{NFT} & \textbf{GRPO} \\
+\midrule
+Loss 类型 & Weighted MSE on $x_0$ & PPO policy gradient \\
+需要 log-prob & 否 & 是 \\
+Dynamics 要求 & ODE（deterministic） & CPS/SDE（stochastic） \\
+Off-policy & 是（EMA $v_{\mathrm{old}}$） & 否（on-policy sampling） \\
+梯度方向 & Velocity-space projection & Log-prob chain \\
+自适应步长 & $1/w$（self-norm） & $\rho$（importance ratio） \\
+Clipping/Mask & 无 & PPO clip / DPPO mask \\
+额外内存 & 仅 final latents & Full trajectory + log-probs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+两种优化目标对 MoF logits 的梯度具有相同的 softmax Jacobian 因子，但信号传递路径不同。NFT 通过 reconstruction 质量传递 reward 信号，GRPO 通过 likelihood ratio 直接传递。GRPO 的 ratio 机制天然补偿 softmax 梯度衰减，但需要 stochastic dynamics 支持。
+
+\end{document}
