@@ -1,0 +1,178 @@
+# MoF-GRPO: 2-teacher experiment with GRPO optimization.
+#
+# Same MoF infrastructure as geneval_pickscore.yaml (teacher mixing, per-set routing)
+# but uses PPO-clipped ratio loss instead of NFT reconstruction loss.
+#
+# Key differences from NFT:
+#   - Stores full trajectory + log_probs during sampling (more memory)
+#   - Optimizes via ratio = exp(new_log_prob - old_log_prob)
+#   - Supports PPO clipping and optional DPPO masking
+#
+# Learnable params: K=2 x T=10 x S=2 = 40 logits.
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/pickscore"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "sd3-5_mof-grpo_geneval_pickscore"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: false
+
+# Training Configuration
+train:
+  trainer_type: 'mof-grpo'                  # MoF with GRPO optimization
+
+  # Per-source teacher configuration
+  teachers:
+    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+      sources: [geneval]
+      reward_name: "geneval"
+    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+      sources: [pickscore]
+      reward_name: "pick_score"
+
+  teacher_route_by_source: true
+  teacher_param_device: 'cuda'
+
+  # ---- MoF core hyperparameters ----
+  logits_init: "teacher_biased"
+  logits_init_bias: 2.0
+  learning_rate: 0.05                       # Large LR for only 40 params
+  temperature: 1.0
+  normalize_weights: true
+
+  # ---- GRPO-specific ----
+  clip_range: [-1e-4, 1e-4]                # PPO ratio clipping (tight for small logit updates)
+  adv_clip_range: [-5.0, 5.0]              # Advantage clipping
+  mask_type: 'kl_adv'             # DPPO: KL-advantage masking
+  kl_mask_threshold: 1.0e-6       # KL threshold for new-vs-old policy divergence.
+  add_kl_coefficient: true        # Scale KL by sigma (for x-based only)
+
+  # ---- EMA schedule ----
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # ---- Per-set reward ----
+  eval_teachers_at_start: true
+  ood_bonus_gamma: 0.2
+
+  # ---- Advantage computation ----
+  advantage_aggregation: "gdpo"
+  global_std: true
+
+  # ---- Timestep control ----
+  num_inference_steps: 10                   # T dimension of logits = number of denoising steps
+
+  # ---- Optimization ----
+  per_device_batch_size: 8
+  group_size: 16
+  unique_sample_num_per_epoch: 96
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 0.0
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 300
+  seed: 42
+
+  # ---- KL penalty (disabled) ----
+  kl_beta: 0.0
+  kl_type: 'v-based'
+
+  # ---- Generation settings ----
+  resolution: 512
+  guidance_scale: 1.0
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "CPS"                      # CPS for stochastic sampling (log_prob well-defined)
+  noise_level: 0.8
+  num_sde_steps: 3
+  sde_steps: [0, 1, 2, 3, 4]
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 16
+  guidance_scale: 1.0
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+
+# Training rewards
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore]
+
+# Evaluation rewards
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false

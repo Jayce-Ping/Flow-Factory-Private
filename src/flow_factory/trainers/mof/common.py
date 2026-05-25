@@ -12,25 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/mof.py
+# src/flow_factory/trainers/mof/common.py
 """
-MoF (Mixture-of-Flow) Trainer.
+MoF (Mixture-of-Flow) Trainer — Shared Infrastructure.
 
-Learns optimal per-timestep, per-prompt-set softmax mixing weights over K
-frozen teacher flow-matching velocities, optimized via the DiffusionNFT
-algorithm with external reward feedback.
+Contains MoFMixingModule (learnable mixing weights) and MoFTrainerBase
+(all shared infrastructure: teacher loading, lambda weights, source routing,
+velocity combination, reward/advantage pipeline, evaluation, checkpointing).
 
-Key extension over MoTV: each prompt set (identified by ``__source__``
-metadata) has its own independent lambda weights, enabling:
-  - Level-1 guarantee: >= single-teacher in-domain performance
-  - Level-2 possibility: > single-teacher via timestep complementarity
-
-Theoretical basis: The convex combination of flow-matching velocities is
-itself a valid velocity field (ODE linearity). Per-set independence means
-each prompt set can find its own optimal teacher schedule.
-
-Total learnable parameters: K × T × S (one weight per teacher per
-denoising step per prompt set, with softmax normalization over K).
+Algorithm-specific subclasses (MoFNFTTrainer, MoFGRPOTrainer) are in
+separate files within this package.
 """
 import os
 from typing import List, Dict, Any, Optional, Set
@@ -185,17 +176,16 @@ class MoFMixingModule(nn.Module):
         return self.forward()[:, :, set_id]
 
 
-class MoFTrainer(BaseTrainer):
+class MoFTrainerBase(BaseTrainer):
     """
-    MoF (Mixture-of-Flow): learns per-timestep, per-prompt-set softmax
-    mixing weights over K frozen teacher velocities, optimized via
-    DiffusionNFT with external reward.
+    MoF (Mixture-of-Flow) Trainer Base Class.
 
-    Key differences from MoTV:
-    - Lambda logits shape: (K, T, S) instead of (K, T)
-    - Each prompt set gets independent teacher mixing strategy
-    - Teacher-to-source routing via TeacherConfig.sources (OPD pattern)
-    - Per-set reward with OOD bonus for cross-teacher complementarity
+    Shared infrastructure for all MoF optimization variants (NFT, GRPO).
+    Handles teacher loading, lambda weight management, source routing,
+    velocity combination, reward/advantage pipeline, evaluation, and
+    checkpointing.
+
+    Subclasses must override: sample() and optimize().
     """
 
     def __init__(self, **kwargs):
@@ -205,7 +195,6 @@ class MoFTrainer(BaseTrainer):
         self.training_args: MoFTrainingArguments
 
         # ---- Unpack config shortcuts ----
-        self.nft_beta = self.training_args.nft_beta
         self.off_policy = self.training_args.off_policy
         self.time_sampling_strategy = self.training_args.time_sampling_strategy
         self.time_shift = self.training_args.time_shift
@@ -530,32 +519,6 @@ class MoFTrainer(BaseTrainer):
         # Weighted sum over K dimension
         combined = (w_expanded * teacher_velocities).sum(dim=0)  # (B, C, H, W)
         return combined
-
-    @staticmethod
-    def _nft_weighted_mse(
-        v_pred: torch.Tensor,
-        noised_latents: torch.Tensor,
-        sigma_broadcast: torch.Tensor,
-        clean_latents: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute NFT's self-normalized MSE loss (per-sample scalar).
-
-        Computes ||x0_pred - x0||^2 / weight, where weight is the detached
-        mean absolute error (prevents gradient through normalization).
-
-        Returns:
-            Per-sample loss of shape (B,).
-        """
-        x0_pred = noised_latents - sigma_broadcast * v_pred
-        with torch.no_grad():
-            weight = (
-                torch.abs(x0_pred.double() - clean_latents.double())
-                .mean(dim=tuple(range(1, clean_latents.ndim)), keepdim=True)
-                .clip(min=1e-5)
-            )
-        return (
-            (x0_pred - clean_latents) ** 2 / weight
-        ).mean(dim=tuple(range(1, clean_latents.ndim)))
 
     # =========================================================================
     # Context Managers
@@ -949,53 +912,12 @@ class MoFTrainer(BaseTrainer):
             self.epoch += 1
 
     # =========================================================================
-    # Sampling
+    # Sampling (override in subclass)
     # =========================================================================
 
     def sample(self) -> List[BaseSample]:
-        """Generate rollouts using per-set lambda-combined teacher velocity.
-
-        Uses interleaved source iterator (OPD pattern) so each batch is
-        homogeneous per source, enabling efficient per-set inference.
-        """
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples = []
-
-        # Use multi-source iterator if available, else single dataloader
-        if self.train_dataloaders_by_source:
-            data_iter = self._interleaved_source_iter()
-        else:
-            data_iter = iter(self.dataloader)
-
-        with torch.no_grad(), self.autocast():
-            for _ in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f'Epoch {self.epoch} Sampling',
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                set_id = self._get_batch_set_id(batch)
-
-                # Use per-set inference context
-                with self._mof_inference_context(set_id):
-                    sample_kwargs = {
-                        **self.training_args,
-                        'compute_log_prob': False,
-                        'trajectory_indices': [-1],
-                        **{k: v for k, v in batch.items() if k != '__source__'},
-                    }
-                    sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                    sample_batch = self.adapter.inference(**sample_kwargs)
-
-                # Propagate __source__ metadata to samples
-                stitch_batch_metadata(batch, sample_batch)
-
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-
-        return samples
+        """Generate rollouts. Must be overridden by subclass (NFT or GRPO)."""
+        raise NotImplementedError("MoFTrainerBase.sample() must be overridden by subclass.")
 
     # =========================================================================
     # Feedback
@@ -1177,216 +1099,12 @@ class MoFTrainer(BaseTrainer):
         self.log_data(log_data, step=self.step)
 
     # =========================================================================
-    # Optimization
+    # Optimization (override in subclass)
     # =========================================================================
 
     def optimize(self, samples: List[BaseSample]) -> None:
-        """Policy optimization: NFT loss on per-set lambda-weighted teacher velocities.
-
-        For each micro-batch:
-        1. Extract per-sample set_ids from __source__ metadata.
-        2. Precompute old_v_pred using EMA logits (per-sample set-specific).
-        3. Recompute teacher velocities and combine with current logits.
-        4. Accumulate gradients over T timesteps, single optimizer step.
-        """
-        device = self.accelerator.device
-        per_device_batch_size = self.training_args.per_device_batch_size
-        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
-
-        for inner_epoch in range(self.training_args.num_inner_epochs):
-            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
-
-            loss_info = defaultdict(list)
-
-            for batch_idx in tqdm(
-                range(num_batches),
-                total=num_batches,
-                desc=f'Epoch {self.epoch} Training',
-                position=0,
-                disable=not self.show_progress_bar,
-            ):
-                start = batch_idx * per_device_batch_size
-                batch_samples = [
-                    sample.to(device)
-                    for sample in shuffled_samples[start:start + per_device_batch_size]
-                ]
-                batch = BaseSample.stack(batch_samples)
-                batch_size = batch['all_latents'].shape[0]
-                clean_latents = batch['all_latents'][:, -1]
-
-                # Per-sample set IDs
-                set_ids = self._get_sample_set_ids(batch_samples)  # (B,)
-
-                # ---- Phase 1: Precompute noised_latents + old_v_pred ----
-                # Teacher velocities are cached here for reuse in Phase 2,
-                # avoiding redundant K teacher forward passes per timestep.
-                self.adapter.rollout()
-                with torch.no_grad(), self.autocast():
-                    all_timesteps = self._sample_timesteps(batch_size)
-                    all_noised_latents: List[torch.Tensor] = []
-                    all_sigma_broadcast: List[torch.Tensor] = []
-                    all_teacher_velocities: List[torch.Tensor] = []
-                    old_v_pred_list: List[torch.Tensor] = []
-
-                    with self.sampling_context():
-                        ema_weights = self._get_lambda_weights(self._lambda_logits)
-
-                    for t_idx in range(self.num_train_timesteps):
-                        t_flat = all_timesteps[t_idx]
-                        sigma_broadcast = to_broadcast_tensor(
-                            flow_match_sigma(t_flat), clean_latents
-                        )
-                        noise = randn_tensor(
-                            clean_latents.shape,
-                            device=clean_latents.device,
-                            dtype=clean_latents.dtype,
-                        )
-                        noised_latents = (
-                            (1 - sigma_broadcast) * clean_latents
-                            + sigma_broadcast * noise
-                        )
-                        all_noised_latents.append(noised_latents)
-                        all_sigma_broadcast.append(sigma_broadcast)
-
-                        # Teacher velocities: deterministic given (x_t, t), cache for Phase 2
-                        teacher_velocities = self._compute_teacher_velocities(
-                            batch, t_flat, noised_latents
-                        )
-                        all_teacher_velocities.append(teacher_velocities)
-
-                        # Per-sample old_v using EMA weights + set_ids
-                        old_v = self._combine_velocities_per_sample(
-                            teacher_velocities, t_idx, ema_weights, set_ids
-                        )
-                        old_v_pred_list.append(old_v.detach())
-
-                # ---- Phase 2: Train with current logits ----
-                # Follows NFT trainer pattern: accelerator.accumulate() handles
-                # DDP no_sync + auto loss scaling by gradient_accumulation_steps.
-                # get_num_train_timesteps() returns num_inference_steps, so
-                # gradient_accumulation_steps already includes the T factor.
-                self.adapter.train()
-                with self.autocast():
-                    for t_idx in tqdm(
-                        range(self.num_train_timesteps),
-                        desc=f'Epoch {self.epoch} Timestep',
-                        position=1,
-                        leave=False,
-                        disable=not self.show_progress_bar,
-                    ):
-                        with self.accelerator.accumulate(self._mixing_module):
-                            t_flat = all_timesteps[t_idx]
-                            sigma_broadcast = all_sigma_broadcast[t_idx]
-                            noised_latents = all_noised_latents[t_idx]
-                            old_v_pred = old_v_pred_list[t_idx]
-                            teacher_velocities = all_teacher_velocities[t_idx]
-
-                            # Recompute weights INSIDE the loop to create a fresh
-                            # computation graph each iteration. Avoids "backward
-                            # through graph a second time" since each iteration
-                            # independently builds: _lambda_logits → softmax →
-                            # weights → new_v_pred → loss, and backward frees
-                            # only that iteration's graph.
-                            current_weights = self._get_lambda_weights(self._lambda_logits)
-
-                            # Per-sample combination with current weights
-                            new_v_pred = self._combine_velocities_per_sample(
-                                teacher_velocities, t_idx, current_weights, set_ids
-                            )
-
-                            # NFT loss computation
-                            adv = torch.as_tensor(
-                                batch['advantage'], dtype=torch.float32, device=device
-                            )
-                            adv_clip_range = self.training_args.adv_clip_range
-                            adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-
-                            normalized_adv = (adv / max(adv_clip_range)) / 2.0 + 0.5
-                            r = torch.clamp(normalized_adv, 0, 1).view(
-                                -1, *([1] * (new_v_pred.dim() - 1))
-                            )
-
-                            # Positive/negative predictions
-                            positive_pred = (
-                                self.nft_beta * new_v_pred
-                                + (1 - self.nft_beta) * old_v_pred
-                            )
-                            negative_pred = (
-                                (1.0 + self.nft_beta) * old_v_pred
-                                - self.nft_beta * new_v_pred
-                            )
-
-                            # NFT self-normalized MSE losses
-                            positive_loss = self._nft_weighted_mse(
-                                positive_pred, noised_latents, sigma_broadcast, clean_latents
-                            )
-                            negative_loss = self._nft_weighted_mse(
-                                negative_pred, noised_latents, sigma_broadcast, clean_latents
-                            )
-
-                            # Combined loss
-                            ori_policy_loss = (
-                                r.squeeze() * positive_loss
-                                + (1.0 - r.squeeze()) * negative_loss
-                            ) / self.nft_beta
-                            policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
-                            loss = policy_loss
-
-                            # Optional KL penalty
-                            if self.enable_kl_loss:
-                                with torch.no_grad(), self.adapter.use_ref_parameters():
-                                    ref_forward_kwargs = self._build_forward_kwargs(
-                                        batch, t_flat, noised_latents
-                                    )
-                                    ref_output = self.adapter.forward(**ref_forward_kwargs)
-                                kl_div = torch.mean(
-                                    (new_v_pred - ref_output.noise_pred) ** 2,
-                                    dim=tuple(range(1, new_v_pred.ndim)),
-                                )
-                                kl_loss = self.training_args.kl_beta * kl_div.mean()
-                                loss = loss + kl_loss
-                                loss_info['kl_div'].append(kl_div.detach())
-                                loss_info['kl_loss'].append(kl_loss.detach())
-
-                            loss_info['policy_loss'].append(policy_loss.detach())
-                            loss_info['unweighted_policy_loss'].append(
-                                ori_policy_loss.mean().detach()
-                            )
-                            loss_info['loss'].append(loss.detach())
-
-                            # Backward (accumulate handles loss scaling + DDP sync)
-                            self.accelerator.backward(loss)
-
-                            # Optimizer step only when gradients are synced
-                            # (after all T accumulation steps complete)
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self._mixing_module.parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-
-                                # Log batch-level metrics
-                                loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info_reduced['grad_norm'] = grad_norm
-                                with torch.no_grad():
-                                    log_weights = self._get_lambda_weights(self._lambda_logits)
-                                    mean_weights = log_weights.mean(dim=1)  # (K, S)
-                                    for k in range(self.K):
-                                        for s in range(self.S):
-                                            src_name = self._set_id_to_source.get(s, str(s))
-                                            loss_info_reduced[f'lambda_t{k}_{src_name}_mean'] = (
-                                                mean_weights[k, s].item()
-                                            )
-                                self.log_data(
-                                    {f'train/{k}': v for k, v in loss_info_reduced.items()},
-                                    step=self.step,
-                                )
-                                self.step += 1
-                                loss_info = defaultdict(list)
+        """Optimize lambda logits. Must be overridden by subclass (NFT or GRPO)."""
+        raise NotImplementedError("MoFTrainerBase.optimize() must be overridden by subclass.")
 
     # =========================================================================
     # Evaluation
@@ -1590,3 +1308,4 @@ class MoFTrainer(BaseTrainer):
             self._reward_running_mean = state['reward_running_mean']
             self._reward_running_var = state['reward_running_var']
         logger.info(f"MoF checkpoint loaded from {state_path} (epoch={self.epoch})")
+
