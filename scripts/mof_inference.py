@@ -82,9 +82,14 @@ def load_mof_weights(
     else:
         state = torch.load(path, map_location="cpu", weights_only=False)
 
-    # Fall back to checkpoint's teacher_names if not provided by user
-    if not teacher_names and "teacher_names" in state:
-        teacher_names = state["teacher_names"]
+    # Resolve teacher names: user-provided vs checkpoint-stored
+    ckpt_teacher_names = state.get("teacher_names", None)
+    if not teacher_names:
+        teacher_names = ckpt_teacher_names
+    elif ckpt_teacher_names and list(teacher_names) != list(ckpt_teacher_names):
+        print(f"  WARNING: --teacher-names {teacher_names} differs from "
+              f"checkpoint's teacher_names {ckpt_teacher_names}. "
+              f"Ensure --teachers order matches training!")
 
     # Get logits
     if use_ema and "logits_ema" in state:
