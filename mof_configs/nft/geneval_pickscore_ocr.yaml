@@ -44,7 +44,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "sd3-5_mof_geneval_pickscore_ocr"
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
