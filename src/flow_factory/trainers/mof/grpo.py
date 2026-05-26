@@ -187,7 +187,7 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 next_latents=next_latents.detach(),
                                 timestep_next=t_next,
                                 compute_log_prob=True,
-                                noise_level=self.adapter.scheduler.noise_level,
+                                noise_level=self.adapter.scheduler.get_noise_level_for_timestep(t),
                                 return_dict=True,
                                 return_kwargs=return_kwargs,
                             )

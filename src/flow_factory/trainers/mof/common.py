@@ -696,7 +696,7 @@ class MoFTrainerBase(BaseTrainer):
             'latents': noised_latents,
             'compute_log_prob': False,
             'return_kwargs': ['noise_pred'],
-            'noise_level': 0.0,
+            'noise_level': self.adapter.scheduler.get_noise_level_for_timestep(t_b),
             **{k: v for k, v in batch.items()
                if k not in ['all_latents', 'timesteps', 'advantage', '__source__']},
         }
