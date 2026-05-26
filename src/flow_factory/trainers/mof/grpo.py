@@ -272,6 +272,15 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 # Reduce and log
                                 loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
                                 loss_info_reduced['grad_norm'] = grad_norm
+                                with torch.no_grad():
+                                    log_weights = self._get_lambda_weights(self._lambda_logits)
+                                    mean_weights = log_weights.mean(dim=1)  # (K, S)
+                                    for k in range(self.K):
+                                        for s in range(self.S):
+                                            src_name = self._set_id_to_source.get(s, str(s))
+                                            loss_info_reduced[f'lambda_t{k}_{src_name}_mean'] = (
+                                                mean_weights[k, s].item()
+                                            )
                                 self.log_data(
                                     {f'train/{k}': v for k, v in loss_info_reduced.items()},
                                     step=self.step,
