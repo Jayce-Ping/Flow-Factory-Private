@@ -385,19 +385,21 @@ class MoFTrainerBase(BaseTrainer):
             self.training_args.teachers is not None
             and self.training_args.teacher_route_by_source
         ):
-            all_sources: Set[str] = set()
+            ordered_sources: List[str] = []
             for tc in self.training_args.teachers:
                 self._teacher_sources.append(
                     set(tc.sources) if tc.sources else None
                 )
                 if tc.sources:
-                    all_sources.update(tc.sources)
+                    for src in tc.sources:
+                        if src not in ordered_sources:
+                            ordered_sources.append(src)
                     # Map each source to its in-domain reward name
                     if tc.reward_name:
                         for src in tc.sources:
                             self._source_to_reward_name[src] = tc.reward_name
-            # Assign set IDs in sorted order for determinism
-            for idx, src in enumerate(sorted(all_sources)):
+            # Assign set IDs in teacher-list order (so set_id aligns with teacher_id)
+            for idx, src in enumerate(ordered_sources):
                 self._source_to_set_id[src] = idx
                 self._set_id_to_source[idx] = src
         else:
@@ -1264,6 +1266,7 @@ class MoFTrainerBase(BaseTrainer):
                 'T': self.num_train_timesteps,
                 'S': self.S,
                 'source_to_set_id': self._source_to_set_id,
+                'teacher_names': self._teacher_names,
                 'reward_running_mean': self._reward_running_mean,
                 'reward_running_var': self._reward_running_var,
             }

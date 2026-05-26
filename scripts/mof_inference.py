@@ -63,6 +63,7 @@ def load_mof_weights(
     Args:
         teacher_names: Display names for each teacher (k=0,1,...).
             Must match the order of --teachers (i.e., training order).
+            If None, reads from checkpoint's 'teacher_names' field.
 
     Returns:
         weights: Tensor of shape (K, T) for the specified set.
@@ -80,6 +81,10 @@ def load_mof_weights(
             )
     else:
         state = torch.load(path, map_location="cpu", weights_only=False)
+
+    # Fall back to checkpoint's teacher_names if not provided by user
+    if not teacher_names and "teacher_names" in state:
+        teacher_names = state["teacher_names"]
 
     # Get logits
     if use_ema and "logits_ema" in state:
