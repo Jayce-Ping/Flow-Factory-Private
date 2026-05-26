@@ -42,7 +42,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "grpo_sd3-5_mof-grpo_geneval_pickscore"
+  run_name: "grpo_sd3-5_mof-grpo_geneval_pickscore_uniform"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -66,7 +66,7 @@ train:
   teacher_param_device: 'cuda'
 
   # ---- MoF core hyperparameters ----
-  logits_init: "teacher_biased"
+  logits_init: "uniform"
   logits_init_bias: 2.0
   learning_rate: 0.05                       # Large LR for only 40 params
   temperature: 1.0
