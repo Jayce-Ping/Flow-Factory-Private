@@ -38,7 +38,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "grpo_sd3-5_mof-grpo_geneval_pickscore_ocr_uniform"
+  run_name: "dppo_sd3-5_mof-grpo_geneval_pickscore_ocr_uniform"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
