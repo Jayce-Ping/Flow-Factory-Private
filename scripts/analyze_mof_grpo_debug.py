@@ -11,181 +11,292 @@ import sys
 import os
 import torch
 import numpy as np
+from pathlib import Path
+
+TOLERANCE = 1e-8
 
 
-def load_snapshots(debug_dir: str):
-    sampling_path = os.path.join(debug_dir, 'sampling_snapshots.pt')
-    optimize_path = os.path.join(debug_dir, 'optimize_snapshots.pt')
+def load_epoch_snapshots(debug_dir: str, epoch: int):
+    sampling_path = os.path.join(debug_dir, f'sampling_epoch{epoch}.pt')
+    optimize_path = os.path.join(debug_dir, f'optimize_epoch{epoch}.pt')
 
-    if not os.path.exists(sampling_path):
-        print(f"ERROR: {sampling_path} not found")
-        sys.exit(1)
-    if not os.path.exists(optimize_path):
-        print(f"ERROR: {optimize_path} not found")
-        sys.exit(1)
+    if not os.path.exists(sampling_path) or not os.path.exists(optimize_path):
+        return None, None
 
     sampling = torch.load(sampling_path, map_location='cpu')
     optimize = torch.load(optimize_path, map_location='cpu')
     return sampling, optimize
 
 
-def tensor_diff_stats(a: torch.Tensor, b: torch.Tensor, name: str):
-    """Print difference statistics between two tensors."""
+def tensor_diff_stats(a: torch.Tensor, b: torch.Tensor, name: str, verbose: bool = True):
+    """Print difference statistics between two tensors. Returns (exact_match, max_diff)."""
+    if a is None and b is None:
+        if verbose:
+            print(f"  {name}: both None")
+        return True, 0.0
+
     if a is None or b is None:
-        print(f"  {name}: one is None (sampling={a is not None}, optimize={b is not None})")
-        return
+        if verbose:
+            print(f"  {name}: ONE IS NONE (sampling={a is not None}, optimize={b is not None})")
+        return False, float('inf')
 
     if a.shape != b.shape:
-        print(f"  {name}: SHAPE MISMATCH! sampling={a.shape}, optimize={b.shape}")
-        return
+        if verbose:
+            print(f"  {name}: SHAPE MISMATCH! sampling={a.shape}, optimize={b.shape}")
+        return False, float('inf')
 
-    # Cast to float32 for comparison
-    a_f = a.float()
-    b_f = b.float()
+    # Cast to float64 for precise comparison
+    a_f = a.double()
+    b_f = b.double()
     diff = (a_f - b_f).abs()
 
-    exact_match = torch.equal(a, b)
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
-    num_nonzero = (diff > 0).sum().item()
-    total = diff.numel()
+    exact_match = max_diff < TOLERANCE
 
-    status = "✓ EXACT MATCH" if exact_match else "✗ DIFFERS"
-    print(f"  {name}: {status}")
-    if not exact_match:
-        print(f"    shape={list(a.shape)}, dtype sampling={a.dtype}, optimize={b.dtype}")
-        print(f"    max_abs_diff={max_diff:.2e}, mean_abs_diff={mean_diff:.2e}")
-        print(f"    nonzero_diffs={num_nonzero}/{total} ({100*num_nonzero/total:.1f}%)")
-        # Relative error (avoid div by zero)
-        denom = a_f.abs().clamp(min=1e-8)
-        rel_diff = diff / denom
-        print(f"    max_rel_diff={rel_diff.max().item():.2e}, mean_rel_diff={rel_diff.mean().item():.2e}")
-        # Show first few values
-        flat_a = a_f.flatten()[:6]
-        flat_b = b_f.flatten()[:6]
-        print(f"    first6 sampling: {flat_a.tolist()}")
-        print(f"    first6 optimize: {flat_b.tolist()}")
+    if verbose:
+        status = "✓ MATCH" if exact_match else "✗ DIFFERS"
+        print(f"  {name}: {status} (max_diff={max_diff:.2e})")
+        if not exact_match:
+            num_nonzero = (diff > TOLERANCE).sum().item()
+            total = diff.numel()
+            print(f"    shape={list(a.shape)}, dtype: samp={a.dtype}, opt={b.dtype}")
+            print(f"    mean_abs_diff={mean_diff:.2e}, nonzero(>{TOLERANCE:.0e})={num_nonzero}/{total}")
+            # Relative error
+            denom = a_f.abs().clamp(min=1e-10)
+            rel_diff = diff / denom
+            print(f"    max_rel_diff={rel_diff.max().item():.2e}")
+            # Show first few
+            flat_a = a_f.flatten()[:4]
+            flat_b = b_f.flatten()[:4]
+            print(f"    first4 samp: {[f'{v:.10f}' for v in flat_a.tolist()]}")
+            print(f"    first4 opt:  {[f'{v:.10f}' for v in flat_b.tolist()]}")
+
+    return exact_match, max_diff
 
 
-def analyze_step(step_idx: int, samp: dict, opt: dict):
-    """Analyze a single denoising step."""
-    print(f"\n{'='*70}")
-    print(f"STEP INDEX: {step_idx}")
-    print(f"{'='*70}")
+def analyze_step(step_idx: int, samp: dict, opt: dict, verbose: bool = True):
+    """Analyze a single denoising step. Returns dict of match results."""
+    results = {}
 
-    # Metadata
-    print(f"\n  [Metadata]")
-    print(f"  noise_level: sampling={samp.get('noise_level')}, optimize={opt.get('noise_level')}")
-    print(f"  compute_log_prob: sampling={samp.get('compute_log_prob')}")
-    print(f"  set_id (sampling): {samp.get('set_id')}")
-    if 'set_ids' in opt:
-        print(f"  set_ids (optimize): {opt['set_ids'].tolist()}")
+    if verbose:
+        print(f"\n{'─'*60}")
+        print(f"  STEP INDEX: {step_idx}")
+        print(f"{'─'*60}")
 
-    # Core tensors
-    print(f"\n  [Timesteps]")
-    tensor_diff_stats(samp.get('t'), opt.get('t'), 't')
-    tensor_diff_stats(samp.get('t_next'), opt.get('t_next'), 't_next')
+        # Metadata
+        print(f"  noise_level: samp={samp.get('noise_level')}, opt={opt.get('noise_level')}")
+        print(f"  set_id(samp)={samp.get('set_id')}, set_ids(opt)={opt.get('set_ids', 'N/A')}")
 
-    print(f"\n  [Latents]")
-    tensor_diff_stats(samp.get('latents'), opt.get('latents'), 'latents')
-    tensor_diff_stats(samp.get('next_latents'), opt.get('next_latents'), 'next_latents')
+    # Core tensor comparisons
+    fields = [
+        ('t', 'Timestep t'),
+        ('t_next', 'Timestep t_next'),
+        ('latents', 'Latents'),
+        ('next_latents', 'Next latents'),
+        ('v_combined', 'Combined velocity'),
+    ]
 
-    print(f"\n  [Teacher Velocities]")
+    for key, label in fields:
+        match, max_d = tensor_diff_stats(
+            samp.get(key), opt.get(key), label, verbose=verbose
+        )
+        results[key] = {'match': match, 'max_diff': max_d}
+
+    # Teacher velocities
     samp_tv = samp.get('teacher_velocities')
     opt_tv = opt.get('teacher_velocities')
     if samp_tv is not None and opt_tv is not None:
         for k in range(samp_tv.shape[0]):
-            tensor_diff_stats(samp_tv[k], opt_tv[k], f'teacher_v[{k}]')
-    else:
-        print(f"  teacher_velocities: sampling={samp_tv is not None}, optimize={opt_tv is not None}")
+            match, max_d = tensor_diff_stats(
+                samp_tv[k], opt_tv[k], f'Teacher v[{k}]', verbose=verbose
+            )
+            results[f'teacher_v_{k}'] = {'match': match, 'max_diff': max_d}
 
-    print(f"\n  [Weights]")
+    # Weights
     samp_w = samp.get('w_i')
     opt_w = opt.get('w_i')
     if samp_w is not None and opt_w is not None:
-        print(f"  w_i sampling (K,): {samp_w.tolist()}")
-        print(f"  w_i optimize (K, S): shape={list(opt_w.shape)}")
-        # For comparison, extract the column matching set_id
-        set_id = samp.get('set_id', 0)
         if opt_w.ndim == 2:
+            set_id = samp.get('set_id', 0)
             opt_w_slice = opt_w[:, set_id]
-            print(f"  w_i optimize[:, set_id={set_id}]: {opt_w_slice.tolist()}")
-            diff = (samp_w.float() - opt_w_slice.float()).abs().max().item()
-            print(f"  w_i max_diff: {diff:.2e}")
         else:
-            print(f"  w_i optimize: {opt_w.tolist()}")
+            opt_w_slice = opt_w
+        match, max_d = tensor_diff_stats(samp_w, opt_w_slice, 'Weights w_i', verbose=verbose)
+        results['w_i'] = {'match': match, 'max_diff': max_d}
+        if verbose and not match:
+            print(f"    w_i samp: {samp_w.tolist()}")
+            print(f"    w_i opt:  {opt_w_slice.tolist()}")
 
-    print(f"\n  [Combined Velocity]")
-    tensor_diff_stats(samp.get('v_combined'), opt.get('v_combined'), 'v_combined')
-
-    print(f"\n  [Log Probabilities]")
+    # Log probabilities
     samp_lp = samp.get('log_prob')
     opt_old_lp = opt.get('old_log_prob')
     opt_new_lp = opt.get('new_log_prob')
 
     if samp_lp is not None and opt_old_lp is not None:
-        tensor_diff_stats(samp_lp, opt_old_lp, 'log_prob (sampling vs old_log_prob)')
-
-    if samp_lp is not None and opt_new_lp is not None:
-        tensor_diff_stats(samp_lp, opt_new_lp, 'log_prob (sampling vs new_log_prob)')
+        match, max_d = tensor_diff_stats(
+            samp_lp, opt_old_lp, 'log_prob: samp vs old_log_prob', verbose=verbose
+        )
+        results['log_prob_samp_vs_old'] = {'match': match, 'max_diff': max_d}
 
     if opt_old_lp is not None and opt_new_lp is not None:
-        tensor_diff_stats(opt_old_lp, opt_new_lp, 'old_log_prob vs new_log_prob')
-        ratio = torch.exp(opt_new_lp.float() - opt_old_lp.float())
-        print(f"\n  [Ratio = exp(new - old)]")
-        print(f"    mean={ratio.mean().item():.8f}, std={ratio.std().item():.2e}")
-        print(f"    min={ratio.min().item():.8f}, max={ratio.max().item():.8f}")
-        print(f"    first6: {ratio.flatten()[:6].tolist()}")
+        match, max_d = tensor_diff_stats(
+            opt_old_lp, opt_new_lp, 'old_log_prob vs new_log_prob', verbose=verbose
+        )
+        results['old_vs_new_log_prob'] = {'match': match, 'max_diff': max_d}
+
+        ratio = torch.exp(opt_new_lp.double() - opt_old_lp.double())
+        ratio_dev = (ratio - 1.0).abs()
+        results['ratio'] = {
+            'mean': ratio.mean().item(),
+            'max_dev': ratio_dev.max().item(),
+            'values': ratio.tolist(),
+        }
+        if verbose:
+            is_one = ratio_dev.max().item() < TOLERANCE
+            status = "✓" if is_one else "✗"
+            print(f"  Ratio: mean={ratio.mean().item():.10f}, "
+                  f"max_dev={ratio_dev.max().item():.2e} {status}")
+            if not is_one:
+                print(f"    ratio values: {[f'{v:.10f}' for v in ratio.tolist()]}")
+
+    return results
 
 
 def main():
     debug_dir = sys.argv[1] if len(sys.argv) > 1 else 'debug'
     print(f"Loading debug snapshots from: {debug_dir}/")
+    print(f"Tolerance: {TOLERANCE:.0e}\n")
 
-    sampling, optimize = load_snapshots(debug_dir)
+    # Discover available epochs
+    available_epochs = []
+    for f in sorted(Path(debug_dir).glob('sampling_epoch*.pt')):
+        epoch = int(f.stem.replace('sampling_epoch', ''))
+        opt_f = Path(debug_dir) / f'optimize_epoch{epoch}.pt'
+        if opt_f.exists():
+            available_epochs.append(epoch)
 
-    # Print overview
-    sampling_steps = sorted(sampling.keys())
-    optimize_steps = sorted(optimize.keys())
-    print(f"\nSampling captured steps: {sampling_steps}")
-    print(f"Optimize captured steps: {optimize_steps}")
-    print(f"Common steps: {sorted(set(sampling_steps) & set(optimize_steps))}")
+    if not available_epochs:
+        # Fallback: try old format
+        if os.path.exists(os.path.join(debug_dir, 'sampling_snapshots.pt')):
+            print("Found legacy format (sampling_snapshots.pt). Use new per-epoch format.")
+        else:
+            print("ERROR: No debug snapshot files found!")
+        sys.exit(1)
 
-    # Analyze each common step
-    common_steps = sorted(set(sampling_steps) & set(optimize_steps))
-    if not common_steps:
-        print("\nWARNING: No common steps between sampling and optimize!")
-        print("This means the timestep_index mapping differs between phases.")
-        print(f"\nSampling step keys: {sampling_steps}")
-        print(f"Optimize step keys: {optimize_steps}")
-        # Try to match by position
-        print("\n--- Attempting positional matching ---")
-        for i, (s_key, o_key) in enumerate(zip(sampling_steps, optimize_steps)):
-            print(f"\nPositional match {i}: sampling key={s_key}, optimize key={o_key}")
-            analyze_step(s_key, sampling[s_key], optimize[o_key])
-        return
+    print(f"Available epochs: {available_epochs}\n")
 
-    for step_idx in common_steps:
-        analyze_step(step_idx, sampling[step_idx], optimize[step_idx])
+    # Per-epoch analysis
+    epoch_summaries = {}
+    for epoch in available_epochs:
+        sampling, optimize = load_epoch_snapshots(debug_dir, epoch)
+        if sampling is None:
+            continue
 
-    # Summary
-    print(f"\n{'='*70}")
-    print("SUMMARY")
-    print(f"{'='*70}")
-    all_ratios = []
-    for step_idx in common_steps:
-        opt = optimize[step_idx]
-        if 'old_log_prob' in opt and 'new_log_prob' in opt:
-            ratio = torch.exp(opt['new_log_prob'].float() - opt['old_log_prob'].float())
-            mean_r = ratio.mean().item()
-            all_ratios.append((step_idx, mean_r))
-            status = "✓" if abs(mean_r - 1.0) < 1e-6 else "✗"
-            print(f"  Step {step_idx}: ratio_mean={mean_r:.8f} {status}")
+        print(f"\n{'═'*70}")
+        print(f"  EPOCH {epoch}")
+        print(f"{'═'*70}")
 
-    if all_ratios:
-        deviations = [abs(r - 1.0) for _, r in all_ratios]
-        print(f"\n  Max ratio deviation from 1.0: {max(deviations):.2e}")
-        print(f"  Steps with ratio != 1: {sum(1 for d in deviations if d > 1e-6)}/{len(deviations)}")
+        sampling_steps = sorted(sampling.keys())
+        optimize_steps = sorted(optimize.keys())
+        common_steps = sorted(set(sampling_steps) & set(optimize_steps))
+
+        print(f"  Sampling steps: {sampling_steps}")
+        print(f"  Optimize steps: {optimize_steps}")
+        print(f"  Common steps:   {common_steps}")
+
+        if not common_steps:
+            print("  WARNING: No common steps! Trying positional match...")
+            common_steps = optimize_steps  # use optimize keys, match sampling by position
+            for o_key in common_steps:
+                if o_key in sampling:
+                    analyze_step(o_key, sampling[o_key], optimize[o_key])
+            continue
+
+        step_results = {}
+        for step_idx in common_steps:
+            results = analyze_step(step_idx, sampling[step_idx], optimize[step_idx])
+            step_results[step_idx] = results
+
+        epoch_summaries[epoch] = step_results
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Cross-epoch summary
+    # ═══════════════════════════════════════════════════════════════════════
+    print(f"\n\n{'═'*70}")
+    print("  CROSS-EPOCH SUMMARY")
+    print(f"{'═'*70}")
+
+    # Table header
+    all_steps = set()
+    for ep_data in epoch_summaries.values():
+        all_steps.update(ep_data.keys())
+    all_steps = sorted(all_steps)
+
+    print(f"\n  {'Field':<25}", end="")
+    for epoch in sorted(epoch_summaries.keys()):
+        print(f" | Epoch {epoch:<5}", end="")
+    print()
+    print(f"  {'─'*25}", end="")
+    for _ in epoch_summaries:
+        print(f" | {'─'*10}", end="")
+    print()
+
+    # For each step, show key metrics across epochs
+    for step_idx in all_steps:
+        print(f"\n  Step {step_idx}:")
+
+        for field in ['latents', 'v_combined', 'teacher_v_0', 'w_i', 'old_vs_new_log_prob']:
+            print(f"    {field:<22}", end="")
+            for epoch in sorted(epoch_summaries.keys()):
+                ep_data = epoch_summaries[epoch]
+                if step_idx in ep_data and field in ep_data[step_idx]:
+                    info = ep_data[step_idx][field]
+                    if info['match']:
+                        print(f" | {'✓':^10}", end="")
+                    else:
+                        print(f" | {info['max_diff']:.1e}", end="")
+                else:
+                    print(f" | {'N/A':^10}", end="")
+            print()
+
+        # Ratio row
+        print(f"    {'ratio_max_dev':<22}", end="")
+        for epoch in sorted(epoch_summaries.keys()):
+            ep_data = epoch_summaries[epoch]
+            if step_idx in ep_data and 'ratio' in ep_data[step_idx]:
+                dev = ep_data[step_idx]['ratio']['max_dev']
+                status = "✓" if dev < TOLERANCE else f"{dev:.1e}"
+                print(f" | {status:^10}", end="")
+            else:
+                print(f" | {'N/A':^10}", end="")
+        print()
+
+    # Final diagnosis
+    print(f"\n\n{'═'*70}")
+    print("  DIAGNOSIS")
+    print(f"{'═'*70}")
+
+    any_ratio_issue = False
+    for epoch in sorted(epoch_summaries.keys()):
+        for step_idx, results in epoch_summaries[epoch].items():
+            if 'ratio' in results and results['ratio']['max_dev'] >= TOLERANCE:
+                any_ratio_issue = True
+                print(f"\n  Epoch {epoch}, Step {step_idx}: ratio ≠ 1 (max_dev={results['ratio']['max_dev']:.2e})")
+                # Identify which inputs differ
+                diffs = []
+                for k, v in results.items():
+                    if k == 'ratio':
+                        continue
+                    if isinstance(v, dict) and 'match' in v and not v['match']:
+                        diffs.append(f"{k}(max_diff={v['max_diff']:.1e})")
+                if diffs:
+                    print(f"    Differing inputs: {', '.join(diffs)}")
+                else:
+                    print(f"    All inputs match but log_prob differs → precision/codepath issue")
+
+    if not any_ratio_issue:
+        print("\n  All ratios are exactly 1.0 (within tolerance). No train-inference inconsistency detected.")
 
 
 if __name__ == '__main__':
