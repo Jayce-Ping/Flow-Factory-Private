@@ -531,10 +531,11 @@ class TrainingArguments(ArgABC):
 def _standardize_clip_range(value, name: str) -> tuple[float, float]:
     """Convert a scalar or sequence to a symmetric (lo, hi) tuple."""
     if not isinstance(value, (tuple, list)):
-        return (-abs(value), abs(value))
-    value = tuple(float(v) for v in value)
-    assert value[0] < value[1], f"`{name}` lower bound must be less than upper bound, got {value}."
-    return (value[0], value[1])
+        v = float(value)
+        return (-abs(v), abs(v))
+    lo, hi = float(value[0]), float(value[1])
+    assert lo < hi, f"`{name}` lower bound must be less than upper bound, got ({lo}, {hi})."
+    return (lo, hi)
 
 
 def _standardize_timestep_range(value: Union[float, Tuple[float, float]]) -> Tuple[float, float]:
