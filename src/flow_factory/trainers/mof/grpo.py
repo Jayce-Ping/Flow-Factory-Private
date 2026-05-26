@@ -24,6 +24,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .common import MoFTrainerBase
+from ...hparams import MoFGRPOTrainingArguments
 from ...samples import BaseSample
 from ...utils.base import filter_kwargs, create_generator, stitch_batch_metadata
 from ...utils.trajectory_collector import compute_trajectory_indices
@@ -41,6 +42,8 @@ class MoFGRPOTrainer(MoFTrainerBase):
 
     Register as trainer_type: 'mof-grpo'.
     """
+
+    training_args: MoFGRPOTrainingArguments
 
     def sample(self) -> List[BaseSample]:
         """Generate rollouts with full trajectory + log_prob storage for GRPO."""

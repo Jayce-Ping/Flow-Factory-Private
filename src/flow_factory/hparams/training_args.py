@@ -720,20 +720,18 @@ class NFTTrainingArguments(TrainingArguments):
 
 
 @dataclass
-class MoFTrainingArguments(TrainingArguments):
-    r"""Training arguments for MoF (Mixture-of-Flow).
+class MoFBaseTrainingArguments(TrainingArguments):
+    r"""Base training arguments shared by all MoF (Mixture-of-Flow) variants.
 
-    Learns per-timestep, per-prompt-set softmax mixing weights over K frozen
-    teacher flow-matching velocities.  The combined velocity
-    ``v_combined(x, t_i, s) = sum_k softmax(logits[:, i, s]) * v_k(x, t_i)``
-    is optimized via DiffusionNFT with external reward feedback.
+    Contains teacher administration, lambda logit configuration, reward
+    pipeline settings, advantage processing, and timestep control fields
+    used by MoFTrainerBase.
+
+    Subclasses (MoFNFTTrainingArguments, MoFGRPOTrainingArguments) add
+    algorithm-specific optimization parameters.
 
     Total learnable parameters: K × T × S, where S is the number of prompt
     sets (determined automatically from ``teachers[*].sources``).
-
-    Key extension over MoTV: each prompt set has independent lambda weights,
-    enabling per-set optimization that guarantees >= single-teacher in-domain
-    performance (Level-1) and enables potential improvement (Level-2).
     """
 
     # ---- Teacher administration (reuse TeacherConfig for source routing) ----
@@ -779,13 +777,9 @@ class MoFTrainingArguments(TrainingArguments):
     )
 
     # ---- MoF core ----
-    nft_beta: float = field(
-        default=1.0,
-        metadata={"help": "Beta parameter for NFT loss (positive/negative interpolation)."},
-    )
     off_policy: bool = field(
         default=True,
-        metadata={"help": "Use EMA of logits for sampling (off-policy NFT)."},
+        metadata={"help": "Use EMA of logits for sampling (off-policy)."},
     )
     logits_init: Literal["uniform", "random", "teacher_biased"] = field(
         default="teacher_biased",
@@ -885,8 +879,8 @@ class MoFTrainingArguments(TrainingArguments):
             "help": (
                 "Number of training timesteps (T dimension of logits). "
                 "0 or None defaults to num_inference_steps. "
-                "Aligned with NFT: controls how many discrete timestep "
-                "slots to iterate over during optimization."
+                "MoF iterates over all inference steps because logits shape "
+                "is (K, T, S) where T = num_inference_steps."
             )
         },
     )
@@ -910,54 +904,26 @@ class MoFTrainingArguments(TrainingArguments):
     # ---- Optional KL (anchor to base model) ----
     kl_type: Literal["v-based"] = field(
         default="v-based",
-        metadata={"help": "Type of KL divergence. MoF supports 'v-based' only."},
+        metadata={"help": "Type of KL divergence. MoF base supports 'v-based' only."},
     )
     kl_beta: float = field(
         default=0,
         metadata={"help": "KL penalty beta. 0 to disable."},
     )
 
-    # ---- MoF-GRPO specific (only used when trainer_type='mof-grpo') ----
-    clip_range: tuple[float, float] = field(
-        default=(-1e-4, 1e-4),
-        metadata={"help": "PPO clip range for ratio (only used in MoF-GRPO mode)."},
-    )
-    mask_type: Literal["kl", "kl_adv", "clip", "none"] = field(
-        default="none",
-        metadata={
-            "help": "Policy loss masking (only used in MoF-GRPO mode). "
-                    "'none'=standard clipping, 'kl_adv'=DPPO-style masking."
-        },
-    )
-    kl_mask_threshold: float = field(
-        default=1.0e-5,
-        metadata={"help": "KL threshold for DPPO masking (only used in MoF-GRPO mode)."},
-    )
-    add_kl_coefficient: bool = field(
-        default=True,
-        metadata={
-            "help": "Scale KL denominator with transition sigma (compute_transition_sigma). "
-                    "When True, kl = diff² / (2σ²); when False, kl = diff² (unit variance)."
-        },
-    )
-
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
-        self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
 
-        # num_train_timesteps: defaults to num_inference_steps.
-        # MoF iterates over all inference steps because logits shape is
-        # (K, T, S) where T = num_inference_steps. The timestep_range is
-        # handled by TimeSampler (selects which scheduler timesteps to use),
-        # not by reducing T.
+        # num_train_timesteps defaults to num_inference_steps for logits shape (K, T, S).
+        # The timestep_range is handled by TimeSampler (selects which scheduler
+        # timesteps to use), not by reducing T.
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
             self.num_train_timesteps = self.num_inference_steps
 
         # Resolve teacher_paths from teachers if needed
         if self.teachers is not None:
-            # Coerce raw dicts (from YAML) to TeacherConfig objects
             coerced: List[TeacherConfig] = []
             for item in self.teachers:
                 if isinstance(item, TeacherConfig):
@@ -972,39 +938,110 @@ class MoFTrainingArguments(TrainingArguments):
             if not self.teacher_paths:
                 self.teacher_paths = [tc.path for tc in self.teachers]
         if not self.teacher_paths:
-            raise ValueError("MoFTrainingArguments requires at least one teacher (via 'teachers' or 'teacher_paths').")
+            raise ValueError(
+                "MoF requires at least one teacher (via 'teachers' or 'teacher_paths')."
+            )
 
+        # Validate MoF-specific fields
         if self.logits_init not in ["uniform", "random", "teacher_biased"]:
             raise ValueError(
                 f"Invalid logits_init: {self.logits_init!r}. "
                 f"Valid options are: ['uniform', 'random', 'teacher_biased']."
             )
-        if self.nft_beta <= 0:
-            raise ValueError(f"nft_beta must be > 0, got {self.nft_beta}.")
         if self.temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {self.temperature}")
-        if self.kl_type not in ["v-based"]:
-            raise ValueError(f"Invalid KL type: {self.kl_type}. Valid: ['v-based'].")
         if self.ood_bonus_gamma < 0:
             raise ValueError(f"ood_bonus_gamma must be >= 0, got {self.ood_bonus_gamma}.")
-        if self.mask_type not in ["kl", "kl_adv", "clip", "none"]:
-            raise ValueError(
-                f"Invalid mask_type: {self.mask_type}. Valid: ['kl', 'kl_adv', 'clip', 'none']."
-            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         """Return num_train_timesteps for gradient accumulation computation.
 
-        Used by _adjust_gradient_accumulation() to set:
-            gradient_accumulation_steps *= get_num_train_timesteps()
-        so that accelerator.accumulate() correctly handles the T timestep
-        iterations as gradient accumulation steps.
+        Default: all T timesteps (NFT-style full iteration).
+        MoF-GRPO overrides this to return scheduler_args.num_sde_steps.
         """
         return self.num_train_timesteps
 
 
-# Backward compatibility alias
-MoTVTrainingArguments = MoFTrainingArguments
+@dataclass
+class MoFNFTTrainingArguments(MoFBaseTrainingArguments):
+    r"""MoF with DiffusionNFT optimization.
+
+    Iterates over ALL T timesteps in the logits tensor per batch.
+    Gradient accumulation multiplier = num_inference_steps.
+
+    Register as trainer_type: 'mof-nft'.
+    """
+
+    nft_beta: float = field(
+        default=1.0,
+        metadata={"help": "Beta parameter for NFT loss (positive/negative interpolation)."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.nft_beta <= 0:
+            raise ValueError(f"nft_beta must be > 0, got {self.nft_beta}.")
+        if self.kl_type not in ["v-based"]:
+            raise ValueError(
+                f"MoF-NFT only supports kl_type='v-based', got {self.kl_type!r}."
+            )
+
+
+@dataclass
+class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
+    r"""MoF with GRPO (PPO-clipped ratio) optimization.
+
+    Iterates over scheduler.train_timesteps (subset of full trajectory).
+    Gradient accumulation multiplier = scheduler_args.num_sde_steps.
+
+    Register as trainer_type: 'mof-grpo'.
+    """
+
+    # ---- GRPO-specific fields ----
+    clip_range: tuple[float, float] = field(
+        default=(-1e-4, 1e-4),
+        metadata={"help": "PPO clip range for ratio."},
+    )
+    mask_type: Literal["kl", "kl_adv", "clip", "none"] = field(
+        default="none",
+        metadata={
+            "help": "Policy loss masking variant. "
+                    "'none'=standard clipping, 'kl_adv'=DPPO-style masking."
+        },
+    )
+    kl_mask_threshold: float = field(
+        default=1.0e-5,
+        metadata={"help": "KL threshold for DPPO masking."},
+    )
+    add_kl_coefficient: bool = field(
+        default=True,
+        metadata={
+            "help": "Scale KL denominator with transition sigma (compute_transition_sigma). "
+                    "When True, kl = diff² / (2σ²); when False, kl = diff² (unit variance)."
+        },
+    )
+    # Override kl_type to support x-based (needed for masking KL computation)
+    kl_type: Literal["v-based", "x-based"] = field(
+        default="x-based",
+        metadata={"help": "KL type. MoF-GRPO supports both 'v-based' and 'x-based'."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
+        if self.mask_type not in ["kl", "kl_adv", "clip", "none"]:
+            raise ValueError(
+                f"Invalid mask_type: {self.mask_type}. Valid: ['kl', 'kl_adv', 'clip', 'none']."
+            )
+        if self.kl_type not in ["v-based", "x-based"]:
+            raise ValueError(
+                f"Invalid kl_type: {self.kl_type}. Valid: ['v-based', 'x-based']."
+            )
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        """GRPO loops over scheduler.train_timesteps."""
+        return args.scheduler_args.num_sde_steps
+
 
 
 @dataclass
@@ -2065,8 +2102,8 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "grpo": GRPOTrainingArguments,
     "grpo-guard": GRPOTrainingArguments,
     "nft": NFTTrainingArguments,
-    "mof-nft": MoFTrainingArguments,
-    "mof-grpo": MoFTrainingArguments,
+    "mof-nft": MoFNFTTrainingArguments,
+    "mof-grpo": MoFGRPOTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,
