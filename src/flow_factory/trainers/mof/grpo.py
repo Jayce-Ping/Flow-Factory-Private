@@ -120,13 +120,15 @@ class MoFGRPOTrainer(MoFTrainerBase):
         # DEBUG: save sampling snapshots and prepare optimize snapshots
         _debug_sampling = getattr(self, '_debug_sampling_snapshots', None)
         _debug_save = (_debug_sampling is not None and len(_debug_sampling) > 0
-                       and self.accelerator.is_main_process and self.epoch == 0)
+                       and self.accelerator.is_main_process and self.epoch < 3)
         _debug_optimize_data = {}  # timestep_index → dict of tensors
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
             perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
+            # DEBUG: disable shuffle to keep batch alignment with sampling snapshots
+            # shuffled_samples = [samples[i] for i in perm]
+            shuffled_samples = samples
             loss_info = defaultdict(list)
 
             with self.autocast():
@@ -313,21 +315,19 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 self.step += 1
                                 loss_info = defaultdict(list)
 
-        # DEBUG: save all snapshots to debug/ directory
+        # DEBUG: save all snapshots to debug/ directory (per epoch)
         if _debug_save and _debug_optimize_data:
             import os
             debug_dir = os.path.join(os.getcwd(), 'debug')
             os.makedirs(debug_dir, exist_ok=True)
-            # Save sampling snapshots (first batch)
+            # Save sampling snapshots (first batch of this epoch)
             torch.save(
-                _debug_sampling[0],
-                os.path.join(debug_dir, 'sampling_snapshots.pt')
+                _debug_sampling[-1],  # last appended = this epoch's first batch
+                os.path.join(debug_dir, f'sampling_epoch{self.epoch}.pt')
             )
-            # Save optimize snapshots (first batch)
+            # Save optimize snapshots (first batch of this epoch)
             torch.save(
                 _debug_optimize_data,
-                os.path.join(debug_dir, 'optimize_snapshots.pt')
+                os.path.join(debug_dir, f'optimize_epoch{self.epoch}.pt')
             )
-            logger.info(f"[DEBUG] Saved debug snapshots to {debug_dir}/")
-            # Clear to avoid saving again
-            self._debug_sampling_snapshots = []
+            logger.info(f"[DEBUG] Saved epoch {self.epoch} debug snapshots to {debug_dir}/")
