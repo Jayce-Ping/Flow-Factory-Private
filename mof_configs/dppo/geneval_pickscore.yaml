@@ -55,10 +55,12 @@ train:
 
   # Per-source teacher configuration
   teachers:
-    - path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-760"
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-760"
       sources: [geneval]
       reward_name: "geneval"
-    - path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-820"
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-820"
       sources: [pickscore]
       reward_name: "pick_score"
 

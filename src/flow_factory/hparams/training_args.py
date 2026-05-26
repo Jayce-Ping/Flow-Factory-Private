@@ -1391,6 +1391,16 @@ class TeacherConfig(ArgABC):
             )
         },
     )
+    name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Human-readable name for this teacher (e.g., 'teacher-geneval'). "
+                "Used as the internal snapshot name and in logging/checkpointing. "
+                "If None, defaults to 'opd_teacher_{index}'."
+            )
+        },
+    )
     sources: Optional[List[str]] = field(
         default=None,
         metadata={
