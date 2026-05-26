@@ -532,6 +532,7 @@ def _standardize_clip_range(value, name: str) -> tuple[float, float]:
     """Convert a scalar or sequence to a symmetric (lo, hi) tuple."""
     if not isinstance(value, (tuple, list)):
         return (-abs(value), abs(value))
+    value = tuple(float(v) for v in value)
     assert value[0] < value[1], f"`{name}` lower bound must be less than upper bound, got {value}."
     return (value[0], value[1])
 
