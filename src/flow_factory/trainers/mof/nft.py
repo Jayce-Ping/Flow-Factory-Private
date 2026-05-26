@@ -25,6 +25,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .common import MoFTrainerBase
+from ...hparams import MoFNFTTrainingArguments
 from ...samples import BaseSample
 from ...utils.base import (
     filter_kwargs,
@@ -48,6 +49,7 @@ class MoFNFTTrainer(MoFTrainerBase):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.training_args: MoFNFTTrainingArguments
         self.nft_beta = self.training_args.nft_beta
 
     @staticmethod

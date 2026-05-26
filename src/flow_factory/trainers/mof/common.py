@@ -38,7 +38,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ..abc import BaseTrainer
-from ...hparams import MoFTrainingArguments
+from ...hparams import MoFBaseTrainingArguments
 from ...samples import BaseSample
 from ...rewards import RewardBuffer
 from ...ema import EMAModuleWrapper
@@ -192,7 +192,7 @@ class MoFTrainerBase(BaseTrainer):
         super().__init__(**kwargs)
         # Note: _initialization() (called by super) already created:
         #   self._teacher_names, self.K, self.S, self._lambda_logits, self.optimizer
-        self.training_args: MoFTrainingArguments
+        self.training_args: MoFBaseTrainingArguments
 
         # ---- Unpack config shortcuts ----
         self.off_policy = self.training_args.off_policy
