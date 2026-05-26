@@ -42,7 +42,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "nft_sd3-5_mof_geneval_pickscore"
+  run_name: "nft_sd3-5_mof_geneval_pickscore_uniform"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -69,7 +69,7 @@ train:
   # ---- MoF core hyperparameters ----
   nft_beta: 1.0                             # NFT loss interpolation strength (1.0 = standard DiffusionNFT)
   off_policy: true                          # Use EMA logits for sampling (stabilizes training)
-  logits_init: "teacher_biased"             # Init lambda biased toward in-domain teacher per set
+  logits_init: "uniform"             # Init lambda biased toward in-domain teacher per set
   logits_init_bias: 2.0                     # Bias strength: softmax(2.0, 0) ≈ (0.88, 0.12) for K=2
   learning_rate: 0.05                       # Learning rate for lambda logits (larger than typical model lr)
   temperature: 1.0                          # Softmax temperature: lower → sharper selection, higher → softer mixing
