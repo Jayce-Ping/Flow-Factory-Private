@@ -579,6 +579,9 @@ class MoFTrainerBase(BaseTrainer):
             # Extract (K, T) slice for this set
             set_weights = weights[:, :, set_id]  # (K, T)
 
+        # DEBUG: store per-step snapshots for train-inference consistency check
+        debug_snapshots = []
+
         def patched_forward(**kwargs):
             t_idx = min(step_counter[0], self.num_train_timesteps - 1)
             step_counter[0] += 1
@@ -599,6 +602,22 @@ class MoFTrainerBase(BaseTrainer):
             expand_shape = (self.K,) + (1,) * (stacked.ndim - 1)
             combined_noise_pred = (w_i.view(*expand_shape) * stacked).sum(dim=0)
 
+            # DEBUG: capture snapshot
+            debug_snapshots.append({
+                'step_idx': t_idx,
+                't': kwargs.get('t'),
+                't_next': kwargs.get('t_next'),
+                'latents_hash': kwargs.get('latents').flatten()[:8].clone() if kwargs.get('latents') is not None else None,
+                'latents_dtype': kwargs.get('latents').dtype if kwargs.get('latents') is not None else None,
+                'next_latents_hash': kwargs.get('next_latents').flatten()[:8].clone() if kwargs.get('next_latents') is not None else None,
+                'v_combined_hash': combined_noise_pred.detach().flatten()[:8].clone(),
+                'v_combined_dtype': combined_noise_pred.dtype,
+                'noise_level': kwargs.get('noise_level'),
+                'compute_log_prob': kwargs.get('compute_log_prob'),
+                'w_i': w_i.clone(),
+                'teacher_v_hashes': [v.detach().flatten()[:8].clone() for v in velocities],
+            })
+
             # Run scheduler step
             scheduler_kwargs = _build_scheduler_step_kwargs(
                 kwargs, combined_noise_pred, self._sched_cache
@@ -615,6 +634,11 @@ class MoFTrainerBase(BaseTrainer):
             finally:
                 torch.set_autocast_cache_enabled(prev_cache)
                 self.adapter.forward = original_forward  # type: ignore[method-assign]
+
+        # DEBUG: store snapshots for comparison in optimize
+        if not hasattr(self, '_debug_sampling_snapshots'):
+            self._debug_sampling_snapshots = []
+        self._debug_sampling_snapshots.append(debug_snapshots)
 
     @contextmanager
     def _single_teacher_inference_context(self, teacher_idx: int):
