@@ -1,0 +1,630 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\detach}{\mathrm{sg}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+
+\title{\textbf{MoF 连续权重网络：从离散查表到连续函数}\\[0.3em]
+\large 将 $\lambda_{k,t,s}$ 推广为 $\lambda_k = f_\psi(\mathbf{c}_{\text{prompt}}, \mathbf{c}_{\text{time}})$}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ═══════════════════════════════════════════════════════════════════
+\section{动机与问题定义}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{当前架构的局限}
+
+当前 MoF 将混合权重存储为离散查表张量：
+\begin{equation}
+\bm{\Lambda} \in \R^{K \times T \times S}, \quad
+w_{k,t,s} = \frac{\exp(\Lambda_{k,t,s} / \tau)}{\sum_{k'=1}^K \exp(\Lambda_{k',t,s} / \tau)}
+\end{equation}
+
+其中 $K$ = teacher 数量，$T$ = 训练时的 denoising 步数，$S$ = prompt 来源集合数量。
+
+\textbf{问题}：
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Timestep 绑定}：权重按 step index 查表，改变推理步数时无法正确映射；
+    \item \textbf{Prompt 离散化}：按 source 分类（geneval/pickscore/ocr），无法处理未见过的 prompt 类型或同一 source 内不同 prompt 的最优混合差异；
+    \item \textbf{泛化能力}：$K \times T \times S$ 参数是纯记忆（lookup table），不具备插值或外推能力。
+\end{enumerate}
+
+\subsection{目标}
+
+将混合权重从离散 lookup table 推广为连续函数：
+\begin{equation}
+\boxed{
+w_k(t, \mathbf{c}) = \frac{\exp(f_\psi^{(k)}(t, \mathbf{c}) / \tau)}
+{\sum_{k'=1}^K \exp(f_\psi^{(k')}(t, \mathbf{c}) / \tau)}
+}
+\end{equation}
+
+其中：
+\begin{itemize}
+    \item $t \in [0, 1]$：连续时间（归一化 timestep），支持任意推理步数；
+    \item $\mathbf{c}$：prompt 条件向量（可以是 pooled text embedding, 也可以是中间隐表示）；
+    \item $f_\psi: \R \times \R^{d_c} \to \R^K$：权重预测网络，参数为 $\psi$。
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{数学框架}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{符号定义}
+
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{符号} & \textbf{含义} \\
+\midrule
+$K$ & Teacher 模型数量 \\
+$v_k(\mathbf{x}_t, t, \mathbf{c})$ & 第 $k$ 个 teacher 在 $(\mathbf{x}_t, t, \mathbf{c})$ 处的预测速度（frozen） \\
+$w_k(t, \mathbf{c}; \psi)$ & 第 $k$ 个 teacher 的混合权重（learnable） \\
+$\bar{v}(\mathbf{x}_t, t, \mathbf{c})$ & 组合速度 $= \sum_{k=1}^K w_k(t,\mathbf{c}) \cdot v_k(\mathbf{x}_t, t, \mathbf{c})$ \\
+$\tau$ & Softmax 温度 \\
+$\psi$ & 权重网络参数 \\
+$\mathbf{c}_{\text{pool}}$ & Pooled text embedding $\in \R^{d}$（来自 text encoder） \\
+$\mathbf{e}_t$ & Timestep embedding $\in \R^{d_t}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{组合速度}
+
+在每个 denoising step，组合速度定义为：
+\begin{equation}
+\bar{v}(\mathbf{x}_t, t, \mathbf{c}; \psi) = \sum_{k=1}^K w_k(t, \mathbf{c}; \psi) \cdot \detach\bigl(v_k(\mathbf{x}_t, t, \mathbf{c})\bigr)
+\end{equation}
+
+$\detach(\cdot)$ 表示 stop-gradient（teacher 速度冻结，梯度仅流过权重）。
+
+\subsection{GRPO 损失（不变）}
+
+GRPO 优化目标不变：
+\begin{align}
+\text{ratio}(t) &= \exp\bigl(\log p_\psi(\mathbf{x}_{t-1} | \mathbf{x}_t, \mathbf{c}) - \log p_{\psi_{\text{old}}}(\mathbf{x}_{t-1} | \mathbf{x}_t, \mathbf{c})\bigr) \\
+\loss_{\text{GRPO}} &= -\E_{t, \mathbf{c}} \left[ \adv \cdot \min\bigl(\text{ratio}(t),\; \text{clip}(\text{ratio}(t), 1\pm\epsilon)\bigr) \right]
+\end{align}
+
+梯度链：
+\[
+\psi \xrightarrow{f_\psi} \text{logits} \xrightarrow{\softmax} w_k \xrightarrow{\text{combine}} \bar{v} \xrightarrow{\text{sched.step}} \log p_\psi \xrightarrow{\exp} \text{ratio} \xrightarrow{-\adv \cdot} \loss
+\]
+
+\subsection{梯度推导}
+
+设 $\ell_k = f_\psi^{(k)}(t, \mathbf{c})$ 为第 $k$ 个 teacher 的 logit 输出，则：
+\begin{equation}
+\frac{\partial w_k}{\partial \ell_j} = w_k(\delta_{kj} - w_j) / \tau
+\end{equation}
+
+对 $\bar{v}$ 的梯度：
+\begin{equation}
+\frac{\partial \bar{v}}{\partial \ell_j} = \frac{1}{\tau} \sum_{k=1}^K w_k(\delta_{kj} - w_j) \cdot v_k
+= \frac{w_j}{\tau} \left( v_j - \bar{v} \right)
+\end{equation}
+
+这说明 logit $\ell_j$ 的梯度方向与 teacher $j$ 的速度偏离组合速度的方向有关——当 advantage 为正时，梯度会倾向于增大那些能使 log-prob 增大的 teacher 的权重。
+
+对网络参数 $\psi$ 的梯度（通过链式法则）：
+\begin{equation}
+\frac{\partial \loss}{\partial \psi} = \sum_{k=1}^K \frac{\partial \loss}{\partial \ell_k} \cdot \frac{\partial \ell_k}{\partial \psi}
+= \sum_{k=1}^K \frac{\partial \loss}{\partial \ell_k} \cdot \nabla_\psi f_\psi^{(k)}(t, \mathbf{c})
+\end{equation}
+
+其中 $\frac{\partial \loss}{\partial \ell_k}$ 由 GRPO ratio-loss 反传得到（与当前离散版完全一致）。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{现代 DiT 模型的 Conditioning 机制分析}
+% ═══════════════════════════════════════════════════════════════════
+
+在设计 MoF 权重网络之前，需要理解主流 DiT 模型如何注入条件信息。不同模型采用不同策略，我们需要一个\textbf{通用}方案。
+
+\subsection{Flux.1 (Black Forest Labs)}
+
+\textbf{Text 注入}：
+\begin{itemize}
+    \item 使用 T5-XXL（dense text features）+ CLIP（cross-modal alignment）双编码器
+    \item \textbf{无 pooled output}：Flux.1 的 MMDiT 直接通过 joint attention 处理 text token 序列
+    \item Text tokens 与 image tokens 拼接后通过 joint self-attention 交互
+\end{itemize}
+
+\textbf{Timestep 注入}：
+\begin{itemize}
+    \item 通过 \textbf{adaLN-Zero}（Adaptive Layer Normalization）将 timestep embedding 注入每个 block
+    \item timestep $\to$ SinusoidalEmb $\to$ MLP $\to$ ($\gamma, \beta, \alpha$) 用于调制 LayerNorm
+    \item \textbf{无显式的 pooled\_projections 输入}
+\end{itemize}
+
+\textbf{对 MoF 的启示}：Flux.1 没有 pooled text embedding，只有 text token 序列。若要支持 Flux，必须从 \texttt{prompt\_embeds} 序列中提取条件信息。
+
+\subsection{Qwen-Image / Wan (Alibaba)}
+
+\textbf{Text 注入}：
+\begin{itemize}
+    \item 使用 Qwen2.5-VL (7B) 作为 text encoder，输出 dense token 序列
+    \item 通过 cross-attention 在每个 DiT block 中注入
+    \item \textbf{无 pooled output}：直接用完整 hidden states 做 cross-attention
+    \item MS-RoPE 实现 text token 与 image patch 的空间对齐
+\end{itemize}
+
+\textbf{Timestep 注入}：
+\begin{itemize}
+    \item 标准 adaLN 机制：timestep embedding 通过 MLP 生成 scale/shift 参数
+\end{itemize}
+
+\textbf{对 MoF 的启示}：Wan 同样没有 pooled embedding，只有序列。路由网络必须能处理变长 token 序列。
+
+\subsection{SD3.5 (Stability AI)}
+
+\textbf{Text 注入}：
+\begin{itemize}
+    \item CLIP-L + CLIP-G + T5-XXL 三编码器
+    \item \textbf{有 pooled output}：$\mathbf{c}_{\text{pool}} \in \R^{2048}$（CLIP pooled 拼接）
+    \item Token 序列通过 MMDiT joint attention 注入
+    \item Pooled embedding 通过 \texttt{pooled\_projections} 输入，与 timestep embedding 拼接后送入 adaLN
+\end{itemize}
+
+\textbf{Timestep 注入}：
+\begin{itemize}
+    \item Sinusoidal $\to$ MLP $\to$ 与 pooled\_projections 拼接 $\to$ adaLN modulation
+\end{itemize}
+
+\subsection{通用性分析}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+\textbf{模型} & \textbf{pooled\_embeds} & \textbf{prompt\_embeds 序列} & \textbf{DiT hidden states} \\
+\midrule
+SD3.5 & $\checkmark$ ($\R^{2048}$) & $\checkmark$ ($\R^{L \times 4096}$) & $\checkmark$ \\
+Flux.1 & $\times$ & $\checkmark$ ($\R^{L \times 4096}$) & $\checkmark$ \\
+Wan/Qwen & $\times$ & $\checkmark$ ($\R^{L \times d}$) & $\checkmark$ \\
+PixArt-$\alpha$ & $\times$ & $\checkmark$ ($\R^{L \times 4096}$) & $\checkmark$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{结论}：\texttt{pooled\_embeds} 不通用（仅 SD3 有）；\texttt{prompt\_embeds} 序列所有模型都有；DiT hidden states 所有模型都有。
+
+\subsection{DiT Router 相关工作}
+
+近期 DiT MoE 路由网络（2024--2025）的关键设计：
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{MoDE}（Noise-Conditioned Routing）：根据 denoising timestep 的噪声水平选择 expert，实现 expert 在不同噪声阶段的专业化。
+    \item \textbf{EC-DiT}（Expert-Choice）：基于 text complexity 和 image patch 重要性分配 expert，97B 参数 64 experts。
+    \item \textbf{ProMoE}（Prototypical Routing）：用 learnable prototypes 在 latent space 做语义级别路由。
+    \item \textbf{adaLN-single}（PixArt-$\alpha$）：所有 block 共享一组 timestep-conditioned 调制参数，通过 per-block learnable offset 区分。
+\end{enumerate}
+
+这些工作的共同模式是：\textbf{router 输入为当前 step 的 hidden states（或条件 embedding），输出为 per-expert 权重}。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{权重网络架构设计}
+% ═══════════════════════════════════════════════════════════════════
+
+基于上述分析，权重网络的输入需要满足\textbf{跨模型通用性}。我们分析可用信号源及对应方案。
+
+\subsection{可用信号源}
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{prompt\_embeds}（所有模型都有）：text encoder 输出的 token 序列 $\mathbf{H} \in \R^{B \times L \times d_{\text{text}}}$
+    \item \textbf{timestep}（所有模型都有）：连续时间 $t \in [0, 1]$ 或 scheduler 整数值
+    \item \textbf{pooled\_prompt\_embeds}（仅 SD3）：全局 text summary $\in \R^{B \times d_{\text{pool}}}$
+    \item \textbf{DiT hidden states}（所有模型都有）：中间层 $\mathbf{Z}_l \in \R^{B \times (H'W' + L) \times d_{\text{model}}}$
+\end{enumerate}
+
+\subsection{输入表示方案}
+
+\subsubsection{方案 A：Attention Pooling on prompt\_embeds（推荐）}
+
+对变长 text token 序列做 attention-based pooling，产出固定维度的 prompt summary：
+\begin{equation}
+\mathbf{c} = \text{AttnPool}(\mathbf{H}) = \frac{\sum_{i=1}^L \alpha_i \mathbf{h}_i}{\sum_{i=1}^L \alpha_i}, \quad
+\alpha_i = \exp(\mathbf{q}^\top \mathbf{h}_i / \sqrt{d})
+\end{equation}
+
+其中 $\mathbf{q} \in \R^{d_\text{text}}$ 是 learnable query vector。
+
+\textbf{优势}：
+\begin{itemize}
+    \item \textbf{通用}：所有模型都有 prompt\_embeds（无论是否有 pooled output）
+    \item \textbf{轻量}：仅需 1 个 learnable query vector + projection（$\sim d$ 参数）
+    \item \textbf{有效}：attention pooling 已被验证优于 mean pooling（Set Transformer, Perceiver 等）
+    \item \textbf{可降级}：对有 pooled\_embeds 的模型，可直接用 pooled\_embeds bypass attention pooling
+\end{itemize}
+
+\subsubsection{方案 B：Mean Pooling on prompt\_embeds}
+
+\begin{equation}
+\mathbf{c} = \frac{1}{L} \sum_{i=1}^L \mathbf{h}_i
+\end{equation}
+
+\textbf{优势}：无额外参数。\textbf{劣势}：信息损失大，长序列被稀释。
+
+\subsubsection{方案 C：DiT Hidden States（最强但最贵）}
+
+从 DiT 的某个中间层提取 hidden states 作为条件：
+\begin{equation}
+\mathbf{c} = \text{Pool}(\mathbf{Z}_{l^*}[\text{text\_tokens}])
+\end{equation}
+
+即取 DiT 第 $l^*$ 层的 text-position hidden states 做 pooling。
+
+\textbf{优势}：包含图像-文本交互后的信息（text tokens 已经 attend to image patches）。
+
+\textbf{劣势}：
+\begin{itemize}
+    \item 需要在 \textbf{teacher forward 之前}获取 hidden states → 需要额外一次 partial forward
+    \item 或者使用\textbf{前一步的 hidden states}（one-step delay），牺牲少量信息
+    \item 增加计算开销
+\end{itemize}
+
+\textbf{适用场景}：当 prompt\_embeds 不足以区分样本时（如所有样本用相同 prompt template）。
+
+\subsubsection{Timestep 条件（统一方案）}
+
+所有方案共享同一种 timestep encoding：
+\begin{equation}
+\mathbf{e}_t = \text{MLP}(\text{SinusoidalPosEmb}(t)) \in \R^{d_h}
+\end{equation}
+
+其中 $t$ 为 scheduler 的归一化时间值 $\in [0, 1]$。MLP 将正弦编码映射到网络隐层维度。
+
+\subsection{网络结构方案}
+
+\subsubsection{方案 I：adaLN-style MLP Router（\textbf{推荐}）}
+
+受 PixArt-$\alpha$ 的 adaLN-single 和 MoDE noise-conditioned routing 启发，采用类似 adaLN 的条件注入方式：
+
+\begin{align}
+\mathbf{e}_t &= \text{SiLU}(\text{Linear}(\text{SinusoidalEmb}(t))) \in \R^{d_h} \\
+\mathbf{c} &= \text{AttnPool}(\text{prompt\_embeds}) \in \R^{d_{\text{text}}} \\
+\mathbf{c}_{\text{proj}} &= \text{Linear}(\mathbf{c}) \in \R^{d_h} \\[0.5em]
+\text{(adaLN modulation)} &\quad \gamma, \beta = \text{chunk}(\text{Linear}(\mathbf{e}_t), 2) \\
+\mathbf{h} &= \gamma \odot \mathbf{c}_{\text{proj}} + \beta \quad \text{(time modulates text)} \\
+\mathbf{h} &= \text{SiLU}(\text{Linear}(\mathbf{h})) \\
+\bm{\ell} &= \text{Linear}(\mathbf{h}) \in \R^K
+\end{align}
+
+\textbf{核心思想}：timestep 通过 adaLN 调制 text embedding，使得同一 prompt 在不同去噪阶段产生不同权重。这直接对应 MoDE 的发现——不同噪声阶段需要不同 expert 专业化。
+
+\textbf{参数量}：设 $d_h = 256$, $d_{\text{text}} = 4096$, $K = 3$：
+\[
+\underbrace{256}_{\text{SinEmb}} + \underbrace{256 \cdot 256}_{e_t\text{ MLP}} + \underbrace{d_{\text{text}}}_{q_{\text{attn}}} + \underbrace{4096 \cdot 256}_{c_{\text{proj}}} + \underbrace{256 \cdot 512}_{\gamma,\beta} + \underbrace{256 \cdot 256}_{\text{MLP}} + \underbrace{256 \cdot 3}_{\text{out}} \approx 1.2\text{M}
+\]
+
+\subsubsection{方案 II：简化 MLP（基线）}
+
+直接拼接所有条件：
+\begin{equation}
+f_\psi(t, \mathbf{c}) = \text{MLP}\bigl([\mathbf{e}_t;\; \text{Linear}(\text{AttnPool}(\mathbf{H}))]\bigr) \in \R^K
+\end{equation}
+
+\begin{align}
+\mathbf{h}_0 &= [\mathbf{e}_t;\; \mathbf{c}_{\text{proj}}] \in \R^{2d_h} \\
+\mathbf{h}_1 &= \text{SiLU}(\text{Linear}_{2d_h \to d_h}(\mathbf{h}_0)) \\
+\bm{\ell} &= \text{Linear}_{d_h \to K}(\mathbf{h}_1)
+\end{align}
+
+\textbf{优势}：最简单，debug 容易。\textbf{劣势}：time 和 text 的交互只能依赖 MLP 隐式学习。
+
+\subsubsection{方案 III：Cross-Attention Router}
+
+以 teacher learnable embedding 为 KV，条件向量为 Q：
+\begin{align}
+\mathbf{q} &= W_q [\mathbf{e}_t;\; \mathbf{c}] \in \R^{d_k} \\
+\mathbf{K} &= W_k \cdot \mathbf{E}_{\text{teachers}} \in \R^{K \times d_k} \quad (\text{learnable teacher embeddings}) \\
+\bm{\ell} &= \frac{\mathbf{K} \cdot \mathbf{q}}{\sqrt{d_k}} \in \R^K
+\end{align}
+
+\textbf{优势}：结构化，可解释（teacher embedding 空间可视化），参数高效。
+
+\textbf{劣势}：当 $K$ 小（$=3$）时，teacher embedding 可能退化为 bias 向量。
+
+\subsubsection{方案 IV：DiT Hidden State Router（最强泛化）}
+
+利用 DiT 中间层的 hidden states（已包含 image-text 交互信息）：
+\begin{align}
+\mathbf{Z}_l &= \text{DiT.layer}_{l}(\mathbf{x}_t, \mathbf{c}) \quad \text{(hook from teacher forward)} \\
+\mathbf{h}_{\text{text}} &= \text{AttnPool}(\mathbf{Z}_l[\text{text positions}]) \\
+\bm{\ell} &= \text{MLP}([\mathbf{h}_{\text{text}};\; \mathbf{e}_t])
+\end{align}
+
+\textbf{适用场景}：prompt\_embeds 不能充分区分样本时。但增加实现复杂度（需 forward hook 或 dual pass）。
+
+% ═══════════════════════════════════════════════════════════════════
+\subsection{推荐方案与理由}
+% ═══════════════════════════════════════════════════════════════════
+
+\begin{tcolorbox}[colback=blue!5!white,colframe=blue!50!black,title=\textbf{最终推荐：方案 I (adaLN-style MLP + AttnPool)}]
+
+\textbf{架构}：
+\begin{enumerate}
+    \item \textbf{Text 条件}：AttnPool(prompt\_embeds) → Linear projection
+    \item \textbf{Time 条件}：SinusoidalEmb(t) → MLP → 产生 $\gamma, \beta$
+    \item \textbf{融合}：Time adaLN-modulates Text → MLP → K logits
+\end{enumerate}
+
+\textbf{选择理由}：
+\begin{enumerate}
+    \item \textbf{通用性}：仅依赖 prompt\_embeds + timestep，所有 DiT 模型都有这两个信号
+    \item \textbf{符合 DiT 范式}：adaLN 是所有主流 DiT (SD3, Flux, PixArt, Wan) 注入 timestep 的标准方式。我们的 router 复用这一设计，使其行为与 DiT 内部一致
+    \item \textbf{噪声阶段专业化}：Time modulates text embedding → 同一 prompt 在去噪早期（全局结构）vs 晚期（细节纹理）选择不同 teacher 权重。这对应 MoDE 的核心发现
+    \item \textbf{参数效率}：$\sim 1.2$M 参数（vs teacher 几十亿参数），训练快速收敛
+    \item \textbf{可降级}：当模型提供 pooled\_embeds 时，可跳过 AttnPool 直接使用 pooled\_embeds
+\end{enumerate}
+\end{tcolorbox}
+
+\begin{center}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{方案} & \textbf{通用性} & \textbf{参数量} & \textbf{表达力} & \textbf{训练稳定性} & \textbf{推理开销} \\
+\midrule
+II. 简化 MLP & 高 & $\sim 1$M & 中 & 高 & $< 1$ms \\
+\textbf{I. adaLN Router} & \textbf{高} & $\sim 1.2$\textbf{M} & \textbf{强} & \textbf{高} & $< 1$\textbf{ms} \\
+III. Cross-Attn Router & 高 & $\sim 0.5$M & 中 & 中 & $< 1$ms \\
+IV. Hidden State Router & 最高 & $\sim 1.5$M & 最强 & 中 & $\sim 5$ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{训练流程}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{与当前 GRPO 的对比}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+& \textbf{当前（离散 LUT）} & \textbf{扩展（连续网络）} \\
+\midrule
+可学习参数 & $\bm{\Lambda} \in \R^{K \times T \times S}$ & 网络参数 $\psi$ \\
+权重获取 & $w = \softmax(\bm{\Lambda}[:, t_{\text{idx}}, s] / \tau)$ & $w = \softmax(f_\psi(t, \mathbf{c}) / \tau)$ \\
+优化器输入 & $\bm{\Lambda}$ (单 Parameter) & $\psi$ (网络所有参数) \\
+梯度流 & $\loss \to w \to \bm{\Lambda}$ & $\loss \to w \to \ell \to \psi$ \\
+推理时输入 & step index $t_{\text{idx}}$, source $s$ & 连续 $t$, prompt embedding $\mathbf{c}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{训练伪代码}
+
+\begin{algorithm}[H]
+\caption{MoF-GRPO with Continuous Weight Network}
+\begin{algorithmic}[1]
+\Require 冻结的 teacher 模型 $\{v_k\}_{k=1}^K$，权重网络 $f_\psi$，text encoder $\text{TE}$
+\Require Scheduler, 学习率 $\eta$, clip range $\epsilon$, advantage $\adv$
+
+\For{epoch $= 1, 2, \ldots$}
+    \State \textcolor{blue}{\texttt{// ── Phase 1: Sampling (on-policy) ──}}
+    \For{each batch of prompts $\{\mathbf{p}_b\}_{b=1}^B$}
+        \State $\mathbf{c}_b \gets \text{TE}(\mathbf{p}_b).\text{pooled}$ \Comment{Prompt conditioning}
+        \State $\mathbf{x}_T \sim \N(0, I)$ \Comment{Initial noise}
+        \For{$i = 0, 1, \ldots, N-1$} \Comment{Denoising steps}
+            \State $t \gets \text{Scheduler.timesteps}[i]$ \Comment{Continuous time value}
+            \State $\bm{\ell} \gets f_\psi(t, \mathbf{c}_b)$ \Comment{Predict logits, shape $(K,)$}
+            \State $\mathbf{w} \gets \softmax(\bm{\ell} / \tau)$ \Comment{Normalize weights}
+            \For{$k = 1, \ldots, K$}
+                \State $\hat{v}_k \gets v_k(\mathbf{x}_t, t, \mathbf{c}_b)$ \Comment{Frozen teacher forward}
+            \EndFor
+            \State $\bar{v} \gets \sum_k w_k \cdot \hat{v}_k$ \Comment{Combine velocities}
+            \State $\mathbf{x}_{t-1}, \log p_{\text{old}} \gets \text{Scheduler.step}(\bar{v}, t, \mathbf{x}_t)$
+            \State Store: $(\mathbf{x}_t, t, \mathbf{c}_b, \log p_{\text{old}})$
+        \EndFor
+    \EndFor
+    \State Compute rewards and advantages $\adv_b$ for each trajectory
+
+    \State
+    \State \textcolor{blue}{\texttt{// ── Phase 2: Optimization (GRPO) ──}}
+    \For{each stored tuple $(\mathbf{x}_t, t, \mathbf{c}_b, \log p_{\text{old}}, \adv_b)$}
+        \State \textcolor{red}{$\bm{\ell} \gets f_\psi(t, \mathbf{c}_b)$} \Comment{Re-compute with \textbf{current} $\psi$}
+        \State $\mathbf{w} \gets \softmax(\bm{\ell} / \tau)$
+        \For{$k = 1, \ldots, K$}
+            \State $\hat{v}_k \gets \detach(v_k(\mathbf{x}_t, t, \mathbf{c}_b))$ \Comment{Detached}
+        \EndFor
+        \State $\bar{v} \gets \sum_k w_k \cdot \hat{v}_k$ \Comment{Grad flows through $w_k$}
+        \State $\log p_{\text{new}} \gets \text{Scheduler.step}(\bar{v}, t, \mathbf{x}_t, \mathbf{x}_{t-1}).\text{log\_prob}$
+        \State $r \gets \exp(\log p_{\text{new}} - \log p_{\text{old}})$ \Comment{Policy ratio}
+        \State $\loss \gets -\adv_b \cdot \min(r, \text{clip}(r, 1\pm\epsilon))$
+        \State $\psi \gets \psi - \eta \cdot \nabla_\psi \loss$ \Comment{Update network}
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{关键设计选择}
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{On-policy 一致性}：Sampling 和 Optimization 必须使用\emph{同一个} $f_\psi$（当前版本）来保证 ratio $= 1$ at iteration start。这与我们之前修复的 \texttt{off\_policy=False} 约束完全一致。
+
+\item \textbf{Prompt conditioning 的来源}：sampling 阶段 text encoder 已经运行过，pooled embedding 可以直接复用（零额外成本）。
+
+\item \textbf{Timestep 的传入}：使用 scheduler 的\textbf{连续时间值}（而非 step index），这样权重网络天然支持任意步数推理。
+
+\item \textbf{训练信号}：梯度来源与离散版完全相同（GRPO ratio loss），唯一变化是 $\partial \ell / \partial \psi$ 由网络反传提供（替代了对 lookup table 的直接更新）。
+\end{enumerate}
+
+% (方案对比已在 Section 4 的推荐方案部分给出)
+
+% ═══════════════════════════════════════════════════════════════════
+\section{实现考量}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{与现有代码的对接}
+
+当前 \texttt{MoFMixingModule} 需替换为：
+
+\begin{verbatim}
+class MoFWeightNetwork(nn.Module):
+    """adaLN-style continuous weight prediction network.
+
+    Inputs: prompt_embeds (sequence) + timestep (scalar)
+    Output: (K,) or (K, B) mixing weights
+
+    Architecture:
+      1. AttnPool(prompt_embeds) -> c_proj  [text summary]
+      2. SinusoidalEmb(t) -> MLP -> (gamma, beta)  [time modulation]
+      3. gamma * c_proj + beta  [adaLN fusion]
+      4. MLP -> K logits -> softmax
+    """
+    def __init__(self, K, d_text, d_hidden=256, d_time=256, tau=1.0):
+        super().__init__()
+        self.K = K
+        self.tau = tau
+
+        # Attention pooling for prompt_embeds (universal)
+        self.attn_query = nn.Parameter(torch.randn(1, 1, d_text))
+        self.c_proj = nn.Linear(d_text, d_hidden)
+
+        # Timestep embedding -> adaLN parameters
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(d_time),
+            nn.Linear(d_time, d_hidden),
+            nn.SiLU(),
+        )
+        self.adaLN_modulation = nn.Linear(d_hidden, 2 * d_hidden)  # gamma, beta
+
+        # Output MLP
+        self.mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_hidden, d_hidden),
+            nn.SiLU(),
+            nn.Linear(d_hidden, K),
+        )
+        # Zero-init output for stable start (uniform weights)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, t, prompt_embeds, pooled_prompt_embeds=None):
+        """
+        Args:
+            t: (B,) timestep (normalized or raw scheduler value)
+            prompt_embeds: (B, L, d_text) text token sequence
+            pooled_prompt_embeds: (B, d_pool) optional, bypass AttnPool
+        Returns:
+            weights: (K, B) mixing weights
+        """
+        # Text conditioning
+        if pooled_prompt_embeds is not None:
+            c = self.c_proj(pooled_prompt_embeds)  # (B, d_hidden)
+        else:
+            # Attention pooling over token sequence
+            attn_scores = (self.attn_query @ prompt_embeds.transpose(-1, -2))
+            attn_weights = F.softmax(attn_scores / (prompt_embeds.shape[-1] ** 0.5), dim=-1)
+            c_pooled = (attn_weights @ prompt_embeds).squeeze(1)  # (B, d_text)
+            c = self.c_proj(c_pooled)  # (B, d_hidden)
+
+        # Time conditioning -> adaLN modulation
+        e_t = self.time_embed(t)  # (B, d_hidden)
+        gamma, beta = self.adaLN_modulation(e_t).chunk(2, dim=-1)
+
+        # adaLN fusion: time modulates text
+        h = gamma * c + beta  # (B, d_hidden)
+
+        # Predict logits
+        logits = self.mlp(h)  # (B, K)
+        weights = F.softmax(logits / self.tau, dim=-1)  # (B, K)
+        return weights.T  # (K, B) for velocity stacking convention
+\end{verbatim}
+
+\subsection{Sampling 阶段的变化}
+
+\texttt{\_mof\_inference\_context} 中，将：
+\begin{verbatim}
+w_i = set_weights[:, t_idx]  # (K,) from lookup
+\end{verbatim}
+替换为：
+\begin{verbatim}
+w_i = self._weight_network(t_normalized, prompt_embeds, pooled)  # (K, B)
+\end{verbatim}
+
+\subsection{Optimization 阶段的变化}
+
+\texttt{grpo.py} 的 \texttt{\_combine\_velocities\_per\_sample} 调用处，将：
+\begin{verbatim}
+current_weights = self._get_lambda_weights(self._lambda_logits)  # (K, T, S)
+v_combined = self._combine_velocities_per_sample(
+    teacher_velocities, timestep_index, current_weights, set_ids
+)
+\end{verbatim}
+替换为：
+\begin{verbatim}
+# t: (B,) actual timestep values, c_pool: (B, d_pool)
+weights = self._weight_network(t, batch['pooled_prompt_embeds'])  # (K, B)
+# Expand for spatial dims and combine
+w_expanded = weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)   # (K, B, 1, 1, 1)
+v_combined = (w_expanded * teacher_velocities).sum(dim=0)        # (B, C, H, W)
+\end{verbatim}
+
+\subsection{训练超参建议}
+
+\begin{itemize}
+    \item \textbf{学习率}：$10^{-4}$ 至 $5 \times 10^{-4}$（比离散版的 $0.05$ 小很多，因为网络参数相互耦合）
+    \item \textbf{权重衰减}：$10^{-4}$（防止权重爆炸）
+    \item \textbf{温度 $\tau$}：初始 $1.0$，可 anneal 到 $0.5$
+    \item \textbf{初始化}：输出层 bias 初始化为 $0$（uniform weights at start）
+    \item \textbf{Gradient clipping}：$\text{max\_grad\_norm} = 1.0$
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{渐进式实现路线}
+% ═══════════════════════════════════════════════════════════════════
+
+\textbf{阶段 1}（验证可行性）：
+\begin{enumerate}
+    \item 保持离散 LUT 不变，仅在推理脚本中用 MLP 拟合已训练好的离散权重，验证连续化不损失性能。
+\end{enumerate}
+
+\textbf{阶段 2}（端到端训练）：
+\begin{enumerate}
+    \item 替换 \texttt{MoFMixingModule} 为 \texttt{MoFWeightNetwork}
+    \item 修改 optimizer 为网络参数
+    \item 在现有 GRPO 框架下训练，验证收敛性
+\end{enumerate}
+
+\textbf{阶段 3}（泛化验证）：
+\begin{enumerate}
+    \item 用训练时未见过的 prompt 测试（OOD generalization）
+    \item 用不同推理步数测试（timestep generalization）
+    \item 与离散版做 A/B 对比
+\end{enumerate}
+
+\end{document}
