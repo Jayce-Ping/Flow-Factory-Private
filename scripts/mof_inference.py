@@ -56,8 +56,13 @@ def load_mof_weights(
     set_id: int = 0,
     temperature: float = 1.0,
     use_ema: bool = False,
+    teacher_names: Optional[List[str]] = None,
 ) -> torch.Tensor:
     """Load and compute lambda weights from MoF checkpoint.
+
+    Args:
+        teacher_names: Display names for each teacher (k=0,1,...).
+            Must match the order of --teachers (i.e., training order).
 
     Returns:
         weights: Tensor of shape (K, T) for the specified set.
@@ -95,9 +100,10 @@ def load_mof_weights(
     source_map = state.get("source_to_set_id", {})
     if source_map:
         set_to_source = {v: k for k, v in source_map.items()}
-        print(f"  Source map: {source_map}")
+        print(f"  Source→set_id map (S dimension): {source_map}")
         if set_id in set_to_source:
-            print(f"  Using set_id={set_id} ({set_to_source[set_id]})")
+            print(f"  Using set_id={set_id} → weights optimized for '{set_to_source[set_id]}' prompts")
+    print(f"  NOTE: K dimension (teacher axis) follows --teachers order, NOT source_map order")
 
     if set_id >= S:
         raise ValueError(f"set_id={set_id} out of range (S={S})")
@@ -106,11 +112,14 @@ def load_mof_weights(
     weights = F.softmax(logits / temperature, dim=0)  # (K, T, S)
     set_weights = weights[:, :, set_id]  # (K, T)
 
-    # Print weight summary
+    # Print weight summary (k indexes teacher in training order)
     for k in range(K):
-        teacher_name = set_to_source.get(k, f"teacher_{k}") if source_map else f"teacher_{k}"
+        if teacher_names and k < len(teacher_names):
+            name = teacher_names[k]
+        else:
+            name = f"teacher_{k}"
         w = set_weights[k]
-        print(f"    {teacher_name}: mean={w.mean():.4f}, min={w.min():.4f}, max={w.max():.4f}")
+        print(f"    [k={k}] {name}: mean={w.mean():.4f}, min={w.min():.4f}, max={w.max():.4f}")
 
     return set_weights
 
@@ -514,11 +523,19 @@ def main():
 
     # ─── Load MoF weights ───
     print("\n[1/4] Loading MoF weights...")
+
+    # Teacher display names for weight summary and comparison grid
+    if args.teacher_names:
+        teacher_display_names = args.teacher_names
+    else:
+        teacher_display_names = [f"teacher-{i}" for i in range(len(args.teachers))]
+
     mof_weights = load_mof_weights(
         args.mof_checkpoint,
         set_id=args.set_id,
         temperature=args.temperature,
         use_ema=args.use_ema,
+        teacher_names=teacher_display_names,
     )
 
     K_weights = mof_weights.shape[0]
@@ -535,12 +552,6 @@ def main():
     # ─── Load teacher LoRAs ───
     print(f"\n[3/4] Loading {len(args.teachers)} teacher LoRA(s)...")
     teacher_adapter_names = load_teacher_loras(pipe, args.teachers, device=args.device)
-
-    # Teacher display names for comparison grid
-    if args.teacher_names:
-        teacher_display_names = args.teacher_names
-    else:
-        teacher_display_names = [f"teacher-{i}" for i in range(len(args.teachers))]
 
     # ─── Generate ───
     print(f"\n[4/4] Generating images...")
