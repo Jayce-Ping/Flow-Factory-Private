@@ -2063,8 +2063,8 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "grpo": GRPOTrainingArguments,
     "grpo-guard": GRPOTrainingArguments,
     "nft": NFTTrainingArguments,
-    "mof": MoFTrainingArguments,
-    "motv": MoFTrainingArguments,  # backward compat alias
+    "mof-nft": MoFTrainingArguments,
+    "mof-grpo": MoFTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,
