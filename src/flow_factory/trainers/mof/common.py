@@ -286,10 +286,19 @@ class MoFTrainerBase(BaseTrainer):
         self.dataloader, self.train_dataloaders_by_source, self.test_dataloaders = self._init_dataloader()
 
         # ---- Step 2: Load teachers + create logits ----
+        # Extract custom names from TeacherConfig (None entries use default)
+        teacher_names_from_config = None
+        if self.training_args.teachers is not None:
+            teacher_names_from_config = [
+                tc.name if tc.name is not None else f"opd_teacher_{i}"
+                for i, tc in enumerate(self.training_args.teachers)
+            ]
+
         self._teacher_names: List[str] = load_teachers(
             self.adapter,
             list(self.training_args.teacher_paths),
             self.training_args.teacher_param_device,
+            teacher_names=teacher_names_from_config,
         )
         self.K = len(self._teacher_names)
 

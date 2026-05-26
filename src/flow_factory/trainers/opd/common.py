@@ -23,7 +23,7 @@ plumbing, and timestep preparation.
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 import torch
 
@@ -41,6 +41,7 @@ def load_teachers(
     adapter: "BaseAdapter",
     teacher_paths: List[str],
     teacher_param_device: str,
+    teacher_names: Optional[List[str]] = None,
 ) -> List[str]:
     """Load each teacher LoRA checkpoint into a named-parameter snapshot.
 
@@ -54,11 +55,12 @@ def load_teachers(
             :func:`load_lora_as_named_parameters`. ``'cuda'`` keeps each
             snapshot on-device for fast swaps at the cost of LoRA-sized VRAM
             per teacher.
+        teacher_names: Optional list of custom snapshot names (one per path).
+            If None or if an entry is None, falls back to ``'opd_teacher_{i}'``.
 
     Returns:
-        Ordered list of snapshot names ``['opd_teacher_0', 'opd_teacher_1', ...]``
-        in the same order as ``teacher_paths``. Use as the lookup keys for
-        :meth:`BaseAdapter.use_named_parameters`.
+        Ordered list of snapshot names in the same order as ``teacher_paths``.
+        Use as the lookup keys for :meth:`BaseAdapter.use_named_parameters`.
 
     Raises:
         ValueError: ``teacher_paths`` is empty.
@@ -68,21 +70,25 @@ def load_teachers(
             "OPD requires at least one teacher LoRA path; " f"got teacher_paths={teacher_paths!r}."
         )
 
-    teacher_names: List[str] = []
+    names: List[str] = []
     for i, path in enumerate(teacher_paths):
-        name = f"opd_teacher_{i}"
+        name = (
+            teacher_names[i]
+            if teacher_names and i < len(teacher_names) and teacher_names[i]
+            else f"opd_teacher_{i}"
+        )
         load_lora_as_named_parameters(
             adapter=adapter,
             name=name,
             lora_path=path,
             device=teacher_param_device,
         )
-        teacher_names.append(name)
+        names.append(name)
     logger.info(
-        f"Loaded {len(teacher_names)} OPD teacher(s): {teacher_names} "
+        f"Loaded {len(names)} OPD teacher(s): {names} "
         f"(device={teacher_param_device!r})."
     )
-    return teacher_names
+    return names
 
 
 def teacher_indices_for_batch(
