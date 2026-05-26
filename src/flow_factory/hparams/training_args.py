@@ -997,6 +997,15 @@ class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
     Register as trainer_type: 'mof-grpo'.
     """
 
+    # ---- Override: GRPO must be on-policy (ratio=1 at start of each epoch) ----
+    off_policy: bool = field(
+        default=False,
+        metadata={
+            "help": "GRPO requires on-policy sampling (current logits = sampling logits) "
+                    "so that ratio = exp(new_log_prob - old_log_prob) = 1 at iteration start."
+        },
+    )
+
     # ---- GRPO-specific fields ----
     clip_range: tuple[float, float] = field(
         default=(-1e-4, 1e-4),
