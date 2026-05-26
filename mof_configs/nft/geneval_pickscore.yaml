@@ -56,10 +56,10 @@ train:
   # Per-source teacher configuration: each teacher is paired with a dataset source.
   # The teacher's velocity is used for samples from its assigned source.
   teachers:
-    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+    - path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-760"
       sources: [geneval]                    # This teacher's in-domain set
       reward_name: "geneval"                # In-domain reward for this source
-    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-820"
       sources: [pickscore]                  # This teacher's in-domain set
       reward_name: "pick_score"             # In-domain reward for this source
 
