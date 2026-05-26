@@ -2,7 +2,8 @@
 """MoF (Mixture-of-Flow) inference script.
 
 Given teacher LoRA paths and a MoF checkpoint, perform mixed inference using
-the learned per-timestep lambda weights. Supports CFG guidance scale.
+the learned per-timestep lambda weights. Supports CFG guidance scale and
+comparison visualization.
 
 Usage:
     # Basic: single prompt
@@ -20,11 +21,13 @@ Usage:
         --output-dir outputs/ \
         --cfg-scale 4.5
 
-    # Use specific source/set weights
+    # Comparison mode: base + each teacher + MoF in one grid
     python scripts/mof_inference.py \
         --mof-checkpoint saves/checkpoint-100/ \
         --teachers jieliu/SD3.5M-FlowGRPO-GenEval jieliu/SD3.5M-FlowGRPO-PickScore jieliu/SD3.5M-FlowGRPO-Text \
+        --teacher-names teacher-geneval teacher-pickscore teacher-ocr \
         --prompt "hello world" \
+        --compare \
         --set-id 2 \
         --num-steps 28 --cfg-scale 5.0
 
@@ -39,13 +42,13 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from pathlib import Path
 from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from PIL import Image, ImageDraw, ImageFont
 
 
 def load_mof_weights(
@@ -135,7 +138,7 @@ def load_teacher_loras(
 ):
     """Load teacher LoRA weights into separate named slots.
 
-    Returns a list of state dicts (LoRA A/B weight tensors) for each teacher.
+    Returns a list of adapter names for each teacher.
     """
     from peft import PeftModel
 
@@ -151,7 +154,7 @@ def load_teacher_loras(
         if i > 0:
             pipe.transformer.load_adapter(path, adapter_name=adapter_name)
         teacher_states.append(adapter_name)
-        print(f"  Loaded teacher {i}: {path} → adapter '{adapter_name}'")
+        print(f"  Loaded teacher {i}: {path} -> adapter '{adapter_name}'")
 
     return teacher_states
 
@@ -199,11 +202,10 @@ def mof_denoise(
 
     for i, t in enumerate(tqdm(timesteps, desc="MoF Denoising")):
         # Map step index to weight index
-        # If num_inference_steps != T_weights, interpolate/index-map
         weight_idx = min(int(i * T_weights / num_inference_steps), T_weights - 1)
         w = mof_weights[:, weight_idx].to(device)  # (K,)
 
-        # Prepare CFG inputs (shared across teachers, done once)
+        # Prepare CFG inputs
         if do_cfg:
             latent_model_input = torch.cat([latents, latents], dim=0)
             prompt_embeds_cfg = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
@@ -219,10 +221,8 @@ def mof_denoise(
         combined_noise_pred = None
 
         for k, adapter_name in enumerate(teacher_adapter_names):
-            # Switch to teacher k
             pipe.transformer.set_adapter(adapter_name)
 
-            # Forward pass through transformer
             noise_pred = pipe.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep_input,
@@ -231,24 +231,128 @@ def mof_denoise(
                 return_dict=False,
             )[0]
 
-            # Apply CFG
             if do_cfg:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-            # Weighted accumulation
             if combined_noise_pred is None:
                 combined_noise_pred = w[k] * noise_pred
             else:
                 combined_noise_pred = combined_noise_pred + w[k] * noise_pred
 
-        # Scheduler step with combined prediction
         latents = pipe.scheduler.step(combined_noise_pred, t, latents, return_dict=False)[0]
 
     return latents
 
 
-def decode_latents(pipe, latents: torch.Tensor) -> "PIL.Image.Image":
+@torch.no_grad()
+def single_teacher_denoise(
+    pipe,
+    adapter_name: str,
+    prompt_embeds: torch.Tensor,
+    pooled_prompt_embeds: torch.Tensor,
+    latents: torch.Tensor,
+    num_inference_steps: int = 28,
+    guidance_scale: float = 1.0,
+    negative_prompt_embeds: Optional[torch.Tensor] = None,
+    negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run denoising with a single teacher adapter active."""
+    pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps = pipe.scheduler.timesteps
+
+    do_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+
+    # Activate only this teacher
+    pipe.transformer.set_adapter(adapter_name)
+
+    for i, t in enumerate(tqdm(timesteps, desc=f"Teacher ({adapter_name})", leave=False)):
+        if do_cfg:
+            latent_model_input = torch.cat([latents, latents], dim=0)
+            prompt_embeds_cfg = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            pooled_cfg = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+            timestep_input = t.expand(latent_model_input.shape[0])
+        else:
+            latent_model_input = latents
+            prompt_embeds_cfg = prompt_embeds
+            pooled_cfg = pooled_prompt_embeds
+            timestep_input = t.expand(latent_model_input.shape[0])
+
+        noise_pred = pipe.transformer(
+            hidden_states=latent_model_input,
+            timestep=timestep_input,
+            encoder_hidden_states=prompt_embeds_cfg,
+            pooled_projections=pooled_cfg,
+            return_dict=False,
+        )[0]
+
+        if do_cfg:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+    return latents
+
+
+@torch.no_grad()
+def base_model_denoise(
+    pipe,
+    prompt_embeds: torch.Tensor,
+    pooled_prompt_embeds: torch.Tensor,
+    latents: torch.Tensor,
+    num_inference_steps: int = 28,
+    guidance_scale: float = 1.0,
+    negative_prompt_embeds: Optional[torch.Tensor] = None,
+    negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run denoising with no adapter (base model only)."""
+    pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps = pipe.scheduler.timesteps
+
+    do_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+
+    # Disable all adapters
+    pipe.transformer.disable_adapter_layers()
+
+    try:
+        for i, t in enumerate(tqdm(timesteps, desc="Base Model", leave=False)):
+            if do_cfg:
+                latent_model_input = torch.cat([latents, latents], dim=0)
+                prompt_embeds_cfg = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                pooled_cfg = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+                timestep_input = t.expand(latent_model_input.shape[0])
+            else:
+                latent_model_input = latents
+                prompt_embeds_cfg = prompt_embeds
+                pooled_cfg = pooled_prompt_embeds
+                timestep_input = t.expand(latent_model_input.shape[0])
+
+            noise_pred = pipe.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep_input,
+                encoder_hidden_states=prompt_embeds_cfg,
+                pooled_projections=pooled_cfg,
+                return_dict=False,
+            )[0]
+
+            if do_cfg:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+    finally:
+        # Re-enable adapter layers
+        pipe.transformer.enable_adapter_layers()
+
+    return latents
+
+
+def decode_latents(pipe, latents: torch.Tensor) -> Image.Image:
     """Decode VAE latents to PIL image."""
     latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
     image = pipe.vae.decode(latents, return_dict=False)[0]
@@ -266,8 +370,6 @@ def encode_prompt(
     dtype: torch.dtype = torch.bfloat16,
 ):
     """Encode prompt using pipeline's text encoders."""
-    # Use pipeline's built-in encode method
-    # For CFG, an empty negative prompt ("") is valid and should still be encoded.
     (
         prompt_embeds,
         negative_prompt_embeds,
@@ -284,6 +386,58 @@ def encode_prompt(
         device=device,
     )
     return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
+
+
+def create_comparison_grid(
+    images: List[Image.Image],
+    labels: List[str],
+    label_height: int = 40,
+    font_size: int = 20,
+) -> Image.Image:
+    """Create a 1xN comparison grid with labels above each image.
+
+    Args:
+        images: List of PIL images (must all be same size).
+        labels: List of text labels (same length as images).
+        label_height: Height of the label bar above each image.
+        font_size: Font size for labels.
+
+    Returns:
+        Single PIL image with all images side by side, labeled.
+    """
+    assert len(images) == len(labels), f"images ({len(images)}) and labels ({len(labels)}) must match"
+
+    N = len(images)
+    img_w, img_h = images[0].size
+    total_w = N * img_w
+    total_h = img_h + label_height
+
+    grid = Image.new("RGB", (total_w, total_h), color=(255, 255, 255))
+    draw = ImageDraw.Draw(grid)
+
+    # Try to load a nice font, fall back to default
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except (OSError, IOError):
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+
+    for i, (img, label) in enumerate(zip(images, labels)):
+        x_offset = i * img_w
+
+        # Draw label centered above image
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_x = x_offset + (img_w - text_w) // 2
+        text_y = (label_height - font_size) // 2
+        draw.text((text_x, text_y), label, fill=(0, 0, 0), font=font)
+
+        # Paste image below label
+        grid.paste(img, (x_offset, label_height))
+
+    return grid
 
 
 def main():
@@ -341,6 +495,13 @@ def main():
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device for inference")
 
+    # Comparison mode
+    parser.add_argument("--compare", action="store_true",
+                        help="Generate comparison grid: Base + each teacher + MoF")
+    parser.add_argument("--teacher-names", nargs="+", default=None,
+                        help="Display names for teachers in comparison grid "
+                             "(default: teacher-0, teacher-1, ...)")
+
     args = parser.parse_args()
 
     # ─── Setup ───
@@ -348,7 +509,7 @@ def main():
     dtype = dtype_map[args.dtype]
 
     print("=" * 60)
-    print("  MoF Inference")
+    print("  MoF Inference" + (" (Comparison Mode)" if args.compare else ""))
     print("=" * 60)
 
     # ─── Load MoF weights ───
@@ -375,12 +536,20 @@ def main():
     print(f"\n[3/4] Loading {len(args.teachers)} teacher LoRA(s)...")
     teacher_adapter_names = load_teacher_loras(pipe, args.teachers, device=args.device)
 
+    # Teacher display names for comparison grid
+    if args.teacher_names:
+        teacher_display_names = args.teacher_names
+    else:
+        teacher_display_names = [f"teacher-{i}" for i in range(len(args.teachers))]
+
     # ─── Generate ───
     print(f"\n[4/4] Generating images...")
     print(f"  CFG scale: {args.cfg_scale}")
     print(f"  Steps: {args.num_steps}")
     print(f"  Resolution: {args.resolution}x{args.resolution}")
     print(f"  Seed: {args.seed}")
+    if args.compare:
+        print(f"  Mode: Comparison (Base + {len(args.teachers)} teachers + MoF)")
 
     # Gather prompts
     if args.prompt:
@@ -392,20 +561,22 @@ def main():
     print(f"  Prompts: {len(prompts)}")
 
     # Setup output
+    os.makedirs(args.output_dir, exist_ok=True)
     if len(prompts) == 1 and args.output:
         output_paths = [args.output]
     else:
-        os.makedirs(args.output_dir, exist_ok=True)
+        suffix = "_compare.png" if args.compare else ".png"
         output_paths = [
-            os.path.join(args.output_dir, f"{i:04d}.png")
+            os.path.join(args.output_dir, f"{i:04d}{suffix}")
             for i in range(len(prompts))
         ]
 
     # Generate
-    generator = torch.Generator(device=args.device).manual_seed(args.seed)
-
     for idx, prompt in enumerate(prompts):
         print(f"\n  [{idx+1}/{len(prompts)}] \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
+
+        # Use a fresh generator per prompt for reproducibility
+        generator = torch.Generator(device=args.device).manual_seed(args.seed + idx)
 
         # Encode prompt
         do_cfg = args.cfg_scale > 1.0
@@ -418,26 +589,18 @@ def main():
             dtype=dtype,
         )
 
-        # Generate initial noise
+        # Generate initial noise (shared across all modes for fair comparison)
         num_channels = pipe.transformer.config.in_channels
         latent_h = args.resolution // pipe.vae_scale_factor
         latent_w = args.resolution // pipe.vae_scale_factor
-        latents = torch.randn(
+        init_latents = torch.randn(
             (1, num_channels, latent_h, latent_w),
             generator=generator,
             device=args.device,
             dtype=dtype,
         )
 
-        # Run MoF denoising
-        latents = mof_denoise(
-            pipe=pipe,
-            teacher_adapter_names=teacher_adapter_names,
-            mof_weights=mof_weights,
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_embeds,
-            latents=latents,
-            num_inference_steps=args.num_steps,
+        cfg_kwargs = dict(
             guidance_scale=args.cfg_scale,
             negative_prompt_embeds=neg_embeds if do_cfg else None,
             negative_pooled_prompt_embeds=neg_pooled if do_cfg else None,
@@ -445,10 +608,75 @@ def main():
             dtype=dtype,
         )
 
-        # Decode and save
-        image = decode_latents(pipe, latents)
-        image.save(output_paths[idx])
-        print(f"    Saved: {output_paths[idx]}")
+        if args.compare:
+            # ─── Comparison mode ───
+            images = []
+            labels = []
+
+            # 1. Base model
+            print("    Generating: Base model...")
+            base_latents = base_model_denoise(
+                pipe,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_embeds,
+                latents=init_latents.clone(),
+                num_inference_steps=args.num_steps,
+                **cfg_kwargs,
+            )
+            images.append(decode_latents(pipe, base_latents))
+            labels.append("Base")
+
+            # 2. Each teacher individually
+            for k, adapter_name in enumerate(teacher_adapter_names):
+                display_name = teacher_display_names[k] if k < len(teacher_display_names) else f"teacher-{k}"
+                print(f"    Generating: {display_name}...")
+                teacher_latents = single_teacher_denoise(
+                    pipe,
+                    adapter_name=adapter_name,
+                    prompt_embeds=prompt_embeds,
+                    pooled_prompt_embeds=pooled_embeds,
+                    latents=init_latents.clone(),
+                    num_inference_steps=args.num_steps,
+                    **cfg_kwargs,
+                )
+                images.append(decode_latents(pipe, teacher_latents))
+                labels.append(display_name)
+
+            # 3. MoF combined
+            print("    Generating: MoF...")
+            mof_latents = mof_denoise(
+                pipe=pipe,
+                teacher_adapter_names=teacher_adapter_names,
+                mof_weights=mof_weights,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_embeds,
+                latents=init_latents.clone(),
+                num_inference_steps=args.num_steps,
+                **cfg_kwargs,
+            )
+            images.append(decode_latents(pipe, mof_latents))
+            labels.append("MoF")
+
+            # Create grid and save
+            grid = create_comparison_grid(images, labels)
+            grid.save(output_paths[idx])
+            print(f"    Saved comparison grid: {output_paths[idx]}")
+
+        else:
+            # ─── Normal mode (MoF only) ───
+            latents = mof_denoise(
+                pipe=pipe,
+                teacher_adapter_names=teacher_adapter_names,
+                mof_weights=mof_weights,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_embeds,
+                latents=init_latents.clone(),
+                num_inference_steps=args.num_steps,
+                **cfg_kwargs,
+            )
+            image = decode_latents(pipe, latents)
+            image.save(output_paths[idx])
+            print(f"    Saved: {output_paths[idx]}")
 
     print(f"\nDone! Generated {len(prompts)} image(s).")
 
