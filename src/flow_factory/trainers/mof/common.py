@@ -580,7 +580,7 @@ class MoFTrainerBase(BaseTrainer):
             set_weights = weights[:, :, set_id]  # (K, T)
 
         # DEBUG: store per-step snapshots for train-inference consistency check
-        debug_snapshots = []
+        debug_snapshots = {}
 
         def patched_forward(**kwargs):
             t_idx = min(step_counter[0], self.num_train_timesteps - 1)
@@ -602,27 +602,31 @@ class MoFTrainerBase(BaseTrainer):
             expand_shape = (self.K,) + (1,) * (stacked.ndim - 1)
             combined_noise_pred = (w_i.view(*expand_shape) * stacked).sum(dim=0)
 
-            # DEBUG: capture snapshot
-            debug_snapshots.append({
-                'step_idx': t_idx,
-                't': kwargs.get('t'),
-                't_next': kwargs.get('t_next'),
-                'latents_hash': kwargs.get('latents').flatten()[:8].clone() if kwargs.get('latents') is not None else None,
-                'latents_dtype': kwargs.get('latents').dtype if kwargs.get('latents') is not None else None,
-                'next_latents_hash': kwargs.get('next_latents').flatten()[:8].clone() if kwargs.get('next_latents') is not None else None,
-                'v_combined_hash': combined_noise_pred.detach().flatten()[:8].clone(),
-                'v_combined_dtype': combined_noise_pred.dtype,
+            # DEBUG: capture snapshot for this step
+            debug_snapshots[t_idx] = {
+                't': kwargs.get('t').detach().cpu().clone() if kwargs.get('t') is not None else None,
+                't_next': kwargs.get('t_next').detach().cpu().clone() if kwargs.get('t_next') is not None else None,
+                'latents': kwargs.get('latents').detach().cpu().clone() if kwargs.get('latents') is not None else None,
+                'next_latents': kwargs.get('next_latents').detach().cpu().clone() if kwargs.get('next_latents') is not None else None,
+                'v_combined': combined_noise_pred.detach().cpu().clone(),
                 'noise_level': kwargs.get('noise_level'),
                 'compute_log_prob': kwargs.get('compute_log_prob'),
-                'w_i': w_i.clone(),
-                'teacher_v_hashes': [v.detach().flatten()[:8].clone() for v in velocities],
-            })
+                'w_i': w_i.detach().cpu().clone(),
+                'teacher_velocities': stacked.detach().cpu().clone(),
+                'set_id': set_id,
+            }
 
             # Run scheduler step
             scheduler_kwargs = _build_scheduler_step_kwargs(
                 kwargs, combined_noise_pred, self._sched_cache
             )
-            return self.adapter.scheduler.step(**scheduler_kwargs)
+            sched_output = self.adapter.scheduler.step(**scheduler_kwargs)
+
+            # DEBUG: also capture log_prob from scheduler output
+            if hasattr(sched_output, 'log_prob') and sched_output.log_prob is not None:
+                debug_snapshots[t_idx]['log_prob'] = sched_output.log_prob.detach().cpu().clone()
+
+            return sched_output
 
         self.adapter.forward = patched_forward  # type: ignore[method-assign]
         prev_cache = torch.is_autocast_cache_enabled()
@@ -635,7 +639,7 @@ class MoFTrainerBase(BaseTrainer):
                 torch.set_autocast_cache_enabled(prev_cache)
                 self.adapter.forward = original_forward  # type: ignore[method-assign]
 
-        # DEBUG: store snapshots for comparison in optimize
+        # DEBUG: store snapshots on the trainer for comparison in optimize
         if not hasattr(self, '_debug_sampling_snapshots'):
             self._debug_sampling_snapshots = []
         self._debug_sampling_snapshots.append(debug_snapshots)

@@ -117,10 +117,11 @@ class MoFGRPOTrainer(MoFTrainerBase):
         kl_threshold = self.training_args.kl_mask_threshold
         add_kl_coefficient = self.training_args.add_kl_coefficient
 
-        # DEBUG: retrieve sampling snapshots for comparison (first batch only)
+        # DEBUG: save sampling snapshots and prepare optimize snapshots
         _debug_sampling = getattr(self, '_debug_sampling_snapshots', None)
-        _debug_first_batch = _debug_sampling[0] if _debug_sampling else None
-        _debug_logged = False
+        _debug_save = (_debug_sampling is not None and len(_debug_sampling) > 0
+                       and self.accelerator.is_main_process and self.epoch == 0)
+        _debug_optimize_data = {}  # timestep_index → dict of tensors
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
@@ -201,46 +202,21 @@ class MoFGRPOTrainer(MoFTrainerBase):
                             )
                             new_log_prob = sched_out.log_prob
 
-                            # ============ DEBUG: compare sampling vs optimize ============
-                            if not _debug_logged and _debug_first_batch is not None and batch_idx == 0:
-                                # Find the matching sampling snapshot for this timestep_index
-                                snap = None
-                                for s in _debug_first_batch:
-                                    if s['step_idx'] == timestep_index:
-                                        snap = s
-                                        break
-                                if snap is not None:
-                                    ratio_debug = torch.exp(new_log_prob - old_log_prob)
-                                    logger.info(
-                                        f"\n{'='*60}\n"
-                                        f"[DEBUG] Epoch {self.epoch} | timestep_index={timestep_index}\n"
-                                        f"  SAMPLING phase:\n"
-                                        f"    t={snap['t']}\n"
-                                        f"    latents dtype={snap['latents_dtype']}, first8={snap['latents_hash']}\n"
-                                        f"    next_latents first8={snap['next_latents_hash']}\n"
-                                        f"    v_combined dtype={snap['v_combined_dtype']}, first8={snap['v_combined_hash']}\n"
-                                        f"    noise_level={snap['noise_level']}\n"
-                                        f"    compute_log_prob={snap['compute_log_prob']}\n"
-                                        f"    w_i={snap['w_i']}\n"
-                                        f"    teacher_v[0] first8={snap['teacher_v_hashes'][0]}\n"
-                                        f"  OPTIMIZE phase:\n"
-                                        f"    t={t[:2]}\n"
-                                        f"    latents dtype={latents.dtype}, first8={latents.flatten()[:8]}\n"
-                                        f"    next_latents first8={next_latents.flatten()[:8]}\n"
-                                        f"    v_combined dtype={v_combined.dtype}, first8={v_combined.detach().flatten()[:8]}\n"
-                                        f"    noise_level={self.adapter.scheduler.get_noise_level_for_timestep(t)}\n"
-                                        f"    w_i (current)={current_weights[:, timestep_index, set_ids[0]]}\n"
-                                        f"    teacher_v[0] first8={teacher_velocities[0].flatten()[:8]}\n"
-                                        f"  RESULT:\n"
-                                        f"    old_log_prob={old_log_prob[:4]}\n"
-                                        f"    new_log_prob={new_log_prob[:4]}\n"
-                                        f"    ratio={ratio_debug[:4]}\n"
-                                        f"    ratio mean={ratio_debug.mean().item():.8f}\n"
-                                        f"{'='*60}"
-                                    )
-                                if timestep_index == self.adapter.scheduler.train_timesteps[-1].item():
-                                    _debug_logged = True
-                            # ============ END DEBUG ============
+                            # DEBUG: capture optimize-phase data for first batch
+                            if _debug_save and batch_idx == 0:
+                                _debug_optimize_data[int(timestep_index)] = {
+                                    't': t.detach().cpu().clone(),
+                                    't_next': t_next.detach().cpu().clone(),
+                                    'latents': latents.detach().cpu().clone(),
+                                    'next_latents': next_latents.detach().cpu().clone(),
+                                    'v_combined': v_combined.detach().cpu().clone(),
+                                    'noise_level': self.adapter.scheduler.get_noise_level_for_timestep(t),
+                                    'w_i': current_weights[:, timestep_index, :].detach().cpu().clone(),
+                                    'set_ids': set_ids.cpu().clone(),
+                                    'teacher_velocities': teacher_velocities.detach().cpu().clone(),
+                                    'old_log_prob': old_log_prob.detach().cpu().clone(),
+                                    'new_log_prob': new_log_prob.detach().cpu().clone(),
+                                }
 
                             # 5. PPO-style clipped loss
                             adv = torch.as_tensor(
@@ -336,3 +312,22 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 )
                                 self.step += 1
                                 loss_info = defaultdict(list)
+
+        # DEBUG: save all snapshots to debug/ directory
+        if _debug_save and _debug_optimize_data:
+            import os
+            debug_dir = os.path.join(os.getcwd(), 'debug')
+            os.makedirs(debug_dir, exist_ok=True)
+            # Save sampling snapshots (first batch)
+            torch.save(
+                _debug_sampling[0],
+                os.path.join(debug_dir, 'sampling_snapshots.pt')
+            )
+            # Save optimize snapshots (first batch)
+            torch.save(
+                _debug_optimize_data,
+                os.path.join(debug_dir, 'optimize_snapshots.pt')
+            )
+            logger.info(f"[DEBUG] Saved debug snapshots to {debug_dir}/")
+            # Clear to avoid saving again
+            self._debug_sampling_snapshots = []
