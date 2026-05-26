@@ -65,7 +65,7 @@ train:
   teacher_param_device: 'cuda'
 
   # ---- MoF core hyperparameters ----
-  logits_init: "teacher_biased"
+  logits_init: "uniform"
   logits_init_bias: 2.0                     # softmax(2,0,0) ≈ (0.78, 0.11, 0.11) for K=3
   learning_rate: 0.05                       # Large LR for only 90 params
   temperature: 1.0

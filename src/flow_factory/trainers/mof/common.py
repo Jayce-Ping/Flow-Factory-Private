@@ -37,7 +37,7 @@ import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from .abc import BaseTrainer
+from ..abc import BaseTrainer
 from ..hparams import MoFTrainingArguments
 from ..samples import BaseSample
 from ..rewards import RewardBuffer
@@ -1263,27 +1263,16 @@ class MoFTrainerBase(BaseTrainer):
         self.accelerator.wait_for_everyone()
 
     def load_mof_checkpoint(self, path: str):
-        """Load MoF state from checkpoint (with backward compat for MoTV)."""
-        # Try MoF format first, then MoTV format
+        """Load MoF state from checkpoint."""
         mof_path = os.path.join(path, 'mof_state.pt')
-        motv_path = os.path.join(path, 'motv_state.pt')
 
-        if os.path.exists(mof_path):
-            state_path = mof_path
-        elif os.path.exists(motv_path):
-            state_path = motv_path
-        else:
+        if not os.path.exists(mof_path):
             raise FileNotFoundError(
-                f"MoF checkpoint not found at {mof_path} or {motv_path}"
+                f"MoF checkpoint not found at {mof_path}"
             )
 
-        state = torch.load(state_path, map_location=self.accelerator.device)
-
-        # Handle MoTV→MoF migration: (K, T) → (K, T, 1)
+        state = torch.load(mof_path, map_location=self.accelerator.device)
         logits = state['lambda_logits']
-        if logits.ndim == 2:
-            logger.info("Loading legacy MoTV checkpoint (K, T) → expanding to (K, T, S)")
-            logits = logits.unsqueeze(-1).expand(-1, -1, self.S).contiguous()
 
         # Validate dimensions
         if logits.shape[0] != self.K:
@@ -1307,5 +1296,5 @@ class MoFTrainerBase(BaseTrainer):
         if 'reward_running_mean' in state:
             self._reward_running_mean = state['reward_running_mean']
             self._reward_running_var = state['reward_running_var']
-        logger.info(f"MoF checkpoint loaded from {state_path} (epoch={self.epoch})")
+        logger.info(f"MoF checkpoint loaded from {mof_path} (epoch={self.epoch})")
 

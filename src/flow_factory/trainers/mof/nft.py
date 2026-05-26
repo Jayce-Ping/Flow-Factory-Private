@@ -43,7 +43,7 @@ class MoFNFTTrainer(MoFTrainerBase):
     advantages. The combined velocity v = Σ λ_k·v_k is evaluated against
     positive/negative predictions interpolated by β.
 
-    Register as trainer_type: 'mof'.
+    Register as trainer_type: 'mof-nft'.
     """
 
     def __init__(self, **kwargs):
