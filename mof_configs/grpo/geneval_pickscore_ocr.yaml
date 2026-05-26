@@ -51,13 +51,13 @@ train:
 
   # Per-source teacher configuration: 3 teachers x 3 prompt sets
   teachers:
-    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+    - path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-760"
       sources: [geneval]
       reward_name: "geneval"
-    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-820"
       sources: [pickscore]
       reward_name: "pick_score"
-    - path: "jieliu/SD3.5M-FlowGRPO-Text"
+    - path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-760"
       sources: [ocr]
       reward_name: "ocr"
 
@@ -105,7 +105,7 @@ train:
   adam_weight_decay: 0.0
   adam_epsilon: 1.0e-8
   ddp_find_unused_parameters: false
-  max_epochs: 300
+  max_epochs: 1000
   seed: 42
 
   # ---- KL penalty (disabled) ----

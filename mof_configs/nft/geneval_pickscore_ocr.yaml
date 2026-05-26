@@ -60,13 +60,13 @@ train:
   # All K=3 teachers produce predictions on ALL samples; lambda weights
   # determine how to mix them per (timestep, prompt_set).
   teachers:
-    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+    - path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-760"
       sources: [geneval]                    # In-domain for composition/counting tasks
       reward_name: "geneval"                # In-domain reward for geneval source
-    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-820"
       sources: [pickscore]                  # In-domain for aesthetic quality
       reward_name: "pick_score"             # In-domain reward for pickscore source
-    - path: "jieliu/SD3.5M-FlowGRPO-Text"
+    - path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-720"
       sources: [ocr]                        # In-domain for text rendering accuracy
       reward_name: "ocr"                    # In-domain reward for ocr source
 
@@ -117,7 +117,7 @@ train:
   adam_weight_decay: 1.0e-4                 # Weight decay (only effective when normalize_weights=false; ignored under softmax)
   adam_epsilon: 1.0e-8                      # Adam epsilon for numerical stability
   ddp_find_unused_parameters: false         # MoF only trains logits; no conditional branches need tracking
-  max_epochs: 300                           # More epochs for 3-set convergence
+  max_epochs: 1000                           # More epochs for 3-set convergence
   seed: 42
 
   # ---- KL penalty (disabled initially) ----
