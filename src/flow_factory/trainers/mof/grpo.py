@@ -117,18 +117,10 @@ class MoFGRPOTrainer(MoFTrainerBase):
         kl_threshold = self.training_args.kl_mask_threshold
         add_kl_coefficient = self.training_args.add_kl_coefficient
 
-        # DEBUG: save sampling snapshots and prepare optimize snapshots
-        _debug_sampling = getattr(self, '_debug_sampling_snapshots', None)
-        _debug_save = (_debug_sampling is not None and len(_debug_sampling) > 0
-                       and self.accelerator.is_main_process and self.epoch < 3)
-        _debug_optimize_data = {}  # timestep_index → dict of tensors
-
         for inner_epoch in range(self.training_args.num_inner_epochs):
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
             perm = torch.randperm(len(samples), generator=perm_gen)
-            # DEBUG: disable shuffle to keep batch alignment with sampling snapshots
-            # shuffled_samples = [samples[i] for i in perm]
-            shuffled_samples = samples
+            shuffled_samples = [samples[i] for i in perm]
             loss_info = defaultdict(list)
 
             with self.autocast():
@@ -203,22 +195,6 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 return_kwargs=return_kwargs,
                             )
                             new_log_prob = sched_out.log_prob
-
-                            # DEBUG: capture optimize-phase data for first batch
-                            if _debug_save and batch_idx == 0:
-                                _debug_optimize_data[int(timestep_index)] = {
-                                    't': t.detach().cpu().clone(),
-                                    't_next': t_next.detach().cpu().clone(),
-                                    'latents': latents.detach().cpu().clone(),
-                                    'next_latents': next_latents.detach().cpu().clone(),
-                                    'v_combined': v_combined.detach().cpu().clone(),
-                                    'noise_level': self.adapter.scheduler.get_noise_level_for_timestep(t),
-                                    'w_i': current_weights[:, timestep_index, :].detach().cpu().clone(),
-                                    'set_ids': set_ids.cpu().clone(),
-                                    'teacher_velocities': teacher_velocities.detach().cpu().clone(),
-                                    'old_log_prob': old_log_prob.detach().cpu().clone(),
-                                    'new_log_prob': new_log_prob.detach().cpu().clone(),
-                                }
 
                             # 5. PPO-style clipped loss
                             adv = torch.as_tensor(
@@ -314,20 +290,3 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 )
                                 self.step += 1
                                 loss_info = defaultdict(list)
-
-        # DEBUG: save all snapshots to debug/ directory (per epoch)
-        if _debug_save and _debug_optimize_data:
-            import os
-            debug_dir = os.path.join(os.getcwd(), 'debug')
-            os.makedirs(debug_dir, exist_ok=True)
-            # Save sampling snapshots (first batch of this epoch)
-            torch.save(
-                _debug_sampling[-1],  # last appended = this epoch's first batch
-                os.path.join(debug_dir, f'sampling_epoch{self.epoch}.pt')
-            )
-            # Save optimize snapshots (first batch of this epoch)
-            torch.save(
-                _debug_optimize_data,
-                os.path.join(debug_dir, f'optimize_epoch{self.epoch}.pt')
-            )
-            logger.info(f"[DEBUG] Saved epoch {self.epoch} debug snapshots to {debug_dir}/")
