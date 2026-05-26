@@ -191,7 +191,9 @@ class MoFGRPOTrainer(MoFTrainerBase):
                             new_log_prob = sched_out.log_prob
 
                             # 5. PPO-style clipped loss
-                            adv = batch['advantage']
+                            adv = torch.as_tensor(
+                                batch['advantage'], dtype=torch.float32, device=device
+                            )
                             adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
 
                             ratio = torch.exp(new_log_prob - old_log_prob)
