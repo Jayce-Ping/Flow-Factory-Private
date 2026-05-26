@@ -1037,6 +1037,12 @@ class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.off_policy:
+            raise ValueError(
+                "MoF-GRPO requires on-policy sampling (off_policy=False). "
+                "Off-policy (EMA logits for sampling) causes train-inference inconsistency: "
+                "ratio = exp(new_log_prob - old_log_prob) ≠ 1 at iteration start."
+            )
         self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
         if self.mask_type not in ["kl", "kl_adv", "clip", "none"]:
             raise ValueError(
