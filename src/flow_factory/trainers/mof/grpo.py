@@ -218,10 +218,10 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                         old_std_dev_t, old_dt, self.adapter.scheduler.dynamics_type
                                     )
                                 else:
-                                    sigma_t = torch.ones_like(t.unsqueeze(-1))
+                                    sigma_t = torch.ones_like(sched_out.std_dev_t, device=device)
 
                                 diff = new_next_latents_mean - old_next_latents_mean
-                                kl_new_old = (diff ** 2 / (2 * sigma_t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) ** 2)).mean(
+                                kl_new_old = (diff ** 2 / (2 * sigma_t ** 2)).mean(
                                     dim=tuple(range(1, diff.ndim))
                                 )
 
