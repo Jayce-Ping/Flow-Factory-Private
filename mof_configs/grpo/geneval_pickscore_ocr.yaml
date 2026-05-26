@@ -57,7 +57,7 @@ train:
     - path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-820"
       sources: [pickscore]
       reward_name: "pick_score"
-    - path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-760"
+    - path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-720"
       sources: [ocr]
       reward_name: "ocr"
 
