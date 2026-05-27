@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MoF Distillation Trainers: distill a weighted teacher mixture into a student LoRA.
+"""MoF On-Policy Distillation Trainer.
 
-Two variants:
-  - MoFDistillTrainer (on-policy): sample student trajectories, then MSE on trajectory points
-  - MoFOfflineDistillTrainer (offline): independent noise sampling, direct MSE on velocities
+Distills a weighted teacher mixture (MoF) into a student LoRA via on-policy
+trajectory MSE. The student generates trajectories, then for each trajectory
+point the teacher-weighted velocity target is matched via MSE.
 
-Both share the same MoF weight loading, teacher velocity computation, and monitoring
-infrastructure via MoFDistillBase.
-
-Register as trainer_type: 'mof-distill' (on-policy) or 'mof-distill-offline'.
+Register as trainer_type: 'mof-distill'.
 """
 from __future__ import annotations
 
@@ -44,7 +41,6 @@ from ...rewards import RewardBuffer
 from ...samples import BaseSample
 from ...utils.base import filter_kwargs, create_generator, create_generator_by_prompt, stitch_batch_metadata
 from ...utils.logger_utils import setup_logger
-from ...utils.noise_schedule import flow_match_sigma
 from ...utils.dist import reduce_loss_info
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..opd.common import load_teachers, cache_forward_signature, filter_forward_kwargs
@@ -55,15 +51,20 @@ logger = setup_logger(__name__, rank_zero_only=True)
 _FORWARD_EXCLUDE_KEYS = frozenset({"all_latents", "timesteps", "__source__", "latent_index_map"})
 
 
-# =============================================================================
-# Shared Base Class
-# =============================================================================
+class MoFDistillTrainer(BaseTrainer):
+    """On-policy MoF distillation: sample student trajectories, then MSE-fit teachers.
 
-class MoFDistillBase(BaseTrainer):
-    """Shared infrastructure for MoF distillation trainers.
+    Algorithm:
+      1. sample(): Student generates full trajectories (stores all_latents at each step)
+      2. optimize(samples): Two-pass per batch (matching OPD's precompute pattern):
+         Pre-pass  (no_grad): K teacher forwards per timestep → cache v_target
+         Main-pass (grad):    student forward only → MSE(v_student, v_target) → backward
 
-    Handles: teacher loading, MoF weight loading, teacher velocity computation,
-    forward kwargs building, data loading, baseline evaluation, reward monitoring.
+    The 2-pass design avoids calling use_named_parameters (parameter swapping)
+    inside the gradient-enabled accumulate() scope, preventing DDP/autocast
+    cache interference with parameter switching.
+
+    Register as trainer_type: 'mof-distill'.
     """
 
     def __init__(self, **kwargs):
@@ -86,6 +87,9 @@ class MoFDistillBase(BaseTrainer):
         )
         self.K = len(self._teacher_names)
 
+        # ---- Verify teacher snapshots differ from student ----
+        self._verify_teacher_snapshots()
+
         # ---- Cache forward signature ----
         self._forward_param_names, self._forward_accepts_var_kwargs = (
             cache_forward_signature(self.adapter.forward)
@@ -100,9 +104,43 @@ class MoFDistillBase(BaseTrainer):
             f"normalize_loss={self.training_args.normalize_d_k}"
         )
 
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """No-op: distillation uses MSE loss, not external rewards."""
-        pass
+    # =========================================================================
+    # Teacher Snapshot Verification
+    # =========================================================================
+
+    def _verify_teacher_snapshots(self) -> None:
+        """Verify teacher parameter snapshots differ from current student weights."""
+        student_params = list(self.adapter.get_trainable_parameters())
+        if not student_params:
+            return
+
+        first_param = student_params[0]
+        student_fp = first_param.data.flatten()[:20].detach().cpu()
+
+        all_identical = True
+        for name in self._teacher_names:
+            info = self.adapter._named_parameters[name]
+            teacher_fp = info.ema_wrapper.ema_parameters[0].flatten()[:20].cpu()
+            max_diff = float((student_fp - teacher_fp).abs().max())
+            if max_diff < 1e-8:
+                logger.error(
+                    f"Teacher snapshot '{name}' has IDENTICAL weights to student "
+                    f"(max_diff={max_diff:.2e}). "
+                    f"This indicates _load_lora failed to load teacher weights."
+                )
+            else:
+                all_identical = False
+                logger.info(
+                    f"Teacher '{name}' snapshot verified: "
+                    f"max_diff_from_student={max_diff:.4e}"
+                )
+
+        if all_identical:
+            raise RuntimeError(
+                "ALL teacher snapshots are identical to student weights. "
+                "Teacher LoRA loading failed silently. "
+                f"Teacher paths: {list(self.training_args.teacher_paths)}"
+            )
 
     # =========================================================================
     # MoF Weight Loading
@@ -240,15 +278,20 @@ class MoFDistillBase(BaseTrainer):
     # =========================================================================
 
     def _compute_teacher_velocities(self, forward_kwargs: Dict[str, Any]) -> torch.Tensor:
-        """Forward all K teachers, return stacked velocities (detached). Autocast-safe."""
+        """Forward all K teachers, return stacked velocities (detached). Autocast-safe.
+
+        Runs under torch.no_grad() to avoid activation storage and prevent DDP
+        from registering gradient hooks for teacher forward calls.
+        """
         velocities = []
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
         try:
-            for name in self._teacher_names:
-                with self.adapter.use_named_parameters(name):
-                    out = self.adapter.forward(**forward_kwargs)
-                velocities.append(out.noise_pred.detach())
+            with torch.no_grad():
+                for name in self._teacher_names:
+                    with self.adapter.use_named_parameters(name):
+                        out = self.adapter.forward(**forward_kwargs)
+                    velocities.append(out.noise_pred.detach())
         finally:
             torch.set_autocast_cache_enabled(prev_cache)
         return torch.stack(velocities, dim=0)  # (K, B, C, H, W)
@@ -393,14 +436,18 @@ class MoFDistillBase(BaseTrainer):
             self.accelerator.wait_for_everyone()
 
     # =========================================================================
-    # Training Reward Monitoring
+    # Main Training Loop
     # =========================================================================
 
-    def start(self):
-        """Main training loop with checkpoint/eval/ema bookkeeping.
+    @property
+    def _train_timestep_indices(self) -> List[int]:
+        """Training timestep indices: all steps for ODE, scheduler-selected for SDE."""
+        if self.adapter.scheduler.dynamics_type == "ODE":
+            return list(range(self.training_args.num_inference_steps))
+        return self.adapter.scheduler.train_timesteps
 
-        Subclasses override `_run_epoch()` to define the epoch body.
-        """
+    def start(self):
+        """Main training loop with checkpoint/eval/ema bookkeeping."""
         if self.epoch == 0 and self.training_args.eval_baselines_at_start:
             self.evaluate_baselines()
 
@@ -419,14 +466,193 @@ class MoFDistillBase(BaseTrainer):
                 self.evaluate()
                 self._log_training_rewards()
 
-            self._run_epoch()
+            samples = self.sample()
+            self.prepare_feedback(samples)
+            self.optimize(samples)
 
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
 
-    def _run_epoch(self) -> None:
-        """Execute one training epoch. Overridden by subclasses."""
-        raise NotImplementedError
+    # =========================================================================
+    # Sampling
+    # =========================================================================
+
+    def sample(self) -> List[BaseSample]:
+        """Generate on-policy student trajectories with stored latents."""
+        self.adapter.rollout()
+        self.reward_buffer.clear()
+        samples: List[BaseSample] = []
+
+        trajectory_indices = compute_trajectory_indices(
+            train_timestep_indices=self._train_timestep_indices,
+            num_inference_steps=self.training_args.num_inference_steps,
+        )
+
+        if self.train_dataloaders_by_source:
+            data_iter = self._interleaved_source_iter()
+        else:
+            data_iter = iter(self.dataloader)
+
+        with torch.no_grad(), self.autocast():
+            for _ in tqdm(
+                range(self.training_args.num_batches_per_epoch),
+                desc=f"Epoch {self.epoch} Sampling",
+                disable=not self.show_progress_bar,
+            ):
+                batch = next(data_iter)
+                sample_kwargs = {
+                    **self.training_args,
+                    "compute_log_prob": False,
+                    "trajectory_indices": trajectory_indices,
+                    **batch,
+                }
+                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
+                sample_batch = self.adapter.inference(**sample_kwargs)
+                stitch_batch_metadata(batch, sample_batch)
+                self._maybe_offload_samples_to_cpu(sample_batch)
+                samples.extend(sample_batch)
+                self.reward_buffer.add_samples(sample_batch)
+
+        return samples
+
+    # =========================================================================
+    # Feedback (reward logging)
+    # =========================================================================
+
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """Finalize rewards on sampled trajectories and log sample images."""
+        log_data: Dict[str, Any] = {}
+
+        if self.reward_models:
+            rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
+            if rewards and self.accelerator.is_main_process:
+                for rname, rvals in rewards.items():
+                    rvals_np = torch.as_tensor(rvals).cpu().numpy()
+                    valid = ~np.isnan(rvals_np)
+                    if valid.any():
+                        log_data[f"train/reward_{rname}_mean"] = float(np.nanmean(rvals_np))
+                    source_groups: Dict[str, List[float]] = defaultdict(list)
+                    for i, sample in enumerate(samples):
+                        source = sample.extra_kwargs.get("__source__", "default")
+                        val = float(rvals_np[i])
+                        if not np.isnan(val):
+                            source_groups[source].append(val)
+                    for source, vals in source_groups.items():
+                        if vals:
+                            log_data[f"train/{source}/reward_{rname}_mean"] = float(np.mean(vals))
+
+        if self.accelerator.is_main_process:
+            log_data["train_samples"] = samples[:30]
+
+        if log_data:
+            self.log_data(log_data, step=self.step)
+
+    # =========================================================================
+    # Optimization (2-pass: precompute teacher targets, then student gradient)
+    # =========================================================================
+
+    def optimize(self, samples: List[BaseSample]) -> None:
+        """MSE velocity distillation on stored student trajectories.
+
+        Uses a 2-pass pattern (matching OPD's _precompute + _train_pass):
+          Pre-pass  (no_grad): compute and cache all teacher velocities per (batch, timestep)
+          Main-pass (grad):    student forward only → MSE against cached v_target → backward
+
+        This avoids calling use_named_parameters (parameter swapping) inside the
+        gradient-enabled accumulate() scope, preventing DDP/autocast cache interference.
+        """
+        device = self.accelerator.device
+        per_device_batch_size = self.training_args.per_device_batch_size
+        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        train_timestep_indices = self._train_timestep_indices
+
+        self.adapter.train()
+        loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+        for inner_epoch in range(self.training_args.num_inner_epochs):
+            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
+            perm = torch.randperm(len(samples), generator=perm_gen)
+            shuffled_samples = [samples[i] for i in perm]
+
+            for batch_idx in tqdm(
+                range(num_batches),
+                desc=f"Epoch {self.epoch} Distill",
+                disable=not self.show_progress_bar,
+            ):
+                start = batch_idx * per_device_batch_size
+                batch_samples = [
+                    s.to(device)
+                    for s in shuffled_samples[start:start + per_device_batch_size]
+                ]
+                batch = BaseSample.stack(batch_samples)
+                latents_index_map = batch["latent_index_map"]
+
+                # ============ Pre-pass: cache teacher targets (no grad) ============
+                v_target_by_timestep: List[torch.Tensor] = []
+                with torch.no_grad(), self.autocast():
+                    for timestep_index in train_timestep_indices:
+                        t = batch["timesteps"][:, timestep_index]
+                        latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                        forward_kwargs = self._build_forward_kwargs(batch, t, latents)
+
+                        teacher_velocities = self._compute_teacher_velocities(forward_kwargs)
+                        weights = self._get_mof_weights(
+                            t=t, batch=batch, batch_samples=batch_samples
+                        )
+                        v_target = self._combine_weighted(weights, teacher_velocities)
+                        v_target_by_timestep.append(v_target)
+
+                        # One-time diagnostic
+                        if not hasattr(self, '_output_verified'):
+                            self._output_verified = True
+                            student_out_dbg = self.adapter.forward(**forward_kwargs)
+                            for k_i in range(teacher_velocities.shape[0]):
+                                diff = (student_out_dbg.noise_pred - teacher_velocities[k_i]).abs().max().item()
+                                logger.info(
+                                    f"DIAGNOSTIC: |v_student - v_teacher_{self._teacher_names[k_i]}| "
+                                    f"max={diff:.6e}"
+                                )
+                            target_diff = (student_out_dbg.noise_pred - v_target).abs().max().item()
+                            logger.info(f"DIAGNOSTIC: |v_student - v_target| max={target_diff:.6e}")
+
+                # ============ Main pass: student forward + loss (with grad) ============
+                with self.autocast():
+                    for t_idx, timestep_index in enumerate(train_timestep_indices):
+                        with self.accelerator.accumulate(*self.adapter.trainable_components):
+                            t = batch["timesteps"][:, timestep_index]
+                            latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                            forward_kwargs = self._build_forward_kwargs(batch, t, latents)
+
+                            student_out = self.adapter.forward(**forward_kwargs)
+                            v_student = student_out.noise_pred
+
+                            v_target = v_target_by_timestep[t_idx]
+
+                            loss = ((v_student.float() - v_target.float()) ** 2).mean()
+                            loss_info["loss"].append(loss.detach())
+
+                            self.accelerator.backward(loss)
+
+                            if self.accelerator.sync_gradients:
+                                grad_norm = self.accelerator.clip_grad_norm_(
+                                    self.adapter.get_trainable_parameters(),
+                                    self.training_args.max_grad_norm,
+                                )
+                                self.optimizer.step()
+                                self.optimizer.zero_grad()
+
+                                loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
+                                loss_info_reduced["grad_norm"] = grad_norm
+                                self.log_data(
+                                    {f"train/{k}": v for k, v in loss_info_reduced.items()},
+                                    step=self.step,
+                                )
+                                self.step += 1
+                                loss_info = defaultdict(list)
+
+    # =========================================================================
+    # Training Reward Monitoring
+    # =========================================================================
 
     def _log_training_rewards(self) -> None:
         """Generate samples and log per-source reward metrics."""
@@ -478,293 +704,3 @@ class MoFDistillBase(BaseTrainer):
                             log_data[f"train/{source}/reward_{rname}_mean"] = float(np.mean(vals))
                 log_data["train_samples"] = all_samples[:30]
                 self.log_data(log_data, step=self.step)
-
-
-# =============================================================================
-# On-Policy Distillation (Correct: sample trajectory → MSE on trajectory)
-# =============================================================================
-
-class MoFDistillTrainer(MoFDistillBase):
-    """On-policy MoF distillation: sample student trajectories, then MSE-fit teachers.
-
-    Algorithm:
-      1. sample(): Student generates full trajectories (stores all_latents at each step)
-      2. optimize(samples): For each stored trajectory point:
-         - Student forward at x_t → v_student (with grad)
-         - K teachers forward at same x_t → v_teacher_k (detached)
-         - v_target = Σ_k λ_k(t, source) * v_teacher_k
-         - loss = MSE(v_student, v_target)
-         - backward → optimizer.step()
-
-    Register as trainer_type: 'mof-distill'.
-    """
-
-    @property
-    def _train_timestep_indices(self) -> List[int]:
-        """Training timestep indices: all steps for ODE, scheduler-selected for SDE."""
-        if self.adapter.scheduler.dynamics_type == "ODE":
-            return list(range(self.training_args.num_inference_steps))
-        return self.adapter.scheduler.train_timesteps
-
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Finalize rewards on sampled trajectories and log sample images."""
-        log_data: Dict[str, Any] = {}
-
-        if self.reward_models:
-            rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
-            if rewards and self.accelerator.is_main_process:
-                for rname, rvals in rewards.items():
-                    rvals_np = torch.as_tensor(rvals).cpu().numpy()
-                    valid = ~np.isnan(rvals_np)
-                    if valid.any():
-                        log_data[f"train/reward_{rname}_mean"] = float(np.nanmean(rvals_np))
-                    source_groups: Dict[str, List[float]] = defaultdict(list)
-                    for i, sample in enumerate(samples):
-                        source = sample.extra_kwargs.get("__source__", "default")
-                        val = float(rvals_np[i])
-                        if not np.isnan(val):
-                            source_groups[source].append(val)
-                    for source, vals in source_groups.items():
-                        if vals:
-                            log_data[f"train/{source}/reward_{rname}_mean"] = float(np.mean(vals))
-
-        if self.accelerator.is_main_process:
-            log_data["train_samples"] = samples[:30]
-
-        if log_data:
-            self.log_data(log_data, step=self.step)
-
-    def _run_epoch(self) -> None:
-        """Sample student trajectories, then MSE-fit on trajectory points."""
-        samples = self.sample()
-        self.prepare_feedback(samples)
-        self.optimize(samples)
-
-    def sample(self) -> List[BaseSample]:
-        """Generate on-policy student trajectories with stored latents."""
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples: List[BaseSample] = []
-
-        trajectory_indices = compute_trajectory_indices(
-            train_timestep_indices=self._train_timestep_indices,
-            num_inference_steps=self.training_args.num_inference_steps,
-        )
-
-        if self.train_dataloaders_by_source:
-            data_iter = self._interleaved_source_iter()
-        else:
-            data_iter = iter(self.dataloader)
-
-        with torch.no_grad(), self.autocast():
-            for _ in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f"Epoch {self.epoch} Sampling",
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                sample_kwargs = {
-                    **self.training_args,
-                    "compute_log_prob": False,
-                    "trajectory_indices": trajectory_indices,
-                    **batch,
-                }
-                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                sample_batch = self.adapter.inference(**sample_kwargs)
-                stitch_batch_metadata(batch, sample_batch)
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-
-        return samples
-
-    def optimize(self, samples: List[BaseSample]) -> None:
-        """MSE velocity distillation on stored student trajectories.
-
-        For each (batch, timestep) from stored trajectories:
-          1. Access stored latents x_t from student's trajectory
-          2. Student forward → v_student (with grad)
-          3. Teachers forward → v_target = Σ λ_k * v_teacher_k (detached)
-          4. loss = MSE(v_student, v_target)
-        """
-        device = self.accelerator.device
-        per_device_batch_size = self.training_args.per_device_batch_size
-        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
-        train_timestep_indices = self._train_timestep_indices
-
-        self.adapter.train()
-        loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
-
-        for inner_epoch in range(self.training_args.num_inner_epochs):
-            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
-
-            with self.autocast():
-                for batch_idx in tqdm(
-                    range(num_batches),
-                    desc=f"Epoch {self.epoch} Distill",
-                    disable=not self.show_progress_bar,
-                ):
-                    start = batch_idx * per_device_batch_size
-                    batch_samples = [
-                        s.to(device)
-                        for s in shuffled_samples[start:start + per_device_batch_size]
-                    ]
-                    batch = BaseSample.stack(batch_samples)
-                    latents_index_map = batch["latent_index_map"]
-
-                    for timestep_index in train_timestep_indices:
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            t = batch["timesteps"][:, timestep_index]
-                            latents = batch["all_latents"][:, latents_index_map[timestep_index]]
-
-                            forward_kwargs = self._build_forward_kwargs(batch, t, latents)
-
-                            student_out = self.adapter.forward(**forward_kwargs)
-                            v_student = student_out.noise_pred
-
-                            teacher_velocities = self._compute_teacher_velocities(forward_kwargs)
-
-                            weights = self._get_mof_weights(
-                                t=t, batch=batch, batch_samples=batch_samples
-                            )
-                            v_target = self._combine_weighted(weights, teacher_velocities)
-
-                            loss = ((v_student.float() - v_target.float()) ** 2).mean()
-                            loss_info["loss"].append(loss.detach())
-
-                            self.accelerator.backward(loss)
-
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-
-                                loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info_reduced["grad_norm"] = grad_norm
-                                self.log_data(
-                                    {f"train/{k}": v for k, v in loss_info_reduced.items()},
-                                    step=self.step,
-                                )
-                                self.step += 1
-                                loss_info = defaultdict(list)
-
-
-# =============================================================================
-# Offline Distillation (Independent noise, no trajectory)
-# =============================================================================
-
-class MoFOfflineDistillTrainer(MoFDistillBase):
-    """Offline MoF distillation: independent noise sampling, direct MSE on velocities.
-
-    Algorithm:
-      1. Encode clean latents from batch images
-      2. Sample random timestep t ~ U[0, 1], add noise to get x_t
-      3. Student forward at x_t → v_student
-      4. Teachers forward at x_t → v_target = Σ λ_k * v_teacher_k
-      5. loss = MSE(v_student, v_target)
-
-    Simpler but off-policy (student doesn't sample its own trajectory).
-    Register as trainer_type: 'mof-distill-offline'.
-    """
-
-    def _run_epoch(self) -> None:
-        """One epoch of offline MSE velocity distillation."""
-        self.optimize()
-
-    def optimize(self) -> None:
-        """One epoch of offline MSE velocity distillation."""
-        device = self.accelerator.device
-        num_batches = self.training_args.num_batches_per_epoch
-
-        if self.train_dataloaders_by_source:
-            data_iter = self._interleaved_source_iter()
-        else:
-            data_iter = iter(self.dataloader)
-
-        self.adapter.train()
-        loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
-
-        with self.autocast():
-            for batch_idx in tqdm(
-                range(num_batches),
-                desc=f"Epoch {self.epoch} Offline Distill",
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                batch_on_device = {
-                    k: v.to(device) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
-
-                # Encode clean latents
-                inference_kwargs = {
-                    **self.training_args,
-                    "compute_log_prob": False,
-                    **batch_on_device,
-                }
-                inference_kwargs = filter_kwargs(self.adapter.encode_latents, **inference_kwargs)
-                clean_latents = self.adapter.encode_latents(**inference_kwargs)
-
-                B = clean_latents.shape[0]
-
-                # Sample timestep + noise
-                t = torch.rand(B, device=device)
-                sigma = flow_match_sigma(t)
-                noise = torch.randn_like(clean_latents)
-                sigma_broadcast = sigma.view(B, *([1] * (clean_latents.ndim - 1)))
-                noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-
-                t_scaled = t * 1000.0
-
-                forward_kwargs = self._build_forward_kwargs(
-                    batch=batch_on_device, t=t_scaled, latents=noised_latents
-                )
-
-                with self.accelerator.accumulate(*self.adapter.trainable_components):
-                    # Student forward
-                    student_out = self.adapter.forward(**forward_kwargs)
-                    v_student = student_out.noise_pred
-
-                    # Teachers forward
-                    teacher_velocities = self._compute_teacher_velocities(forward_kwargs)
-
-                    # MoF weighted target
-                    weights = self._get_mof_weights(t=t_scaled, batch=batch_on_device)
-                    v_target = self._combine_weighted(weights, teacher_velocities)
-
-                    # MSE loss
-                    diff_sq = (v_student.float() - v_target.float()) ** 2
-                    per_sample_loss = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))
-
-                    if self.training_args.normalize_d_k:
-                        sigma_sq = (sigma ** 2).clamp(min=1e-12)
-                        per_sample_loss = per_sample_loss / (2.0 * sigma_sq)
-
-                    loss = per_sample_loss.mean()
-
-                    loss_info["loss"].append(loss.detach())
-                    loss_info["mse_raw"].append(diff_sq.mean().detach())
-
-                    self.accelerator.backward(loss)
-
-                    if self.accelerator.sync_gradients:
-                        grad_norm = self.accelerator.clip_grad_norm_(
-                            self.adapter.get_trainable_parameters(),
-                            self.training_args.max_grad_norm,
-                        )
-                        self.optimizer.step()
-                        self.optimizer.zero_grad()
-
-                        loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
-                        loss_info_reduced["grad_norm"] = grad_norm
-                        self.log_data(
-                            {f"train/{k}": v for k, v in loss_info_reduced.items()},
-                            step=self.step,
-                        )
-                        self.step += 1
-                        loss_info = defaultdict(list)
