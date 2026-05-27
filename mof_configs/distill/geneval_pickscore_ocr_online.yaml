@@ -120,7 +120,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 1024
-  per_device_batch_size: 16
+  per_device_batch_size: 8
   guidance_scale: 1.0
   num_inference_steps: 40
   eval_freq: 10
