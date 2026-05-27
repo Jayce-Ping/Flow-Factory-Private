@@ -623,6 +623,8 @@ class MoFDistillTrainer(BaseTrainer):
 
                 # ============ Pre-pass: cache teacher targets (no grad) ============
                 v_target_by_timestep: List[torch.Tensor] = []
+                teacher_velocities_by_timestep: List[torch.Tensor] = []
+                weights_by_timestep: List[torch.Tensor] = []
                 with torch.no_grad(), self.autocast():
                     for timestep_index in train_timestep_indices:
                         t = batch["timesteps"][:, timestep_index]
@@ -635,19 +637,8 @@ class MoFDistillTrainer(BaseTrainer):
                         )
                         v_target = self._combine_weighted(weights, teacher_velocities)
                         v_target_by_timestep.append(v_target)
-
-                        # One-time diagnostic
-                        if not hasattr(self, '_output_verified'):
-                            self._output_verified = True
-                            student_out_dbg = self.adapter.forward(**forward_kwargs)
-                            for k_i in range(teacher_velocities.shape[0]):
-                                diff = (student_out_dbg.noise_pred - teacher_velocities[k_i]).abs().max().item()
-                                logger.info(
-                                    f"DIAGNOSTIC: |v_student - v_teacher_{self._teacher_names[k_i]}| "
-                                    f"max={diff:.6e}"
-                                )
-                            target_diff = (student_out_dbg.noise_pred - v_target).abs().max().item()
-                            logger.info(f"DIAGNOSTIC: |v_student - v_target| max={target_diff:.6e}")
+                        teacher_velocities_by_timestep.append(teacher_velocities)
+                        weights_by_timestep.append(weights)
 
                 # ============ Main pass: student forward + loss (with grad) ============
                 with self.autocast():
@@ -664,6 +655,17 @@ class MoFDistillTrainer(BaseTrainer):
 
                             loss = ((v_student.float() - v_target.float()) ** 2).mean()
                             loss_info["loss"].append(loss.detach())
+
+                            # Per-teacher MSE decomposition (detached, for logging only)
+                            teacher_vels = teacher_velocities_by_timestep[t_idx]
+                            mof_weights = weights_by_timestep[t_idx]  # (K, B)
+                            v_student_detached = v_student.detach().float()
+                            for k_i in range(self.K):
+                                mse_k = ((v_student_detached - teacher_vels[k_i].float()) ** 2).mean()
+                                loss_info[f"mse_{self._teacher_names[k_i]}"].append(mse_k)
+                                loss_info[f"weight_{self._teacher_names[k_i]}"].append(
+                                    mof_weights[k_i].mean().detach()
+                                )
 
                             self.accelerator.backward(loss)
 
