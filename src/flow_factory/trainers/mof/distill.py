@@ -112,6 +112,10 @@ class MoFDistillTrainer(BaseTrainer):
             f"normalize_loss={self.normalize_loss}"
         )
 
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """No-op: distillation uses MSE loss, not external rewards."""
+        pass
+
     # =========================================================================
     # MoF Weight Loading
     # =========================================================================
