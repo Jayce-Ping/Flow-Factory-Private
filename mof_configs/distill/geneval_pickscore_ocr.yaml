@@ -1,14 +1,11 @@
-# MoF-GRPO: 2-teacher experiment with GRPO optimization.
+# MoF Distillation: distill 3-teacher weighted mixture → single student LoRA.
 #
-# Same MoF infrastructure as geneval_pickscore.yaml (teacher mixing, per-set routing)
-# but uses PPO-clipped ratio loss instead of NFT reconstruction loss.
+# Loads MoF checkpoint (saves/mof.pt) containing learned per-timestep mixing
+# weights (K=3, T=10, S=3), then distills the weighted velocity combination
+# into a single student LoRA via pathwise MSE loss.
 #
-# Key differences from NFT:
-#   - Stores full trajectory + log_probs during sampling (more memory)
-#   - Optimizes via ratio = exp(new_log_prob - old_log_prob)
-#   - Supports PPO clipping and optional DPPO masking
-#
-# Learnable params: K=2 x T=10 x S=2 = 40 logits.
+# Data: GenEval + PickScore + OCR (round-robin interleaving, same as MoF training).
+# Target: v_target = Σ_k λ_k(t, source) * v_teacher_k
 
 # Environment Configuration
 launcher: "accelerate"
@@ -17,12 +14,13 @@ num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
 
-# Data Configuration — multi-source
+# Data Configuration — multi-source (same 3 prompt sets as MoF training)
 data:
-  dataset_dir: "dataset/geneval"
+  dataset_dir: "dataset/ocr"
   dataset_dirs:
     - "dataset/geneval"
     - "dataset/pickscore"
+    - "dataset/ocr"
   preprocessing_batch_size: 32
   dataloader_num_workers: 16
   force_reprocess: false
@@ -30,7 +28,7 @@ data:
   max_dataset_size: null
   sampler_type: "auto"
 
-# Model Configuration
+# Model Configuration (student LoRA)
 model:
   finetune_type: 'lora'
   lora_rank: 32
@@ -42,18 +40,18 @@ model:
   resume_type: null
 
 log:
-  run_name: "dppo_sd3-5_mof-grpo_geneval_pickscore_uniform"
+  run_name: "mof_distill_sd3-5_geneval_pickscore_ocr_lut"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
-  save_freq: 20
+  save_freq: 10
   save_model_only: false
 
 # Training Configuration
 train:
-  trainer_type: 'mof-grpo'                  # MoF with GRPO optimization
+  trainer_type: 'mof-distill'
 
-  # Per-source teacher configuration
+  # ---- Teacher configuration (same order as MoF training!) ----
   teachers:
     - name: "teacher-geneval"
       path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
@@ -63,74 +61,52 @@ train:
       path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
       sources: [pickscore]
       reward_name: "pick_score"
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"
 
-  teacher_route_by_source: true
   teacher_param_device: 'cuda'
 
-  # ---- MoF core hyperparameters ----
-  logits_init: "uniform"
-  logits_init_bias: 2.0
-  learning_rate: 0.05                       # Large LR for only 40 params
-  temperature: 1.0
-  normalize_weights: true
+  # ---- MoF checkpoint (source of mixing weights) ----
+  mof_checkpoint: "saves/mof.pt"
+  mof_module_type: "lut"                     # Discrete LUT mode (K=3, T=10, S=3)
+  mof_temperature: 1.0
+  mof_use_ema: false
 
-  # ---- GRPO-specific ----
-  clip_range: [-1e-4, 1e-4]                # PPO ratio clipping (tight for small logit updates)
-  adv_clip_range: [-5.0, 5.0]              # Advantage clipping
-  mask_type: 'kl_adv'             # DPPO: KL-advantage masking
-  kl_mask_threshold: 1.0e-6       # KL threshold for new-vs-old policy divergence.
-  add_kl_coefficient: true        # Scale KL by sigma (for x-based only)
-
-  # ---- EMA schedule ----
-  ema_decay: 0.9
-  ema_update_interval: 4
-  ema_device: "cuda"
-
-  # ---- Per-set reward ----
-  eval_teachers_at_start: true
-  ood_bonus_gamma: 0.2
-
-  # ---- Advantage computation ----
-  advantage_aggregation: "gdpo"
-  global_std: true
-
-  # ---- Timestep control ----
-  num_inference_steps: 10                   # T dimension of logits = number of denoising steps
+  # ---- Distillation loss ----
+  normalize_d_k: false                        # Pure MSE (set true for time-reweighted SDE)
 
   # ---- Optimization ----
+  learning_rate: 3.0e-4
   per_device_batch_size: 8
-  group_size: 16
-  unique_sample_num_per_epoch: 96
+  group_size: 1
+  num_batches_per_epoch: 96 # 32 * 3 = 96
   num_inner_epochs: 1
-  gradient_step_per_epoch: 2
+  gradient_step_per_epoch: 1 # 1 gradient step per epoch
   gradient_accumulation_steps: auto
   max_grad_norm: 1.0
-  adam_weight_decay: 0.0
+  adam_weight_decay: 1.0e-4
   adam_epsilon: 1.0e-8
   ddp_find_unused_parameters: false
-  max_epochs: 300
+  max_epochs: 500
   seed: 42
 
-  # ---- KL penalty (disabled) ----
-  kl_beta: 0.0
-  kl_type: 'v-based'
-
-  # ---- Generation settings ----
+  # ---- Generation settings (for monitoring inference) ----
   resolution: 512
   guidance_scale: 1.0
-  enable_gradient_checkpointing: false
+  num_inference_steps: 10
+  enable_gradient_checkpointing: true
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "CPS"                      # CPS for stochastic sampling (log_prob well-defined)
-  noise_level: 0.8
-  num_sde_steps: 2
-  sde_steps: [0, 1, 2, 3, 4]
+  dynamics_type: "ODE"                        # ODE for distillation (no stochastic noise)
+  noise_level: 0.0
   seed: 42
 
 # Evaluation settings
 eval:
-  resolution: 512
+  resolution: 1024
   per_device_batch_size: 16
   guidance_scale: 1.0
   num_inference_steps: 40
@@ -145,8 +121,12 @@ eval:
       dataset_dir: dataset/pickscore
       split: test
       eval_reward_names: [pick_score]
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
 
-# Training rewards
+# Training rewards (for periodic monitoring during distillation)
 rewards:
   - name: "geneval"
     reward_model: "geneval"
@@ -161,7 +141,14 @@ rewards:
     device: "cuda"
     dtype: bfloat16
     async_reward: false
-    applicable_sources: [geneval, pickscore]
+    applicable_sources: [geneval, pickscore, ocr]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
 
 # Evaluation rewards
 eval_rewards:
@@ -178,3 +165,10 @@ eval_rewards:
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]

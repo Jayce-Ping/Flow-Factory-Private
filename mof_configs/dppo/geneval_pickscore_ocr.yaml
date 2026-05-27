@@ -52,15 +52,15 @@ train:
   # Per-source teacher configuration: 3 teachers x 3 prompt sets
   teachers:
     - name: "teacher-geneval"
-      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-760"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
       sources: [geneval]
       reward_name: "geneval"
     - name: "teacher-pickscore"
-      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-820"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
       sources: [pickscore]
       reward_name: "pick_score"
     - name: "teacher-ocr"
-      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-720"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
       sources: [ocr]
       reward_name: "ocr"
 
