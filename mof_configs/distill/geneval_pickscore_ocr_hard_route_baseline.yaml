@@ -1,0 +1,209 @@
+# Baseline: Hard per-source teacher routing (DiffusionOPD-style multi-task distillation).
+#
+# This config implements the multi-task on-policy distillation baseline from
+# the DiffusionOPD algorithm (Algorithm 1) using the existing MoF distill
+# infrastructure. Each prompt source is hard-routed to its corresponding
+# in-domain teacher with weight 1.0 (no mixing across teachers):
+#
+#   geneval prompts   → teacher-geneval   (weight 1.0, others 0.0)
+#   pickscore prompts → teacher-pickscore (weight 1.0, others 0.0)
+#   ocr prompts       → teacher-ocr       (weight 1.0, others 0.0)
+#
+# Equivalent to setting λ(k, t, s) = 1[k = s] in the MoF formulation. The
+# unified student v_θ is distilled from each in-domain teacher only on its
+# matching prompt subset (Stage 2 of DiffusionOPD).
+#
+# This serves as a baseline for comparison against the learned MoF router,
+# which can mix teachers across sources (e.g., apply teacher-pickscore on
+# geneval prompts when it improves aesthetic quality).
+#
+# The hard-routing weights are encoded in a frozen LUT checkpoint at
+# `checkpoints/hard_route_baseline/mof_state.pt`. Generate it via:
+#
+#   python scripts/build_hard_route_baseline_checkpoint.py
+#
+# Algorithm correspondence (DiffusionOPD Algorithm 1, Stage 2):
+#   for m = 1..M:
+#     sample prompts c ~ C^(m)            # done by interleaved_source_iter
+#     roll out v_θ on c → trajectory       # student on-policy sampling
+#     L_m = MSE(v_θ, v_φ_m)               # MSE against in-domain teacher
+#                                          # (= MSE(v_θ, Σ_k λ_k v_k) when λ is one-hot)
+#     L_total += L_m
+#   update θ on L_total
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (3 prompt sets, round-robin interleaving)
+data:
+  dataset_dir: "dataset/ocr"
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/pickscore"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration (student LoRA)
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "mof_distill_online_sd3-5_geneval_pickscore_ocr_hard-route-baseline"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 10
+  save_model_only: false
+
+# Training Configuration
+train:
+  trainer_type: 'mof-distill'
+
+  # ---- Teacher configuration ----
+  # IMPORTANT: order MUST match the LUT checkpoint's source_to_set_id mapping
+  # (built by build_hard_route_baseline_checkpoint.py). Teachers are listed
+  # in the same order as their sources receive set_id 0, 1, 2.
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]
+      reward_name: "geneval"
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]
+      reward_name: "pick_score"
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"
+
+  teacher_param_device: 'cuda'
+
+  # ---- Hard-route LUT checkpoint (frozen, identity routing) ----
+  # The LUT contains lambda_logits[k, t, s] = 50 if k==s else 0, so
+  # softmax(λ) yields one-hot per-source routing for every timestep.
+  mof_checkpoint: "checkpoints/hard_route_baseline/mof_state.pt"
+  mof_module_type: "lut"
+  mof_temperature: 1.0
+  mof_use_ema: false                          # No EMA: weights are static one-hot
+
+  # ---- Distillation loss ----
+  normalize_d_k: false                        # Pure MSE (matches DiffusionOPD Eq. 11/12)
+  eval_baselines_at_start: true               # Evaluate teachers + base model before training
+
+  # ---- Optimization ----
+  learning_rate: 3.0e-4
+  per_device_batch_size: 8
+  group_size: 16
+  unique_sample_num_per_epoch: 72             # 3 * 24 = 72 (round-robin: 24 per source)
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 200
+  seed: 42
+
+  # ---- EMA (smooths on-policy trajectory drift on the student side) ----
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # ---- Generation settings (for on-policy trajectory sampling) ----
+  resolution: 512
+  guidance_scale: 1.0
+  num_inference_steps: 10                     # Must match T in the LUT checkpoint
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"                        # ODE for distillation (deterministic)
+  noise_level: 0.0
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 16
+  guidance_scale: 1.0
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards (for periodic monitoring during distillation)
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+
+# Evaluation rewards
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
