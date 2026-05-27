@@ -52,6 +52,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ..abc import BaseTrainer
 from ...hparams import MoFDistillTrainingArguments
+from ...rewards import RewardBuffer
 from ...samples import BaseSample
 from ...utils.base import filter_kwargs, stitch_batch_metadata
 from ...utils.logger_utils import setup_logger
@@ -349,11 +350,89 @@ class MoFDistillTrainer(BaseTrainer):
         return torch.rand(batch_size, device=device)
 
     # =========================================================================
+    # Baseline Evaluation (teachers + base model)
+    # =========================================================================
+
+    def evaluate_baselines(self) -> None:
+        """Evaluate each teacher and base model on all test sets before training.
+
+        Logs metrics under:
+          - teacher/{teacher_name}/{test_set_name}/reward_{metric}_mean
+          - base/{test_set_name}/reward_{metric}_mean
+
+        This establishes baselines for comparison with the distilled student.
+        """
+        if not self.test_dataloaders:
+            return
+
+        self.adapter.eval()
+
+        # ---- Evaluate each teacher ----
+        for k, teacher_name in enumerate(self._teacher_names):
+            applicable_test_sets = sorted(self.test_dataloaders.keys())
+            logger.info(f"Evaluating teacher '{teacher_name}' on: {applicable_test_sets}")
+
+            for ts_name in applicable_test_sets:
+                self.eval_reward_buffer = RewardBuffer(
+                    self._eval_reward_processor_for_test_set(ts_name),
+                    self.training_args.group_size,
+                )
+                merged_eval = self._merged_eval_args_for_test_set_name(ts_name)
+                eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
+
+                # Use teacher's LoRA for inference
+                prev_cache = torch.is_autocast_cache_enabled()
+                torch.set_autocast_cache_enabled(False)
+                with torch.no_grad(), self.autocast(), \
+                        self.adapter.use_named_parameters(teacher_name):
+                    all_samples = self._run_eval_inference_batches(
+                        ts_name, merged_eval, eval_seed
+                    )
+                    gathered_rewards = self._gather_eval_rewards()
+                    gathered_tags = self._gather_eval_tags(all_samples)
+                    if self.accelerator.is_main_process:
+                        log_pfx = f"teacher/{teacher_name}/{ts_name}"
+                        self._log_eval_reward_metrics(
+                            gathered_rewards, log_pfx, all_samples,
+                            gathered_tags=gathered_tags,
+                        )
+                torch.set_autocast_cache_enabled(prev_cache)
+                self.accelerator.wait_for_everyone()
+
+        # ---- Evaluate base model (no LoRA) ----
+        logger.info("Evaluating base model (no LoRA) on all test sets")
+        for ts_name in sorted(self.test_dataloaders.keys()):
+            self.eval_reward_buffer = RewardBuffer(
+                self._eval_reward_processor_for_test_set(ts_name),
+                self.training_args.group_size,
+            )
+            merged_eval = self._merged_eval_args_for_test_set_name(ts_name)
+            eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
+
+            with torch.no_grad(), self.autocast(), self.adapter.use_ref_parameters():
+                all_samples = self._run_eval_inference_batches(
+                    ts_name, merged_eval, eval_seed
+                )
+                gathered_rewards = self._gather_eval_rewards()
+                gathered_tags = self._gather_eval_tags(all_samples)
+                if self.accelerator.is_main_process:
+                    log_pfx = f"base/{ts_name}"
+                    self._log_eval_reward_metrics(
+                        gathered_rewards, log_pfx, all_samples,
+                        gathered_tags=gathered_tags,
+                    )
+            self.accelerator.wait_for_everyone()
+
+    # =========================================================================
     # Main Training Loop
     # =========================================================================
 
     def start(self):
         """Main training loop: pure MSE velocity distillation."""
+        # Evaluate baselines before training starts
+        if self.epoch == 0:
+            self.evaluate_baselines()
+
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
 

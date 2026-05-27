@@ -96,7 +96,7 @@ train:
   resolution: 512
   guidance_scale: 1.0
   num_inference_steps: 10
-  enable_gradient_checkpointing: true
+  enable_gradient_checkpointing: false
 
 # Scheduler Configuration
 scheduler:
