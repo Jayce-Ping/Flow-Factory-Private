@@ -1,0 +1,397 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,shapes.geometric}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\concat}{\mathbin\Vert}
+\newcommand{\R}{\mathbb{R}}
+
+\title{\textbf{MoF 路由网络架构数据流分析}\\[0.3em]
+\large LUT · adaLN Router · MLP Router}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ═══════════════════════════════════════════════════════════════════
+\section{概述}
+% ═══════════════════════════════════════════════════════════════════
+
+MoF (Mixture-of-Flow) 使用一个\textbf{路由模块}来预测每个 denoising step 中各 teacher 的混合权重。系统实现了三种路由架构，共享相同的外部接口：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{架构} & \textbf{配置名} & \textbf{核心思想} \\
+\midrule
+离散查找表 (LUT) & \texttt{lut} & 固定 $(K, T, S)$ 参数，按 index 查表 \\
+adaLN Router & \texttt{adaln\_router} & 时间调制文本，类 DiT 的 adaLN 模式 \\
+MLP Router & \texttt{mlp\_router} & 拼接时间+文本，简单 MLP 预测 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{统一输出}：所有架构输出 $\mathbf{W} \in \R^{K \times B}$，其中 $K$ = teacher 数量，$B$ = batch size，每列归一化 $\sum_k W_{k,b} = 1$。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{架构 1：离散查找表 (MoFMixingModule)}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{数据流图}
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=2.8cm, minimum height=0.8cm, align=center, fill=blue!8},
+    param/.style={draw, rounded corners, minimum width=2.5cm, minimum height=0.8cm, align=center, fill=orange!15},
+    io/.style={draw, rounded corners, minimum width=2.5cm, minimum height=0.8cm, align=center, fill=green!10},
+    arr/.style={-{Stealth[length=3mm]}, thick},
+]
+    % Inputs
+    \node[io] (tidx) at (0, 4) {$t_{\text{idx}} \in \mathbb{Z}$\\{\scriptsize timestep index}};
+    \node[io] (setids) at (4, 4) {$\mathbf{s} \in \mathbb{Z}^B$\\{\scriptsize set IDs}};
+
+    % Parameter
+    \node[param] (logits) at (2, 2.5) {$\bm{\Lambda} \in \R^{K \times T \times S}$\\{\scriptsize learnable logits}};
+
+    % Operations
+    \node[box] (index) at (2, 1) {Index: $\bm{\Lambda}[:, t_{\text{idx}}, \mathbf{s}]$};
+    \node[box] (softmax) at (2, -0.5) {$\softmax(\cdot / \tau, \text{dim}=0)$};
+
+    % Output
+    \node[io] (out) at (2, -2) {$\mathbf{W} \in \R^{K \times B}$\\{\scriptsize 混合权重}};
+
+    % Arrows
+    \draw[arr] (tidx) -- (index);
+    \draw[arr] (setids) -- (index);
+    \draw[arr] (logits) -- (index);
+    \draw[arr] (index) -- (softmax);
+    \draw[arr] (softmax) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\subsection{张量维度详解}
+
+\begin{center}
+\begin{tabular}{lcp{8cm}}
+\toprule
+\textbf{张量} & \textbf{形状} & \textbf{维度含义} \\
+\midrule
+$\bm{\Lambda}$ (logits) & $(K, T, S)$ &
+    $K$: teacher 数量 (e.g., 3) \newline
+    $T$: denoising 总步数 (e.g., 10) \newline
+    $S$: prompt source 集合数 (e.g., 3 for geneval/pickscore/ocr) \\
+\midrule
+$t_{\text{idx}}$ & scalar $\in [0, T{-}1]$ & 当前 denoising step 的整数索引 \\
+\midrule
+$\mathbf{s}$ (set\_ids) & $(B,)$ & 每个样本对应的 source 集合 ID \\
+\midrule
+$\bm{\Lambda}[:, t_{\text{idx}}, :]$ & $(K, S)$ & 当前 step 下所有 teacher × 所有 source 的 logits \\
+\midrule
+$\bm{\Lambda}[:, t_{\text{idx}}, \mathbf{s}]$ & $(K, B)$ & 每样本取对应 source 的 logits (advanced indexing) \\
+\midrule
+$\mathbf{W}$ & $(K, B)$ & softmax 归一化后的权重，$\sum_k W_{k,b} = 1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{计算逻辑}
+
+\begin{equation}
+W_{k,b} = \frac{\exp(\Lambda_{k, t_{\text{idx}}, s_b} / \tau)}{\sum_{k'=1}^K \exp(\Lambda_{k', t_{\text{idx}}, s_b} / \tau)}
+\end{equation}
+
+\textbf{特点}：无神经网络计算，纯查表 + softmax。$K \times T \times S$ 个可学习参数。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{架构 2：adaLN Router (MoFAdaLNRouter)}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{数据流图}
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, fill=blue!8},
+    param/.style={draw, rounded corners, minimum width=2.5cm, minimum height=0.8cm, align=center, fill=orange!15},
+    io/.style={draw, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, fill=green!10},
+    arr/.style={-{Stealth[length=3mm]}, thick},
+    node distance=0.8cm,
+]
+    % Inputs
+    \node[io] (t_in) at (-3, 6) {$\mathbf{t} \in \R^B$\\{\scriptsize raw timestep}};
+    \node[io] (pe_in) at (3, 6) {$\mathbf{H} \in \R^{B \times L \times d_{\text{text}}}$\\{\scriptsize prompt\_embeds}};
+
+    % Time branch
+    \node[box] (sinemb) at (-3, 4.5) {SinusoidalEmb\\{\scriptsize $\R^B \to \R^{B \times d_t}$}};
+    \node[box] (tmlp) at (-3, 3) {Linear + SiLU\\{\scriptsize $\R^{B \times d_t} \to \R^{B \times d_h}$}};
+    \node[box] (adaln) at (-3, 1.5) {Linear (adaLN)\\{\scriptsize $\R^{B \times d_h} \to \R^{B \times 2d_h}$}};
+    \node[box] (chunk) at (-3, 0) {chunk $\to (\gamma, \beta)$\\{\scriptsize 各 $\R^{B \times d_h}$}};
+
+    % Text branch
+    \node[box] (attnpool) at (3, 4.5) {AttnPool($\mathbf{q}$)\\{\scriptsize $\R^{B \times L \times d_{\text{text}}} \to \R^{B \times d_{\text{text}}}$}};
+    \node[box] (cproj) at (3, 3) {Linear (c\_proj)\\{\scriptsize $\R^{B \times d_{\text{text}}} \to \R^{B \times d_h}$}};
+
+    % Fusion
+    \node[box, fill=red!10, minimum width=4cm] (fuse) at (0, -1.5) {$\mathbf{h} = \gamma \odot \mathbf{c} + \beta$\\{\scriptsize adaLN modulation, $\R^{B \times d_h}$}};
+
+    % Output MLP
+    \node[box] (mlp) at (0, -3) {SiLU → Linear → SiLU → Linear\\{\scriptsize $\R^{B \times d_h} \to \R^{B \times K}$}};
+    \node[box] (sm) at (0, -4.5) {$\softmax(\cdot / \tau, \text{dim}{=}{-}1)$};
+    \node[io] (out) at (0, -6) {$\mathbf{W} \in \R^{K \times B}$ {\scriptsize (transposed)}};
+
+    % Arrows
+    \draw[arr] (t_in) -- (sinemb);
+    \draw[arr] (sinemb) -- (tmlp);
+    \draw[arr] (tmlp) -- (adaln);
+    \draw[arr] (adaln) -- (chunk);
+    \draw[arr] (pe_in) -- (attnpool);
+    \draw[arr] (attnpool) -- (cproj);
+    \draw[arr] (chunk) -- (fuse);
+    \draw[arr] (cproj) -- node[right, font=\scriptsize]{$\mathbf{c}$} (fuse);
+    \draw[arr] (fuse) -- (mlp);
+    \draw[arr] (mlp) -- (sm);
+    \draw[arr] (sm) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\subsection{张量维度详解}
+
+\begin{center}
+\small
+\begin{tabular}{lcp{7.5cm}}
+\toprule
+\textbf{张量} & \textbf{形状} & \textbf{维度含义} \\
+\midrule
+\multicolumn{3}{l}{\textit{--- 输入 ---}} \\
+$\mathbf{t}$ & $(B,)$ & 每样本的 raw timestep 值 (e.g., 0--1000) \\
+$\mathbf{H}$ (prompt\_embeds) & $(B, L, d_{\text{text}})$ &
+    $B$: batch size \newline
+    $L$: token 序列长度 (e.g., 77--512) \newline
+    $d_{\text{text}}$: text encoder hidden dim (e.g., 4096) \\
+$\mathbf{H}_{\text{pool}}$ (可选) & $(B, d_{\text{pool}})$ & pooled text embedding (SD3: 2048)。若提供则跳过 AttnPool \\
+\midrule
+\multicolumn{3}{l}{\textit{--- Time Branch ---}} \\
+SinusoidalEmb($\mathbf{t}$) & $(B, d_t)$ & 正弦位置编码 ($d_t$=256) \\
+$\mathbf{t}_h$ = Linear+SiLU & $(B, d_h)$ & 时间隐表示 ($d_h$=256) \\
+adaLN output & $(B, 2d_h)$ & Linear 映射后的 $\gamma, \beta$ 拼接 \\
+$\gamma, \beta$ & 各 $(B, d_h)$ & adaLN 调制参数（初始化为 0） \\
+\midrule
+\multicolumn{3}{l}{\textit{--- Text Branch ---}} \\
+$\mathbf{q}$ (attn\_query) & $(1, 1, d_{\text{text}})$ & Learnable attention query（初始化 $\sim \mathcal{N}(0, 0.02)$） \\
+attn scores & $(B, 1, L)$ & $\mathbf{q} \cdot \mathbf{H}^\top / \sqrt{d_{\text{text}}}$ \\
+attn weights & $(B, 1, L)$ & softmax over $L$ dimension \\
+$\mathbf{c}_{\text{pooled}}$ & $(B, d_{\text{text}})$ & Weighted sum of tokens \\
+$\mathbf{c}$ = c\_proj & $(B, d_h)$ & 投射到隐层维度 \\
+\midrule
+\multicolumn{3}{l}{\textit{--- Fusion + Output ---}} \\
+$\mathbf{h} = \gamma \odot \mathbf{c} + \beta$ & $(B, d_h)$ & 时间调制后的融合表示 \\
+MLP output (logits) & $(B, K)$ & K 个 teacher 的 unnormalized logits \\
+$\mathbf{W}$ (output) & $(K, B)$ & softmax 后 transpose，$\sum_k W_{k,b} = 1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{计算逻辑}
+
+\begin{align}
+\mathbf{t}_h &= \text{SiLU}(\text{Linear}(\text{SinusoidalEmb}(\mathbf{t}))) && \in \R^{B \times d_h} \\
+(\gamma, \beta) &= \text{chunk}(\text{Linear}_{\text{adaLN}}(\mathbf{t}_h), 2) && \text{各} \in \R^{B \times d_h} \\[0.5em]
+\mathbf{c} &= \text{Linear}_{\text{proj}}(\text{AttnPool}(\mathbf{H})) && \in \R^{B \times d_h} \\[0.5em]
+\mathbf{h} &= \gamma \odot \mathbf{c} + \beta && \in \R^{B \times d_h} \\
+\bm{\ell} &= \text{MLP}(\mathbf{h}) && \in \R^{B \times K} \\
+W_{k,b} &= \softmax(\bm{\ell}_b / \tau)_k && \in \R^{K \times B}
+\end{align}
+
+\textbf{关键特性}：$\gamma$ 和 $\beta$ 初始化为 0 → 训练初期 $\mathbf{h} = \mathbf{0}$ → 输出层也零初始化 → 初始权重均匀 $1/K$。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{架构 3：MLP Router (MoFMLPRouter)}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{数据流图}
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, fill=blue!8},
+    io/.style={draw, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, fill=green!10},
+    arr/.style={-{Stealth[length=3mm]}, thick},
+]
+    % Inputs
+    \node[io] (t_in) at (-3, 5) {$\mathbf{t} \in \R^B$\\{\scriptsize raw timestep}};
+    \node[io] (pe_in) at (3, 5) {$\mathbf{H} \in \R^{B \times L \times d_{\text{text}}}$\\{\scriptsize prompt\_embeds}};
+
+    % Time branch
+    \node[box] (sinemb) at (-3, 3.5) {SinusoidalEmb\\{\scriptsize $\to \R^{B \times d_t}$}};
+    \node[box] (tproj) at (-3, 2) {Linear + SiLU\\{\scriptsize $\to \R^{B \times d_h}$}};
+
+    % Text branch
+    \node[box] (attnpool) at (3, 3.5) {AttnPool($\mathbf{q}$)\\{\scriptsize $\to \R^{B \times d_{\text{text}}}$}};
+    \node[box] (cproj) at (3, 2) {Linear (c\_proj)\\{\scriptsize $\to \R^{B \times d_h}$}};
+
+    % Concat
+    \node[box, fill=yellow!15, minimum width=4cm] (cat) at (0, 0.5) {Concat: $[\mathbf{t}_h;\; \mathbf{c}]$\\{\scriptsize $\R^{B \times 2d_h}$}};
+
+    % MLP
+    \node[box] (mlp) at (0, -1) {Linear → SiLU → Linear → SiLU → Linear\\{\scriptsize $\R^{B \times 2d_h} \to \R^{B \times K}$}};
+    \node[box] (sm) at (0, -2.5) {$\softmax(\cdot / \tau, \text{dim}{=}{-}1)$};
+    \node[io] (out) at (0, -4) {$\mathbf{W} \in \R^{K \times B}$ {\scriptsize (transposed)}};
+
+    % Arrows
+    \draw[arr] (t_in) -- (sinemb);
+    \draw[arr] (sinemb) -- (tproj);
+    \draw[arr] (pe_in) -- (attnpool);
+    \draw[arr] (attnpool) -- (cproj);
+    \draw[arr] (tproj) -- (cat);
+    \draw[arr] (cproj) -- (cat);
+    \draw[arr] (cat) -- (mlp);
+    \draw[arr] (mlp) -- (sm);
+    \draw[arr] (sm) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\subsection{张量维度详解}
+
+\begin{center}
+\small
+\begin{tabular}{lcp{7.5cm}}
+\toprule
+\textbf{张量} & \textbf{形状} & \textbf{维度含义} \\
+\midrule
+\multicolumn{3}{l}{\textit{--- 输入（与 adaLN Router 相同）---}} \\
+$\mathbf{t}$ & $(B,)$ & raw timestep \\
+$\mathbf{H}$ & $(B, L, d_{\text{text}})$ & text token 序列 \\
+\midrule
+\multicolumn{3}{l}{\textit{--- 中间计算 ---}} \\
+$\mathbf{t}_h$ & $(B, d_h)$ & 时间隐表示（SinusoidalEmb → Linear → SiLU） \\
+$\mathbf{c}$ & $(B, d_h)$ & 文本隐表示（AttnPool → c\_proj） \\
+$[\mathbf{t}_h;\; \mathbf{c}]$ & $(B, 2d_h)$ & 拼接（dim=-1 上 concat） \\
+\midrule
+\multicolumn{3}{l}{\textit{--- MLP (3 层) ---}} \\
+Layer 1: Linear + SiLU & $(B, 2d_h) \to (B, d_h)$ & 压缩维度 \\
+Layer 2: Linear + SiLU & $(B, d_h) \to (B, d_h)$ & 非线性变换 \\
+Layer 3: Linear & $(B, d_h) \to (B, K)$ & 输出 logits（零初始化） \\
+\midrule
+$\mathbf{W}$ & $(K, B)$ & softmax + transpose \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{计算逻辑}
+
+\begin{align}
+\mathbf{t}_h &= \text{SiLU}(\text{Linear}(\text{SinusoidalEmb}(\mathbf{t}))) && \in \R^{B \times d_h} \\
+\mathbf{c} &= \text{Linear}_{\text{proj}}(\text{AttnPool}(\mathbf{H})) && \in \R^{B \times d_h} \\[0.5em]
+\mathbf{h} &= [\mathbf{t}_h \concat \mathbf{c}] && \in \R^{B \times 2d_h} \\
+\bm{\ell} &= \text{MLP}_{3\text{-layer}}(\mathbf{h}) && \in \R^{B \times K} \\
+W_{k,b} &= \softmax(\bm{\ell}_b / \tau)_k && \in \R^{K \times B}
+\end{align}
+
+\textbf{与 adaLN 的区别}：时间和文本通过简单拼接而非乘法调制融合。交互能力完全依赖 MLP 隐式学习。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{三种架构对比}
+% ═══════════════════════════════════════════════════════════════════
+
+\begin{center}
+\small
+\begin{tabular}{l|ccc}
+\toprule
+& \textbf{LUT} & \textbf{adaLN Router} & \textbf{MLP Router} \\
+\midrule
+\textbf{输入} & $t_{\text{idx}}, \mathbf{s}$ (整数) & $\mathbf{t}, \mathbf{H}$ (连续) & $\mathbf{t}, \mathbf{H}$ (连续) \\
+\textbf{输出} & $(K, B)$ & $(K, B)$ & $(K, B)$ \\
+\textbf{参数量} (K=3, T=10, S=3) & 90 & $\sim$1.2M & $\sim$1.0M \\
+\textbf{时间-文本交互} & 无（独立查表） & 显式乘法调制 & 隐式 MLP \\
+\textbf{泛化能力} & 无（仅记忆） & 强（连续插值） & 中（依赖 MLP 容量） \\
+\textbf{初始化策略} & uniform/biased & 零初始化输出+adaLN & 零初始化输出 \\
+\textbf{推理步数依赖} & 绑定 $T$ & 任意步数 & 任意步数 \\
+\textbf{per-prompt 适应} & 仅按 source 分组 & 每个 prompt 独立 & 每个 prompt 独立 \\
+\textbf{训练稳定性} & 极稳定 & 稳定（零初始化保证） & 稳定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{共享组件：AttnPool 详解}
+% ═══════════════════════════════════════════════════════════════════
+
+adaLN Router 和 MLP Router 共享同一个 Attention Pooling 模块（继承自 \texttt{MoFRouterBase}）。其作用是将变长 token 序列压缩为固定维度向量：
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=3cm, minimum height=0.7cm, align=center, fill=blue!8},
+    io/.style={draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, align=center, fill=green!10},
+    arr/.style={-{Stealth[length=2.5mm]}, thick},
+]
+    \node[io] (H) at (0, 3) {$\mathbf{H} \in \R^{B \times L \times d_{\text{text}}}$};
+    \node[io] (q) at (4.5, 3) {$\mathbf{q} \in \R^{1 \times 1 \times d_{\text{text}}}$\\{\scriptsize learnable}};
+
+    \node[box] (dot) at (2, 1.8) {$\mathbf{q} \cdot \mathbf{H}^\top / \sqrt{d_{\text{text}}}$\\{\scriptsize → $(B, 1, L)$}};
+    \node[box] (sm) at (2, 0.6) {$\softmax(\cdot, \text{dim}=-1)$\\{\scriptsize → $(B, 1, L)$}};
+    \node[box] (mul) at (2, -0.6) {$\alpha \cdot \mathbf{H}$\\{\scriptsize $(B,1,L) \times (B,L,d_{\text{text}}) \to (B,1,d_{\text{text}})$}};
+    \node[box] (sq) at (2, -1.8) {squeeze(1)\\{\scriptsize → $(B, d_{\text{text}})$}};
+    \node[io] (out) at (2, -3) {$\mathbf{c}_{\text{pooled}} \in \R^{B \times d_{\text{text}}}$};
+
+    \draw[arr] (H) -- (dot);
+    \draw[arr] (q) -- (dot);
+    \draw[arr] (dot) -- (sm);
+    \draw[arr] (sm) -- (mul);
+    \draw[arr] (mul) -- (sq);
+    \draw[arr] (sq) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\textbf{Bypass 机制}：若模型提供 \texttt{pooled\_prompt\_embeds}（如 SD3.5 的 CLIP pooled output），则跳过 AttnPool 直接使用，节省计算。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{共享组件：Timestep Embedding 详解}
+% ═══════════════════════════════════════════════════════════════════
+
+两种 Router 共享同一套时间编码：
+
+\begin{equation}
+\mathbf{t}_h = \text{SiLU}\bigl(\text{Linear}_{d_t \to d_h}(\text{SinusoidalPosEmb}_{d_t}(\mathbf{t}))\bigr)
+\end{equation}
+
+其中 SinusoidalPosEmb 使用 \texttt{diffusers.models.embeddings.Timesteps}：
+\begin{equation}
+\text{SinusoidalPosEmb}(t)_i = \begin{cases}
+\cos(t / 10000^{2i/d_t}) & \text{if } i < d_t/2 \\
+\sin(t / 10000^{2(i - d_t/2)/d_t}) & \text{if } i \geq d_t/2
+\end{cases}
+\end{equation}
+
+输入 $\mathbf{t}$ 为 scheduler 原始值（e.g., 0--1000），编码器自动处理不同尺度。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{输出使用：速度组合}
+% ═══════════════════════════════════════════════════════════════════
+
+无论使用哪种路由架构，输出权重 $\mathbf{W} \in \R^{K \times B}$ 以相同方式参与速度组合：
+
+\begin{equation}
+\bar{v}_b = \sum_{k=1}^K W_{k,b} \cdot v_k(\mathbf{x}_t, t, \mathbf{c})_b, \quad \forall b \in [1, B]
+\end{equation}
+
+实现时通过广播展开：
+\begin{align}
+\mathbf{W}_{\text{expanded}} &= \text{reshape}(\mathbf{W}, (K, B, 1, 1, 1)) && \text{匹配 spatial dims} \\
+\bar{\mathbf{v}} &= \sum_{k=1}^K \mathbf{W}_{\text{expanded}}[k] \odot \mathbf{v}_k && \in \R^{B \times C \times H \times W}
+\end{align}
+
+\end{document}
