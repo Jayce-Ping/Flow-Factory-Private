@@ -50,7 +50,7 @@ from ...utils.trajectory_collector import compute_trajectory_indices
 from ..opd.common import load_teachers, cache_forward_signature, filter_forward_kwargs
 from .common import create_mixing_module
 
-logger = setup_logger(__name__)
+logger = setup_logger(__name__, rank_zero_only=True)
 
 _FORWARD_EXCLUDE_KEYS = frozenset({"all_latents", "timesteps", "__source__", "latent_index_map"})
 
