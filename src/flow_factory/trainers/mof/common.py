@@ -925,9 +925,12 @@ class MoFTrainerBase(BaseTrainer):
 
             if is_router:
                 # Router mode: predict weights from (t, prompt_embeds)
+                # NOTE: patched_forward intercepts adapter.forward(), which uses
+                # adapter-level kwarg names (prompt_embeds, pooled_prompt_embeds),
+                # NOT transformer-internal names (encoder_hidden_states, pooled_projections).
                 t_val = kwargs.get('t')  # (B,) or scalar
-                prompt_emb = kwargs.get('encoder_hidden_states')  # (B, L, d)
-                pooled = kwargs.get('pooled_projections')  # (B, d_pool) or None
+                prompt_emb = kwargs.get('prompt_embeds')  # (B, L, d)
+                pooled = kwargs.get('pooled_prompt_embeds')  # (B, d_pool) or None
                 w_i = self._mixing_module_unwrapped(t_val, prompt_emb, pooled)  # (K, B)
                 n_spatial = stacked.ndim - 2
                 w_expanded = w_i.view(self.K, -1, *([1] * n_spatial))
