@@ -2246,6 +2246,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "mof-nft": MoFNFTTrainingArguments,
     "mof-grpo": MoFGRPOTrainingArguments,
     "mof-distill": MoFDistillTrainingArguments,
+    "mof-distill-offline": MoFDistillTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,
