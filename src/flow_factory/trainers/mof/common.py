@@ -928,9 +928,13 @@ class MoFTrainerBase(BaseTrainer):
                 # NOTE: patched_forward intercepts adapter.forward(), which uses
                 # adapter-level kwarg names (prompt_embeds, pooled_prompt_embeds),
                 # NOT transformer-internal names (encoder_hidden_states, pooled_projections).
-                t_val = kwargs.get('t')  # (B,) or scalar
+                t_val = kwargs.get('t')  # scalar or (B,)
                 prompt_emb = kwargs.get('prompt_embeds')  # (B, L, d)
                 pooled = kwargs.get('pooled_prompt_embeds')  # (B, d_pool) or None
+                # Router's _embed_time requires 1D (B,) tensor; adapter.forward
+                # receives a scalar t from the inference loop iteration.
+                if t_val.dim() == 0:
+                    t_val = t_val.expand(prompt_emb.shape[0])
                 w_i = self._mixing_module_unwrapped(t_val, prompt_emb, pooled)  # (K, B)
                 n_spatial = stacked.ndim - 2
                 w_expanded = w_i.view(self.K, -1, *([1] * n_spatial))
