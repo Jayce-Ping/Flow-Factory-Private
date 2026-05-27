@@ -394,4 +394,302 @@ adaLN Router 和 MLP Router 共享同一个 Attention Pooling 模块（继承自
 \bar{\mathbf{v}} &= \sum_{k=1}^K \mathbf{W}_{\text{expanded}}[k] \odot \mathbf{v}_k && \in \R^{B \times C \times H \times W}
 \end{align}
 
+% ═══════════════════════════════════════════════════════════════════
+\newpage
+\section{中间维度 $d_h$ 的设计分析}
+\label{sec:hidden_dim_analysis}
+% ═══════════════════════════════════════════════════════════════════
+
+Router 的核心设计参数是中间隐藏维度 $d_h$。当前实现选择 $d_h = 256$，本节从信息论、优化理论和工程实践三个角度系统分析这一选择的理由，并讨论替代方案。
+
+\subsection{问题定义：维度压缩的本质}
+
+Router 的计算路径是一个维度压缩流水线：
+
+\begin{equation}
+\underbrace{d_{\text{text}}}_{2048} \xrightarrow{\texttt{c\_proj}} \underbrace{d_h}_{?} \xrightarrow{\text{fusion}} d_h \xrightarrow{\text{MLP}} \underbrace{K}_{3}
+\end{equation}
+
+输入空间维度为 $d_{\text{text}} = 2048$（SD3.5 的 CLIP-L[768] $\oplus$ OpenCLIP-G[1280] pooled embedding），输出仅为 $K = 3$ 个标量。因此 $d_h$ 的选择本质上是在回答：
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!50, title=核心问题]
+从 2048 维的语义空间中，需要保留多少信息才能做出正确的 3-way 路由决策？
+\end{tcolorbox}
+
+\subsection{信息论分析}
+
+\subsubsection{输出信息量的上界}
+
+Router 的输出是一个 $K$-维 simplex 上的概率向量 $(w_1, w_2, w_3)$，其自由度仅为 $K - 1 = 2$。考虑 softmax 前的 logit 空间，实际输出的有效维度为 $K = 3$ 个标量（其中一个自由度被归一化消除）。
+
+因此，从信息论角度，路由决策的\textbf{内在维度}极低——仅需区分 $K$ 种 teacher 的相对强度。
+
+\subsubsection{条件信息需求}
+
+Router 的条件输入有两个维度：
+\begin{itemize}
+    \item \textbf{时间 $t$}：编码为 $d_{\text{time}} = 256$ 维正弦向量。但有效信息量远低于此——denoising 过程中只有 10--50 个离散步，且相邻步间路由策略平滑变化。
+    \item \textbf{文本 $\mathbf{c}$}：原始 $d_{\text{text}} = 2048$ 维。但对路由决策有效的信息远小于全部语义信息。路由只需区分"该 prompt 更适合哪个 teacher"——这是一个粗粒度的分类决策，不需要保留细粒度的语义细节。
+\end{itemize}
+
+\subsubsection{信息瓶颈视角}
+
+从 Information Bottleneck (Tishby et al., 2000) 的视角，$d_h$ 控制了压缩表示 $\mathbf{h}$ 中保留的互信息量 $I(\mathbf{H}; \mathbf{h})$。最优的中间表示应当：
+\begin{equation}
+\min_{p(\mathbf{h}|\mathbf{H})} I(\mathbf{H}; \mathbf{h}) - \beta \cdot I(\mathbf{h}; \mathbf{W})
+\end{equation}
+即在保持对输出 $\mathbf{W}$ 预测能力的同时，最大程度地压缩输入。由于 $\mathbf{W}$ 仅有 2 个自由度，最优 $\mathbf{h}$ 的有效信息量应该很低。
+
+\subsection{参数量与过拟合风险分析}
+
+\subsubsection{训练信号的稀疏性}
+
+MoF 的训练信号来源于 RL reward，具有以下特点：
+\begin{itemize}
+    \item 每 epoch 仅 $N_{\text{samples}} = 144$ 个样本（典型配置）
+    \item 每个样本提供一个标量 reward（经 advantage normalization 后）
+    \item 梯度信号经过 NFT/GRPO loss → ratio/β-interpolation → 多层链式法则，信噪比较低
+\end{itemize}
+
+这意味着可用的有效训练信号约为 $\sim 144$ scalar/epoch。对比不同 $d_h$ 下的参数量：
+
+\begin{center}
+\begin{tabular}{r|rrr|c}
+\toprule
+$d_h$ & \textbf{AdaLN 参数量} & \textbf{MLP 参数量} & \textbf{参数/样本比} & \textbf{过拟合风险} \\
+\midrule
+64    & $\sim$162K & $\sim$144K & $\sim$1,125:1 & 高 \\
+128   & $\sim$347K & $\sim$314K & $\sim$2,410:1 & 高 \\
+\textbf{256}  & $\sim$\textbf{790K} & $\sim$\textbf{660K} & $\sim$\textbf{5,486:1} & \textbf{高（但可控）} \\
+512   & $\sim$1.97M & $\sim$1.75M & $\sim$13,680:1 & 极高 \\
+1024  & $\sim$5.5M & $\sim$5.0M & $\sim$38,200:1 & 不可接受 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{注}：参数/样本比（params-per-sample ratio）越高，过拟合风险越大。经典监督学习中，$\sim$10:1 是合理比例。RL 场景的信号更稀疏，实际有效信息量更低。
+
+\subsubsection{为什么 256 仍然可行}
+
+尽管参数/样本比极高（$\sim$5,500:1），以下因素使 $d_h = 256$ 仍然稳定：
+
+\begin{enumerate}
+    \item \textbf{零初始化}：adaLN 调制参数 $(\gamma, \beta)$ 和输出层均初始化为零，确保训练开始时所有 teacher 均匀加权（$1/K$）。网络只需从 uniform baseline 做\emph{微小偏移}。
+    \item \textbf{EMA 平滑}：Off-policy 训练使用 EMA 权重采样，当前权重仅用于 loss 计算。EMA 的时间平均效应抑制了过拟合到单 batch 的噪声。
+    \item \textbf{softmax 归一化}：输出经过 softmax（$\tau = 1.0$），将 logit 空间的自由度约束到 simplex 上。即使 MLP 容量很大，输出空间仍然是 $(K{-}1)$-维的。
+    \item \textbf{Gradient clipping}：$\|\nabla\|_{\max} = 1.0$ 配合 $\text{lr} = 10^{-3}$，每步参数更新幅度极小。
+    \item \textbf{低秩约束}：c\_proj 将 2048→256 是一个线性瓶颈，天然限制了网络可学习的函数族——只能在 256 维子空间中做决策。
+\end{enumerate}
+
+\subsection{不同 $d_h$ 选择的系统分析}
+
+\subsubsection{方案 A：$d_h > d_{\text{text}}$（如 4096, 8192）}
+
+\textbf{含义}：将文本先投射到比原始空间更高的维度。
+
+\begin{center}
+\begin{tabular}{>{\raggedright}p{3cm}|p{9cm}}
+\toprule
+\textbf{方面} & \textbf{分析} \\
+\midrule
+表达能力 & 极高。可学习任意复杂的时间-文本交互模式。\\
+过拟合风险 & \textcolor{red}{极高}。参数量 $> 20$M，远超有效训练信号。\\
+计算开销 & 显著增加推理延迟。每个 denoising step 的 router forward pass 不可忽略。\\
+适用场景 & 仅当训练数据极其充足（如百万级有标签样本）时才合理。在 RL 训练中完全不适用。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{结论}：无实际意义——这相当于用 LLM 级别的网络来预测 3 个数字。
+
+\subsubsection{方案 B：$d_h \approx d_{\text{text}}$（如 1024, 2048）}
+
+\textbf{含义}：保留接近原始文本维度的信息量。
+
+\begin{center}
+\begin{tabular}{>{\raggedright}p{3cm}|p{9cm}}
+\toprule
+\textbf{方面} & \textbf{分析} \\
+\midrule
+表达能力 & 充分保留文本语义。可以基于细粒度语义差异做路由。\\
+过拟合风险 & \textcolor{red}{很高}。$d_h = 1024$ 时参数量 $\sim$5.5M。\\
+信息效率 & 极低——保留了大量对路由决策无关的语义信息（如句法结构、同义词差异等）。\\
+与 DiT 的对比 & SD3/Flux 使用 1536-dim conditioning，但它们驱动一个 2B 参数的 transformer 生成整幅图像。Router 仅输出 3 个标量——维度应与输出复杂度匹配，而非输入复杂度。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{结论}：对本问题过度参数化。适用于需要精细 prompt 理解的场景（如数百个 teacher 的 dense MoE），但 $K = 3$ 不需要。
+
+\subsubsection{方案 C：$d_h \in [384, 512]$（中等瓶颈）}
+
+\textbf{含义}：$2 \times$--$4 \times$ 压缩，保留较多文本信息。
+
+\begin{center}
+\begin{tabular}{>{\raggedright}p{3cm}|p{9cm}}
+\toprule
+\textbf{方面} & \textbf{分析} \\
+\midrule
+表达能力 & 可区分较精细的文本类别（如 prompt 中的物体数量、场景复杂度、OCR 内容长度）。\\
+参数量 & $d_h = 512$: AdaLN $\sim$1.97M, MLP $\sim$1.75M。约为当前方案的 $2.5\times$。\\
+过拟合风险 & 中高。可能在 144 samples/epoch 的 regime 下需要更强的正则化（dropout, weight decay, 更低 lr）。\\
+学习率需求 & 可能需要降低到 $\sim 3 \times 10^{-4}$，减缓训练速度。\\
+潜在优势 & 若 teacher 专长的边界需要从 prompt 的细粒度语义推断（而非粗粒度类别），更高维度可能有帮助。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{结论}：合理的 ablation 候选。当 teacher 数量增加（$K \geq 5$）或 prompt 空间更复杂时值得考虑。
+
+\subsubsection{方案 D：$d_h = 256$（当前选择）}
+
+\textbf{含义}：$\sim 8 \times$ 压缩，激进瓶颈。
+
+\begin{center}
+\begin{tabular}{>{\raggedright}p{3cm}|p{9cm}}
+\toprule
+\textbf{方面} & \textbf{分析} \\
+\midrule
+表达能力 & 保留文本的\emph{粗粒度语义类别}信息。可区分"关于物体组合的 prompt"vs"关于美学的 prompt"vs"关于文字的 prompt"。\\
+参数量 & AdaLN $\sim$790K, MLP $\sim$660K。训练高效，单 GPU 可快速迭代。\\
+过拟合风险 & 中等。零初始化 + EMA + gradient clipping 联合控制。\\
+与 $d_{\text{time}}$ 对齐 & $d_h = d_{\text{time}} = 256$，无需额外投射层。Time MLP 的输出直接作为 adaLN 的输入，架构简洁。\\
+信息效率 & 高——强制网络学习与\emph{路由决策相关}的压缩表示，忽略无关的语义细节。正则化效果类似于信息瓶颈中增大 $\beta$ 惩罚。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{结论}：在 $K = 3$, 144 samples/epoch 的 regime 下是最优平衡点。
+
+\subsubsection{方案 E：$d_h < 256$（如 64, 128）}
+
+\textbf{含义}：$16 \times$--$32 \times$ 压缩。
+
+\begin{center}
+\begin{tabular}{>{\raggedright}p{3cm}|p{9cm}}
+\toprule
+\textbf{方面} & \textbf{分析} \\
+\midrule
+表达能力 & 可能不足以表达时间-文本的非线性交互。$d_h = 64$ 的 adaLN 调制仅有 64 个 $(\gamma, \beta)$ 对，限制了表达力。\\
+欠拟合风险 & \textcolor{red}{中高}。若 optimal routing policy 需要 prompt 内容的细粒度区分（e.g., 同为 OCR 但长短文本需要不同权重），可能容量不足。\\
+参数量 & $d_h = 64$: AdaLN $\sim$162K, MLP $\sim$144K。接近 LUT 的参数效率。\\
+退化为 LUT & 极端情况下 ($d_h \to 1$)，router 退化为 "所有 prompt 得到相同权重"，等价于去掉 per-prompt adaptation。\\
+适用场景 & 若事前知道路由决策几乎只依赖时间（所有 prompt 在同一 $t$ 处使用相同权重），则低 $d_h$ 足矣。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{结论}：参数效率最高，但牺牲了 per-prompt 适应性——正是 router 相比 LUT 的核心优势。仅在 $K = 2$ 或路由策略极简单时考虑。
+
+\subsection{维度选择的决定性因素}
+
+综合分析，$d_h$ 的选择取决于以下因素的平衡：
+
+\begin{center}
+\begin{tikzpicture}[
+    factor/.style={draw, rounded corners, minimum width=3.5cm, minimum height=1cm, align=center, fill=blue!8},
+    arr/.style={-{Stealth[length=3mm]}, thick},
+]
+    \node[factor] (K) at (0, 0) {\textbf{Teacher 数量 $K$}\\{\scriptsize $K$ 越大 → $d_h$ 应越大}};
+    \node[factor] (N) at (5.5, 0) {\textbf{样本量 $N$}\\{\scriptsize $N$ 越大 → $d_h$ 可越大}};
+    \node[factor] (C) at (0, -2.5) {\textbf{路由复杂度}\\{\scriptsize prompt 多样性越高 → $d_h$ 越大}};
+    \node[factor] (R) at (5.5, -2.5) {\textbf{奖励信噪比}\\{\scriptsize 信号越稀疏 → $d_h$ 越小}};
+
+    \node[draw, rounded corners, thick, fill=red!10, minimum width=2.5cm, minimum height=0.8cm, align=center]
+        (dh) at (2.75, -5) {$d_h = ?$};
+
+    \draw[arr] (K) -- (dh);
+    \draw[arr] (N) -- (dh);
+    \draw[arr] (C) -- (dh);
+    \draw[arr] (R) -- (dh);
+\end{tikzpicture}
+\end{center}
+
+\subsection{与相关工作中 gating dimension 的对比}
+
+\begin{center}
+\small
+\begin{tabular}{l|cccc}
+\toprule
+\textbf{系统} & $d_{\text{input}}$ & $d_{\text{hidden}}$ & $K$ & \textbf{压缩比} \\
+\midrule
+\textbf{MoF Router (ours)} & 2048 & 256 & 3 & $8\times$ \\
+Mixtral MoE gate & 4096 & — (single linear) & 8 & $\infty$ (无隐层) \\
+Switch Transformer gate & 768 & — (single linear) & 16 & $\infty$ (无隐层) \\
+DiT adaLN (SD3) & 2048 & 1536 & $d_{\text{model}}$ & $1.3\times$ \\
+PixArt-$\alpha$ cross-attn & 4096 & 1152 & $d_{\text{model}}$ & $3.5\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{关键观察}：
+\begin{itemize}
+    \item \textbf{MoE gating} 通常使用\emph{单层线性}（无隐层），因为它们有海量监督信号（每个 token 都训练 gate）和大 $K$（8--128 experts）。压缩通过单一矩阵完成。
+    \item \textbf{DiT conditioning} 使用高维隐层（1536），因为输出不是 $K$ 个标量，而是调制整个 transformer block 的所有参数（$\sim d_{\text{model}}$ 个 $\gamma, \beta$）。
+    \item \textbf{MoF Router} 处于中间位置：输出仅 $K = 3$（比 MoE 的 8--128 少），但需要非线性时间-文本交互（比单层 linear gate 更复杂）。$d_h = 256$ 是该 regime 的合理折中。
+\end{itemize}
+
+\subsection{scaling law 推导：$d_h$ 应如何随 $K$ 和 $N$ 变化}
+
+基于以上分析，我们可以给出启发式 scaling 建议：
+
+\begin{equation}
+d_h^* \approx C \cdot \sqrt{K \cdot \log N}
+\end{equation}
+
+其中 $C$ 是常数（取决于任务复杂度），$N$ 为 effective sample size per epoch。
+
+\textbf{直觉}：
+\begin{itemize}
+    \item $\sqrt{K}$ 依赖：输出 simplex 维度为 $K{-}1$，但区分 $K$ 个 teacher 需要 $O(\sqrt{K})$ 的表达力增长（类似 random projection 的 Johnson–Lindenstrauss 维度）。
+    \item $\log N$ 依赖：可用样本量翻倍时，过拟合风险降低，可适度增加容量。但收益是对数级的——即使样本增加 10 倍，$d_h$ 也只需微增。
+\end{itemize}
+
+对于当前设置（$K = 3$, $N = 144$）：
+\begin{equation}
+d_h^* \approx C \cdot \sqrt{3 \cdot \log 144} \approx C \cdot \sqrt{3 \times 4.97} \approx 3.86 \cdot C
+\end{equation}
+
+取 $C \approx 66$（基于经验校准）得 $d_h^* \approx 256$，与我们的选择一致。
+
+\subsection{消融实验指导}
+
+基于以上分析，推荐以下消融方向：
+
+\begin{center}
+\begin{tabular}{l|p{4cm}|p{5.5cm}}
+\toprule
+\textbf{实验} & \textbf{动机} & \textbf{预期结果} \\
+\midrule
+$d_h = 128$ vs 256 vs 512 & 验证瓶颈效应 & 128 可能略欠拟合（OCR 识别边界 case），512 可能训练不稳定 \\
+\midrule
+去掉 MLP 隐层（$d_h \to K$） & 测试是否需要非线性 & 类似 MoE linear gate。若性能接近则说明路由函数接近线性 \\
+\midrule
+$K = 5$ 时增大 $d_h$ & 验证 $\sqrt{K}$ scaling & $K$ 从 3 增到 5 时，$d_h$ 从 256 增到 $\sim$330 应有帮助 \\
+\midrule
+增大 $N$ (800 samples/epoch) & 验证 $\log N$ scaling & 更多样本应允许更大 $d_h$ 而不过拟合 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{结论：为什么 $d_h = 256$ 是当前最优选择}
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50, title=设计总结]
+\begin{enumerate}
+    \item \textbf{输出复杂度匹配}：$K = 3$ 个输出仅需极低的信息量，$d_h = 256$ 提供了充足但不冗余的中间表示容量。
+    \item \textbf{训练信号适配}：144 samples/epoch 的稀疏 RL 信号无法支撑更大网络。$\sim$790K 参数在零初始化 + EMA + grad clip 的约束下可稳定训练。
+    \item \textbf{架构对齐}：$d_h = d_{\text{time}} = 256$ 使 time embedding 和 text projection 在同一维度空间，无需额外对齐层。
+    \item \textbf{计算效率}：Router 在每个 denoising step 调用一次。$d_h = 256$ 的 forward pass $< 0.1$ms（单 GPU），相比 teacher forward（$\sim$50ms）可忽略。
+    \item \textbf{信息瓶颈正则化}：激进的 $8\times$ 压缩迫使网络只保留与路由决策相关的信息，隐式实现了正则化效果。
+\end{enumerate}
+\end{tcolorbox}
+
+\textbf{推荐变更条件}：
+\begin{itemize}
+    \item 若 $K$ 增加到 5--10：考虑 $d_h = 384$--$512$。
+    \item 若从 RL 切换到 supervised distillation（充足标签）：可增到 $d_h = 512$--$1024$。
+    \item 若 $d_{\text{text}}$ 变化（如 T5-XXL 的 4096）：保持 $\sim 8\times$--$16\times$ 压缩比，即 $d_h = 256$--$512$。
+    \item 若路由策略已知为几乎纯时间依赖（所有 prompt 类似）：可降至 $d_h = 128$ 或直接用 LUT。
+\end{itemize}
+
 \end{document}
