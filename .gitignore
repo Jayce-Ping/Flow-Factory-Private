@@ -94,6 +94,7 @@ debug_output/
 *.metadata
 *.distcp
 latest_checkpointed_iteration.txt
+!checkpoints/hard_route_baseline/mof_state.pt
 
 # ====================
 # Claude Code — keep settings, ignore personal notes
