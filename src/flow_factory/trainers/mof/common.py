@@ -593,13 +593,16 @@ class MoFTrainerBase(BaseTrainer):
           - self._source_to_set_id: source name → integer set index
           - self._set_id_to_source: inverse mapping
           - self._source_to_reward_name: source → in-domain reward name (from TeacherConfig.reward_name)
+
+        Note: Source awareness is ALWAYS populated from teacher config when
+        teachers define sources. This is needed for advantage computation
+        (OOD bonus) and per-source logging regardless of routing strategy.
+        The `teacher_route_by_source` flag only controls whether the LUT
+        uses the S dimension for inference routing.
         """
         self._source_to_reward_name: Dict[str, str] = {}
 
-        if (
-            self.training_args.teachers is not None
-            and self.training_args.teacher_route_by_source
-        ):
+        if self.training_args.teachers is not None:
             ordered_sources: List[str] = []
             for tc in self.training_args.teachers:
                 self._teacher_sources.append(
@@ -613,10 +616,16 @@ class MoFTrainerBase(BaseTrainer):
                     if tc.reward_name:
                         for src in tc.sources:
                             self._source_to_reward_name[src] = tc.reward_name
-            # Assign set IDs in teacher-list order (so set_id aligns with teacher_id)
-            for idx, src in enumerate(ordered_sources):
-                self._source_to_set_id[src] = idx
-                self._set_id_to_source[idx] = src
+
+            if ordered_sources:
+                # Assign set IDs in teacher-list order (so set_id aligns with teacher_id)
+                for idx, src in enumerate(ordered_sources):
+                    self._source_to_set_id[src] = idx
+                    self._set_id_to_source[idx] = src
+            else:
+                # Teachers exist but define no sources
+                self._source_to_set_id = {"default": 0}
+                self._set_id_to_source = {0: "default"}
         else:
             # Legacy / single-set mode: all teachers broadcast
             self._teacher_sources = [None] * self.K
