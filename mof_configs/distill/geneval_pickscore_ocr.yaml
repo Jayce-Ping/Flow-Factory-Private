@@ -76,6 +76,7 @@ train:
 
   # ---- Distillation loss ----
   normalize_d_k: false                        # Pure MSE (set true for time-reweighted SDE)
+  eval_baselines_at_start: true               # Evaluate teachers + base model before training
 
   # ---- Optimization ----
   learning_rate: 3.0e-4
