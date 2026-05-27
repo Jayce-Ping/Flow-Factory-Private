@@ -584,7 +584,7 @@ class MoFDistillTrainer(MoFDistillBase):
                     latents_index_map = batch["latent_index_map"]
 
                     for timestep_index in train_timestep_indices:
-                        with self.accelerator.accumulate(self.adapter.get_trainable_module()):
+                        with self.accelerator.accumulate(*self.adapter.trainable_components):
                             t = batch["timesteps"][:, timestep_index]
                             latents = batch["all_latents"][:, latents_index_map[timestep_index]]
 
@@ -694,7 +694,7 @@ class MoFOfflineDistillTrainer(MoFDistillBase):
                     batch=batch_on_device, t=t_scaled, latents=noised_latents
                 )
 
-                with self.accelerator.accumulate(self.adapter.get_trainable_module()):
+                with self.accelerator.accumulate(*self.adapter.trainable_components):
                     # Student forward
                     student_out = self.adapter.forward(**forward_kwargs)
                     v_student = student_out.noise_pred
