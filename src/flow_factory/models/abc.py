@@ -88,7 +88,7 @@ SAFE_DIFFUSION_WEIGHTS_INDEX_NAME = f"{SAFE_DIFFUSION_WEIGHTS_NAME}.index.json"
 LORA_ADAPTER_CONFIG_NAME = "adapter_config.json"
 LORA_ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 
-logger = setup_logger(__name__)
+logger = setup_logger(__name__, rank_zero_only=True)
 
 @dataclass
 class NamedParametersInfo:

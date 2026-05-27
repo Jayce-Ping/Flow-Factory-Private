@@ -12,28 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/mof/distill.py
-"""MoF Distillation Trainer: distill a weighted teacher mixture into a student LoRA.
+"""MoF Distillation Trainers: distill a weighted teacher mixture into a student LoRA.
 
-After MoF training learns per-timestep mixing weights λ_{k,t,s}, this trainer
-distills the weighted velocity mixture (Σ_k λ_k * v_teacher_k) into a single
-student LoRA via pure pathwise MSE loss on velocities.
+Two variants:
+  - MoFDistillTrainer (on-policy): sample student trajectories, then MSE on trajectory points
+  - MoFOfflineDistillTrainer (offline): independent noise sampling, direct MSE on velocities
 
-Loss:
-    L = E_{t, x_t} [ ||v_student(x_t, t, c) - Σ_k λ_k(t, s) * v_teacher_k(x_t, t, c)||² ]
+Both share the same MoF weight loading, teacher velocity computation, and monitoring
+infrastructure via MoFDistillBase.
 
-    Optionally normalized by 2σ²(t) for time-reweighted MSE (SDE regime).
-
-The trainer is self-contained — no trajectory sampling, no REINFORCE, no
-dependency on OPDTrainer. Just:
-  1. Sample timestep + noise
-  2. Student forward → v_student
-  3. All teachers forward → v_teacher_k (detached)
-  4. Weighted target: v_target = Σ_k λ_k * v_teacher_k
-  5. Loss = MSE(v_student, v_target)
-  6. Backward → update student LoRA
-
-Register as trainer_type: 'mof-distill'.
+Register as trainer_type: 'mof-distill' (on-policy) or 'mof-distill-offline'.
 """
 from __future__ import annotations
 
@@ -41,7 +29,7 @@ import os
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import numpy as np
 import torch
@@ -54,25 +42,28 @@ from ..abc import BaseTrainer
 from ...hparams import MoFDistillTrainingArguments
 from ...rewards import RewardBuffer
 from ...samples import BaseSample
-from ...utils.base import filter_kwargs, stitch_batch_metadata
+from ...utils.base import filter_kwargs, create_generator, create_generator_by_prompt, stitch_batch_metadata
 from ...utils.logger_utils import setup_logger
 from ...utils.noise_schedule import flow_match_sigma
 from ...utils.dist import reduce_loss_info
+from ...utils.trajectory_collector import compute_trajectory_indices
 from ..opd.common import load_teachers, cache_forward_signature, filter_forward_kwargs
 from .common import create_mixing_module
 
 logger = setup_logger(__name__)
 
+_FORWARD_EXCLUDE_KEYS = frozenset({"all_latents", "timesteps", "__source__", "latent_index_map"})
 
-class MoFDistillTrainer(BaseTrainer):
-    """Distill a MoF-learned weighted teacher mixture into a single student LoRA.
 
-    Pure pathwise MSE distillation — no trajectory sampling, no REINFORCE.
-    The student learns to match the MoF-weighted combination of teacher velocities
-    at each denoising timestep.
+# =============================================================================
+# Shared Base Class
+# =============================================================================
 
-    Supports multi-source data loading (round-robin interleaving) with automatic
-    source → set_id routing from the MoF checkpoint.
+class MoFDistillBase(BaseTrainer):
+    """Shared infrastructure for MoF distillation trainers.
+
+    Handles: teacher loading, MoF weight loading, teacher velocity computation,
+    forward kwargs building, data loading, baseline evaluation, reward monitoring.
     """
 
     def __init__(self, **kwargs):
@@ -100,16 +91,13 @@ class MoFDistillTrainer(BaseTrainer):
             cache_forward_signature(self.adapter.forward)
         )
 
-        # ---- Loss settings ----
-        self.normalize_loss = self.training_args.normalize_d_k
-
         # ---- Load MoF weights ----
         self._load_mof_weights()
 
         logger.info(
             f"MoF Distill: K={self.K} teachers, "
             f"module_type={self.training_args.mof_module_type}, "
-            f"normalize_loss={self.normalize_loss}"
+            f"normalize_loss={self.training_args.normalize_d_k}"
         )
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
@@ -157,10 +145,8 @@ class MoFDistillTrainer(BaseTrainer):
             )
 
         module_type = args.mof_module_type
-        self._mof_is_router = module_type != "lut"
 
-        if self._mof_is_router:
-            # Router mode: load neural network
+        if module_type != "lut":
             d_text = args.mof_d_text or 4096
             router = create_mixing_module(
                 module_type=module_type,
@@ -172,10 +158,7 @@ class MoFDistillTrainer(BaseTrainer):
             if "mixing_module_state_dict" in state:
                 router.load_state_dict(state["mixing_module_state_dict"])
             else:
-                logger.warning(
-                    "MoF checkpoint missing 'mixing_module_state_dict'. "
-                    "Router uses random init (likely incorrect)."
-                )
+                logger.warning("MoF checkpoint missing 'mixing_module_state_dict'.")
             router = router.to(self.accelerator.device).eval()
             for param in router.parameters():
                 param.requires_grad_(False)
@@ -183,7 +166,6 @@ class MoFDistillTrainer(BaseTrainer):
             self._mof_weights = None
             logger.info(f"MoF distill: loaded {module_type} router (K={self._mof_K})")
         else:
-            # LUT mode: logits → softmax → frozen weights
             if args.mof_use_ema and "logits_ema" in state:
                 ema_state = state["logits_ema"]
                 if "ema_parameters" in ema_state and len(ema_state["ema_parameters"]) > 0:
@@ -225,40 +207,29 @@ class MoFDistillTrainer(BaseTrainer):
         """
         B = t.shape[0]
 
-        if self._mof_is_router:
+        if self._mof_router is not None:
             prompt_embeds = batch.get("prompt_embeds")
             pooled = batch.get("pooled_prompt_embeds")
             with torch.no_grad():
                 return self._mof_router(t, prompt_embeds, pooled)  # (K, B)
         else:
             T_w = self._mof_weights.shape[1]
-
-            # Per-sample timestep → LUT index (t is in [0, 1000] range)
             t_normalized = t.float() / 1000.0  # → [0, 1]
             t_indices = (t_normalized * (T_w - 1)).long().clamp(0, T_w - 1)  # (B,)
 
-            # Per-sample source → set_id
             if batch_samples is not None:
                 set_ids = torch.tensor(
-                    [
-                        self._mof_source_to_set_id.get(
-                            s.extra_kwargs.get("__source__", "default"), 0
-                        )
-                        for s in batch_samples
-                    ],
-                    device=self._mof_weights.device,
-                    dtype=torch.long,
+                    [self._mof_source_to_set_id.get(
+                        s.extra_kwargs.get("__source__", "default"), 0
+                    ) for s in batch_samples],
+                    device=self._mof_weights.device, dtype=torch.long,
                 )
             else:
-                # Batch-level source (from interleaved iter: all samples share same source)
                 batch_source = batch.get("__source__", "default")
                 set_id = self._mof_source_to_set_id.get(batch_source, 0)
                 set_ids = torch.full((B,), set_id, device=self._mof_weights.device, dtype=torch.long)
 
-            # Gather per-sample weights: mof_weights[k, t_idx, set_id] for each sample
-            # mof_weights shape: (K, T, S)
             weights_per_sample = self._mof_weights[:, t_indices, :]  # (K, B, S)
-            # Select per-sample set: (K, B, S) → (K, B) using set_ids
             weights_per_sample = weights_per_sample[
                 :, torch.arange(B, device=self._mof_weights.device), set_ids
             ]  # (K, B)
@@ -268,17 +239,8 @@ class MoFDistillTrainer(BaseTrainer):
     # Teacher Velocity Computation
     # =========================================================================
 
-    def _compute_teacher_velocities(
-        self,
-        forward_kwargs: Dict[str, Any],
-    ) -> torch.Tensor:
-        """Forward all K teachers and return stacked velocities (detached).
-
-        Disables autocast weight cache during weight swap (CLAUDE.md invariant).
-
-        Returns:
-            (K, B, C, H, W) detached teacher velocity predictions.
-        """
+    def _compute_teacher_velocities(self, forward_kwargs: Dict[str, Any]) -> torch.Tensor:
+        """Forward all K teachers, return stacked velocities (detached). Autocast-safe."""
         velocities = []
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
@@ -289,18 +251,20 @@ class MoFDistillTrainer(BaseTrainer):
                 velocities.append(out.noise_pred.detach())
         finally:
             torch.set_autocast_cache_enabled(prev_cache)
-
         return torch.stack(velocities, dim=0)  # (K, B, C, H, W)
+
+    def _combine_weighted(self, weights: torch.Tensor, teacher_velocities: torch.Tensor) -> torch.Tensor:
+        """Combine teacher velocities with MoF weights: (K,B) x (K,B,C,H,W) → (B,C,H,W)."""
+        n_spatial = teacher_velocities.ndim - 2
+        w_expanded = weights.view(self.K, -1, *([1] * n_spatial))
+        return (w_expanded * teacher_velocities).sum(dim=0)
 
     # =========================================================================
     # Forward Kwargs Builder
     # =========================================================================
 
     def _build_forward_kwargs(
-        self,
-        batch: Dict[str, Any],
-        t: torch.Tensor,
-        latents: torch.Tensor,
+        self, batch: Dict[str, Any], t: torch.Tensor, latents: torch.Tensor,
     ) -> Dict[str, Any]:
         """Build kwargs for adapter.forward (noise_pred only, no log_prob)."""
         full_kwargs = {
@@ -311,12 +275,13 @@ class MoFDistillTrainer(BaseTrainer):
             "compute_log_prob": False,
             "return_kwargs": ["noise_pred"],
             "noise_level": 0.0,
-            **{k: v for k, v in batch.items()
-               if k not in ["all_latents", "timesteps", "__source__"]},
+            **{k: v for k, v in batch.items() if k not in _FORWARD_EXCLUDE_KEYS},
         }
         forward_kwargs = filter_forward_kwargs(
             full_kwargs, self._forward_param_names, self._forward_accepts_var_kwargs
         )
+        # Re-inject: filter_forward_kwargs strips non-signature keys, but adapters
+        # use return_kwargs to control which outputs are computed.
         forward_kwargs["return_kwargs"] = ["noise_pred"]
         return forward_kwargs
 
@@ -324,11 +289,40 @@ class MoFDistillTrainer(BaseTrainer):
     # Data Loading
     # =========================================================================
 
-    def _interleaved_source_iter(self):
+    def _run_eval_inference_batches(self, test_set_name, merged_eval, eval_seed):
+        """Override: tag eval batches with __source__ for reward applicable_sources filtering."""
+        all_samples: List[BaseSample] = []
+        for batch in tqdm(
+            self.test_dataloaders[test_set_name],
+            desc=self._eval_progress_desc(test_set_name),
+            disable=not self.show_progress_bar,
+        ):
+            batch["__source__"] = test_set_name
+            if "metadata" in batch:
+                for meta in batch["metadata"]:
+                    if isinstance(meta, dict):
+                        meta["__source__"] = test_set_name
+
+            generator = create_generator_by_prompt(batch["prompt"], eval_seed)
+            inference_kwargs = {
+                "compute_log_prob": False,
+                "generator": generator,
+                "trajectory_indices": None,
+                **merged_eval,
+            }
+            inference_kwargs.update(**batch)
+            inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
+            samples = self.adapter.inference(**inference_kwargs)
+
+            stitch_batch_metadata(batch, samples)
+            all_samples.extend(samples)
+            self.eval_reward_buffer.add_samples(samples)
+        return all_samples
+
+    def _interleaved_source_iter(self) -> Generator[Dict[str, Any], None, None]:
         """Round-robin iterator over per-source dataloaders."""
         source_names = sorted(self.train_dataloaders_by_source.keys())
         iters = {name: iter(dl) for name, dl in self.train_dataloaders_by_source.items()}
-
         while True:
             for name in source_names:
                 try:
@@ -344,39 +338,19 @@ class MoFDistillTrainer(BaseTrainer):
                 yield batch
 
     # =========================================================================
-    # Timestep Sampling
-    # =========================================================================
-
-    def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
-        """Sample random timesteps for distillation. Returns (B,) in [0, 1]."""
-        device = self.accelerator.device
-        # Uniform sampling in [0, 1] (flow matching convention)
-        return torch.rand(batch_size, device=device)
-
-    # =========================================================================
-    # Baseline Evaluation (teachers + base model)
+    # Baseline Evaluation
     # =========================================================================
 
     def evaluate_baselines(self) -> None:
-        """Evaluate each teacher and base model on all test sets before training.
-
-        Logs metrics under:
-          - teacher/{teacher_name}/{test_set_name}/reward_{metric}_mean
-          - base/{test_set_name}/reward_{metric}_mean
-
-        This establishes baselines for comparison with the distilled student.
-        """
+        """Evaluate each teacher and base model on all test sets."""
         if not self.test_dataloaders:
             return
 
         self.adapter.eval()
 
-        # ---- Evaluate each teacher ----
         for k, teacher_name in enumerate(self._teacher_names):
-            applicable_test_sets = sorted(self.test_dataloaders.keys())
-            logger.info(f"Evaluating teacher '{teacher_name}' on: {applicable_test_sets}")
-
-            for ts_name in applicable_test_sets:
+            logger.info(f"Evaluating teacher '{teacher_name}'")
+            for ts_name in sorted(self.test_dataloaders.keys()):
                 self.eval_reward_buffer = RewardBuffer(
                     self._eval_reward_processor_for_test_set(ts_name),
                     self.training_args.group_size,
@@ -384,27 +358,22 @@ class MoFDistillTrainer(BaseTrainer):
                 merged_eval = self._merged_eval_args_for_test_set_name(ts_name)
                 eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
 
-                # Use teacher's LoRA for inference
                 prev_cache = torch.is_autocast_cache_enabled()
                 torch.set_autocast_cache_enabled(False)
                 with torch.no_grad(), self.autocast(), \
                         self.adapter.use_named_parameters(teacher_name):
-                    all_samples = self._run_eval_inference_batches(
-                        ts_name, merged_eval, eval_seed
-                    )
+                    all_samples = self._run_eval_inference_batches(ts_name, merged_eval, eval_seed)
                     gathered_rewards = self._gather_eval_rewards()
                     gathered_tags = self._gather_eval_tags(all_samples)
                     if self.accelerator.is_main_process:
-                        log_pfx = f"teacher/{teacher_name}/{ts_name}"
                         self._log_eval_reward_metrics(
-                            gathered_rewards, log_pfx, all_samples,
-                            gathered_tags=gathered_tags,
+                            gathered_rewards, f"teacher/{teacher_name}/{ts_name}",
+                            all_samples, gathered_tags=gathered_tags,
                         )
                 torch.set_autocast_cache_enabled(prev_cache)
                 self.accelerator.wait_for_everyone()
 
-        # ---- Evaluate base model (no LoRA) ----
-        logger.info("Evaluating base model (no LoRA) on all test sets")
+        logger.info("Evaluating base model (no LoRA)")
         for ts_name in sorted(self.test_dataloaders.keys()):
             self.eval_reward_buffer = RewardBuffer(
                 self._eval_reward_processor_for_test_set(ts_name),
@@ -412,66 +381,55 @@ class MoFDistillTrainer(BaseTrainer):
             )
             merged_eval = self._merged_eval_args_for_test_set_name(ts_name)
             eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
-
             with torch.no_grad(), self.autocast(), self.adapter.use_ref_parameters():
-                all_samples = self._run_eval_inference_batches(
-                    ts_name, merged_eval, eval_seed
-                )
+                all_samples = self._run_eval_inference_batches(ts_name, merged_eval, eval_seed)
                 gathered_rewards = self._gather_eval_rewards()
                 gathered_tags = self._gather_eval_tags(all_samples)
                 if self.accelerator.is_main_process:
-                    log_pfx = f"base/{ts_name}"
                     self._log_eval_reward_metrics(
-                        gathered_rewards, log_pfx, all_samples,
-                        gathered_tags=gathered_tags,
+                        gathered_rewards, f"base/{ts_name}",
+                        all_samples, gathered_tags=gathered_tags,
                     )
             self.accelerator.wait_for_everyone()
 
     # =========================================================================
-    # Main Training Loop
+    # Training Reward Monitoring
     # =========================================================================
 
     def start(self):
-        """Main training loop: pure MSE velocity distillation."""
-        # Evaluate baselines before training starts
+        """Main training loop with checkpoint/eval/ema bookkeeping.
+
+        Subclasses override `_run_epoch()` to define the epoch body.
+        """
         if self.epoch == 0 and self.training_args.eval_baselines_at_start:
             self.evaluate_baselines()
 
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
 
-            # Checkpoint
-            if (
-                self.log_args.save_freq > 0
-                and self.epoch % self.log_args.save_freq == 0
-                and self.log_args.save_dir
-            ):
+            if (self.log_args.save_freq > 0
+                    and self.epoch % self.log_args.save_freq == 0
+                    and self.log_args.save_dir):
                 save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    "checkpoints",
+                    self.log_args.save_dir, str(self.log_args.run_name), "checkpoints",
                 )
                 self.save_checkpoint(save_dir, epoch=self.epoch)
 
-            # Evaluation + training reward monitoring
             if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
                 self.evaluate()
                 self._log_training_rewards()
 
-            # Optimize (velocity MSE distillation)
-            self.optimize()
+            self._run_epoch()
 
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
 
-    def _log_training_rewards(self) -> None:
-        """Generate a batch of training samples and log per-source reward metrics.
+    def _run_epoch(self) -> None:
+        """Execute one training epoch. Overridden by subclasses."""
+        raise NotImplementedError
 
-        Runs inference on a subset of training data (from each source),
-        computes rewards, and logs as train/{source}/{reward_name}.
-        This provides training-time quality monitoring without affecting
-        the distillation loss.
-        """
+    def _log_training_rewards(self) -> None:
+        """Generate samples and log per-source reward metrics."""
         if not self.reward_models:
             return
 
@@ -479,16 +437,12 @@ class MoFDistillTrainer(BaseTrainer):
         self.reward_buffer.clear()
         all_samples: List[BaseSample] = []
 
-        # Generate samples from each source
         if self.train_dataloaders_by_source:
             data_iter = self._interleaved_source_iter()
         else:
             data_iter = iter(self.dataloader)
 
-        # Generate a small number of batches for monitoring
-        num_monitor_batches = min(
-            getattr(self.training_args, 'num_batches_per_epoch', 4), 4
-        )
+        num_monitor_batches = min(self.training_args.num_batches_per_epoch, 4)
 
         with torch.no_grad(), self.autocast():
             for _ in range(num_monitor_batches):
@@ -504,97 +458,238 @@ class MoFDistillTrainer(BaseTrainer):
                 all_samples.extend(samples)
                 self.reward_buffer.add_samples(samples)
 
-        # Compute rewards and log per-source
         if all_samples:
             rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
             if rewards and self.accelerator.is_main_process:
                 log_data: Dict[str, Any] = {}
                 for rname, rvals in rewards.items():
                     rvals_np = torch.as_tensor(rvals).cpu().numpy()
-                    # Global mean
                     valid = ~np.isnan(rvals_np)
                     if valid.any():
                         log_data[f"train/reward_{rname}_mean"] = float(np.nanmean(rvals_np))
-
-                    # Per-source breakdown
                     source_groups: Dict[str, List[float]] = defaultdict(list)
                     for i, sample in enumerate(all_samples):
                         source = sample.extra_kwargs.get("__source__", "default")
                         val = float(rvals_np[i])
                         if not np.isnan(val):
                             source_groups[source].append(val)
-
                     for source, vals in source_groups.items():
                         if vals:
                             log_data[f"train/{source}/reward_{rname}_mean"] = float(np.mean(vals))
-
-                # Log training sample images
                 log_data["train_samples"] = all_samples[:30]
                 self.log_data(log_data, step=self.step)
 
-    def optimize(self) -> None:
-        """One epoch of MSE velocity distillation.
 
-        For each batch:
-          1. Sample random timestep t ~ U[0, 1]
-          2. Noise latents: x_t = (1-σ(t)) * x_0 + σ(t) * ε
-          3. Student forward → v_student
-          4. All teachers forward → v_teacher_k (detached)
-          5. MoF weighted target: v_target = Σ_k λ_k(t, s) * v_teacher_k
-          6. Loss = MSE(v_student, v_target)
-          7. Backward → optimizer.step()
+# =============================================================================
+# On-Policy Distillation (Correct: sample trajectory → MSE on trajectory)
+# =============================================================================
+
+class MoFDistillTrainer(MoFDistillBase):
+    """On-policy MoF distillation: sample student trajectories, then MSE-fit teachers.
+
+    Algorithm:
+      1. sample(): Student generates full trajectories (stores all_latents at each step)
+      2. optimize(samples): For each stored trajectory point:
+         - Student forward at x_t → v_student (with grad)
+         - K teachers forward at same x_t → v_teacher_k (detached)
+         - v_target = Σ_k λ_k(t, source) * v_teacher_k
+         - loss = MSE(v_student, v_target)
+         - backward → optimizer.step()
+
+    Register as trainer_type: 'mof-distill'.
+    """
+
+    @property
+    def _train_timestep_indices(self) -> List[int]:
+        """Training timestep indices: all steps for ODE, scheduler-selected for SDE."""
+        if self.adapter.scheduler.dynamics_type == "ODE":
+            return list(range(self.training_args.num_inference_steps))
+        return self.adapter.scheduler.train_timesteps
+
+    def _run_epoch(self) -> None:
+        """Sample student trajectories, then MSE-fit on trajectory points."""
+        samples = self.sample()
+        self.optimize(samples)
+
+    def sample(self) -> List[BaseSample]:
+        """Generate on-policy student trajectories with stored latents."""
+        self.adapter.rollout()
+        samples: List[BaseSample] = []
+
+        trajectory_indices = compute_trajectory_indices(
+            train_timestep_indices=self._train_timestep_indices,
+            num_inference_steps=self.training_args.num_inference_steps,
+        )
+
+        if self.train_dataloaders_by_source:
+            data_iter = self._interleaved_source_iter()
+        else:
+            data_iter = iter(self.dataloader)
+
+        with torch.no_grad(), self.autocast():
+            for _ in tqdm(
+                range(self.training_args.num_batches_per_epoch),
+                desc=f"Epoch {self.epoch} Sampling",
+                disable=not self.show_progress_bar,
+            ):
+                batch = next(data_iter)
+                sample_kwargs = {
+                    **self.training_args,
+                    "compute_log_prob": False,
+                    "trajectory_indices": trajectory_indices,
+                    **batch,
+                }
+                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
+                sample_batch = self.adapter.inference(**sample_kwargs)
+                stitch_batch_metadata(batch, sample_batch)
+                self._maybe_offload_samples_to_cpu(sample_batch)
+                samples.extend(sample_batch)
+
+        return samples
+
+    def optimize(self, samples: List[BaseSample]) -> None:
+        """MSE velocity distillation on stored student trajectories.
+
+        For each (batch, timestep) from stored trajectories:
+          1. Access stored latents x_t from student's trajectory
+          2. Student forward → v_student (with grad)
+          3. Teachers forward → v_target = Σ λ_k * v_teacher_k (detached)
+          4. loss = MSE(v_student, v_target)
         """
+        device = self.accelerator.device
+        per_device_batch_size = self.training_args.per_device_batch_size
+        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        train_timestep_indices = self._train_timestep_indices
+
+        self.adapter.train()
+        loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+        for inner_epoch in range(self.training_args.num_inner_epochs):
+            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
+            perm = torch.randperm(len(samples), generator=perm_gen)
+            shuffled_samples = [samples[i] for i in perm]
+
+            with self.autocast():
+                for batch_idx in tqdm(
+                    range(num_batches),
+                    desc=f"Epoch {self.epoch} Distill",
+                    disable=not self.show_progress_bar,
+                ):
+                    start = batch_idx * per_device_batch_size
+                    batch_samples = [
+                        s.to(device)
+                        for s in shuffled_samples[start:start + per_device_batch_size]
+                    ]
+                    batch = BaseSample.stack(batch_samples)
+                    latents_index_map = batch["latent_index_map"]
+
+                    for timestep_index in train_timestep_indices:
+                        with self.accelerator.accumulate(self.adapter.get_trainable_module()):
+                            t = batch["timesteps"][:, timestep_index]
+                            latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+
+                            forward_kwargs = self._build_forward_kwargs(batch, t, latents)
+
+                            student_out = self.adapter.forward(**forward_kwargs)
+                            v_student = student_out.noise_pred
+
+                            teacher_velocities = self._compute_teacher_velocities(forward_kwargs)
+
+                            weights = self._get_mof_weights(
+                                t=t, batch=batch, batch_samples=batch_samples
+                            )
+                            v_target = self._combine_weighted(weights, teacher_velocities)
+
+                            loss = ((v_student.float() - v_target.float()) ** 2).mean()
+                            loss_info["loss"].append(loss.detach())
+
+                            self.accelerator.backward(loss)
+
+                            if self.accelerator.sync_gradients:
+                                grad_norm = self.accelerator.clip_grad_norm_(
+                                    self.adapter.get_trainable_parameters(),
+                                    self.training_args.max_grad_norm,
+                                )
+                                self.optimizer.step()
+                                self.optimizer.zero_grad()
+
+                                loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
+                                loss_info_reduced["grad_norm"] = grad_norm
+                                self.log_data(
+                                    {f"train/{k}": v for k, v in loss_info_reduced.items()},
+                                    step=self.step,
+                                )
+                                self.step += 1
+                                loss_info = defaultdict(list)
+
+
+# =============================================================================
+# Offline Distillation (Independent noise, no trajectory)
+# =============================================================================
+
+class MoFOfflineDistillTrainer(MoFDistillBase):
+    """Offline MoF distillation: independent noise sampling, direct MSE on velocities.
+
+    Algorithm:
+      1. Encode clean latents from batch images
+      2. Sample random timestep t ~ U[0, 1], add noise to get x_t
+      3. Student forward at x_t → v_student
+      4. Teachers forward at x_t → v_target = Σ λ_k * v_teacher_k
+      5. loss = MSE(v_student, v_target)
+
+    Simpler but off-policy (student doesn't sample its own trajectory).
+    Register as trainer_type: 'mof-distill-offline'.
+    """
+
+    def _run_epoch(self) -> None:
+        """One epoch of offline MSE velocity distillation."""
+        self.optimize()
+
+    def optimize(self) -> None:
+        """One epoch of offline MSE velocity distillation."""
         device = self.accelerator.device
         num_batches = self.training_args.num_batches_per_epoch
 
-        # Data iterator
         if self.train_dataloaders_by_source:
             data_iter = self._interleaved_source_iter()
         else:
             data_iter = iter(self.dataloader)
 
         self.adapter.train()
-        loss_info = defaultdict(list)
+        loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         with self.autocast():
             for batch_idx in tqdm(
                 range(num_batches),
-                desc=f"Epoch {self.epoch} Distill",
+                desc=f"Epoch {self.epoch} Offline Distill",
                 disable=not self.show_progress_bar,
             ):
                 batch = next(data_iter)
-
-                # Move batch data to device (prompt_embeds, etc.)
                 batch_on_device = {
                     k: v.to(device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()
                 }
 
-                # Get clean latents from batch (encoded images)
-                # For distillation we need latent-space data
+                # Encode clean latents
                 inference_kwargs = {
                     **self.training_args,
                     "compute_log_prob": False,
                     **batch_on_device,
                 }
                 inference_kwargs = filter_kwargs(self.adapter.encode_latents, **inference_kwargs)
-                clean_latents = self.adapter.encode_latents(**inference_kwargs)  # (B, C, H, W)
+                clean_latents = self.adapter.encode_latents(**inference_kwargs)
 
                 B = clean_latents.shape[0]
 
-                # Sample timestep
-                t = self._sample_timesteps(B)  # (B,) in [0, 1]
-                sigma = flow_match_sigma(t)  # (B,)
-
-                # Noise latents
+                # Sample timestep + noise
+                t = torch.rand(B, device=device)
+                sigma = flow_match_sigma(t)
                 noise = torch.randn_like(clean_latents)
                 sigma_broadcast = sigma.view(B, *([1] * (clean_latents.ndim - 1)))
                 noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
 
-                # Scale timestep to scheduler range (typically [0, 1000])
                 t_scaled = t * 1000.0
 
-                # Build forward kwargs
                 forward_kwargs = self._build_forward_kwargs(
                     batch=batch_on_device, t=t_scaled, latents=noised_latents
                 )
@@ -602,39 +697,28 @@ class MoFDistillTrainer(BaseTrainer):
                 with self.accelerator.accumulate(self.adapter.get_trainable_module()):
                     # Student forward
                     student_out = self.adapter.forward(**forward_kwargs)
-                    v_student = student_out.noise_pred  # (B, C, H, W)
+                    v_student = student_out.noise_pred
 
-                    # Teacher forwards (all K, detached)
+                    # Teachers forward
                     teacher_velocities = self._compute_teacher_velocities(forward_kwargs)
-                    # (K, B, C, H, W)
 
-                    # MoF weighted target (per-sample t and source routing)
-                    weights = self._get_mof_weights(
-                        t=t_scaled,
-                        batch=batch_on_device,
-                    )  # (K, B)
-
-                    # Combine: v_target = Σ_k w_k * v_teacher_k
-                    n_spatial = teacher_velocities.ndim - 2
-                    w_expanded = weights.view(self.K, B, *([1] * n_spatial))
-                    v_target = (w_expanded * teacher_velocities).sum(dim=0)  # (B, C, H, W)
+                    # MoF weighted target
+                    weights = self._get_mof_weights(t=t_scaled, batch=batch_on_device)
+                    v_target = self._combine_weighted(weights, teacher_velocities)
 
                     # MSE loss
                     diff_sq = (v_student.float() - v_target.float()) ** 2
-                    per_sample_loss = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
+                    per_sample_loss = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))
 
-                    if self.normalize_loss:
-                        # Time-weighted: divide by 2σ²(t) for SDE regime
+                    if self.training_args.normalize_d_k:
                         sigma_sq = (sigma ** 2).clamp(min=1e-12)
                         per_sample_loss = per_sample_loss / (2.0 * sigma_sq)
 
                     loss = per_sample_loss.mean()
 
-                    # Logging
                     loss_info["loss"].append(loss.detach())
                     loss_info["mse_raw"].append(diff_sq.mean().detach())
 
-                    # Backward
                     self.accelerator.backward(loss)
 
                     if self.accelerator.sync_gradients:
@@ -645,7 +729,6 @@ class MoFDistillTrainer(BaseTrainer):
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
-                        # Log
                         loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
                         loss_info_reduced["grad_norm"] = grad_norm
                         self.log_data(
