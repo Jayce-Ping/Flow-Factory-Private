@@ -1762,6 +1762,87 @@ class OPDTrainingArguments(TrainingArguments):
 
 
 @dataclass
+class MoFDistillTrainingArguments(TrainingArguments):
+    r"""Training arguments for MoF Distillation: distill weighted teacher mixture → student LoRA.
+
+    Pure pathwise MSE distillation (no REINFORCE, no trajectory sampling).
+    The target velocity is Σ_k λ_k(t, s) * v_teacher_k, where λ comes from
+    a trained MoF checkpoint.
+
+    Register as trainer_type: 'mof-distill'.
+    """
+
+    # ---- Teacher admin ----
+    teachers: Optional[List[Any]] = field(
+        default=None,
+        metadata={"help": "List of TeacherConfig dicts (path, name, sources, reward_name)."},
+    )
+    teacher_paths: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Legacy flat list of teacher LoRA paths."},
+    )
+    teacher_param_device: str = field(
+        default="cuda",
+        metadata={"help": "Device for teacher parameter snapshots ('cpu' or 'cuda')."},
+    )
+
+    # ---- MoF checkpoint ----
+    mof_checkpoint: str = field(
+        default="",
+        metadata={"help": "Path to MoF checkpoint (directory containing mof_state.pt, or file path)."},
+    )
+    mof_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Softmax temperature for mixing weights."},
+    )
+    mof_use_ema: bool = field(
+        default=False,
+        metadata={"help": "Use EMA logits from MoF checkpoint (only for LUT mode)."},
+    )
+
+    # ---- Router mode settings ----
+    mof_module_type: Literal["lut", "adaln_router", "mlp_router"] = field(
+        default="lut",
+        metadata={"help": "Type of mixing module in MoF checkpoint."},
+    )
+    mof_d_text: Optional[int] = field(
+        default=None,
+        metadata={"help": "Text embedding dimension for router. If None, defaults to 4096."},
+    )
+    mof_hidden_dim: int = field(
+        default=256,
+        metadata={"help": "Hidden dimension for router network."},
+    )
+
+    # ---- Distillation settings ----
+    normalize_d_k: bool = field(
+        default=False,
+        metadata={"help": "Normalize MSE loss by 2σ²(t) for time-reweighting (SDE regime)."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.mof_checkpoint:
+            raise ValueError(
+                "MoF distillation requires 'mof_checkpoint' path to a trained MoF state."
+            )
+        # Resolve teachers (same logic as MoFBase)
+        if self.teachers is not None:
+            from .training_args import TeacherConfig
+            coerced = []
+            for item in self.teachers:
+                if isinstance(item, dict):
+                    coerced.append(TeacherConfig.from_dict(item))
+                else:
+                    coerced.append(item)
+            self.teachers = coerced
+            if not self.teacher_paths:
+                self.teacher_paths = [tc.path for tc in self.teachers]
+        if not self.teacher_paths:
+            raise ValueError("MoF distillation requires at least one teacher path.")
+
+
+@dataclass
 class DiffusionOPDTrainingArguments(TrainingArguments):
     r"""Training arguments for multi-task DiffusionOPD (Algorithm 1).
 
@@ -2157,6 +2238,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "nft": NFTTrainingArguments,
     "mof-nft": MoFNFTTrainingArguments,
     "mof-grpo": MoFGRPOTrainingArguments,
+    "mof-distill": MoFDistillTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,
