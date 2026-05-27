@@ -82,9 +82,9 @@ train:
   learning_rate: 3.0e-4
   per_device_batch_size: 8
   group_size: 1
-  num_batches_per_epoch: 96 # 32 * 3 = 96
+  unique_sample_num_per_epoch: 768            # 8 * 96 = 768 → num_batches_per_epoch = 96 (per GPU)
   num_inner_epochs: 1
-  gradient_step_per_epoch: 1 # 1 gradient step per epoch
+  gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
   max_grad_norm: 1.0
   adam_weight_decay: 1.0e-4
