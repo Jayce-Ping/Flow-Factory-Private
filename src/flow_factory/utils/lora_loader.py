@@ -35,7 +35,7 @@ from .logger_utils import setup_logger
 if TYPE_CHECKING:
     from ..models.abc import BaseAdapter
 
-logger = setup_logger(__name__)
+logger = setup_logger(__name__, rank_zero_only=True)
 
 
 def load_lora_as_named_parameters(
