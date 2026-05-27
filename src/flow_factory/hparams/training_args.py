@@ -1848,6 +1848,18 @@ class MoFDistillTrainingArguments(TrainingArguments):
         if not self.teacher_paths:
             raise ValueError("MoF distillation requires at least one teacher path.")
 
+    def get_num_train_timesteps(self, args: Any) -> int:
+        """GAS multiplier: online distill loops over all train timesteps per batch.
+
+        - 'mof-distill' (online): iterates all timestep indices → multiply by T.
+        - 'mof-distill-offline': single random timestep per sample → no multiplier.
+        """
+        if self.trainer_type == "mof-distill":
+            if args.scheduler_args.dynamics_type == "ODE":
+                return self.num_inference_steps
+            return args.scheduler_args.num_sde_steps
+        return 1
+
 
 @dataclass
 class DiffusionOPDTrainingArguments(TrainingArguments):
