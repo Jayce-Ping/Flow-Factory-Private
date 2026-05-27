@@ -48,6 +48,19 @@ class MoFGRPOTrainer(MoFTrainerBase):
 
     training_args: MoFGRPOTrainingArguments
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # GRPO computes log-probabilities via σ_trans² in the denominator.
+        # Under ODE dynamics (noise_level=0), σ_trans=0 → division by zero → NaN.
+        dynamics_type = self.adapter.scheduler.dynamics_type
+        if dynamics_type == "ODE":
+            raise ValueError(
+                f"MoF-GRPO requires stochastic dynamics (CPS, Flow-SDE, or Dance-SDE) "
+                f"but scheduler.dynamics_type='{dynamics_type}'. "
+                f"ODE has σ_trans=0, causing NaN in log-probability computation. "
+                f"Use MoF-NFT for deterministic (ODE) dynamics."
+            )
+
     def sample(self) -> List[BaseSample]:
         """Generate rollouts with full trajectory + log_prob storage for GRPO."""
         self.adapter.rollout()
