@@ -506,14 +506,44 @@ class MoFDistillTrainer(MoFDistillBase):
             return list(range(self.training_args.num_inference_steps))
         return self.adapter.scheduler.train_timesteps
 
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """Finalize rewards on sampled trajectories and log sample images."""
+        log_data: Dict[str, Any] = {}
+
+        if self.reward_models:
+            rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
+            if rewards and self.accelerator.is_main_process:
+                for rname, rvals in rewards.items():
+                    rvals_np = torch.as_tensor(rvals).cpu().numpy()
+                    valid = ~np.isnan(rvals_np)
+                    if valid.any():
+                        log_data[f"train/reward_{rname}_mean"] = float(np.nanmean(rvals_np))
+                    source_groups: Dict[str, List[float]] = defaultdict(list)
+                    for i, sample in enumerate(samples):
+                        source = sample.extra_kwargs.get("__source__", "default")
+                        val = float(rvals_np[i])
+                        if not np.isnan(val):
+                            source_groups[source].append(val)
+                    for source, vals in source_groups.items():
+                        if vals:
+                            log_data[f"train/{source}/reward_{rname}_mean"] = float(np.mean(vals))
+
+        if self.accelerator.is_main_process:
+            log_data["train_samples"] = samples[:30]
+
+        if log_data:
+            self.log_data(log_data, step=self.step)
+
     def _run_epoch(self) -> None:
         """Sample student trajectories, then MSE-fit on trajectory points."""
         samples = self.sample()
+        self.prepare_feedback(samples)
         self.optimize(samples)
 
     def sample(self) -> List[BaseSample]:
         """Generate on-policy student trajectories with stored latents."""
         self.adapter.rollout()
+        self.reward_buffer.clear()
         samples: List[BaseSample] = []
 
         trajectory_indices = compute_trajectory_indices(
@@ -544,6 +574,7 @@ class MoFDistillTrainer(MoFDistillBase):
                 stitch_batch_metadata(batch, sample_batch)
                 self._maybe_offload_samples_to_cpu(sample_batch)
                 samples.extend(sample_batch)
+                self.reward_buffer.add_samples(sample_batch)
 
         return samples
 
