@@ -28,10 +28,8 @@ from .common import MoFTrainerBase
 from ...hparams import MoFNFTTrainingArguments
 from ...samples import BaseSample
 from ...utils.base import (
-    filter_kwargs,
     create_generator,
     to_broadcast_tensor,
-    stitch_batch_metadata,
 )
 from ...utils.noise_schedule import flow_match_sigma
 from ...utils.dist import reduce_loss_info
@@ -78,45 +76,14 @@ class MoFNFTTrainer(MoFTrainerBase):
             (x0_pred - clean_latents) ** 2 / weight
         ).mean(dim=tuple(range(1, clean_latents.ndim)))
 
-    def sample(self) -> List[BaseSample]:
-        """Generate rollouts using per-set lambda-combined teacher velocity.
-
-        NFT mode: compute_log_prob=False, stores only final clean latents.
-        """
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples = []
-
-        if self.train_dataloaders_by_source:
-            data_iter = self._interleaved_source_iter()
-        else:
-            data_iter = iter(self.dataloader)
-
-        with torch.no_grad(), self.autocast():
-            for _ in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f'Epoch {self.epoch} Sampling',
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                set_id = self._get_batch_set_id(batch)
-
-                with self._mof_inference_context(set_id):
-                    sample_kwargs = {
-                        **self.training_args,
-                        'compute_log_prob': False,
-                        'trajectory_indices': [-1],
-                        **{k: v for k, v in batch.items() if k != '__source__'},
-                    }
-                    sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                    sample_batch = self.adapter.inference(**sample_kwargs)
-
-                stitch_batch_metadata(batch, sample_batch)
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-
-        return samples
+    def _build_sample_kwargs(self, batch):
+        """NFT sampling: no log_prob, store only final latents."""
+        return {
+            **self.training_args,
+            'compute_log_prob': False,
+            'trajectory_indices': [-1],
+            **{k: v for k, v in batch.items() if k != '__source__'},
+        }
 
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimization: NFT loss on per-set lambda-weighted teacher velocities.

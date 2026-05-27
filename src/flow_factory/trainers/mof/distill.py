@@ -24,10 +24,9 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -46,6 +45,7 @@ from ...utils.dist import reduce_loss_info
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..opd.common import load_teachers, cache_forward_signature, filter_forward_kwargs
 from .common import create_mixing_module
+from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -275,34 +275,6 @@ class MoFDistillTrainer(BaseTrainer):
             return weights_per_sample
 
     # =========================================================================
-    # DDP Bypass for Weight Swap
-    # =========================================================================
-
-    @contextmanager
-    def _bypass_ddp_for_weight_swap(self):
-        """Temporarily replace DDP-wrapped transformer with unwrapped module.
-
-        DDP's internal parameter buffers (used for gradient bucketing and
-        find_unused_parameters tracking) are NOT updated by .data.copy_()
-        which use_named_parameters relies on. In inference mode (no_grad),
-        calling the DDP-wrapped module still reads from these stale buffers,
-        causing all teacher forwards to produce identical outputs.
-
-        This context manager temporarily points the adapter's transformer
-        component to the raw unwrapped module, bypassing DDP's forward path.
-        Safe during inference since DDP's gradient sync is not needed.
-        """
-        unwrapped = self.adapter.get_component_unwrapped('transformer')
-        wrapped = self.adapter.get_component('transformer')
-        if unwrapped is not wrapped:
-            self.adapter.set_component('transformer', unwrapped)
-        try:
-            yield
-        finally:
-            if unwrapped is not wrapped:
-                self.adapter.set_component('transformer', wrapped)
-
-    # =========================================================================
     # Teacher Velocity Computation
     # =========================================================================
 
@@ -310,7 +282,7 @@ class MoFDistillTrainer(BaseTrainer):
         """Forward all K teachers, return stacked velocities (detached). Autocast-safe.
 
         Disables autocast weight cache and bypasses DDP during the loop
-        (see CLAUDE.md invariant and _bypass_ddp_for_weight_swap docstring).
+        (see CLAUDE.md invariant and mof/utils.py:bypass_ddp_for_weight_swap).
 
         Runs under torch.no_grad() to avoid activation storage and prevent DDP
         from registering gradient hooks for teacher forward calls.
@@ -318,7 +290,7 @@ class MoFDistillTrainer(BaseTrainer):
         velocities = []
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        with self._bypass_ddp_for_weight_swap():
+        with bypass_ddp_for_weight_swap(self.adapter):
             try:
                 with torch.no_grad():
                     for name in self._teacher_names:
@@ -395,24 +367,6 @@ class MoFDistillTrainer(BaseTrainer):
             self.eval_reward_buffer.add_samples(samples)
         return all_samples
 
-    def _interleaved_source_iter(self) -> Generator[Dict[str, Any], None, None]:
-        """Round-robin iterator over per-source dataloaders."""
-        source_names = sorted(self.train_dataloaders_by_source.keys())
-        iters = {name: iter(dl) for name, dl in self.train_dataloaders_by_source.items()}
-        while True:
-            for name in source_names:
-                try:
-                    batch = next(iters[name])
-                except StopIteration:
-                    iters[name] = iter(self.train_dataloaders_by_source[name])
-                    batch = next(iters[name])
-                batch["__source__"] = name
-                if "metadata" in batch:
-                    for meta in batch["metadata"]:
-                        if isinstance(meta, dict):
-                            meta["__source__"] = name
-                yield batch
-
     # =========================================================================
     # Baseline Evaluation
     # =========================================================================
@@ -436,7 +390,7 @@ class MoFDistillTrainer(BaseTrainer):
 
                 prev_cache = torch.is_autocast_cache_enabled()
                 torch.set_autocast_cache_enabled(False)
-                with self._bypass_ddp_for_weight_swap():
+                with bypass_ddp_for_weight_swap(self.adapter):
                     with torch.no_grad(), self.autocast(), \
                             self.adapter.use_named_parameters(teacher_name):
                         all_samples = self._run_eval_inference_batches(ts_name, merged_eval, eval_seed)
@@ -523,7 +477,7 @@ class MoFDistillTrainer(BaseTrainer):
         )
 
         if self.train_dataloaders_by_source:
-            data_iter = self._interleaved_source_iter()
+            data_iter = interleaved_source_iter(self.train_dataloaders_by_source)
         else:
             data_iter = iter(self.dataloader)
 
@@ -700,7 +654,7 @@ class MoFDistillTrainer(BaseTrainer):
         all_samples: List[BaseSample] = []
 
         if self.train_dataloaders_by_source:
-            data_iter = self._interleaved_source_iter()
+            data_iter = interleaved_source_iter(self.train_dataloaders_by_source)
         else:
             data_iter = iter(self.dataloader)
 
