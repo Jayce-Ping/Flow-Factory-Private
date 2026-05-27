@@ -440,9 +440,9 @@ class MoFTrainerBase(BaseTrainer):
         # ---- Cache scheduler step signature ----
         self._sched_cache = cache_scheduler_step_signature(self.adapter.scheduler.step)
 
-        # ---- Reward normalization running stats ----
-        self._reward_running_mean: Dict[str, float] = {}  # Reserved for future use
-        self._reward_running_var: Dict[str, float] = {}   # Reserved for future use
+        # ---- Reward normalization running stats (vestigial — saved/loaded for checkpoint compat) ----
+        self._reward_running_mean: Dict[str, float] = {}
+        self._reward_running_var: Dict[str, float] = {}
 
     # =========================================================================
     # Initialization (called by super().__init__ → _initialization)
@@ -1016,7 +1016,12 @@ class MoFTrainerBase(BaseTrainer):
     ) -> torch.Tensor:
         """Forward each teacher and return stacked velocities (all detached).
 
-        Disables autocast weight cache and bypasses DDP during the loop
+        Runs under torch.no_grad() to avoid building computation graphs for
+        teacher forwards (outputs are always detached — gradients never flow
+        through teachers). This prevents wasted activation memory when called
+        from gradient-enabled contexts (e.g., GRPO optimize loop).
+
+        Also disables autocast weight cache and bypasses DDP during the loop
         (see CLAUDE.md invariant and _bypass_ddp_for_weight_swap docstring).
 
         Returns:
@@ -1027,7 +1032,7 @@ class MoFTrainerBase(BaseTrainer):
 
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        with self._bypass_ddp_for_weight_swap():
+        with self._bypass_ddp_for_weight_swap(), torch.no_grad():
             try:
                 for name in self._teacher_names:
                     with self.adapter.use_named_parameters(name):
@@ -1159,70 +1164,6 @@ class MoFTrainerBase(BaseTrainer):
             store_to_samples=store_to_samples,
             aggregation_func=aggregation_func,
         )
-
-    # =========================================================================
-    # Per-Set Reward Computation
-    # =========================================================================
-
-    def _compute_per_set_rewards(
-        self,
-        samples: List[BaseSample],
-        raw_rewards: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """[DEPRECATED] Compute per-set composite rewards with OOD bonus.
-
-        NOTE: This method is superseded by the per-reward normalization pipeline
-        in prepare_feedback() (Step 1→2→3). Kept for backward compatibility and
-        potential use in evaluation/debugging contexts where raw-space aggregation
-        is acceptable.
-
-        Aggregation only (no normalization): for each sample in set s,
-            composite = R_in_domain + gamma * mean(R_ood for applicable j != s)
-
-        Normalization is delegated to GDPO advantage computation downstream
-        (group mean subtraction + global std division).
-
-        NaN values (from applicable_sources filtering) are gracefully skipped.
-
-        Returns:
-            Dict with single key "mof_reward" → tensor of per-sample rewards.
-        """
-        gamma = self.training_args.ood_bonus_gamma
-        reward_names = list(raw_rewards.keys())
-        composite = torch.zeros(len(samples), device=self.accelerator.device)
-
-        for i, sample in enumerate(samples):
-            source = sample.extra_kwargs.get("__source__", "default")
-            in_domain_name = self._find_in_domain_reward(source, reward_names)
-
-            # Collect applicable (non-NaN) raw rewards for this sample
-            applicable: Dict[str, float] = {}
-            for rn in reward_names:
-                val = raw_rewards[rn][i]
-                if not torch.isnan(val):
-                    applicable[rn] = val.item()
-
-            if in_domain_name and in_domain_name in applicable:
-                composite[i] = applicable[in_domain_name]
-                if gamma > 0:
-                    ood_vals = [v for k, v in applicable.items() if k != in_domain_name]
-                    if ood_vals:
-                        composite[i] += gamma * sum(ood_vals) / len(ood_vals)
-            elif applicable:
-                # Fallback: average all applicable rewards
-                composite[i] = sum(applicable.values()) / len(applicable)
-
-        return {"mof_reward": composite}
-
-    def _find_in_domain_reward(self, source: str, reward_names: List[str]) -> Optional[str]:
-        """Find the in-domain reward name for a given source.
-
-        Uses explicit mapping from TeacherConfig.reward_name (populated in _init_source_routing).
-        """
-        reward_name = self._source_to_reward_name.get(source)
-        if reward_name and reward_name in reward_names:
-            return reward_name
-        return None
 
     # =========================================================================
     # Main Training Loop
