@@ -1819,6 +1819,13 @@ class MoFDistillTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Normalize MSE loss by 2σ²(t) for time-reweighting (SDE regime)."},
     )
+    eval_baselines_at_start: bool = field(
+        default=True,
+        metadata={
+            "help": "Evaluate each teacher and base model on all test sets at epoch 0 "
+                    "before training begins. Establishes baselines for comparison."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()

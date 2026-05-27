@@ -430,7 +430,7 @@ class MoFDistillTrainer(BaseTrainer):
     def start(self):
         """Main training loop: pure MSE velocity distillation."""
         # Evaluate baselines before training starts
-        if self.epoch == 0:
+        if self.epoch == 0 and self.training_args.eval_baselines_at_start:
             self.evaluate_baselines()
 
         while self.should_continue_training():
