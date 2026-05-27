@@ -1579,14 +1579,13 @@ class MoFTrainerBase(BaseTrainer):
     # =========================================================================
 
     def _save_mof_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
-        """Save MoF-specific state (lambda logits + EMA + source mapping)."""
+        """Save MoF-specific state (lambda logits or router state_dict + EMA + source mapping)."""
         if epoch is not None:
             save_directory = os.path.join(save_directory, f"checkpoint-{epoch}")
 
         if self.accelerator.is_main_process:
             os.makedirs(save_directory, exist_ok=True)
             state = {
-                'lambda_logits': self._lambda_logits.detach().cpu(),
                 'logits_ema': self._logits_ema.state_dict(),
                 'epoch': self.epoch,
                 'step': self.step,
@@ -1597,7 +1596,20 @@ class MoFTrainerBase(BaseTrainer):
                 'teacher_names': self._teacher_names,
                 'reward_running_mean': self._reward_running_mean,
                 'reward_running_var': self._reward_running_var,
+                'mixing_module_type': self.training_args.mixing_module_type,
             }
+
+            if self._is_router_mode:
+                # Router mode: save full module state_dict
+                state['mixing_module_state_dict'] = (
+                    self._mixing_module_unwrapped.state_dict()
+                )
+                # Also save a dummy lambda_logits=None marker for compatibility
+                state['lambda_logits'] = None
+            else:
+                # LUT mode: save logits tensor
+                state['lambda_logits'] = self._lambda_logits.detach().cpu()
+
             save_path = os.path.join(save_directory, 'mof_state.pt')
             torch.save(state, save_path)
             logger.info(f"MoF checkpoint saved to {save_path}")
@@ -1614,23 +1626,43 @@ class MoFTrainerBase(BaseTrainer):
             )
 
         state = torch.load(mof_path, map_location=self.accelerator.device)
-        logits = state['lambda_logits']
 
-        # Validate dimensions
-        if logits.shape[0] != self.K:
-            raise ValueError(
-                f"Checkpoint K={logits.shape[0]} != current K={self.K}"
-            )
-        if logits.shape[1] != self.num_train_timesteps:
-            raise ValueError(
-                f"Checkpoint T={logits.shape[1]} != current T={self.num_train_timesteps}"
-            )
-        if logits.shape[2] != self.S:
-            raise ValueError(
-                f"Checkpoint S={logits.shape[2]} != current S={self.S}"
-            )
+        if self._is_router_mode:
+            # Router mode: load module state_dict
+            if 'mixing_module_state_dict' in state:
+                self._mixing_module_unwrapped.load_state_dict(
+                    state['mixing_module_state_dict']
+                )
+            else:
+                raise ValueError(
+                    f"Router mode checkpoint missing 'mixing_module_state_dict'. "
+                    f"Checkpoint may be from LUT mode training."
+                )
+        else:
+            # LUT mode: load logits tensor
+            logits = state['lambda_logits']
+            if logits is None:
+                raise ValueError(
+                    "LUT mode but checkpoint has lambda_logits=None. "
+                    "Checkpoint may be from router mode training."
+                )
 
-        self._lambda_logits.data.copy_(logits.to(self.accelerator.device))
+            # Validate dimensions
+            if logits.shape[0] != self.K:
+                raise ValueError(
+                    f"Checkpoint K={logits.shape[0]} != current K={self.K}"
+                )
+            if logits.shape[1] != self.num_train_timesteps:
+                raise ValueError(
+                    f"Checkpoint T={logits.shape[1]} != current T={self.num_train_timesteps}"
+                )
+            if logits.shape[2] != self.S:
+                raise ValueError(
+                    f"Checkpoint S={logits.shape[2]} != current S={self.S}"
+                )
+
+            self._lambda_logits.data.copy_(logits.to(self.accelerator.device))
+
         if 'logits_ema' in state:
             self._logits_ema.load_state_dict(state['logits_ema'])
         self.epoch = state.get('epoch', 0)
