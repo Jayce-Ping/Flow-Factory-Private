@@ -821,6 +821,34 @@ class MoFBaseTrainingArguments(TrainingArguments):
         },
     )
 
+    # ---- Mixing module type (LUT vs neural router) ----
+    mixing_module_type: Literal["lut", "adaln_router", "mlp_router"] = field(
+        default="lut",
+        metadata={
+            "help": (
+                "Type of mixing weight module. "
+                "'lut': discrete lookup table (K, T, S) — original MoF. "
+                "'adaln_router': adaLN-style network conditioned on (timestep, prompt_embeds). "
+                "'mlp_router': simple MLP conditioned on (timestep, prompt_embeds)."
+            )
+        },
+    )
+    mixing_hidden_dim: int = field(
+        default=256,
+        metadata={
+            "help": "Hidden dimension for router networks (adaln_router/mlp_router). Ignored for 'lut'."
+        },
+    )
+    mixing_d_text: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Text embedding dimension (prompt_embeds last dim) for router networks. "
+                "If None, auto-detected from the first batch during training."
+            )
+        },
+    )
+
     # ---- Per-set reward ----
     eval_teachers_at_start: bool = field(
         default=True,

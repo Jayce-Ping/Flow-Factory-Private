@@ -172,11 +172,11 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 batch, t, latents
                             )  # (K, B, C, H, W)
 
-                            # 3. Combine with CURRENT λ weights (differentiable)
-                            current_weights = self._get_lambda_weights(self._lambda_logits)
-                            v_combined = self._combine_velocities_per_sample(
-                                teacher_velocities, timestep_index, current_weights, set_ids
-                            )  # (B, C, H, W) — gradient flows through logits
+                            # 3. Combine with CURRENT weights (differentiable)
+                            v_combined = self._compute_combined_velocity(
+                                teacher_velocities, t, batch,
+                                timestep_index=timestep_index, set_ids=set_ids,
+                            )  # (B, C, H, W) — gradient flows through mixing weights
 
                             # 4. Compute new log_prob via scheduler step
                             return_kwargs = ['log_prob']
@@ -275,16 +275,17 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 # Reduce and log
                                 loss_info_reduced = reduce_loss_info(self.accelerator, loss_info)
                                 loss_info_reduced['grad_norm'] = grad_norm
-                                with torch.no_grad():
-                                    log_weights = self._get_lambda_weights(self._lambda_logits)
-                                    mean_weights = log_weights.mean(dim=1)  # (K, S)
-                                    for k in range(self.K):
-                                        teacher_name = self._teacher_names[k]
-                                        for s in range(self.S):
-                                            src_name = self._set_id_to_source.get(s, str(s))
-                                            loss_info_reduced[f'lambda_{teacher_name}_{src_name}_mean'] = (
-                                                mean_weights[k, s].item()
-                                            )
+                                if not self._is_router_mode:
+                                    with torch.no_grad():
+                                        log_weights = self._get_lambda_weights(self._lambda_logits)
+                                        mean_weights = log_weights.mean(dim=1)  # (K, S)
+                                        for k in range(self.K):
+                                            teacher_name = self._teacher_names[k]
+                                            for s in range(self.S):
+                                                src_name = self._set_id_to_source.get(s, str(s))
+                                                loss_info_reduced[f'lambda_{teacher_name}_{src_name}_mean'] = (
+                                                    mean_weights[k, s].item()
+                                                )
                                 self.log_data(
                                     {f'train/{k}': v for k, v in loss_info_reduced.items()},
                                     step=self.step,

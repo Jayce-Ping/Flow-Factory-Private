@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.models.embeddings import Timesteps
 import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
@@ -176,6 +177,220 @@ class MoFMixingModule(nn.Module):
         return self.forward()[:, :, set_id]
 
 
+class MoFRouterBase(nn.Module):
+    """Base class for continuous weight prediction networks.
+
+    Shared components:
+      - Attention pooling over prompt_embeds (or bypass with pooled_prompt_embeds)
+      - Sinusoidal timestep embedding + projection
+      - Output softmax normalization
+      - Zero-init on output layer for uniform weights at start
+
+    Subclasses implement `_fuse_and_predict(c, t_hidden) → logits`.
+    """
+
+    def __init__(
+        self,
+        K: int,
+        d_text: int,
+        d_hidden: int = 256,
+        d_time: int = 256,
+        tau: float = 1.0,
+    ):
+        super().__init__()
+        self.K = K
+        self.d_hidden = d_hidden
+        self.tau = tau
+
+        # ---- Attention pooling for prompt_embeds ----
+        self.attn_query = nn.Parameter(torch.randn(1, 1, d_text) * 0.02)
+        self.c_proj = nn.Linear(d_text, d_hidden)
+
+        # ---- Timestep embedding ----
+        self.time_sinusoidal = Timesteps(d_time, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(d_time, d_hidden),
+            nn.SiLU(),
+        )
+
+    def _pool_text(
+        self,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Pool text embeddings to a fixed-dim vector.
+
+        Args:
+            prompt_embeds: (B, L, d_text) token sequence.
+            pooled_prompt_embeds: (B, d_pool) optional; bypasses AttnPool.
+
+        Returns:
+            c: (B, d_hidden) projected text summary.
+        """
+        if pooled_prompt_embeds is not None:
+            return self.c_proj(pooled_prompt_embeds)
+        # Attention pooling over token sequence
+        d = prompt_embeds.shape[-1]
+        attn_scores = torch.matmul(
+            self.attn_query, prompt_embeds.transpose(-1, -2)
+        )  # (B, 1, L)
+        attn_weights = F.softmax(attn_scores / (d ** 0.5), dim=-1)
+        c_pooled = torch.matmul(attn_weights, prompt_embeds).squeeze(1)  # (B, d_text)
+        return self.c_proj(c_pooled)  # (B, d_hidden)
+
+    def _embed_time(self, t: torch.Tensor) -> torch.Tensor:
+        """Encode timestep to hidden representation.
+
+        Args:
+            t: (B,) raw timestep values.
+
+        Returns:
+            t_hidden: (B, d_hidden).
+        """
+        return self.time_mlp(self.time_sinusoidal(t))
+
+    def _fuse_and_predict(self, c: torch.Tensor, t_hidden: torch.Tensor) -> torch.Tensor:
+        """Fuse text and time conditioning, predict K logits.
+
+        Must be implemented by subclasses.
+
+        Args:
+            c: (B, d_hidden) text conditioning.
+            t_hidden: (B, d_hidden) time conditioning.
+
+        Returns:
+            logits: (B, K) unnormalized teacher logits.
+        """
+        raise NotImplementedError
+
+    def forward(
+        self,
+        t: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict mixing weights from timestep and text conditioning.
+
+        Args:
+            t: (B,) raw timestep values from scheduler.
+            prompt_embeds: (B, L, d_text) text token sequence.
+            pooled_prompt_embeds: (B, d_pool) optional; bypasses AttnPool if provided.
+
+        Returns:
+            weights: (K, B) softmax-normalized mixing weights.
+        """
+        c = self._pool_text(prompt_embeds, pooled_prompt_embeds)
+        t_hidden = self._embed_time(t)
+        logits = self._fuse_and_predict(c, t_hidden)  # (B, K)
+        weights = F.softmax(logits / self.tau, dim=-1)  # (B, K)
+        return weights.T  # (K, B) to match velocity stacking convention
+
+
+class MoFAdaLNRouter(MoFRouterBase):
+    """adaLN-style continuous weight prediction network.
+
+    Time modulates text conditioning via adaptive layer normalization (γ, β),
+    following the standard DiT conditioning pattern (PixArt-α, SD3, Flux).
+
+    Architecture: time → (γ, β); h = γ * c + β; MLP(h) → K logits.
+    """
+
+    def __init__(self, K: int, d_text: int, d_hidden: int = 256, d_time: int = 256, tau: float = 1.0):
+        super().__init__(K, d_text, d_hidden, d_time, tau)
+
+        self.adaLN_modulation = nn.Linear(d_hidden, 2 * d_hidden)
+        self.mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_hidden, d_hidden),
+            nn.SiLU(),
+            nn.Linear(d_hidden, K),
+        )
+
+        # Zero-init for uniform weights at start
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+        nn.init.zeros_(self.adaLN_modulation.weight)
+        nn.init.zeros_(self.adaLN_modulation.bias)
+
+    def _fuse_and_predict(self, c: torch.Tensor, t_hidden: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.adaLN_modulation(t_hidden).chunk(2, dim=-1)
+        h = gamma * c + beta  # adaLN: time modulates text
+        return self.mlp(h)  # (B, K)
+
+
+class MoFMLPRouter(MoFRouterBase):
+    """Simple MLP continuous weight prediction network.
+
+    Concatenates time and text embeddings, then passes through MLP.
+    Simpler baseline compared to MoFAdaLNRouter.
+
+    Architecture: h = concat(time, text); MLP(h) → K logits.
+    """
+
+    def __init__(self, K: int, d_text: int, d_hidden: int = 256, d_time: int = 256, tau: float = 1.0):
+        super().__init__(K, d_text, d_hidden, d_time, tau)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * d_hidden, d_hidden),
+            nn.SiLU(),
+            nn.Linear(d_hidden, d_hidden),
+            nn.SiLU(),
+            nn.Linear(d_hidden, K),
+        )
+
+        # Zero-init for uniform weights at start
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def _fuse_and_predict(self, c: torch.Tensor, t_hidden: torch.Tensor) -> torch.Tensor:
+        h = torch.cat([t_hidden, c], dim=-1)  # (B, 2*d_hidden)
+        return self.mlp(h)  # (B, K)
+
+
+def create_mixing_module(
+    module_type: str,
+    K: int,
+    T: int = 10,
+    S: int = 1,
+    d_text: int = 4096,
+    d_hidden: int = 256,
+    temperature: float = 1.0,
+    **lut_kwargs,
+) -> nn.Module:
+    """Factory function for creating mixing weight modules.
+
+    Args:
+        module_type: One of "lut", "adaln_router", "mlp_router".
+        K: Number of teachers.
+        T: Number of timesteps (only used for "lut").
+        S: Number of prompt sets (only used for "lut").
+        d_text: Text embedding dimension (only for router variants).
+        d_hidden: Hidden dimension for router networks.
+        temperature: Softmax temperature.
+        **lut_kwargs: Additional kwargs for MoFMixingModule (normalize_weights, etc).
+
+    Returns:
+        nn.Module with appropriate interface.
+    """
+    if module_type == "lut":
+        return MoFMixingModule(
+            K=K, T=T, S=S, temperature=temperature, **lut_kwargs
+        )
+    elif module_type == "adaln_router":
+        return MoFAdaLNRouter(
+            K=K, d_text=d_text, d_hidden=d_hidden, tau=temperature
+        )
+    elif module_type == "mlp_router":
+        return MoFMLPRouter(
+            K=K, d_text=d_text, d_hidden=d_hidden, tau=temperature
+        )
+    else:
+        raise ValueError(
+            f"Invalid mixing_module_type: {module_type!r}. "
+            f"Valid: ['lut', 'adaln_router', 'mlp_router']."
+        )
+
+
 class MoFTrainerBase(BaseTrainer):
     """
     MoF (Mixture-of-Flow) Trainer Base Class.
@@ -201,14 +416,14 @@ class MoFTrainerBase(BaseTrainer):
         self.timestep_range = self.training_args.timestep_range
         self.num_train_timesteps = self.training_args.num_train_timesteps
 
-        # ---- EMA for logits (off-policy old policy, aligned with NFT schedule) ----
+        # ---- EMA for mixing module parameters (off-policy old policy) ----
         ema_device = (
             self.accelerator.device
             if self.training_args.ema_device == "cuda"
             else torch.device("cpu")
         )
         self._logits_ema = EMAModuleWrapper(
-            parameters=[self._lambda_logits],
+            parameters=self._ema_target_params,
             decay=self.training_args.ema_decay,
             update_step_interval=self.training_args.ema_update_interval,
             device=ema_device,
@@ -321,10 +536,10 @@ class MoFTrainerBase(BaseTrainer):
         self.optimizer = self._init_optimizer()
 
         # Keep a direct reference to logits BEFORE prepare() wraps the module.
-        # After DDP wrapping, self._mixing_module becomes DistributedDataParallel
-        # and the original module is at self._mixing_module.module. But
-        # _lambda_logits is the same tensor object regardless of wrapping.
-        self._lambda_logits = self._mixing_module.logits
+        # For LUT mode: _lambda_logits points to the (K,T,S) Parameter tensor.
+        # For router mode: _lambda_logits is None (router has its own parameters).
+        if hasattr(self._mixing_module, 'logits'):
+            self._lambda_logits = self._mixing_module.logits
         # Store unwrapped module for direct method access (avoids DDP/DeepSpeed wrapper checks)
         self._mixing_module_unwrapped = self._mixing_module
 
@@ -417,38 +632,135 @@ class MoFTrainerBase(BaseTrainer):
         The module is stored as self._mixing_module and included in
         accelerator.prepare() for DeepSpeed ZeRO compatibility.
         """
-        # Build teacher→set mapping for biased init
-        teacher_set_mapping: Dict[int, int] = {}
-        for src, s_id in self._source_to_set_id.items():
-            for k, teacher_srcs in enumerate(self._teacher_sources):
-                if teacher_srcs is not None and src in teacher_srcs:
-                    teacher_set_mapping[s_id] = k
-                    break
+        module_type = self.training_args.mixing_module_type
 
-        self._mixing_module = MoFMixingModule(
-            K=self.K,
-            T=self.training_args.num_inference_steps,
-            S=self.S,
-            temperature=self.training_args.temperature,
-            normalize_weights=self.training_args.normalize_weights,
-            init_mode=self.training_args.logits_init,
-            init_bias=self.training_args.logits_init_bias,
-            teacher_set_mapping=teacher_set_mapping,
-        ).to(self.accelerator.device)
+        if module_type == "lut":
+            # Build teacher→set mapping for biased init
+            teacher_set_mapping: Dict[int, int] = {}
+            for src, s_id in self._source_to_set_id.items():
+                for k, teacher_srcs in enumerate(self._teacher_sources):
+                    if teacher_srcs is not None and src in teacher_srcs:
+                        teacher_set_mapping[s_id] = k
+                        break
 
-        return self._mixing_module.logits
+            self._mixing_module = create_mixing_module(
+                module_type="lut",
+                K=self.K,
+                T=self.training_args.num_inference_steps,
+                S=self.S,
+                temperature=self.training_args.temperature,
+                normalize_weights=self.training_args.normalize_weights,
+                init_mode=self.training_args.logits_init,
+                init_bias=self.training_args.logits_init_bias,
+                teacher_set_mapping=teacher_set_mapping,
+            ).to(self.accelerator.device)
+
+            return self._mixing_module.logits
+        else:
+            # Router mode: create neural weight network
+            d_text = self.training_args.mixing_d_text
+            if d_text is None:
+                # Auto-detect: try to get from adapter's text encoder config
+                # Default to 4096 (SD3.5 T5-XXL + CLIP concatenated dim)
+                d_text = 4096
+                logger.info(
+                    f"mixing_d_text not set, defaulting to {d_text}. "
+                    f"Set explicitly in config if this doesn't match your model."
+                )
+
+            self._mixing_module = create_mixing_module(
+                module_type=module_type,
+                K=self.K,
+                d_text=d_text,
+                d_hidden=self.training_args.mixing_hidden_dim,
+                temperature=self.training_args.temperature,
+            ).to(self.accelerator.device)
+
+            logger.info(
+                f"MoF router ({module_type}): K={self.K}, d_text={d_text}, "
+                f"d_hidden={self.training_args.mixing_hidden_dim}, "
+                f"params={sum(p.numel() for p in self._mixing_module.parameters()):,}"
+            )
+            # Router mode: no single logits parameter
+            return None
 
     # =========================================================================
     # Lambda Weights
     # =========================================================================
+
+    @property
+    def _is_router_mode(self) -> bool:
+        """Whether the mixing module is a neural router (vs discrete LUT)."""
+        return self.training_args.mixing_module_type != "lut"
 
     def _get_lambda_weights(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute mixing weights — delegates to MoFMixingModule.get_weights().
 
         Uses the unwrapped module reference (stored before accelerator.prepare)
         to avoid DDP/DeepSpeed wrapper differences.
+        Only valid in LUT mode.
         """
         return self._mixing_module_unwrapped.get_weights(logits)
+
+    def _compute_router_weights(
+        self,
+        t: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute mixing weights from router network.
+
+        Args:
+            t: (B,) timestep values.
+            prompt_embeds: (B, L, d_text) text token sequence.
+            pooled_prompt_embeds: (B, d_pool) optional pooled embeddings.
+
+        Returns:
+            weights: (K, B) mixing weights.
+        """
+        return self._mixing_module_unwrapped(t, prompt_embeds, pooled_prompt_embeds)
+
+    @property
+    def _ema_target_params(self) -> List[torch.Tensor]:
+        """Parameters to track with EMA (all mixing module params for router, logits for LUT)."""
+        if self._is_router_mode:
+            return list(self._mixing_module_unwrapped.parameters())
+        return [self._lambda_logits]
+
+    def _compute_combined_velocity(
+        self,
+        teacher_velocities: torch.Tensor,
+        t: torch.Tensor,
+        batch: Any,
+        timestep_index: int = 0,
+        set_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute combined velocity using current mixing weights (differentiable).
+
+        Dispatches between LUT and router mode.
+
+        Args:
+            teacher_velocities: (K, B, *latent_dims) detached teacher predictions.
+            t: (B,) timestep values.
+            batch: Stacked BaseSample batch (must contain 'prompt_embeds' for router mode).
+            timestep_index: Index into T dimension (only used in LUT mode).
+            set_ids: (B,) integer set IDs (only used in LUT mode).
+
+        Returns:
+            v_combined: (B, *latent_dims) with gradients through mixing weights.
+        """
+        if self._is_router_mode:
+            weights = self._compute_router_weights(
+                t, batch['prompt_embeds'], batch.get('pooled_prompt_embeds')
+            )  # (K, B)
+            n_spatial = teacher_velocities.ndim - 2
+            w_expanded = weights.view(self.K, -1, *([1] * n_spatial))
+            return (w_expanded * teacher_velocities).sum(dim=0)
+        else:
+            current_weights = self._get_lambda_weights(self._lambda_logits)
+            return self._combine_velocities_per_sample(
+                teacher_velocities, timestep_index, current_weights, set_ids
+            )
 
     @property
     def enable_kl_loss(self) -> bool:
@@ -537,9 +849,9 @@ class MoFTrainerBase(BaseTrainer):
 
     @contextmanager
     def sampling_context(self):
-        """Use EMA logits for sampling when off-policy."""
+        """Use EMA parameters for sampling when off-policy."""
         if self.off_policy:
-            with self._logits_ema.use_ema_parameters([self._lambda_logits]):
+            with self._logits_ema.use_ema_parameters(self._ema_target_params):
                 yield
         else:
             yield
@@ -574,21 +886,25 @@ class MoFTrainerBase(BaseTrainer):
 
         Args:
             set_id: Which prompt set's weights to use for this inference pass.
+                    Only used in LUT mode; router mode ignores this (uses prompt_embeds).
 
         During sampling (rollout), replaces adapter.forward so each denoising
         step:
         1. Runs each teacher forward → K noise_pred tensors
-        2. Combines them with current lambda weights for set_id
+        2. Combines them with current lambda weights for set_id (LUT) or
+           with router-predicted weights from (t, prompt_embeds) (router mode)
         3. Passes combined to scheduler.step
         """
         original_forward = self.adapter.forward
         step_counter = [0]
+        is_router = self._is_router_mode
 
-        # Precompute weights (detached since sampling under no_grad)
-        with torch.no_grad():
-            weights = self._get_lambda_weights(self._lambda_logits)  # (K, T, S)
-            # Extract (K, T) slice for this set
-            set_weights = weights[:, :, set_id]  # (K, T)
+        # Precompute weights for LUT mode (detached since sampling under no_grad)
+        set_weights = None
+        if not is_router:
+            with torch.no_grad():
+                weights = self._get_lambda_weights(self._lambda_logits)  # (K, T, S)
+                set_weights = weights[:, :, set_id]  # (K, T)
 
         def patched_forward(**kwargs):
             t_idx = min(step_counter[0], self.num_train_timesteps - 1)
@@ -604,11 +920,23 @@ class MoFTrainerBase(BaseTrainer):
                     out = original_forward(**noise_only_kwargs)
                 velocities.append(out.noise_pred)
 
-            # Combine using lambda weights for this set at this timestep
+            # Combine using weights
             stacked = torch.stack(velocities, dim=0)  # (K, B, ...)
-            w_i = set_weights[:, t_idx]  # (K,)
-            expand_shape = (self.K,) + (1,) * (stacked.ndim - 1)
-            combined_noise_pred = (w_i.view(*expand_shape) * stacked).sum(dim=0)
+
+            if is_router:
+                # Router mode: predict weights from (t, prompt_embeds)
+                t_val = kwargs.get('t')  # (B,) or scalar
+                prompt_emb = kwargs.get('encoder_hidden_states')  # (B, L, d)
+                pooled = kwargs.get('pooled_projections')  # (B, d_pool) or None
+                w_i = self._mixing_module_unwrapped(t_val, prompt_emb, pooled)  # (K, B)
+                n_spatial = stacked.ndim - 2
+                w_expanded = w_i.view(self.K, -1, *([1] * n_spatial))
+                combined_noise_pred = (w_expanded * stacked).sum(dim=0)
+            else:
+                # LUT mode: index by timestep
+                w_i = set_weights[:, t_idx]  # (K,)
+                expand_shape = (self.K,) + (1,) * (stacked.ndim - 1)
+                combined_noise_pred = (w_i.view(*expand_shape) * stacked).sum(dim=0)
 
             # Run scheduler step
             scheduler_kwargs = _build_scheduler_step_kwargs(
@@ -920,8 +1248,8 @@ class MoFTrainerBase(BaseTrainer):
             self.prepare_feedback(samples)
             self.optimize(samples)
 
-            # Update EMA of logits
-            self._logits_ema.step([self._lambda_logits], optimization_step=self.epoch)
+            # Update EMA of mixing module parameters
+            self._logits_ema.step(self._ema_target_params, optimization_step=self.epoch)
             self.epoch += 1
 
     # =========================================================================
