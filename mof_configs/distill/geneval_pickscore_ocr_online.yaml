@@ -88,8 +88,8 @@ train:
   # ---- Optimization ----
   learning_rate: 3.0e-4
   per_device_batch_size: 8
-  group_size: 1
-  unique_sample_num_per_epoch: 144            # 3 * 48 = 144 (round-robin: 48 per source)
+  group_size: 16
+  unique_sample_num_per_epoch: 72            # 3 * 24 = 72 (round-robin: 24 per source)
   num_inner_epochs: 1
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
