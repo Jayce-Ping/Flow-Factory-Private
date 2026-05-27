@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
@@ -274,11 +275,42 @@ class MoFDistillTrainer(BaseTrainer):
             return weights_per_sample
 
     # =========================================================================
+    # DDP Bypass for Weight Swap
+    # =========================================================================
+
+    @contextmanager
+    def _bypass_ddp_for_weight_swap(self):
+        """Temporarily replace DDP-wrapped transformer with unwrapped module.
+
+        DDP's internal parameter buffers (used for gradient bucketing and
+        find_unused_parameters tracking) are NOT updated by .data.copy_()
+        which use_named_parameters relies on. In inference mode (no_grad),
+        calling the DDP-wrapped module still reads from these stale buffers,
+        causing all teacher forwards to produce identical outputs.
+
+        This context manager temporarily points the adapter's transformer
+        component to the raw unwrapped module, bypassing DDP's forward path.
+        Safe during inference since DDP's gradient sync is not needed.
+        """
+        unwrapped = self.adapter.get_component_unwrapped('transformer')
+        wrapped = self.adapter.get_component('transformer')
+        if unwrapped is not wrapped:
+            self.adapter.set_component('transformer', unwrapped)
+        try:
+            yield
+        finally:
+            if unwrapped is not wrapped:
+                self.adapter.set_component('transformer', wrapped)
+
+    # =========================================================================
     # Teacher Velocity Computation
     # =========================================================================
 
     def _compute_teacher_velocities(self, forward_kwargs: Dict[str, Any]) -> torch.Tensor:
         """Forward all K teachers, return stacked velocities (detached). Autocast-safe.
+
+        Disables autocast weight cache and bypasses DDP during the loop
+        (see CLAUDE.md invariant and _bypass_ddp_for_weight_swap docstring).
 
         Runs under torch.no_grad() to avoid activation storage and prevent DDP
         from registering gradient hooks for teacher forward calls.
@@ -286,14 +318,15 @@ class MoFDistillTrainer(BaseTrainer):
         velocities = []
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        try:
-            with torch.no_grad():
-                for name in self._teacher_names:
-                    with self.adapter.use_named_parameters(name):
-                        out = self.adapter.forward(**forward_kwargs)
-                    velocities.append(out.noise_pred.detach())
-        finally:
-            torch.set_autocast_cache_enabled(prev_cache)
+        with self._bypass_ddp_for_weight_swap():
+            try:
+                with torch.no_grad():
+                    for name in self._teacher_names:
+                        with self.adapter.use_named_parameters(name):
+                            out = self.adapter.forward(**forward_kwargs)
+                        velocities.append(out.noise_pred.detach())
+            finally:
+                torch.set_autocast_cache_enabled(prev_cache)
         return torch.stack(velocities, dim=0)  # (K, B, C, H, W)
 
     def _combine_weighted(self, weights: torch.Tensor, teacher_velocities: torch.Tensor) -> torch.Tensor:
@@ -403,16 +436,17 @@ class MoFDistillTrainer(BaseTrainer):
 
                 prev_cache = torch.is_autocast_cache_enabled()
                 torch.set_autocast_cache_enabled(False)
-                with torch.no_grad(), self.autocast(), \
-                        self.adapter.use_named_parameters(teacher_name):
-                    all_samples = self._run_eval_inference_batches(ts_name, merged_eval, eval_seed)
-                    gathered_rewards = self._gather_eval_rewards()
-                    gathered_tags = self._gather_eval_tags(all_samples)
-                    if self.accelerator.is_main_process:
-                        self._log_eval_reward_metrics(
-                            gathered_rewards, f"teacher/{teacher_name}/{ts_name}",
-                            all_samples, gathered_tags=gathered_tags,
-                        )
+                with self._bypass_ddp_for_weight_swap():
+                    with torch.no_grad(), self.autocast(), \
+                            self.adapter.use_named_parameters(teacher_name):
+                        all_samples = self._run_eval_inference_batches(ts_name, merged_eval, eval_seed)
+                        gathered_rewards = self._gather_eval_rewards()
+                        gathered_tags = self._gather_eval_tags(all_samples)
+                        if self.accelerator.is_main_process:
+                            self._log_eval_reward_metrics(
+                                gathered_rewards, f"teacher/{teacher_name}/{ts_name}",
+                                all_samples, gathered_tags=gathered_tags,
+                            )
                 torch.set_autocast_cache_enabled(prev_cache)
                 self.accelerator.wait_for_everyone()
 
