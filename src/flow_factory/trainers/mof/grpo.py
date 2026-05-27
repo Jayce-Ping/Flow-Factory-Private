@@ -26,7 +26,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 from .common import MoFTrainerBase
 from ...hparams import MoFGRPOTrainingArguments
 from ...samples import BaseSample
-from ...utils.base import filter_kwargs, create_generator, stitch_batch_metadata
+from ...utils.base import create_generator
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ...utils.noise_schedule import compute_transition_sigma
 from ...utils.dist import reduce_loss_info
@@ -61,54 +61,24 @@ class MoFGRPOTrainer(MoFTrainerBase):
                 f"Use MoF-NFT for deterministic (ODE) dynamics."
             )
 
-    def sample(self) -> List[BaseSample]:
-        """Generate rollouts with full trajectory + log_prob storage for GRPO."""
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples = []
-        mask_type = self.training_args.mask_type
-
-        if self.train_dataloaders_by_source:
-            data_iter = self._interleaved_source_iter()
-        else:
-            data_iter = iter(self.dataloader)
-
-        trajectory_indices = compute_trajectory_indices(
+        # Pre-compute trajectory indices and extra callback kwargs for sampling
+        self._trajectory_indices = compute_trajectory_indices(
             train_timestep_indices=self.adapter.scheduler.train_timesteps,
             num_inference_steps=self.training_args.num_inference_steps,
         )
+        self._extra_call_back_kwargs = []
+        if self.training_args.mask_type in ('kl', 'kl_adv'):
+            self._extra_call_back_kwargs = ['next_latents_mean', 'std_dev_t', 'dt']
 
-        with torch.no_grad(), self.autocast():
-            for _ in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f'Epoch {self.epoch} Sampling',
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                set_id = self._get_batch_set_id(batch)
-
-                # Store x-space data for kl_adv/kl masking
-                extra_call_back_kwargs = []
-                if mask_type in ('kl', 'kl_adv'):
-                    extra_call_back_kwargs = ['next_latents_mean', 'std_dev_t', 'dt']
-
-                with self._mof_inference_context(set_id):
-                    sample_kwargs = {
-                        **self.training_args,
-                        'compute_log_prob': True,
-                        'trajectory_indices': trajectory_indices,
-                        'extra_call_back_kwargs': extra_call_back_kwargs,
-                        **{k: v for k, v in batch.items() if k != '__source__'},
-                    }
-                    sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                    sample_batch = self.adapter.inference(**sample_kwargs)
-
-                stitch_batch_metadata(batch, sample_batch)
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-
-        return samples
+    def _build_sample_kwargs(self, batch):
+        """GRPO sampling: full trajectory with log_prob for ratio computation."""
+        return {
+            **self.training_args,
+            'compute_log_prob': True,
+            'trajectory_indices': self._trajectory_indices,
+            'extra_call_back_kwargs': self._extra_call_back_kwargs,
+            **{k: v for k, v in batch.items() if k != '__source__'},
+        }
 
     def optimize(self, samples: List[BaseSample]) -> None:
         """GRPO-style optimization: PPO-clipped ratio loss on lambda logits.

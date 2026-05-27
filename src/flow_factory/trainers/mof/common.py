@@ -58,6 +58,7 @@ from ..ensemble_eval.common import (
     cache_scheduler_step_signature,
     _build_scheduler_step_kwargs,
 )
+from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter
 
 logger = setup_logger(__name__)
 
@@ -866,30 +867,6 @@ class MoFTrainerBase(BaseTrainer):
             yield
 
     @contextmanager
-    def _bypass_ddp_for_weight_swap(self):
-        """Temporarily replace DDP-wrapped transformer with unwrapped module.
-
-        DDP's internal parameter buffers (used for gradient bucketing and
-        find_unused_parameters tracking) are NOT updated by .data.copy_()
-        which use_named_parameters relies on. In inference mode (no_grad),
-        calling the DDP-wrapped module still reads from these stale buffers,
-        causing all teacher forwards to produce identical outputs.
-
-        This context manager temporarily points the adapter's transformer
-        component to the raw unwrapped module, bypassing DDP's forward path.
-        Safe during inference since DDP's gradient sync is not needed.
-        """
-        unwrapped = self.adapter.get_component_unwrapped('transformer')
-        wrapped = self.adapter.get_component('transformer')
-        if unwrapped is not wrapped:
-            self.adapter.set_component('transformer', unwrapped)
-        try:
-            yield
-        finally:
-            if unwrapped is not wrapped:
-                self.adapter.set_component('transformer', wrapped)
-
-    @contextmanager
     def _mof_inference_context(self, set_id: int = 0):
         """Patch adapter.forward to return lambda-combined teacher velocity.
 
@@ -965,7 +942,7 @@ class MoFTrainerBase(BaseTrainer):
         self.adapter.forward = patched_forward  # type: ignore[method-assign]
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        with self._bypass_ddp_for_weight_swap():
+        with bypass_ddp_for_weight_swap(self.adapter):
             try:
                 step_counter[0] = 0
                 yield
@@ -1000,7 +977,7 @@ class MoFTrainerBase(BaseTrainer):
         self.adapter.forward = patched_forward  # type: ignore[method-assign]
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        with self._bypass_ddp_for_weight_swap():
+        with bypass_ddp_for_weight_swap(self.adapter):
             try:
                 step_counter[0] = 0
                 yield
@@ -1022,7 +999,7 @@ class MoFTrainerBase(BaseTrainer):
         from gradient-enabled contexts (e.g., GRPO optimize loop).
 
         Also disables autocast weight cache and bypasses DDP during the loop
-        (see CLAUDE.md invariant and _bypass_ddp_for_weight_swap docstring).
+        (see CLAUDE.md invariant and mof/utils.py:bypass_ddp_for_weight_swap).
 
         Returns:
             Tensor of shape (K, B, *latent_dims) with all teacher predictions.
@@ -1032,7 +1009,7 @@ class MoFTrainerBase(BaseTrainer):
 
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        with self._bypass_ddp_for_weight_swap(), torch.no_grad():
+        with bypass_ddp_for_weight_swap(self.adapter), torch.no_grad():
             try:
                 for name in self._teacher_names:
                     with self.adapter.use_named_parameters(name):
@@ -1124,26 +1101,8 @@ class MoFTrainerBase(BaseTrainer):
     # =========================================================================
 
     def _interleaved_source_iter(self):
-        """Round-robin iterator over per-source dataloaders (OPD pattern).
-
-        Each yielded batch is tagged with ``__source__`` for downstream routing.
-        """
-        source_names = sorted(self.train_dataloaders_by_source.keys())
-        iters = {name: iter(dl) for name, dl in self.train_dataloaders_by_source.items()}
-
-        while True:
-            for name in source_names:
-                try:
-                    batch = next(iters[name])
-                except StopIteration:
-                    iters[name] = iter(self.train_dataloaders_by_source[name])
-                    batch = next(iters[name])
-                batch["__source__"] = name
-                if "metadata" in batch:
-                    for meta in batch["metadata"]:
-                        if isinstance(meta, dict):
-                            meta["__source__"] = name
-                yield batch
+        """Round-robin iterator over per-source dataloaders. See mof/utils.py."""
+        yield from interleaved_source_iter(self.train_dataloaders_by_source)
 
     # =========================================================================
     # Advantage Computation
@@ -1210,12 +1169,62 @@ class MoFTrainerBase(BaseTrainer):
             self.epoch += 1
 
     # =========================================================================
-    # Sampling (override in subclass)
+    # Sampling (template method — subclasses override _build_sample_kwargs)
     # =========================================================================
 
     def sample(self) -> List[BaseSample]:
-        """Generate rollouts. Must be overridden by subclass (NFT or GRPO)."""
-        raise NotImplementedError("MoFTrainerBase.sample() must be overridden by subclass.")
+        """Generate rollouts using per-set lambda-combined teacher velocity.
+
+        Template method: the common loop is here; subclasses implement
+        _build_sample_kwargs(batch) to specify algorithm-specific inference
+        parameters (compute_log_prob, trajectory_indices, etc.).
+        """
+        self.adapter.rollout()
+        self.reward_buffer.clear()
+        samples = []
+
+        if self.train_dataloaders_by_source:
+            data_iter = self._interleaved_source_iter()
+        else:
+            data_iter = iter(self.dataloader)
+
+        with torch.no_grad(), self.autocast():
+            for _ in tqdm(
+                range(self.training_args.num_batches_per_epoch),
+                desc=f'Epoch {self.epoch} Sampling',
+                disable=not self.show_progress_bar,
+            ):
+                batch = next(data_iter)
+                set_id = self._get_batch_set_id(batch)
+
+                with self._mof_inference_context(set_id):
+                    sample_kwargs = self._build_sample_kwargs(batch)
+                    sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
+                    sample_batch = self.adapter.inference(**sample_kwargs)
+
+                stitch_batch_metadata(batch, sample_batch)
+                self._maybe_offload_samples_to_cpu(sample_batch)
+                samples.extend(sample_batch)
+                self.reward_buffer.add_samples(sample_batch)
+
+        return samples
+
+    def _build_sample_kwargs(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Build algorithm-specific inference kwargs for sampling.
+
+        Must be overridden by subclass (NFT or GRPO). Returns a dict that
+        will be filtered through filter_kwargs(adapter.inference, ...) before
+        being passed to adapter.inference().
+
+        Args:
+            batch: Current data batch (already tagged with __source__).
+
+        Returns:
+            Dict of keyword arguments for adapter.inference().
+        """
+        raise NotImplementedError(
+            "MoFTrainerBase._build_sample_kwargs() must be overridden by subclass."
+        )
 
     # =========================================================================
     # Feedback
