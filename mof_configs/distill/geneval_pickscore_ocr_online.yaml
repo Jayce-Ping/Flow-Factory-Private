@@ -1,11 +1,18 @@
-# MoF Distillation: distill 3-teacher weighted mixture → single student LoRA.
+# MoF Online Distillation: on-policy trajectory → MSE fit teachers.
 #
-# Loads MoF checkpoint (saves/mof.pt) containing learned per-timestep mixing
-# weights (K=3, T=10, S=3), then distills the weighted velocity combination
-# into a single student LoRA via pathwise MSE loss.
+# Algorithm:
+#   1. Student generates full trajectories (on-policy, stores all_latents)
+#   2. For each trajectory point x_t:
+#      - Student forward(x_t, t) → v_student (with grad)
+#      - K teachers forward(x_t, t) → v_teacher_k (detached)
+#      - v_target = Σ_k λ_k(t, source) * v_teacher_k
+#      - loss = MSE(v_student, v_target)
+#
+# Key difference from offline: the noise distribution is on-policy (student's
+# own trajectory), so the optimization landscape matches what student actually
+# produces at inference time.
 #
 # Data: GenEval + PickScore + OCR (round-robin interleaving, same as MoF training).
-# Target: v_target = Σ_k λ_k(t, source) * v_teacher_k
 
 # Environment Configuration
 launcher: "accelerate"
@@ -40,7 +47,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "mof_distill_sd3-5_geneval_pickscore_ocr_lut"
+  run_name: "mof_distill_online_sd3-5_geneval_pickscore_ocr_lut"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -49,7 +56,7 @@ log:
 
 # Training Configuration
 train:
-  trainer_type: 'mof-distill-offline'
+  trainer_type: 'mof-distill'
 
   # ---- Teacher configuration (same order as MoF training!) ----
   teachers:
@@ -82,7 +89,7 @@ train:
   learning_rate: 3.0e-4
   per_device_batch_size: 8
   group_size: 1
-  unique_sample_num_per_epoch: 144            # 3 * 48 = 144
+  unique_sample_num_per_epoch: 144            # 3 * 48 = 144 (round-robin: 48 per source)
   num_inner_epochs: 1
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
@@ -90,10 +97,15 @@ train:
   adam_weight_decay: 1.0e-4
   adam_epsilon: 1.0e-8
   ddp_find_unused_parameters: false
-  max_epochs: 500
+  max_epochs: 200
   seed: 42
 
-  # ---- Generation settings (for monitoring inference) ----
+  # ---- EMA (smooths on-policy trajectory drift) ----
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # ---- Generation settings (for on-policy trajectory sampling) ----
   resolution: 512
   guidance_scale: 1.0
   num_inference_steps: 10

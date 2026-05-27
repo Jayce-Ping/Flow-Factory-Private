@@ -5,18 +5,20 @@ Exports:
     MoFTrainerBase  — Shared infrastructure (teacher loading, lambda weights, etc.)
     MoFNFTTrainer   — NFT (DiffusionNFT) optimization variant (trainer_type: 'mof-nft')
     MoFGRPOTrainer  — GRPO (PPO-clipped ratio) optimization variant (trainer_type: 'mof-grpo')
-    MoFDistillTrainer — Distill MoF-weighted mixture → student LoRA (trainer_type: 'mof-distill')
+    MoFDistillTrainer — On-policy trajectory distillation (trainer_type: 'mof-distill')
+    MoFOfflineDistillTrainer — Offline noise-based distillation (trainer_type: 'mof-distill-offline')
     MoFMixingModule — Learnable (K,T,S) mixing weight module
 """
 from .common import MoFTrainerBase, MoFMixingModule
 from .nft import MoFNFTTrainer
 from .grpo import MoFGRPOTrainer
-from .distill import MoFDistillTrainer
+from .distill import MoFDistillTrainer, MoFOfflineDistillTrainer
 
 __all__ = [
     'MoFTrainerBase',
     'MoFNFTTrainer',
     'MoFGRPOTrainer',
     'MoFDistillTrainer',
+    'MoFOfflineDistillTrainer',
     'MoFMixingModule',
 ]
