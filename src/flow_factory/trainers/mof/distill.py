@@ -45,7 +45,7 @@ from ...utils.dist import reduce_loss_info
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..opd.common import load_teachers, cache_forward_signature, filter_forward_kwargs
 from .common import create_mixing_module, _validate_teacher_order
-from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter
+from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter, validate_source_ratio
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -103,6 +103,12 @@ class MoFDistillTrainer(BaseTrainer):
             f"MoF Distill: K={self.K} teachers, "
             f"module_type={self.training_args.mof_module_type}, "
             f"normalize_loss={self.training_args.normalize_d_k}"
+        )
+
+        validate_source_ratio(
+            self.training_args.source_ratio,
+            self.training_args.num_batches_per_epoch,
+            self.train_dataloaders_by_source,
         )
 
     # =========================================================================
@@ -686,7 +692,10 @@ class MoFDistillTrainer(BaseTrainer):
         )
 
         if self.train_dataloaders_by_source:
-            data_iter = interleaved_source_iter(self.train_dataloaders_by_source)
+            data_iter = interleaved_source_iter(
+                self.train_dataloaders_by_source,
+                source_ratio=self.training_args.source_ratio,
+            )
         else:
             data_iter = iter(self.dataloader)
 
@@ -864,7 +873,10 @@ class MoFDistillTrainer(BaseTrainer):
         all_samples: List[BaseSample] = []
 
         if self.train_dataloaders_by_source:
-            data_iter = interleaved_source_iter(self.train_dataloaders_by_source)
+            data_iter = interleaved_source_iter(
+                self.train_dataloaders_by_source,
+                source_ratio=self.training_args.source_ratio,
+            )
         else:
             data_iter = iter(self.dataloader)
 

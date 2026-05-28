@@ -775,6 +775,23 @@ class MoFBaseTrainingArguments(TrainingArguments):
             )
         },
     )
+    source_ratio: Optional[Dict[str, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-source sampling ratio dict (e.g. "
+                "{'geneval': 2, 'pickscore': 1, 'ocr': 2}). Values must be "
+                "non-negative integer-valued floats. None means equal "
+                "1:1:... round-robin (default). Used to manually rebalance "
+                "multi-source sampling — e.g. mitigate PickScore dominance "
+                "(see docs/mof/mof_pickscore_dominance_analysis.tex). "
+                "Constraint: num_batches_per_epoch must be divisible by "
+                "int(sum(values)) so each epoch contains an integer number "
+                "of full source-cycles. Must specify a weight for every "
+                "source present in the data."
+            )
+        },
+    )
 
     # ---- MoF core ----
     off_policy: bool = field(
@@ -1873,6 +1890,21 @@ class MoFDistillTrainingArguments(TrainingArguments):
         metadata={
             "help": "Evaluate each teacher and base model on all test sets at epoch 0 "
                     "before training begins. Establishes baselines for comparison."
+        },
+    )
+    source_ratio: Optional[Dict[str, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-source sampling ratio dict (e.g. "
+                "{'geneval': 2, 'pickscore': 1, 'ocr': 2}). Values must be "
+                "non-negative integer-valued floats. None means equal "
+                "1:1:... round-robin (default). Used to manually rebalance "
+                "multi-source sampling. Constraint: num_batches_per_epoch "
+                "must be divisible by int(sum(values)) so each epoch "
+                "contains an integer number of full source-cycles. Must "
+                "specify a weight for every source present in the data."
+            )
         },
     )
 

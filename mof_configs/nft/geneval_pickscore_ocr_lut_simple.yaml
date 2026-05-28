@@ -134,6 +134,11 @@ train:
   per_device_batch_size: 8                  # Micro-batch per GPU (small due to K teacher forwards per step)
   group_size: 16                            # Samples per prompt for within-group advantage
   unique_sample_num_per_epoch: 144          # 3 teachers × 48 samples per teacher = 144 total per epoch
+  # Per-source sampling weights. null → equal 1:1:1 round-robin (default).
+  # Example to mitigate PickScore dominance (see docs/mof/mof_pickscore_dominance_analysis.tex):
+  #   source_ratio: {geneval: 2.0, pickscore: 1.0, ocr: 2.0}
+  # Constraint: num_batches_per_epoch % int(sum(values)) must be 0.
+  source_ratio: null
   num_inner_epochs: 1                       # Single pass over samples per epoch
   gradient_step_per_epoch: 1                # Gradient steps per epoch (aligned with NFT)
   gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts (NFT pattern)
