@@ -1,0 +1,244 @@
+# MoF (Mixture-of-Flow): 3-teacher Time Router experiment.
+#
+# Time Router is the simplest continuous-time router: a small 2-layer MLP
+# that maps a raw timestep t ∈ R to mixing weights W ∈ Δ^{K-1}, with NO
+# text conditioning (no prompt_embeds / pooled_prompt_embeds branch).
+#
+# Architecture:
+#   t (B,) → SinusoidalPosEmb(d_time)
+#         → Linear(d_time → d_hidden) + SiLU
+#         → Linear(d_hidden → d_hidden) + SiLU
+#         → Linear(d_hidden → K) [zero-init]
+#         → softmax(/τ, dim=-1) → W ∈ R^{K × B}
+#
+# Total params: ~132K (K=3, d_time=d_hidden=256). Compare:
+#   LUT       (K, T, S):              90 params
+#   LUT-SA    (K, T):                 30 params
+#   Time Router:                      ~132K params
+#   adaLN Router (with text branch):  ~790K params
+#   MLP Router (with text branch):    ~660K params
+#
+# Key invariants — see docs/mof/mof_router_architectures.tex §1C:
+#   * Mixing weights W_k(t) depend ONLY on t (not on s_b or prompt content).
+#   * Reward / advantage is still source-aware:
+#         A_b = a_in(s_b) + γ · mean(a_ood)
+#     Source-aware gradients flow into source-agnostic NN weights θ_TR.
+#   * H_TR|_T_train ⊆ H_LUT-SA  (lower effective DOF on training timesteps)
+#     H_TR|_R     ⊄ H_LUT-SA  (TR extrapolates to ANY t ∈ R)
+#
+# When to use:
+#   * Inference at a different num_inference_steps than training (TR's
+#     unique advantage; LUT/LUT-SA cannot do this without retraining).
+#   * Smoothness inductive bias helps under sparse RL signal.
+#   * Ablation against full routers: if Time Router ≈ adaLN/MLP, prompt
+#     content carries no routing signal — the optimal policy is purely
+#     time-dependent.
+#
+# When NOT to use:
+#   * Optimal mixing depends on prompt content → use adaln_router/mlp_router.
+#   * Optimal weights have sharp t-domain transitions → LUT-SA is more
+#     direct (no smoothness regularization).
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (3 prompt sets, source labels feed advantage routing)
+data:
+  dataset_dir: "dataset/ocr"
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/pickscore"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_time-router"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: false
+
+# Training Configuration
+train:
+  trainer_type: 'mof-nft'
+
+  # ---- Teachers (sources/reward_name only used for advantage routing) ----
+  # Time Router does NOT consume teacher.sources for mixing — sources are
+  # used purely to populate _source_to_set_id (advantage path).
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]
+      reward_name: "geneval"
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]
+      reward_name: "pick_score"
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"
+
+  teacher_route_by_source: false            # Mixing handled per-timestep, not per-source
+  teacher_param_device: 'cuda'
+
+  # ---- Mixing module: Time Router ----
+  mixing_module_type: "time_router"         # NEW: continuous-time MLP, no text input
+  mixing_hidden_dim: 256                    # MLP hidden dim
+  mixing_d_time: 256                        # Sinusoidal time embedding dim (default; explicit for clarity)
+  # NOTE: mixing_d_pool and mixing_d_seq are NOT set — Time Router has no
+  # text branch and will warn-then-ignore if they're set. Omit them entirely
+  # to keep the config clean.
+  temperature: 1.0
+  normalize_weights: true                   # Softmax on router output (always true for routers)
+
+  # ---- MoF core hyperparameters ----
+  nft_beta: 1.0
+  off_policy: true                          # Sample with EMA weights, train with current
+  learning_rate: 1.0e-3                     # Same as adaLN/MLP routers (~100K-class NN regime)
+
+  # ---- EMA schedule ----
+  ema_decay_schedule: "piecewise_linear"
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.5
+  ema_update_interval: 1
+  ema_device: "cuda"
+
+  # ---- Per-set reward design (UNCHANGED — still source-aware) ----
+  # advantage(b) = a_R_in(s_b)(x_b) + γ · mean_{j ≠ R_in(s_b)} a_j(x_b)
+  eval_teachers_at_start: true
+  ood_bonus_gamma: 0.2
+
+  # ---- Advantage computation ----
+  advantage_aggregation: "gdpo"
+  adv_clip_range: [-5.0, 5.0]
+  global_std: true
+
+  # ---- Timestep control ----
+  time_sampling_strategy: "discrete"
+  timestep_range: 0.9
+  num_inference_steps: 10                   # Training T. Eval can use a different T (Time Router's edge).
+
+  # ---- Optimization ----
+  per_device_batch_size: 8
+  group_size: 16
+  unique_sample_num_per_epoch: 144
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 1000
+  seed: 42
+
+  # ---- KL penalty (disabled initially) ----
+  kl_beta: 0.0
+  kl_type: 'v-based'
+
+  # ---- Generation settings ----
+  resolution: 512
+  guidance_scale: 1.0                       # NFT requires no CFG
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"                      # NFT requires ODE dynamics
+  noise_level: 0.0
+  seed: 42
+
+# Evaluation settings
+# NOTE: Time Router's unique advantage — eval num_inference_steps can differ
+# from training. Here we deliberately use 40 (vs train's 10) to demonstrate
+# the continuous-time extrapolation. For a tighter LUT/LUT-SA comparison,
+# set this to 10 instead.
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0
+  num_inference_steps: 40                   # Eval at higher T (training was at 10)
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+
+# Evaluation rewards
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
