@@ -1,0 +1,522 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,shapes.geometric}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+
+\title{\textbf{MoF 训练失败模式分析}\\[0.3em]
+\large 神经路由器下的 PickScore-dominance 与 OCR 性能退化}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ═══════════════════════════════════════════════════════════════════
+\section{现象记录}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{实验设置}
+
+K=3 teachers (\texttt{teacher\_geneval}, \texttt{teacher\_pickscore}, \texttt{teacher\_ocr}) 在三个 prompt sets 上训练 MoF：
+
+\begin{itemize}
+    \item Sources: \texttt{geneval}, \texttt{pickscore}, \texttt{ocr}（每个对应一个 in-domain teacher）
+    \item Rewards 配置：
+        \begin{itemize}
+            \item \texttt{geneval} reward → \texttt{applicable\_sources: [geneval]}（domain-specific）
+            \item \texttt{pick\_score} reward → \texttt{applicable\_sources: [geneval, pickscore, ocr]}（\textbf{universal}）
+            \item \texttt{ocr} reward → \texttt{applicable\_sources: [ocr]}（domain-specific）
+        \end{itemize}
+    \item OOD bonus 系数 $\gamma = 0.2$
+\end{itemize}
+
+\subsection{观察到的训练表现}
+
+\begin{center}
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{架构} & \textbf{GenEval reward} & \textbf{PickScore reward} & \textbf{OCR reward} \\
+\midrule
+LUT (uniform init) & 达到 teacher 水平 & 达到 teacher 水平 & 达到 teacher 水平 \\
+LUT (biased init)  & 达到 teacher 水平 & 达到 teacher 水平 & 达到 teacher 水平 \\
+\midrule
+Time Router        & 平衡（达到 teacher） & \textcolor{red}{\textbf{主导}} & \textcolor{red}{\textbf{下降}} \\
+adaLN Router       & 平衡（达到 teacher） & \textcolor{red}{\textbf{主导}} & \textcolor{red}{\textbf{下降}} \\
+MLP Router         & 平衡（达到 teacher） & \textcolor{red}{\textbf{主导}} & \textcolor{red}{\textbf{下降}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{核心异象}：
+\begin{enumerate}
+    \item \textbf{LUT 不论何种初始化都能让所有三个 reward 达到对应 teacher 水平}。
+    \item \textbf{所有神经路由器（Time / adaLN / MLP）都呈现 PickScore teacher 主导}：路由权重显著偏向 \texttt{teacher\_pickscore}，OCR 的 in-domain 性能下降，而 GenEval 看似仍达到 teacher 水平。
+\end{enumerate}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{Reward / Advantage 公式回顾}
+% ═══════════════════════════════════════════════════════════════════
+
+每个 sample $b$（来自 source $s_b$）的 advantage 通过 \texttt{prepare\_feedback} 中的三步流程计算：
+
+\begin{enumerate}
+    \item Per-reward, per-group z-score → $a_j(x_b) \sim \mathcal{N}(0, 1)$，对该 reward 不适用的样本设为 NaN。
+    \item Per-sample 聚合：
+        \begin{equation}
+        A(x_b, s_b) = a_{R_{\text{in}}(s_b)}(x_b) + \gamma \cdot \frac{1}{|J_b|} \sum_{j \in J_b} a_j(x_b)
+        \label{eq:advantage}
+        \end{equation}
+        其中 $J_b = \{j : j \neq R_{\text{in}}(s_b),\, a_j(x_b) \neq \text{NaN}\}$ 为该 sample 的 OOD reward 集合。
+    \item Global-std 归一化 + clipping。
+\end{enumerate}
+
+\subsection{展开三类样本的 advantage}
+
+由于 \texttt{pick\_score} 是唯一在所有 source 上都 applicable 的 reward，OOD 集合 $J_b$ 在三类样本上是\textbf{不对称的}：
+
+\begin{center}
+\begin{tabular}{l|c|c|c}
+\toprule
+\textbf{样本类型} & \textbf{$R_{\text{in}}(s_b)$} & \textbf{$J_b$（OOD 集合）} & \textbf{advantage 公式} \\
+\midrule
+\texttt{pickscore} 样本 & \texttt{pick\_score} & $\emptyset$ &
+    $A_b = a_{\text{pick}}(x_b)$ \\
+\midrule
+\texttt{geneval} 样本 & \texttt{geneval} & $\{\text{pick}\}$ &
+    $A_b = a_{\text{gen}}(x_b) + \gamma\,a_{\text{pick}}(x_b)$ \\
+\midrule
+\texttt{ocr} 样本 & \texttt{ocr} & $\{\text{pick}\}$ &
+    $A_b = a_{\text{ocr}}(x_b) + \gamma\,a_{\text{pick}}(x_b)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{关键观察}：
+\begin{itemize}
+    \item PickScore 信号通过 OOD term \emph{渗透到 geneval 和 ocr 样本} 的 advantage 中。
+    \item GenEval 和 OCR 信号 \emph{互不渗透到对方}（因 \texttt{applicable\_sources} 限制使彼此 NaN）。
+    \item GenEval 和 OCR 信号 \emph{完全不渗透到 pickscore 样本}（同上）。
+\end{itemize}
+
+PickScore 信号是\textbf{唯一双向流动}的——它既驱动自己的 in-domain 优化，又通过 OOD 影响其他两个 source。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{LUT 解耦 vs NN 参数共享}
+\label{sec:decouple_vs_share}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{两种参数化方式对信号路由的影响}
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=3cm, minimum height=0.9cm, align=center, fill=blue!8},
+    src/.style={draw, rounded corners, minimum width=2.4cm, minimum height=0.8cm, align=center, fill=green!10},
+    arr/.style={-{Stealth[length=3mm]}, thick},
+    block/.style={draw, rounded corners, minimum width=4.5cm, minimum height=4cm, align=center, fill=gray!5},
+]
+    % LUT
+    \node[block, label=above:{\textbf{LUT (K, T, S)}}] (lut_box) at (-3.7, 0) {};
+    \node[src] (gen_lut) at (-3.7, 1.7) {GenEval samples\\\scriptsize $A=a_{\text{gen}}+\gamma a_{\text{pick}}$};
+    \node[src] (pick_lut) at (-3.7, 0.3) {PickScore samples\\\scriptsize $A=a_{\text{pick}}$};
+    \node[src] (ocr_lut) at (-3.7, -1.1) {OCR samples\\\scriptsize $A=a_{\text{ocr}}+\gamma a_{\text{pick}}$};
+    \node[box, fill=orange!15] (lut_param) at (-3.7, -2.4) {$\Lambda[:,t,s]$\\\scriptsize 三组独立列};
+
+    \draw[arr, blue!50] (gen_lut) -- node[right, font=\scriptsize, xshift=1mm]{$\to s{=}$gen} (lut_param.north -| gen_lut);
+    \draw[arr, blue!50] (pick_lut) -- node[right, font=\scriptsize, xshift=1mm]{$\to s{=}$pick} (lut_param.north -| pick_lut);
+    \draw[arr, blue!50] (ocr_lut) -- node[right, font=\scriptsize, xshift=1mm]{$\to s{=}$ocr} (lut_param.north -| ocr_lut);
+
+    % NN router
+    \node[block, fill=red!5, label=above:{\textbf{NN Router (shared $\theta$)}}] (nn_box) at (3.7, 0) {};
+    \node[src] (gen_nn) at (3.7, 1.7) {GenEval samples};
+    \node[src] (pick_nn) at (3.7, 0.3) {PickScore samples};
+    \node[src] (ocr_nn) at (3.7, -1.1) {OCR samples};
+    \node[box, fill=red!15] (nn_param) at (3.7, -2.4) {$\theta$\\\scriptsize 一组共享参数};
+
+    \draw[arr, red!70] (gen_nn) -- (nn_param);
+    \draw[arr, red!70] (pick_nn) -- (nn_param);
+    \draw[arr, red!70] (ocr_nn) -- (nn_param);
+\end{tikzpicture}
+\end{center}
+
+\subsection{LUT：参数解耦}
+
+LUT 的可学习参数为 $\bm{\Lambda} \in \R^{K \times T \times S}$。对一个来自 source $s$ 的样本 $x_b$，它\textbf{只}对 $\bm{\Lambda}[:, t, s]$ 这一列产生梯度（per-sample 索引由 \texttt{set\_ids} 决定）。
+
+考察 ocr\_set 列（$s = \texttt{ocr}$）的梯度积分：
+\begin{align}
+\nabla_{\Lambda[:, t, \text{ocr}]} \mathcal{L}
+&= \E_{x \sim \texttt{ocr}}\bigl[
+    A(x, \texttt{ocr}) \cdot \nabla_{\Lambda[:, t, \text{ocr}]} \log p(x|t)
+\bigr] \notag \\
+&= \E_{x \sim \texttt{ocr}}\bigl[
+    \underbrace{a_{\text{ocr}}(x)}_{\text{权重 }1.0}
+    + \underbrace{\gamma \cdot a_{\text{pick}}(x)}_{\text{权重 }0.2}
+\bigr] \cdot \nabla_{\Lambda[:, t, \text{ocr}]} \log p(x|t)
+\label{eq:lut_ocr_grad}
+\end{align}
+
+\textbf{关键比例}：在 ocr\_set 列上，$a_{\text{ocr}}$ 权重 $1.0$，$a_{\text{pick}}$ 权重 $\gamma = 0.2$。OCR 信号在自己的列上享有 $5\times$ 优势，PickScore 主导效应被严格遏制在每列内部。
+
+类似地，pickscore\_set 列只接受 pickscore 样本梯度（$A = a_{\text{pick}}$），geneval\_set 列接受 geneval 样本梯度（$A = a_{\text{gen}} + \gamma a_{\text{pick}}$）。\textbf{各列之间无串扰}。
+
+\subsection{NN Router：参数共享}
+
+NN router 的可学习参数 $\theta$ 由所有样本梯度共享。每个 sample 的梯度都流入同一组 $\theta$：
+\begin{align}
+\nabla_\theta \mathcal{L}
+= \E_{(x, s)}\bigl[A(x, s) \cdot \nabla_\theta \log p_\theta(x|t,c)\bigr]
+\end{align}
+
+按 source 分解（假设三类样本等频率 $\tfrac{1}{3}$）：
+\begin{align}
+\nabla_\theta \mathcal{L} = \tfrac{1}{3}\Bigl[
+    & \E_{x \sim \text{pick}}[\,a_{\text{pick}}(x) \cdot g(x;\theta)\,] \notag \\
+    +\,&\E_{x \sim \text{gen}}[(a_{\text{gen}}(x) + \gamma a_{\text{pick}}(x)) \cdot g(x;\theta)\,] \notag \\
+    +\,&\E_{x \sim \text{ocr}}[(a_{\text{ocr}}(x) + \gamma a_{\text{pick}}(x)) \cdot g(x;\theta)\,]
+\Bigr]
+\label{eq:nn_grad}
+\end{align}
+
+其中 $g(x; \theta) := \nabla_\theta \log p_\theta(x|t,c)$ 为 score function。
+
+\subsection{信号总强度对比表}
+
+把每个 reward 信号在\textbf{整体梯度}中的"覆盖率"列出（频率 $\times$ 系数之和）：
+
+\begin{center}
+\begin{tabular}{l|c|c|c}
+\toprule
+\textbf{Reward 信号} & \textbf{LUT 在自己列上} & \textbf{NN 在共享 $\theta$ 上} & \textbf{相对差异} \\
+\midrule
+PickScore signal &
+    1.0（pickscore 列） &
+    $\tfrac{1}{3}{\cdot}1.0 + \tfrac{1}{3}{\cdot}\gamma + \tfrac{1}{3}{\cdot}\gamma = 0.467$ &
+    \textbf{NN 上 PickScore 多 0.467} \\
+\midrule
+GenEval signal &
+    1.0（geneval 列） &
+    $\tfrac{1}{3}{\cdot}1.0 = 0.333$ &
+    NN 上 GenEval 仅 0.333 \\
+\midrule
+OCR signal &
+    1.0（ocr 列） &
+    $\tfrac{1}{3}{\cdot}1.0 = 0.333$ &
+    NN 上 OCR 仅 0.333 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{在 NN 路由器的共享参数 $\theta$ 上}：
+\begin{equation}
+\frac{F_{\text{pick}}}{F_{\text{ocr}}} = \frac{0.467}{0.333} = 1.4
+\label{eq:signal_ratio}
+\end{equation}
+
+PickScore 信号是 OCR 信号的 1.4 倍。LUT 上对应的比例是 $1.0/1.0 = 1.0$（每列独占）。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{为什么 NN 路由器收敛到 PickScore-dominant 解}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{平滑性归纳偏置放大不对称信号}
+
+NN router 输出的混合权重 $W(t, c; \theta)$ 关于输入是连续函数（线性层 + SiLU 激活的 Lipschitz 性质）。这意味着：
+
+\begin{itemize}
+    \item 相近的 $(t, c)$ 输入 $\to$ 相近的 $W$ 输出（隐式平滑约束）。
+    \item 在样本稀疏（每 epoch 144 样本）的 RL 设置下，NN 难以学到 prompt 内容的细粒度判别特征。
+    \item 容易找到的局部最优是\textbf{全局共享的} $W^*(t)$，对所有 prompt 输出相近的混合权重。
+\end{itemize}
+
+\subsection{在共享 $W$ 上找最大化期望 advantage 的解}
+
+把 NN 路由器近似为输出全局共享的 $W \in \Delta^{K-1}$（极简情况，但反映平滑性偏置）。最优 $W^*$ 满足：
+\begin{align}
+W^*
+&= \arg\max_W \,\E_{(x, s)}[A(x, s) \cdot \log p_W(x)] \notag \\
+&\propto \arg\max_W \;\bigl[
+    F_{\text{pick}} \cdot W_{\text{pick-aligned}}
+    + F_{\text{gen}} \cdot W_{\text{gen-aligned}}
+    + F_{\text{ocr}} \cdot W_{\text{ocr-aligned}}
+\bigr]
+\end{align}
+
+其中 $W_{k\text{-aligned}}$ 表示朝 $\text{teacher}_k$ 的对齐方向（即 $W \to \mathbf{e}_k$ one-hot）。由 \eqref{eq:signal_ratio}，$F_{\text{pick}} > F_{\text{gen}} = F_{\text{ocr}}$，最优解\textbf{偏向 teacher\_pickscore}。
+
+形式上：在 simplex $\Delta^{K-1}$ 上的"重心"（按 $F_k$ 加权）：
+\begin{equation}
+W^*_k \propto \frac{F_k}{\sum_{k'} F_{k'}} = \begin{cases}
+    0.467 / 1.133 \approx 0.412 & k = \text{pick} \\
+    0.333 / 1.133 \approx 0.294 & k = \text{gen} \\
+    0.333 / 1.133 \approx 0.294 & k = \text{ocr}
+\end{cases}
+\label{eq:nn_optimum}
+\end{equation}
+
+PickScore 占 41.2\%，GenEval / OCR 各 29.4\%。这是\textbf{在最简平滑假设下的预测}——实际 NN 可以在 prompt 维度上做有限分化，缓解但不消除这个偏置。
+
+\subsection{实验观察与理论预测一致}
+
+观察到的"PickScore teacher 主导，OCR 性能下降"恰好对应：
+\begin{itemize}
+    \item NN router 收敛到 \eqref{eq:nn_optimum} 附近（PickScore 比重最高）。
+    \item 路由策略对所有 prompt 类似（平滑性偏置）。
+    \item OCR 样本被路由到 teacher\_pickscore $\to$ OCR 性能下降。
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{为什么 GenEval 仍然平衡？}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{Teacher 间的"在 source 上的得分"矩阵}
+
+设 $R_{k,s}$ 表示 teacher $k$ 单独 inference 时在 source $s$ 上的 in-domain reward 期望。基于经验 Diffusion 训练观察，矩阵大致结构：
+
+\begin{center}
+\begin{tabular}{l|ccc}
+\toprule
+$R_{k,s}$ & \textbf{geneval} & \textbf{pickscore} & \textbf{ocr} \\
+\midrule
+\textbf{teacher\_geneval}   & high & med  & low \\
+\textbf{teacher\_pickscore} & med  & high & \textcolor{red}{\textbf{low}} \\
+\textbf{teacher\_ocr}       & low  & low  & high \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+关键不对称：
+\begin{tcolorbox}[colback=yellow!5, colframe=orange!50, title=Teacher 性能不对称]
+\begin{itemize}
+    \item \textbf{teacher\_pickscore 在 GenEval 上得 med}：美学好的图像通常也包含基本的物体正确性，所以 PickScore 偏好（构图美观）与 GenEval 偏好（物体计数/属性）有较高重合。
+    \item \textbf{teacher\_pickscore 在 OCR 上得 low}：OCR 是高度专业化的任务（精确的文字渲染），与美学偏好正交甚至冲突——美学训练倾向于"画面整体和谐"，可能模糊文字细节。
+    \item \textbf{teacher\_ocr 在 OCR 上得 high}：专业化训练带来 OCR 专属能力。
+\end{itemize}
+\end{tcolorbox}
+
+\subsection{NN 收敛后的实际效果分析}
+
+NN router 收敛到 \eqref{eq:nn_optimum} 后的student 性能：
+\begin{align}
+R_{\text{student}, s} \approx \sum_k W^*_k \cdot R_{k,s}
+\end{align}
+
+具体计算（用 high=1.0, med=0.7, low=0.3 估算）：
+
+\begin{center}
+\begin{tabular}{l|ccc|c}
+\toprule
+\textbf{Source $s$} & \textbf{$W^*_{\text{gen}}{\cdot}R_{\text{gen},s}$} & \textbf{$W^*_{\text{pick}}{\cdot}R_{\text{pick},s}$} & \textbf{$W^*_{\text{ocr}}{\cdot}R_{\text{ocr},s}$} & \textbf{Student $R$} \\
+\midrule
+geneval  & $0.294 {\cdot} 1.0 = 0.294$ & $0.412 {\cdot} 0.7 = 0.288$ & $0.294 {\cdot} 0.3 = 0.088$ & \textbf{0.670} \\
+pickscore & $0.294 {\cdot} 0.7 = 0.206$ & $0.412 {\cdot} 1.0 = 0.412$ & $0.294 {\cdot} 0.3 = 0.088$ & \textbf{0.706} \\
+ocr      & $0.294 {\cdot} 0.3 = 0.088$ & $0.412 {\cdot} 0.3 = 0.124$ & $0.294 {\cdot} 1.0 = 0.294$ & \textbf{0.506} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对比每个 source 上的"单一 teacher 上限"（即 $R_{s,s}$ = high = 1.0）：
+
+\begin{center}
+\begin{tabular}{l|c|c|c}
+\toprule
+\textbf{Source} & \textbf{Single-teacher 上限} & \textbf{NN router 实际} & \textbf{相对差距} \\
+\midrule
+geneval & 1.0 & 0.670 & $-33\%$ \\
+pickscore & 1.0 & 0.706 & $-29\%$ \\
+\textbf{ocr} & \textbf{1.0} & \textbf{0.506} & \textbf{$-49\%$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{OCR 上的相对损失最大}，因为：
+\begin{enumerate}
+    \item teacher\_pickscore（被 NN 偏好）在 OCR 上几乎无贡献（$R = 0.3$）。
+    \item teacher\_geneval（次偏好）在 OCR 上同样无贡献。
+    \item 只有 29.4\% 权重给到唯一有 OCR 能力的 teacher\_ocr。
+\end{enumerate}
+
+GenEval 看起来"平衡"（达到 teacher 水平）的解释：
+\begin{itemize}
+    \item \textbf{teacher\_pickscore 在 GenEval 上不差}（med=0.7），加上 teacher\_geneval 的 29.4\% 权重（high=1.0），合计达到约 0.67，可能与某些 epoch 下 teacher\_geneval 单独 inference 的水平接近（\textbf{特别是当 single teacher 性能本身在 0.6--0.7 区间时}，看起来"达到"了）。
+    \item 关键：GenEval 的"达到 teacher 水平"是相对于 \texttt{teacher\_geneval baseline} 的，而非真正的 high-bar 水平。
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{为什么 LUT 没有这个问题}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{每列独立优化}
+
+LUT 的 ocr\_set 列只看 OCR 样本（in-domain $a_{\text{ocr}}$ 权重 $1.0$ + OOD $a_{\text{pick}}$ 权重 $\gamma=0.2$）。其最优解：
+\begin{equation}
+\Lambda^*[:, t, \text{ocr}] = \arg\max_\Lambda \E_{x \sim \text{ocr}}\bigl[(a_{\text{ocr}}(x) + \gamma a_{\text{pick}}(x)) \cdot \log p_\Lambda(x|t)\bigr]
+\end{equation}
+
+由于 $1.0 \gg \gamma$，最优解高度偏向 \texttt{teacher\_ocr}（在 OCR 上得 high），略微偏向 \texttt{teacher\_pickscore}（在 OCR 上得 low，但 OOD 系数小）。
+
+\subsection{初始化不影响最终收敛}
+
+\textbf{LUT 的关键性质}：每列独立、低维（$K = 3$ 个参数），损失景观简单（$K{-}1$ 维 simplex 上的近似线性目标），uniform 和 biased 两种初始化都能在足够 epochs 下收敛到同一最优解。这解释了"两种初始化都能让所有 reward 达到 teacher 水平"。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{缓解方案}
+\label{sec:mitigations}
+% ═══════════════════════════════════════════════════════════════════
+
+按推荐优先级排序：
+
+\subsection{\textcolor{green!50!black}{方案 1：减小 OOD bonus 系数 (推荐首选)}}
+
+直接把 NN router 配置中的 \texttt{ood\_bonus\_gamma} 从 $0.2$ 降到 $0.0$。
+
+\begin{itemize}
+    \item \textbf{原理}：完全切断 PickScore 信号通过 OOD 渗透到 GenEval/OCR 样本的路径。每个样本的 advantage 退化为纯 in-domain。
+    \item 信号强度对比表变为 $F_{\text{pick}} : F_{\text{gen}} : F_{\text{ocr}} = 1 : 1 : 1$（均衡）。
+    \item \textbf{代价}：失去 OOD bonus 的设计意图（鼓励 cross-domain transfer）。但实测看，这个意图在当前 reward 配置下\emph{反而}带来主导问题。
+    \item \textbf{预期}：OCR 性能恢复到 teacher 水平，PickScore 主导消失。
+    \item \textbf{实现}：仅改 config，无需代码改动。
+\end{itemize}
+
+\subsection{方案 2：对称化 reward 应用范围}
+
+把 \texttt{pick\_score} reward 的 \texttt{applicable\_sources} 从 \texttt{[geneval, pickscore, ocr]} 改为 \texttt{[pickscore]}（domain-specific）。
+
+\begin{itemize}
+    \item \textbf{原理}：把 PickScore 也变成 domain-specific reward，与 GenEval/OCR 对称。所有样本的 OOD 集合 $J_b = \emptyset$，与方案 1 等效。
+    \item \textbf{代价}：失去 PickScore 作为通用美学锚点的作用——若你希望所有 prompt 的图都美观，这个改动不利。
+    \item \textbf{效果}：与方案 1 等价，但通过 reward 配置实现，更"语义清晰"。
+\end{itemize}
+
+\subsection{方案 3：折中的不对称 OOD}
+
+保留 OOD 但对 PickScore 不对称处理：
+\begin{itemize}
+    \item 不让 \texttt{pickscore} 出现在其他 source 的 OOD 中（即对 geneval/ocr 样本，$J = \emptyset$）；
+    \item 让 GenEval/OCR 出现在彼此的 OOD 中（如果你想要这种 transfer 的话——但目前 \texttt{applicable\_sources} 限制让它们已经互相 NaN 了，所以也是 $\emptyset$）。
+\end{itemize}
+
+\textbf{当前 reward 配置下，方案 3 退化为方案 1}（因为 GenEval/OCR 已经互不渗透）。所以方案 1 和方案 2 是当前主要可选项。
+
+\subsection{方案 4：Source-conditioned NN router}
+
+修改 NN router 输入：在 $(t, c)$ 之外，再喂入 source one-hot 嵌入 $\mathbf{e}_s \in \R^S$。即 $W = f(t, c, s; \theta)$。
+
+\begin{itemize}
+    \item \textbf{原理}：把 LUT 的 source-decoupling 性质带回到 NN，让 NN 可以学到 per-source 的 W。
+    \item \textbf{风险}：\texttt{推理时需要正确的 source 标签}（与现有 router 的"source-agnostic"卖点相违背）。
+    \item \textbf{代码改动量}：中等——给 \texttt{MoFAdaLNRouter} / \texttt{MoFMLPRouter} 加一个 source 嵌入分支。
+    \item \textbf{适用情形}：你认可 source 标签可在推理时获取，且希望保留 OOD bonus 的 cross-domain 潜力。
+\end{itemize}
+
+\subsection{方案 5：Per-source advantage 重权}
+
+在 advantage 计算后，按 source 频率倒数重权：
+\begin{equation}
+A'(x_b, s_b) = w_{s_b} \cdot A(x_b, s_b), \quad w_s = \frac{c}{F_s^{\text{eff}}}
+\end{equation}
+
+其中 $F_s^{\text{eff}}$ 是 source $s$ 的 \emph{effective signal coverage}（OCR 信号覆盖率 0.333 → $w_{\text{ocr}} = 1.4$；PickScore 0.467 → $w_{\text{pick}} = 1.0$）。
+
+\begin{itemize}
+    \item \textbf{原理}：对受 OOD 串扰削弱的 source 加大其样本权重，回归 $1{:}1{:}1$。
+    \item \textbf{代价}：理论依据较弱（粗暴的频率倒数），且需要额外超参。
+    \item \textbf{适用情形}：方案 1 不可接受（必须保留 OOD bonus），方案 4 不可接受（必须保留 source-agnostic）。
+\end{itemize}
+
+\subsection{方案对比}
+
+\begin{center}
+\small
+\begin{tabular}{l|c|c|c|p{4.5cm}}
+\toprule
+\textbf{方案} & \textbf{改动量} & \textbf{保留 OOD?} & \textbf{保留 source-agnostic?} & \textbf{风险} \\
+\midrule
+\textbf{1. $\gamma=0$} & 仅 config & ✗ & ✓ & 低 \\
+2. 对称化 applicable & 仅 config & 形式 ✓ 实质 ✗ & ✓ & 低 \\
+3. 不对称 $\gamma$ & 仅 config & 部分 & ✓ & 低（当前等价于 1） \\
+4. Source-conditioned NN & 中等代码 & ✓ & ✗ & 中（推理时需 source 标签） \\
+5. Per-source 重权 & 中等代码 & ✓ & ✓ & 中（超参敏感） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ═══════════════════════════════════════════════════════════════════
+\section{推荐的诊断 / Ablation 实验}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{快速验证假设}
+
+\textbf{实验 A}：在 \texttt{adaln\_router} 配置上做 $\gamma$ ablation，固定其他超参：
+\begin{itemize}
+    \item $\gamma \in \{0.0,\ 0.05,\ 0.1,\ 0.2\}$（当前是 0.2）
+    \item 监控 OCR training reward 与 OCR test 性能
+    \item \textbf{预期}：$\gamma$ 越小，OCR 性能越好。$\gamma=0$ 应能恢复到 teacher 水平。
+    \item \textbf{若实验结果与预期一致}：确认 OOD 串扰为主要原因。
+\end{itemize}
+
+\textbf{实验 B}：在 \texttt{adaln\_router} 配置上对称化 reward：
+\begin{itemize}
+    \item 把 \texttt{pick\_score} 的 \texttt{applicable\_sources} 改成 \texttt{[pickscore]}。
+    \item 等价于方案 2。
+    \item \textbf{预期}：与实验 A($\gamma{=}0$) 类似的结果。
+\end{itemize}
+
+\subsection{LUT-SA 关键对照}
+
+\textbf{实验 C}：跑 \texttt{lut\_simple}（源无关 LUT）作为关键对照。
+\begin{itemize}
+    \item LUT-SA 也是\textbf{参数共享 + source-agnostic mixing}（与 NN router 同性质），但用离散查表参数化（与 LUT 同性质）。
+    \item 若 LUT-SA \emph{也}呈现 PickScore 主导 → 主因是\textbf{参数共享 + OOD 串扰}（与 NN 的平滑性偏置无关）。
+    \item 若 LUT-SA \emph{没有}问题 → 主因是\textbf{NN 的平滑性归纳偏置}对不对称信号的放大。
+    \item 这个区分对方案选择有指导意义：前者 → 方案 1 必要；后者 → 方案 4 也有效。
+\end{itemize}
+
+\subsection{细粒度日志}
+
+在所有实验中，\texttt{wandb} 上记录\textbf{按 source 分别的}：
+\begin{itemize}
+    \item \texttt{train/\{source\}/router\_W\_\{teacher\}}（每个 source 的 sample 的平均混合权重）
+    \item \texttt{train/\{source\}/raw\_\{reward\}}（z-score 前的原始 reward）
+    \item \texttt{train/\{source\}/advantage}（z-score 后归一化前的 advantage）
+\end{itemize}
+
+可视化诊断：若 NN router 在 OCR 样本上的 $W_{\text{teacher\_pickscore}}$ 显著高于 LUT 在同等条件下的值 → 印证平滑性偏置假设。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{结论}
+% ═══════════════════════════════════════════════════════════════════
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!50, title=核心论断]
+\textbf{PickScore 主导效应 = 通用 reward $\times$ OOD bonus $\times$ 参数共享} 三方耦合的产物。
+\begin{itemize}
+    \item \textbf{通用 reward}：PickScore 的 \texttt{applicable\_sources} 涵盖所有 sources，使其成为唯一双向流动的信号。
+    \item \textbf{OOD bonus} ($\gamma > 0$)：把 PickScore 信号渗透到 GenEval/OCR 样本的 advantage 中，放大其总信号强度。
+    \item \textbf{NN 参数共享}：让来自所有 source 的 PickScore 信号累积在同一组 $\theta$ 上；LUT 的列解耦把这种串扰局限在每个 set 内部，所以不受影响。
+\end{itemize}
+\end{tcolorbox}
+
+\textbf{为什么 OCR 受影响最严重}：teacher\_pickscore 在 OCR 上几乎无贡献（low score），而在 GenEval 上"恰好不差"（med score）——这是 task 间能力相关性的不对称。
+
+\textbf{为什么 LUT 不论何种初始化都成功}：LUT 每列独立优化，损失景观局部线性、$K{-}1$ 维 simplex，初始化对最终收敛位置不敏感。
+
+\textbf{推荐立即行动}：在 NN router 配置上设 $\gamma = 0$（方案 1，仅改 config）作为基线，确认 OCR 性能恢复后再考虑是否值得为保留 OOD bonus 引入更复杂的方案（4 或 5）。
+
+\end{document}
