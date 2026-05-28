@@ -843,9 +843,30 @@ class MoFBaseTrainingArguments(TrainingArguments):
         default=None,
         metadata={
             "help": (
-                "Text embedding dimension (prompt_embeds last dim) for router networks. "
-                "If None, auto-detected from the first batch during training."
+                "Pooled-text-embedding dimension for the router's pooled-bypass "
+                "path (e.g. 2048 for SD3.5 pooled_prompt_embeds, 768 for Flux). "
+                "Required when mixing_module_type is a router. The historical "
+                "name (`d_text`) is preserved for back-compat; semantically this "
+                "is `d_pool`."
             )
+        },
+    )
+    mixing_d_seq: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-token text-embedding dimension (prompt_embeds last dim) for "
+                "the router's optional AttnPool fallback path (e.g. 4096 for "
+                "SD3.5 T5-XXL output). Only needed if you intend to call the "
+                "router without pooled_prompt_embeds. Leave None to disable "
+                "AttnPool and require pooled_prompt_embeds at forward time."
+            )
+        },
+    )
+    mixing_d_time: int = field(
+        default=256,
+        metadata={
+            "help": "Sinusoidal time-embedding dim for routers. Ignored for 'lut'."
         },
     )
 
@@ -1807,7 +1828,27 @@ class MoFDistillTrainingArguments(TrainingArguments):
     )
     mof_d_text: Optional[int] = field(
         default=None,
-        metadata={"help": "Text embedding dimension for router. If None, defaults to 4096."},
+        metadata={
+            "help": (
+                "Pooled-text-embedding dimension for the router's pooled-bypass "
+                "path. Defaults to 4096 if None. Overridden by checkpoint's "
+                "router_arch metadata when present."
+            )
+        },
+    )
+    mof_d_seq: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-token text-embedding dim for the router's optional "
+                "AttnPool fallback. Only needed if you call the router "
+                "without pooled_prompt_embeds."
+            )
+        },
+    )
+    mof_d_time: int = field(
+        default=256,
+        metadata={"help": "Sinusoidal time-embedding dim for the router."},
     )
     mof_hidden_dim: int = field(
         default=256,

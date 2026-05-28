@@ -186,13 +186,81 @@ class MoFDistillTrainer(BaseTrainer):
         module_type = args.mof_module_type
 
         if module_type != "lut":
-            d_text = args.mof_d_text or 4096
+            d_pool = args.mof_d_text or 4096
+            d_seq = getattr(args, "mof_d_seq", None)
+            d_hidden = args.mof_hidden_dim
+            d_time = getattr(args, "mof_d_time", 256)
+            temperature = args.mof_temperature
+
+            # If the checkpoint records the router architecture, prefer
+            # those values over config drift. This avoids silently building
+            # a router with different dimensions than what was trained.
+            saved_arch = state.get("router_arch")
+            if saved_arch is not None:
+                if (
+                    saved_arch.get("d_pool") is not None
+                    and saved_arch.get("d_pool") != d_pool
+                ):
+                    logger.warning(
+                        f"Distill: config mof_d_text={d_pool} differs from "
+                        f"checkpoint d_pool={saved_arch['d_pool']}. Using "
+                        f"checkpoint value."
+                    )
+                    d_pool = saved_arch["d_pool"]
+                if saved_arch.get("d_seq") is not None and saved_arch.get("d_seq") != d_seq:
+                    logger.warning(
+                        f"Distill: config mof_d_seq={d_seq} differs from "
+                        f"checkpoint d_seq={saved_arch['d_seq']}. Using "
+                        f"checkpoint value."
+                    )
+                    d_seq = saved_arch["d_seq"]
+                if (
+                    saved_arch.get("d_hidden") is not None
+                    and saved_arch.get("d_hidden") != d_hidden
+                ):
+                    logger.warning(
+                        f"Distill: config mof_hidden_dim={d_hidden} differs "
+                        f"from checkpoint d_hidden={saved_arch['d_hidden']}. "
+                        f"Using checkpoint value."
+                    )
+                    d_hidden = saved_arch["d_hidden"]
+                if (
+                    saved_arch.get("d_time") is not None
+                    and saved_arch.get("d_time") != d_time
+                ):
+                    logger.warning(
+                        f"Distill: config mof_d_time={d_time} differs from "
+                        f"checkpoint d_time={saved_arch['d_time']}. Using "
+                        f"checkpoint value."
+                    )
+                    d_time = saved_arch["d_time"]
+                if (
+                    saved_arch.get("tau") is not None
+                    and abs(saved_arch.get("tau") - temperature) > 1e-9
+                ):
+                    logger.warning(
+                        f"Distill: config mof_temperature={temperature} "
+                        f"differs from checkpoint tau={saved_arch['tau']}. "
+                        f"Using checkpoint value (router weights were trained "
+                        f"with this temperature)."
+                    )
+                    temperature = saved_arch["tau"]
+            else:
+                logger.warning(
+                    "MoF router checkpoint has no 'router_arch' metadata "
+                    "(legacy format). Building router from current config; "
+                    "verify mof_d_text / mof_hidden_dim / mof_temperature "
+                    "match the training config manually."
+                )
+
             router = create_mixing_module(
                 module_type=module_type,
                 K=self._mof_K,
-                d_text=d_text,
-                d_hidden=args.mof_hidden_dim,
-                temperature=args.mof_temperature,
+                d_pool=d_pool,
+                d_hidden=d_hidden,
+                d_time=d_time,
+                d_seq=d_seq,
+                temperature=temperature,
             )
             if "mixing_module_state_dict" in state:
                 router.load_state_dict(state["mixing_module_state_dict"])
@@ -203,7 +271,11 @@ class MoFDistillTrainer(BaseTrainer):
                 param.requires_grad_(False)
             self._mof_router = router
             self._mof_weights = None
-            logger.info(f"MoF distill: loaded {module_type} router (K={self._mof_K})")
+            logger.info(
+                f"MoF distill: loaded {module_type} router "
+                f"(K={self._mof_K}, d_pool={d_pool}, d_seq={d_seq}, "
+                f"d_hidden={d_hidden}, d_time={d_time}, tau={temperature})"
+            )
         else:
             if args.mof_use_ema and "logits_ema" in state:
                 ema_state = state["logits_ema"]
