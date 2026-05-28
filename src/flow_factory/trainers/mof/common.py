@@ -608,6 +608,128 @@ class MoFMLPRouter(MoFRouterBase):
         return self.mlp(h)  # (B, K)
 
 
+class MoFTimeRouter(nn.Module):
+    """Source-agnostic, text-agnostic continuous-time mixing router.
+
+    Maps a continuous timestep ``t ∈ R`` to mixing weights ``W ∈ Δ^{K-1}``
+    via a small 2-layer MLP on top of a sinusoidal time embedding.
+    There is **no** text branch (no ``c_proj``, no ``AttnPool``) and
+    **no** source axis — see ``docs/mof/mof_router_architectures.tex §1C``
+    for the design rationale.
+
+    Why not inherit from :class:`MoFRouterBase`?
+        ``MoFRouterBase`` builds ``c_proj`` (``Linear(d_pool, d_hidden)``)
+        unconditionally in its ``__init__``, which forces a ``d_pool``
+        dependency. Time Router has no text branch at all, so this class
+        inherits directly from ``nn.Module`` and self-contains the
+        sinusoidal embedding + time MLP + output head (about 10 lines of
+        duplicated time-embed code, accepted as the simpler trade-off).
+
+    Forward signature compatibility:
+        ``forward(t, prompt_embeds=None, pooled_prompt_embeds=None)`` —
+        the prompt arguments are accepted but ignored, so the trainer's
+        ``patched_forward`` and ``_compute_router_weights`` call sites
+        need no special-case branching.
+
+    Architecture:
+
+    .. code-block:: text
+
+        t ∈ R^B  →  SinusoidalPosEmb(d_time)
+                 →  Linear(d_time → d_hidden) + SiLU
+                 →  Linear(d_hidden → d_hidden) + SiLU
+                 →  Linear(d_hidden → K)  [zero-init]
+                 →  softmax(/τ, dim=-1)
+                 →  W ∈ R^{K × B}  (transposed)
+
+    Param count (K=3, d_time=d_hidden=256): ~132K (~5x smaller than full
+    text routers, ~4400x larger than LUT-SA — sits in the middle of the
+    expressivity / efficiency frontier).
+
+    Args:
+        K: Number of teachers (output dimension).
+        d_hidden: MLP hidden dim (default 256, reuses ``mixing_hidden_dim``).
+        d_time: Sinusoidal time embedding dim (default 256, reuses
+            ``mixing_d_time``).
+        tau: Softmax temperature (default 1.0, reuses ``temperature``).
+    """
+
+    def __init__(
+        self,
+        K: int,
+        d_hidden: int = 256,
+        d_time: int = 256,
+        tau: float = 1.0,
+    ):
+        super().__init__()
+        self.K = K
+        self.d_hidden = d_hidden
+        self.d_time = d_time
+        self.tau = tau
+        # Markers used by save/load arch-mismatch checks: TimeRouter has
+        # no text branch, so these dims are recorded as None in
+        # ``router_arch`` and serve as the "this is a Time Router"
+        # discriminator for downstream consumers (distill, eval).
+        self.d_pool = None
+        self.d_seq = None
+
+        # Sinusoidal time embedding — same Timesteps module used by
+        # MoFRouterBase, kept consistent for behavioral parity with
+        # adaLN/MLP routers.
+        from diffusers.models.embeddings import Timesteps
+
+        self.time_embed = Timesteps(
+            num_channels=d_time,
+            flip_sin_to_cos=True,
+            downscale_freq_shift=0,
+        )
+
+        # Time MLP: 2 hidden layers + SiLU activations
+        self.time_mlp = nn.Sequential(
+            nn.Linear(d_time, d_hidden),
+            nn.SiLU(),
+            nn.Linear(d_hidden, d_hidden),
+            nn.SiLU(),
+        )
+
+        # Output classifier — zero-init so initial logits are 0 and
+        # softmax produces the uniform mixture 1/K. Aligns with the
+        # zero-init strategy used by adaLN/MLP routers.
+        self.out_proj = nn.Linear(d_hidden, K)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        t: torch.Tensor,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        pooled_prompt_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute mixing weights ``W ∈ R^{K × B}`` from continuous timestep.
+
+        Args:
+            t: ``(B,)`` timestep values (raw scheduler scale, e.g. 0..1000).
+                Must be a 1D tensor. The trainer's ``patched_forward`` is
+                responsible for expanding any scalar ``t`` to ``(B,)``
+                before this call.
+            prompt_embeds: IGNORED. Accepted for API parity with
+                adaLN/MLP routers so the trainer's call sites do not need
+                a separate branch.
+            pooled_prompt_embeds: IGNORED.
+
+        Returns:
+            ``(K, B)`` mixing weights with ``∑_k W_{k,b} = 1`` for every
+            ``b``. When all ``t_b`` in the batch are equal (typical MoF
+            inference), all columns of the output are equal.
+        """
+        del prompt_embeds, pooled_prompt_embeds  # explicit "unused" signal
+        e = self.time_embed(t)                            # (B, d_time)
+        h = self.time_mlp(e)                               # (B, d_hidden)
+        logits = self.out_proj(h)                          # (B, K)
+        weights = F.softmax(logits / self.tau, dim=-1)     # (B, K)
+        return weights.transpose(0, 1).contiguous()        # (K, B)
+
+
 def create_mixing_module(
     module_type: str,
     K: int,
@@ -623,9 +745,13 @@ def create_mixing_module(
     """Factory function for creating mixing weight modules.
 
     Args:
-        module_type: One of "lut", "lut_simple", "adaln_router", "mlp_router".
-            "lut_simple" is the source-agnostic LUT (logits shape (K, T)),
-            broadcasts along S at forward time.
+        module_type: One of "lut", "lut_simple", "time_router",
+            "adaln_router", "mlp_router".
+            - "lut_simple" is the source-agnostic LUT (logits shape (K, T)),
+              broadcasts along S at forward time.
+            - "time_router" is the source-agnostic, text-agnostic continuous-
+              time router (only ``t`` input). ``d_pool`` and ``d_seq`` are
+              ignored.
         K: Number of teachers.
         T: Number of timesteps (only used for "lut" / "lut_simple").
         S: Number of prompt sets. For "lut": owns S real entries. For
@@ -633,13 +759,14 @@ def create_mixing_module(
             forward output still has shape (K, T, S) for API parity).
         d_pool: Pooled-text-embedding dim, e.g. 2048 for SD3.5
             ``pooled_prompt_embeds`` (CLIP-L+G concat). Used for the pooled
-            bypass path. Router only.
+            bypass path. adaLN/MLP router only; ignored for "time_router".
         d_hidden: Hidden dimension for router networks.
         d_time: Time embedding dim. Router only.
         temperature: Softmax temperature.
         d_seq: Per-token text-embedding dim, e.g. 4096 for SD3.5
             ``prompt_embeds`` (T5-XXL). Optional; only required if you want
-            the AttnPool fallback path. Router only.
+            the AttnPool fallback path. adaLN/MLP router only; ignored for
+            "time_router".
         **lut_kwargs: Additional kwargs for LUT modules (normalize_weights,
             init_mode, init_bias, teacher_set_mapping).
 
@@ -654,6 +781,11 @@ def create_mixing_module(
         return MoFMixingModuleSimple(
             K=K, T=T, S=S, temperature=temperature, **lut_kwargs
         )
+    elif module_type == "time_router":
+        # No text branch — d_pool / d_seq deliberately not forwarded.
+        return MoFTimeRouter(
+            K=K, d_hidden=d_hidden, d_time=d_time, tau=temperature,
+        )
     elif module_type == "adaln_router":
         return MoFAdaLNRouter(
             K=K, d_pool=d_pool, d_hidden=d_hidden, d_time=d_time,
@@ -667,7 +799,8 @@ def create_mixing_module(
     else:
         raise ValueError(
             f"Invalid mixing_module_type: {module_type!r}. "
-            f"Valid: ['lut', 'lut_simple', 'adaln_router', 'mlp_router']."
+            f"Valid: ['lut', 'lut_simple', 'time_router', "
+            f"'adaln_router', 'mlp_router']."
         )
 
 
@@ -954,8 +1087,40 @@ class MoFTrainerBase(BaseTrainer):
                 f"(source-{'aware' if module_type == 'lut' else 'agnostic'})"
             )
             return self._mixing_module.logits
+        elif module_type == "time_router":
+            # Time Router: continuous time, NO text branch.
+            # Warn (not error) if user accidentally set text-related dims —
+            # they are silently ignored otherwise, which can mask config typos.
+            if self.training_args.mixing_d_pool is not None:
+                logger.warning(
+                    f"mixing_d_pool={self.training_args.mixing_d_pool} is set "
+                    f"but mixing_module_type='time_router' has no text branch. "
+                    f"Ignoring."
+                )
+            if self.training_args.mixing_d_seq is not None:
+                logger.warning(
+                    f"mixing_d_seq={self.training_args.mixing_d_seq} is set "
+                    f"but mixing_module_type='time_router' has no AttnPool. "
+                    f"Ignoring."
+                )
+            self._mixing_module = create_mixing_module(
+                module_type="time_router",
+                K=self.K,
+                d_hidden=self.training_args.mixing_hidden_dim,
+                d_time=self.training_args.mixing_d_time,
+                temperature=self.training_args.temperature,
+            ).to(self.accelerator.device)
+            n_params = sum(p.numel() for p in self._mixing_module.parameters())
+            logger.info(
+                f"MoF time_router: K={self.K}, "
+                f"d_hidden={self.training_args.mixing_hidden_dim}, "
+                f"d_time={self.training_args.mixing_d_time}, "
+                f"params={n_params:,} (source-agnostic, text-agnostic)"
+            )
+            # Router mode: no single logits parameter
+            return None
         else:
-            # Router mode: create neural weight network
+            # adaLN / MLP router mode: create neural weight network
             # `mixing_d_pool` is the pooled-bypass dim (the path that's actually
             # used in current configs). `mixing_d_seq` is the optional AttnPool
             # fallback (only needed if you call the router without

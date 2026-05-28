@@ -195,7 +195,77 @@ class MoFDistillTrainer(BaseTrainer):
 
         module_type = args.mof_module_type
 
-        if module_type not in ("lut", "lut_simple"):
+        if module_type == "time_router":
+            # Time Router: continuous-time MLP, NO text branch.
+            # d_pool / d_seq are not used — keep them None for the factory.
+            d_hidden = args.mof_hidden_dim
+            d_time = args.mof_d_time
+            temperature = args.mof_temperature
+
+            saved_arch = state.get("router_arch")
+            if saved_arch is not None:
+                # d_pool / d_seq are None on both sides for time_router; only
+                # validate the dims that actually exist on the module.
+                if (
+                    saved_arch.get("d_hidden") is not None
+                    and saved_arch.get("d_hidden") != d_hidden
+                ):
+                    logger.warning(
+                        f"Distill: config mof_hidden_dim={d_hidden} differs "
+                        f"from checkpoint d_hidden={saved_arch['d_hidden']}. "
+                        f"Using checkpoint value."
+                    )
+                    d_hidden = saved_arch["d_hidden"]
+                if (
+                    saved_arch.get("d_time") is not None
+                    and saved_arch.get("d_time") != d_time
+                ):
+                    logger.warning(
+                        f"Distill: config mof_d_time={d_time} differs from "
+                        f"checkpoint d_time={saved_arch['d_time']}. Using "
+                        f"checkpoint value."
+                    )
+                    d_time = saved_arch["d_time"]
+                if (
+                    saved_arch.get("tau") is not None
+                    and abs(saved_arch.get("tau") - temperature) > 1e-9
+                ):
+                    logger.warning(
+                        f"Distill: config mof_temperature={temperature} "
+                        f"differs from checkpoint tau={saved_arch['tau']}. "
+                        f"Using checkpoint value."
+                    )
+                    temperature = saved_arch["tau"]
+            else:
+                logger.warning(
+                    "MoF time_router checkpoint has no 'router_arch' metadata "
+                    "(legacy format). Building router from current config; "
+                    "verify mof_hidden_dim / mof_d_time / mof_temperature "
+                    "match the training config manually."
+                )
+
+            router = create_mixing_module(
+                module_type="time_router",
+                K=self._mof_K,
+                d_hidden=d_hidden,
+                d_time=d_time,
+                temperature=temperature,
+            )
+            if "mixing_module_state_dict" in state:
+                router.load_state_dict(state["mixing_module_state_dict"])
+            else:
+                logger.warning("MoF checkpoint missing 'mixing_module_state_dict'.")
+            router = router.to(self.accelerator.device).eval()
+            for param in router.parameters():
+                param.requires_grad_(False)
+            self._mof_router = router
+            self._mof_weights = None
+            logger.info(
+                f"MoF distill: loaded time_router "
+                f"(K={self._mof_K}, d_hidden={d_hidden}, d_time={d_time}, "
+                f"tau={temperature})"
+            )
+        elif module_type not in ("lut", "lut_simple"):
             # All these fields are first-class dataclass members on
             # MoFDistillTrainingArguments with defined defaults; read them
             # directly. `mof_d_pool=None` means "auto-default to 4096"; any

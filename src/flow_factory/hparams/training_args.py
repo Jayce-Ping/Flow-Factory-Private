@@ -822,7 +822,9 @@ class MoFBaseTrainingArguments(TrainingArguments):
     )
 
     # ---- Mixing module type (LUT vs neural router) ----
-    mixing_module_type: Literal["lut", "lut_simple", "adaln_router", "mlp_router"] = field(
+    mixing_module_type: Literal[
+        "lut", "lut_simple", "time_router", "adaln_router", "mlp_router"
+    ] = field(
         default="lut",
         metadata={
             "help": (
@@ -831,6 +833,9 @@ class MoFBaseTrainingArguments(TrainingArguments):
                 "'lut_simple': source-agnostic LUT (K, T) — same per-timestep "
                 "weights for every sample, broadcast along S. Reward / advantage "
                 "computation is still source-aware. "
+                "'time_router': continuous-time MLP, NO text branch and NO source "
+                "axis. Maps t∈R to mixing weights via SinusoidalEmb + 2-layer MLP "
+                "(~132K params). Inference T can differ from training T. "
                 "'adaln_router': adaLN-style network conditioned on (timestep, prompt_embeds). "
                 "'mlp_router': simple MLP conditioned on (timestep, prompt_embeds)."
             )
@@ -1823,7 +1828,9 @@ class MoFDistillTrainingArguments(TrainingArguments):
     )
 
     # ---- Router mode settings ----
-    mof_module_type: Literal["lut", "lut_simple", "adaln_router", "mlp_router"] = field(
+    mof_module_type: Literal[
+        "lut", "lut_simple", "time_router", "adaln_router", "mlp_router"
+    ] = field(
         default="lut",
         metadata={"help": "Type of mixing module in MoF checkpoint."},
     )
