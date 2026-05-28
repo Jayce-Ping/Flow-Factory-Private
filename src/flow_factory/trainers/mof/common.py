@@ -63,6 +63,53 @@ from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter
 logger = setup_logger(__name__)
 
 
+def _validate_teacher_order(
+    saved_names: Optional[List[str]],
+    current_names: List[str],
+    context: str,
+) -> None:
+    """Validate that the checkpoint's teacher order matches the current config.
+
+    The K axis of every MoF artifact (LUT logits, router output layer, EMA
+    state) is positional: index ``k`` is hard-bound to ``teachers[k]`` at
+    save time. If a downstream consumer (resume / distill / eval) loads the
+    checkpoint with a different teacher order, the K-axis weights are
+    silently applied to the wrong teachers — no shape error, just semantic
+    corruption.
+
+    Args:
+        saved_names: ``state['teacher_names']`` from the checkpoint, or None
+            for legacy checkpoints that didn't record this.
+        current_names: Trainer's currently loaded ``self._teacher_names``.
+        context: Free-form label of the calling site, for error messages.
+
+    Raises:
+        ValueError: When ``saved_names`` exists and disagrees with
+            ``current_names`` in length or position-by-position.
+    """
+    if saved_names is None:
+        logger.warning(
+            f"{context}: checkpoint has no 'teacher_names' metadata "
+            f"(legacy format). Cannot validate teacher order; the K axis "
+            f"of the loaded weights is assumed to match the current "
+            f"teacher list {current_names}."
+        )
+        return
+
+    saved = list(saved_names)
+    current = list(current_names)
+    if saved != current:
+        raise ValueError(
+            f"{context}: teacher list order mismatch between checkpoint "
+            f"and current config. The K axis of the saved weights is "
+            f"position-bound to teachers[k]; reordering the teacher list "
+            f"would silently apply the wrong weights to the wrong teachers.\n"
+            f"  Checkpoint teacher_names: {saved}\n"
+            f"  Current teacher_names:    {current}\n"
+            f"Restore the original order, or retrain MoF with the new order."
+        )
+
+
 class MoFMixingModule(nn.Module):
     """Learnable per-timestep, per-set teacher mixing weights.
 
@@ -1685,6 +1732,15 @@ class MoFTrainerBase(BaseTrainer):
             )
 
         state = torch.load(mof_path, map_location=self.accelerator.device)
+
+        # Validate teacher list order: the K axis of every saved weight is
+        # position-bound to the teacher list. A reorder between train and
+        # resume/load would silently apply weights to the wrong teachers.
+        _validate_teacher_order(
+            saved_names=state.get('teacher_names'),
+            current_names=self._teacher_names,
+            context="MoF resume",
+        )
 
         if self._is_router_mode:
             # Router mode: load module state_dict

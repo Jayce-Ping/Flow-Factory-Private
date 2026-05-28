@@ -57,6 +57,7 @@ def load_mof_weights(
     temperature: float = 1.0,
     use_ema: bool = False,
     teacher_names: Optional[List[str]] = None,
+    strict_teacher_order: bool = True,
 ) -> torch.Tensor:
     """Load and compute lambda weights from MoF checkpoint.
 
@@ -64,6 +65,10 @@ def load_mof_weights(
         teacher_names: Display names for each teacher (k=0,1,...).
             Must match the order of --teachers (i.e., training order).
             If None, reads from checkpoint's 'teacher_names' field.
+        strict_teacher_order: If True (default), raise on any mismatch between
+            user-supplied --teacher-names and the checkpoint's teacher_names.
+            Set to False to allow renaming teachers at inference time at the
+            user's own risk.
 
     Returns:
         weights: Tensor of shape (K, T) for the specified set.
@@ -87,9 +92,22 @@ def load_mof_weights(
     if not teacher_names:
         teacher_names = ckpt_teacher_names
     elif ckpt_teacher_names and list(teacher_names) != list(ckpt_teacher_names):
-        print(f"  WARNING: --teacher-names {teacher_names} differs from "
-              f"checkpoint's teacher_names {ckpt_teacher_names}. "
-              f"Ensure --teachers order matches training!")
+        msg = (
+            f"--teacher-names {list(teacher_names)} does not match the "
+            f"checkpoint's teacher_names {list(ckpt_teacher_names)}. The K "
+            f"axis of the LUT/router is position-bound to the training "
+            f"teacher order; loading with a different order silently applies "
+            f"the wrong weights to the wrong teachers."
+        )
+        if strict_teacher_order:
+            raise ValueError(
+                msg + "\nFix --teachers / --teacher-names to match the "
+                "training order, or pass --no-strict-teacher-order to "
+                "override (for renaming/debugging only)."
+            )
+        else:
+            print(f"  WARNING: {msg} Continuing because "
+                  f"--no-strict-teacher-order was set.")
 
     # Get logits
     if use_ema and "logits_ema" in state:
@@ -520,6 +538,12 @@ def main():
     parser.add_argument("--teacher-names", nargs="+", default=None,
                         help="Display names for teachers in comparison grid "
                              "(default: teacher-0, teacher-1, ...)")
+    parser.add_argument("--no-strict-teacher-order", action="store_true",
+                        help="Skip the strict equality check between "
+                             "--teacher-names and the checkpoint's saved "
+                             "teacher_names. ONLY use this for debugging or "
+                             "renaming; reordering --teachers silently "
+                             "corrupts the K axis of the LUT/router.")
 
     args = parser.parse_args()
 
@@ -546,6 +570,7 @@ def main():
         temperature=args.temperature,
         use_ema=args.use_ema,
         teacher_names=teacher_display_names,
+        strict_teacher_order=not args.no_strict_teacher_order,
     )
 
     K_weights = mof_weights.shape[0]
