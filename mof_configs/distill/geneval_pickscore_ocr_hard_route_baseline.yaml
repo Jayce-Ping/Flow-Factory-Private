@@ -110,8 +110,8 @@ train:
   # ---- Optimization ----
   learning_rate: 3.0e-4
   per_device_batch_size: 8
-  group_size: 16
-  unique_sample_num_per_epoch: 72             # 3 * 24 = 72 (round-robin: 24 per source)
+  group_size: 4
+  unique_sample_num_per_epoch: 96            # 3 * 32 = 96 (round-robin: 32 per source)
   num_inner_epochs: 1
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
@@ -123,7 +123,7 @@ train:
   seed: 42
 
   # ---- EMA (smooths on-policy trajectory drift on the student side) ----
-  ema_decay: 0.99
+  ema_decay: 0.9
   ema_update_interval: 4
   ema_device: "cuda"
 
