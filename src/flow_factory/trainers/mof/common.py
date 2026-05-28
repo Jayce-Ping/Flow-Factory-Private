@@ -182,30 +182,61 @@ class MoFRouterBase(nn.Module):
     """Base class for continuous weight prediction networks.
 
     Shared components:
-      - Attention pooling over prompt_embeds (or bypass with pooled_prompt_embeds)
-      - Sinusoidal timestep embedding + projection
-      - Output softmax normalization
-      - Zero-init on output layer for uniform weights at start
+      - Pooled-bypass projection (d_pool → d_hidden): always built; used when
+        the caller passes ``pooled_prompt_embeds``.
+      - Optional attention pooling over the token sequence (d_seq → d_hidden):
+        built only if ``d_seq`` is provided. Used when ``pooled_prompt_embeds``
+        is None at forward time.
+      - Sinusoidal timestep embedding + projection.
+      - Output softmax normalization.
+      - Zero-init on output layer for uniform weights at start.
 
-    Subclasses implement `_fuse_and_predict(c, t_hidden) → logits`.
+    Note on dimensions (CRITICAL):
+        SD3.5 / Flux / etc. provide TWO text representations whose dims differ:
+          * pooled_prompt_embeds: e.g. (B, 2048) for SD3.5 (CLIP-L+G concat)
+          * prompt_embeds:        e.g. (B, L, 4096) for SD3.5 (T5-XXL output)
+        A single ``d_text`` cannot serve both. We require ``d_pool`` always
+        and accept an optional ``d_seq`` for the AttnPool fallback. If both
+        are equal the two paths share the same d_text scalar; otherwise the
+        sub-modules are sized independently.
+
+    Subclasses implement ``_fuse_and_predict(c, t_hidden) → logits``.
     """
 
     def __init__(
         self,
         K: int,
-        d_text: int,
+        d_pool: int,
         d_hidden: int = 256,
         d_time: int = 256,
         tau: float = 1.0,
+        d_seq: Optional[int] = None,
     ):
         super().__init__()
         self.K = K
+        self.d_pool = d_pool
+        self.d_seq = d_seq
         self.d_hidden = d_hidden
+        self.d_time = d_time
         self.tau = tau
 
-        # ---- Attention pooling for prompt_embeds ----
-        self.attn_query = nn.Parameter(torch.randn(1, 1, d_text) * 0.02)
-        self.c_proj = nn.Linear(d_text, d_hidden)
+        # ---- Pooled-bypass projection (always built) ----
+        self.c_proj = nn.Linear(d_pool, d_hidden)
+
+        # ---- Optional attention pooling for token sequences ----
+        # Only built when caller declares an AttnPool sequence dim. Avoids
+        # a silent dim-mismatch when the model's pooled and per-token text
+        # dims differ (SD3.5: 2048 vs 4096) and pooled is always provided.
+        if d_seq is not None:
+            self.attn_query = nn.Parameter(torch.randn(1, 1, d_seq) * 0.02)
+            if d_seq != d_pool:
+                self.seq_proj = nn.Linear(d_seq, d_hidden)
+            else:
+                # When seq and pool dims match, share c_proj to save params.
+                self.seq_proj = None
+        else:
+            self.attn_query = None
+            self.seq_proj = None
 
         # ---- Timestep embedding ----
         self.time_sinusoidal = Timesteps(d_time, flip_sin_to_cos=True, downscale_freq_shift=0)
@@ -222,7 +253,9 @@ class MoFRouterBase(nn.Module):
         """Pool text embeddings to a fixed-dim vector.
 
         Args:
-            prompt_embeds: (B, L, d_text) token sequence.
+            prompt_embeds: (B, L, d_seq) token sequence (only required if
+                ``pooled_prompt_embeds`` is None and the router was built
+                with ``d_seq`` set).
             pooled_prompt_embeds: (B, d_pool) optional; bypasses AttnPool.
 
         Returns:
@@ -230,14 +263,31 @@ class MoFRouterBase(nn.Module):
         """
         if pooled_prompt_embeds is not None:
             return self.c_proj(pooled_prompt_embeds)
-        # Attention pooling over token sequence
+
+        # Fallback: attention pool over the token sequence.
+        if self.attn_query is None:
+            raise RuntimeError(
+                "Router was constructed without `d_seq`, so AttnPool over "
+                "prompt_embeds is unavailable. Either provide "
+                "`pooled_prompt_embeds` at forward time, or pass `d_seq` to "
+                "the router constructor (= prompt_embeds.shape[-1])."
+            )
+        if prompt_embeds.shape[-1] != self.attn_query.shape[-1]:
+            raise ValueError(
+                f"prompt_embeds last dim ({prompt_embeds.shape[-1]}) does "
+                f"not match router's d_seq ({self.attn_query.shape[-1]}). "
+                f"Reconstruct the router with the correct d_seq."
+            )
         d = prompt_embeds.shape[-1]
         attn_scores = torch.matmul(
             self.attn_query, prompt_embeds.transpose(-1, -2)
         )  # (B, 1, L)
         attn_weights = F.softmax(attn_scores / (d ** 0.5), dim=-1)
-        c_pooled = torch.matmul(attn_weights, prompt_embeds).squeeze(1)  # (B, d_text)
-        return self.c_proj(c_pooled)  # (B, d_hidden)
+        c_pooled = torch.matmul(attn_weights, prompt_embeds).squeeze(1)  # (B, d_seq)
+        if self.seq_proj is not None:
+            return self.seq_proj(c_pooled)  # (B, d_hidden)
+        # d_seq == d_pool: reuse c_proj.
+        return self.c_proj(c_pooled)
 
     def _embed_time(self, t: torch.Tensor) -> torch.Tensor:
         """Encode timestep to hidden representation.
@@ -274,7 +324,7 @@ class MoFRouterBase(nn.Module):
 
         Args:
             t: (B,) raw timestep values from scheduler.
-            prompt_embeds: (B, L, d_text) text token sequence.
+            prompt_embeds: (B, L, d_seq) text token sequence.
             pooled_prompt_embeds: (B, d_pool) optional; bypasses AttnPool if provided.
 
         Returns:
@@ -296,8 +346,16 @@ class MoFAdaLNRouter(MoFRouterBase):
     Architecture: time → (γ, β); h = γ * c + β; MLP(h) → K logits.
     """
 
-    def __init__(self, K: int, d_text: int, d_hidden: int = 256, d_time: int = 256, tau: float = 1.0):
-        super().__init__(K, d_text, d_hidden, d_time, tau)
+    def __init__(
+        self,
+        K: int,
+        d_pool: int,
+        d_hidden: int = 256,
+        d_time: int = 256,
+        tau: float = 1.0,
+        d_seq: Optional[int] = None,
+    ):
+        super().__init__(K, d_pool, d_hidden, d_time, tau, d_seq=d_seq)
 
         self.adaLN_modulation = nn.Linear(d_hidden, 2 * d_hidden)
         self.mlp = nn.Sequential(
@@ -328,8 +386,16 @@ class MoFMLPRouter(MoFRouterBase):
     Architecture: h = concat(time, text); MLP(h) → K logits.
     """
 
-    def __init__(self, K: int, d_text: int, d_hidden: int = 256, d_time: int = 256, tau: float = 1.0):
-        super().__init__(K, d_text, d_hidden, d_time, tau)
+    def __init__(
+        self,
+        K: int,
+        d_pool: int,
+        d_hidden: int = 256,
+        d_time: int = 256,
+        tau: float = 1.0,
+        d_seq: Optional[int] = None,
+    ):
+        super().__init__(K, d_pool, d_hidden, d_time, tau, d_seq=d_seq)
 
         self.mlp = nn.Sequential(
             nn.Linear(2 * d_hidden, d_hidden),
@@ -353,9 +419,11 @@ def create_mixing_module(
     K: int,
     T: int = 10,
     S: int = 1,
-    d_text: int = 4096,
+    d_pool: int = 4096,
     d_hidden: int = 256,
+    d_time: int = 256,
     temperature: float = 1.0,
+    d_seq: Optional[int] = None,
     **lut_kwargs,
 ) -> nn.Module:
     """Factory function for creating mixing weight modules.
@@ -365,9 +433,15 @@ def create_mixing_module(
         K: Number of teachers.
         T: Number of timesteps (only used for "lut").
         S: Number of prompt sets (only used for "lut").
-        d_text: Text embedding dimension (only for router variants).
+        d_pool: Pooled-text-embedding dim, e.g. 2048 for SD3.5
+            ``pooled_prompt_embeds`` (CLIP-L+G concat). Used for the pooled
+            bypass path. Router only.
         d_hidden: Hidden dimension for router networks.
+        d_time: Time embedding dim. Router only.
         temperature: Softmax temperature.
+        d_seq: Per-token text-embedding dim, e.g. 4096 for SD3.5
+            ``prompt_embeds`` (T5-XXL). Optional; only required if you want
+            the AttnPool fallback path. Router only.
         **lut_kwargs: Additional kwargs for MoFMixingModule (normalize_weights, etc).
 
     Returns:
@@ -379,11 +453,13 @@ def create_mixing_module(
         )
     elif module_type == "adaln_router":
         return MoFAdaLNRouter(
-            K=K, d_text=d_text, d_hidden=d_hidden, tau=temperature
+            K=K, d_pool=d_pool, d_hidden=d_hidden, d_time=d_time,
+            tau=temperature, d_seq=d_seq,
         )
     elif module_type == "mlp_router":
         return MoFMLPRouter(
-            K=K, d_text=d_text, d_hidden=d_hidden, tau=temperature
+            K=K, d_pool=d_pool, d_hidden=d_hidden, d_time=d_time,
+            tau=temperature, d_seq=d_seq,
         )
     else:
         raise ValueError(
@@ -668,27 +744,33 @@ class MoFTrainerBase(BaseTrainer):
             return self._mixing_module.logits
         else:
             # Router mode: create neural weight network
-            d_text = self.training_args.mixing_d_text
-            if d_text is None:
+            # `mixing_d_text` historically named the pooled-bypass dim (the
+            # path that's actually used in current configs). We now also
+            # accept `mixing_d_seq` for the optional AttnPool fallback.
+            d_pool = self.training_args.mixing_d_text
+            if d_pool is None:
                 # Auto-detect: try to get from adapter's text encoder config
-                # Default to 4096 (SD3.5 T5-XXL + CLIP concatenated dim)
-                d_text = 4096
+                # Default to 4096 (a safe choice for most CLIP/T5 pooled dims)
+                d_pool = 4096
                 logger.info(
-                    f"mixing_d_text not set, defaulting to {d_text}. "
+                    f"mixing_d_text not set, defaulting to {d_pool}. "
                     f"Set explicitly in config if this doesn't match your model."
                 )
+            d_seq = getattr(self.training_args, "mixing_d_seq", None)
 
             self._mixing_module = create_mixing_module(
                 module_type=module_type,
                 K=self.K,
-                d_text=d_text,
+                d_pool=d_pool,
                 d_hidden=self.training_args.mixing_hidden_dim,
+                d_time=getattr(self.training_args, "mixing_d_time", 256),
+                d_seq=d_seq,
                 temperature=self.training_args.temperature,
             ).to(self.accelerator.device)
 
             logger.info(
-                f"MoF router ({module_type}): K={self.K}, d_text={d_text}, "
-                f"d_hidden={self.training_args.mixing_hidden_dim}, "
+                f"MoF router ({module_type}): K={self.K}, d_pool={d_pool}, "
+                f"d_seq={d_seq}, d_hidden={self.training_args.mixing_hidden_dim}, "
                 f"params={sum(p.numel() for p in self._mixing_module.parameters()):,}"
             )
             # Router mode: no single logits parameter
@@ -722,7 +804,7 @@ class MoFTrainerBase(BaseTrainer):
 
         Args:
             t: (B,) timestep values.
-            prompt_embeds: (B, L, d_text) text token sequence.
+            prompt_embeds: (B, L, d_seq) text token sequence.
             pooled_prompt_embeds: (B, d_pool) optional pooled embeddings.
 
         Returns:
@@ -1566,10 +1648,21 @@ class MoFTrainerBase(BaseTrainer):
             }
 
             if self._is_router_mode:
-                # Router mode: save full module state_dict
-                state['mixing_module_state_dict'] = (
-                    self._mixing_module_unwrapped.state_dict()
-                )
+                # Router mode: save full module state_dict + architecture
+                # metadata so consumers (distill, eval) can reconstruct the
+                # exact same network. Without this, a config drift in
+                # `mixing_d_text` / `mixing_hidden_dim` / `temperature`
+                # silently changes router behavior at load time.
+                router = self._mixing_module_unwrapped
+                state['mixing_module_state_dict'] = router.state_dict()
+                state['router_arch'] = {
+                    'K': getattr(router, 'K', self.K),
+                    'd_pool': getattr(router, 'd_pool', None),
+                    'd_seq': getattr(router, 'd_seq', None),
+                    'd_hidden': getattr(router, 'd_hidden', None),
+                    'd_time': getattr(router, 'd_time', None),
+                    'tau': getattr(router, 'tau', None),
+                }
                 # Also save a dummy lambda_logits=None marker for compatibility
                 state['lambda_logits'] = None
             else:
@@ -1595,15 +1688,51 @@ class MoFTrainerBase(BaseTrainer):
 
         if self._is_router_mode:
             # Router mode: load module state_dict
-            if 'mixing_module_state_dict' in state:
-                self._mixing_module_unwrapped.load_state_dict(
-                    state['mixing_module_state_dict']
-                )
-            else:
+            if 'mixing_module_state_dict' not in state:
                 raise ValueError(
                     f"Router mode checkpoint missing 'mixing_module_state_dict'. "
                     f"Checkpoint may be from LUT mode training."
                 )
+
+            # Validate architecture consistency: a saved checkpoint with
+            # different d_pool/d_hidden/d_time/tau than the currently
+            # constructed router would produce silent semantic drift (or a
+            # cryptic state_dict shape error). Fail loudly with a clear
+            # message instead.
+            saved_arch = state.get('router_arch')
+            if saved_arch is not None:
+                router = self._mixing_module_unwrapped
+                current_arch = {
+                    'K': getattr(router, 'K', None),
+                    'd_pool': getattr(router, 'd_pool', None),
+                    'd_seq': getattr(router, 'd_seq', None),
+                    'd_hidden': getattr(router, 'd_hidden', None),
+                    'd_time': getattr(router, 'd_time', None),
+                    'tau': getattr(router, 'tau', None),
+                }
+                mismatches = {
+                    k: (saved_arch.get(k), current_arch.get(k))
+                    for k in saved_arch
+                    if saved_arch.get(k) != current_arch.get(k)
+                }
+                if mismatches:
+                    raise ValueError(
+                        f"Router architecture mismatch between checkpoint and "
+                        f"current config. Mismatches (saved → current): "
+                        f"{mismatches}. Update the config to match, or train "
+                        f"a fresh router."
+                    )
+            else:
+                logger.warning(
+                    "MoF router checkpoint has no 'router_arch' metadata "
+                    "(legacy format). Architecture consistency is not "
+                    "validated; verify mixing_d_text / mixing_hidden_dim / "
+                    "temperature match the training config manually."
+                )
+
+            self._mixing_module_unwrapped.load_state_dict(
+                state['mixing_module_state_dict']
+            )
         else:
             # LUT mode: load logits tensor
             logits = state['lambda_logits']
