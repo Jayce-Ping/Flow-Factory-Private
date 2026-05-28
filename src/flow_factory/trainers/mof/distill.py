@@ -195,7 +195,7 @@ class MoFDistillTrainer(BaseTrainer):
 
         module_type = args.mof_module_type
 
-        if module_type != "lut":
+        if module_type not in ("lut", "lut_simple"):
             # All these fields are first-class dataclass members on
             # MoFDistillTrainingArguments with defined defaults; read them
             # directly. `mof_d_pool=None` means "auto-default to 4096"; any
@@ -301,6 +301,19 @@ class MoFDistillTrainer(BaseTrainer):
             else:
                 logits = state["lambda_logits"]
 
+            # "lut_simple" stores logits of shape (K, T); broadcast to
+            # (K, T, S) so the rest of distill (which indexes weights by
+            # set_id) works without a separate code path.
+            if module_type == "lut_simple":
+                if logits.ndim == 2:
+                    logits = logits.unsqueeze(-1).expand(
+                        self._mof_K, self._mof_T, max(1, self._mof_S)
+                    )
+                else:
+                    # Edge case: legacy ckpt that already saved (K, T, 1) or
+                    # similar despite being source-agnostic. Still safe.
+                    pass
+
             weights = F.softmax(logits / args.mof_temperature, dim=0)  # (K, T, S)
             self._mof_weights = weights.to(self.accelerator.device)
             self._mof_router = None
@@ -318,8 +331,9 @@ class MoFDistillTrainer(BaseTrainer):
                     f"MoF training with T={student_T} or set "
                     f"num_inference_steps={lut_T} in the distill config."
                 )
+            kind = "LUT-SA (source-agnostic)" if module_type == "lut_simple" else "LUT"
             logger.info(
-                f"MoF distill: loaded LUT (K={self._mof_K}, T={self._mof_T}, S={self._mof_S}), "
+                f"MoF distill: loaded {kind} (K={self._mof_K}, T={self._mof_T}, S={self._mof_S}), "
                 f"source_map={self._mof_source_to_set_id}"
             )
             for k in range(self.K):

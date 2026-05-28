@@ -225,6 +225,153 @@ class MoFMixingModule(nn.Module):
         return self.forward()[:, :, set_id]
 
 
+class MoFMixingModuleSimple(nn.Module):
+    """Source-agnostic LUT: trainable logits of shape (K, T) only.
+
+    A simplification of :class:`MoFMixingModule` that drops the per-source
+    axis. The same per-timestep teacher mixture is used for every sample,
+    independent of the sample's source label or prompt content.
+
+    Key properties:
+      - Parameters: K * T (vs K * T * S for source-aware LUT).
+      - The forward output is broadcast along an artificial S-axis to keep
+        the downstream API identical to source-aware LUT — i.e.
+        ``forward()`` still returns a tensor of shape ``(K, T, S)``, where
+        every S-slice is equal. The trainer's per-sample indexing
+        (``weights[:, t, set_ids]``) therefore works without modification.
+      - Source-aware **reward / advantage** routing in
+        ``MoFTrainerBase._compute_advantages`` is untouched: each sample
+        still gets ``A = a_in(s) + γ * mean(a_ood)`` based on its own
+        ``__source__`` label.
+
+    When to use:
+      - Baseline against the (K, T, S) LUT to test whether per-source
+        mixing actually helps, or if a single global mixing law suffices.
+      - When the optimal teacher mixture is similar across sources
+        (e.g. teachers are "globally complementary" rather than
+        source-specialized).
+      - As a parameter-efficient alternative when S is large.
+
+    Args:
+        K: Number of teachers.
+        T: Number of denoising timesteps.
+        S: Number of prompt sets — accepted for API parity with
+            :class:`MoFMixingModule`. Used only to broadcast the
+            ``(K, T)`` logits along an S-axis at ``forward`` time.
+        temperature: Softmax temperature (lower = sharper selection).
+        normalize_weights: If True, ``softmax`` over K. If False, raw
+            logits are used as weights directly.
+        init_mode: One of 'uniform', 'random', 'teacher_biased'.
+            'teacher_biased' is interpreted as "favor the union of
+            in-domain teachers across all known sources" (since there is
+            no per-source dimension to bias independently).
+        init_bias: Bias strength for 'teacher_biased' init.
+        teacher_set_mapping: Optional dict mapping ``set_id → teacher_index``,
+            used only by 'teacher_biased' init to determine which teacher
+            indices receive the initial bias.
+    """
+
+    def __init__(
+        self,
+        K: int,
+        T: int,
+        S: int = 1,
+        temperature: float = 1.0,
+        normalize_weights: bool = True,
+        init_mode: str = "uniform",
+        init_bias: float = 2.0,
+        teacher_set_mapping: Optional[Dict[int, int]] = None,
+    ):
+        super().__init__()
+        self.K = K
+        self.T = T
+        self.S = S  # advertised S; logits do NOT include this axis
+        self.temperature = temperature
+        self.normalize_weights = normalize_weights
+
+        # ---- Initialization (K, T only) ----
+        if normalize_weights:
+            if init_mode == "uniform":
+                data = torch.zeros(K, T)
+            elif init_mode == "random":
+                data = torch.randn(K, T) * 0.01
+            elif init_mode == "teacher_biased":
+                # No per-source axis here — bias is applied uniformly across
+                # all timesteps to the union of in-domain teacher indices.
+                # Each in-domain teacher gets +init_bias on its row; ties are
+                # broken by softmax (multi-source teachers stack their bias).
+                data = torch.zeros(K, T)
+                if teacher_set_mapping:
+                    bias_per_teacher = torch.zeros(K)
+                    for _s_id, k_idx in teacher_set_mapping.items():
+                        bias_per_teacher[k_idx] += init_bias
+                    data += bias_per_teacher.view(K, 1)
+            else:
+                raise ValueError(f"Invalid logits_init: {init_mode!r}")
+        else:
+            # Unnormalized mode: logits ARE the weights.
+            if init_mode == "uniform":
+                data = torch.full((K, T), 1.0 / K)
+            elif init_mode == "random":
+                data = torch.full((K, T), 1.0 / K) + torch.randn(K, T) * 0.01
+            elif init_mode == "teacher_biased":
+                # Apply a single softmax-equivalent bias profile (averaged
+                # across sources, since this module is source-agnostic).
+                logit_init = torch.zeros(K)
+                if teacher_set_mapping:
+                    for _s_id, k_idx in teacher_set_mapping.items():
+                        logit_init[k_idx] += init_bias
+                target_weights = F.softmax(logit_init / temperature, dim=0)
+                data = target_weights.view(K, 1).expand(K, T).clone()
+            else:
+                raise ValueError(f"Invalid logits_init: {init_mode!r}")
+
+        self.logits = nn.Parameter(data)
+
+    def forward(self) -> torch.Tensor:
+        """Compute mixing weights from logits.
+
+        Returns:
+            Tensor of shape ``(K, T, S)``. The (K, T) logits are
+            broadcast / expanded along the S-axis so downstream code
+            (advanced indexing by ``set_ids``, slicing by ``set_id``)
+            works identically to :class:`MoFMixingModule`.
+        """
+        if self.normalize_weights:
+            w_kt = F.softmax(self.logits / self.temperature, dim=0)
+        else:
+            w_kt = self.logits
+        # Broadcast (K, T) -> (K, T, S). expand returns a view, no extra params.
+        return w_kt.unsqueeze(-1).expand(self.K, self.T, self.S)
+
+    def get_weights(self, logits: torch.Tensor) -> torch.Tensor:
+        """Compute mixing weights from an arbitrary logits tensor.
+
+        Args:
+            logits: (K, T) tensor — may be ``self.logits`` or an EMA shadow.
+
+        Returns:
+            Tensor of shape ``(K, T, S)`` with the same broadcast behavior
+            as :meth:`forward`.
+        """
+        if self.normalize_weights:
+            w_kt = F.softmax(logits / self.temperature, dim=0)
+        else:
+            w_kt = logits
+        return w_kt.unsqueeze(-1).expand(self.K, self.T, self.S)
+
+    def get_weights_for_set(self, set_id: int) -> torch.Tensor:
+        """Get (K, T) weights for a specific prompt set.
+
+        Source-agnostic: returns the same weights regardless of ``set_id``.
+        """
+        del set_id  # source-agnostic
+        if self.normalize_weights:
+            return F.softmax(self.logits / self.temperature, dim=0)
+        else:
+            return self.logits
+
+
 class MoFRouterBase(nn.Module):
     """Base class for continuous weight prediction networks.
 
@@ -476,10 +623,14 @@ def create_mixing_module(
     """Factory function for creating mixing weight modules.
 
     Args:
-        module_type: One of "lut", "adaln_router", "mlp_router".
+        module_type: One of "lut", "lut_simple", "adaln_router", "mlp_router".
+            "lut_simple" is the source-agnostic LUT (logits shape (K, T)),
+            broadcasts along S at forward time.
         K: Number of teachers.
-        T: Number of timesteps (only used for "lut").
-        S: Number of prompt sets (only used for "lut").
+        T: Number of timesteps (only used for "lut" / "lut_simple").
+        S: Number of prompt sets. For "lut": owns S real entries. For
+            "lut_simple": entries are broadcast (only K*T params, but the
+            forward output still has shape (K, T, S) for API parity).
         d_pool: Pooled-text-embedding dim, e.g. 2048 for SD3.5
             ``pooled_prompt_embeds`` (CLIP-L+G concat). Used for the pooled
             bypass path. Router only.
@@ -489,13 +640,18 @@ def create_mixing_module(
         d_seq: Per-token text-embedding dim, e.g. 4096 for SD3.5
             ``prompt_embeds`` (T5-XXL). Optional; only required if you want
             the AttnPool fallback path. Router only.
-        **lut_kwargs: Additional kwargs for MoFMixingModule (normalize_weights, etc).
+        **lut_kwargs: Additional kwargs for LUT modules (normalize_weights,
+            init_mode, init_bias, teacher_set_mapping).
 
     Returns:
         nn.Module with appropriate interface.
     """
     if module_type == "lut":
         return MoFMixingModule(
+            K=K, T=T, S=S, temperature=temperature, **lut_kwargs
+        )
+    elif module_type == "lut_simple":
+        return MoFMixingModuleSimple(
             K=K, T=T, S=S, temperature=temperature, **lut_kwargs
         )
     elif module_type == "adaln_router":
@@ -511,7 +667,7 @@ def create_mixing_module(
     else:
         raise ValueError(
             f"Invalid mixing_module_type: {module_type!r}. "
-            f"Valid: ['lut', 'adaln_router', 'mlp_router']."
+            f"Valid: ['lut', 'lut_simple', 'adaln_router', 'mlp_router']."
         )
 
 
@@ -767,8 +923,11 @@ class MoFTrainerBase(BaseTrainer):
         """
         module_type = self.training_args.mixing_module_type
 
-        if module_type == "lut":
-            # Build teacher→set mapping for biased init
+        if module_type in ("lut", "lut_simple"):
+            # Build teacher→set mapping for biased init.
+            # For "lut_simple" the LUT itself has no per-source axis, but
+            # the mapping is still consumed by the init helper to decide
+            # which teacher rows receive the +init_bias kick.
             teacher_set_mapping: Dict[int, int] = {}
             for src, s_id in self._source_to_set_id.items():
                 for k, teacher_srcs in enumerate(self._teacher_sources):
@@ -777,7 +936,7 @@ class MoFTrainerBase(BaseTrainer):
                         break
 
             self._mixing_module = create_mixing_module(
-                module_type="lut",
+                module_type=module_type,
                 K=self.K,
                 T=self.training_args.num_inference_steps,
                 S=self.S,
@@ -788,6 +947,12 @@ class MoFTrainerBase(BaseTrainer):
                 teacher_set_mapping=teacher_set_mapping,
             ).to(self.accelerator.device)
 
+            n_params = sum(p.numel() for p in self._mixing_module.parameters())
+            logger.info(
+                f"MoF {module_type}: K={self.K}, T={self.training_args.num_inference_steps}, "
+                f"S={self.S}, params={n_params:,} "
+                f"(source-{'aware' if module_type == 'lut' else 'agnostic'})"
+            )
             return self._mixing_module.logits
         else:
             # Router mode: create neural weight network
@@ -832,8 +997,13 @@ class MoFTrainerBase(BaseTrainer):
 
     @property
     def _is_router_mode(self) -> bool:
-        """Whether the mixing module is a neural router (vs discrete LUT)."""
-        return self.training_args.mixing_module_type != "lut"
+        """Whether the mixing module is a neural router (vs any LUT variant).
+
+        Both "lut" (source-aware, K×T×S) and "lut_simple" (source-agnostic,
+        K×T broadcast) are non-router LUT modes — they share a Parameter
+        ``logits`` tensor and use the trainer's per-sample LUT lookup path.
+        """
+        return self.training_args.mixing_module_type not in ("lut", "lut_simple")
 
     def _get_lambda_weights(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute mixing weights — delegates to MoFMixingModule.get_weights().
@@ -1372,6 +1542,12 @@ class MoFTrainerBase(BaseTrainer):
 
         This ensures γ has consistent semantic meaning regardless of raw reward
         scales (e.g. GenEval ∈ [0,1] vs PickScore ∈ [0.8, 0.95]).
+
+        Source routing is **independent of mixing_module_type**: the per-sample
+        ``__source__`` label drives in-domain reward selection regardless of
+        whether the mixing module is "lut" (source-aware), "lut_simple"
+        (source-agnostic), or a router. So even with a source-agnostic LUT,
+        each sample still gets advantage = a_in(s) + γ · mean(a_ood).
 
         Handles distributed training via AdvantageProcessor's gather/scatter
         infrastructure (correctly accounts for groups split across ranks).
