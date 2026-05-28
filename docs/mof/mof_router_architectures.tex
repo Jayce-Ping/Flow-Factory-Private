@@ -33,7 +33,7 @@
 \section{概述}
 % ═══════════════════════════════════════════════════════════════════
 
-MoF (Mixture-of-Flow) 使用一个\textbf{路由模块}来预测每个 denoising step 中各 teacher 的混合权重。系统实现了四种路由架构，共享相同的外部接口：
+MoF (Mixture-of-Flow) 使用一个\textbf{路由模块}来预测每个 denoising step 中各 teacher 的混合权重。系统实现了五种路由架构，共享相同的外部接口：
 
 \begin{center}
 \begin{tabular}{lll}
@@ -42,6 +42,7 @@ MoF (Mixture-of-Flow) 使用一个\textbf{路由模块}来预测每个 denoising
 \midrule
 离散查找表 (LUT) & \texttt{lut} & 固定 $(K, T, S)$ 参数，按 source × timestep 查表 \\
 源无关 LUT (LUT-SA) & \texttt{lut\_simple} & 固定 $(K, T)$ 参数，仅按 timestep 查表 \\
+时间路由器 (Time Router) & \texttt{time\_router} & 连续 $t \to W$ 的小型 MLP，无文本输入 \\
 adaLN Router & \texttt{adaln\_router} & 时间调制文本，类 DiT 的 adaLN 模式 \\
 MLP Router & \texttt{mlp\_router} & 拼接时间+文本，简单 MLP 预测 \\
 \bottomrule
@@ -302,6 +303,273 @@ LUT-SA 训练流程（以 NFT 为例）：
 \end{enumerate}
 
 % ═══════════════════════════════════════════════════════════════════
+\section{架构 1C：时间路由器 (MoFTimeRouter, ``Time Router'')}
+\label{sec:time_router}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{动机：从离散查表到连续时间函数}
+
+LUT-SA 抹掉了 $S$ 轴，但仍保留 $T$ 轴的离散查表结构，这意味着：
+
+\begin{itemize}
+    \item 训练与推理必须使用\textbf{相同的} $T$（推理时第 $i$ 步固定查 $\bm{\Lambda}[:, i]$）。
+    \item 相邻 timestep 的权重之间无显式连续性约束——网络可以学到任意跳跃的混合曲线。
+\end{itemize}
+
+时间路由器进一步把离散查表替换为关于 $t$ 的\textbf{连续函数} $W: \R \to \Delta^{K-1}$，但\textbf{不引入文本条件}：
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!50, title=核心问题]
+若混合策略只随 timestep 平滑变化，与 prompt 内容无关，能否用一个仅以 $t$ 为输入的小型 MLP 替代离散 LUT？这种参数化能否在保持表达力的同时获得\textbf{推理 $T$ 灵活性}？
+\end{tcolorbox}
+
+\textbf{设计定位}：Time Router 是连续时间路由器中的最简变体——只有时间分支，没有文本分支。它在假设空间和参数效率上位于 LUT-SA 与全路由器之间：
+
+\begin{center}
+\small
+\begin{tabular}{l|cccc}
+\toprule
+\textbf{模块} & \textbf{时间} & \textbf{文本/Source} & \textbf{时间平滑性} & \textbf{推理 $T$} \\
+\midrule
+LUT          & 离散查表 & source-aware       & 任意（可跳跃）  & 绑定训练 $T$ \\
+LUT-SA       & 离散查表 & 无（边际化）       & 任意（可跳跃）  & 绑定训练 $T$ \\
+\textbf{Time Router} & \textbf{连续 NN} & \textbf{无} & \textbf{隐式平滑} & \textbf{任意 $T$} \\
+adaLN Router & 连续 NN  & 隐式经 prompt      & 隐式平滑        & 任意 $T$ \\
+MLP Router   & 连续 NN  & 隐式经 prompt      & 隐式平滑        & 任意 $T$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{数据流图}
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, fill=blue!8},
+    io/.style={draw, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, fill=green!10},
+    arr/.style={-{Stealth[length=3mm]}, thick},
+]
+    % Input
+    \node[io] (t_in) at (0, 5) {$\mathbf{t} \in \R^B$\\{\scriptsize raw timestep}};
+
+    % Time branch (no text branch)
+    \node[box] (sinemb) at (0, 3.5) {SinusoidalPosEmb\\{\scriptsize $\R^B \to \R^{B \times d_t}$}};
+    \node[box] (lin1) at (0, 2) {Linear$_1$ + SiLU\\{\scriptsize $\R^{B \times d_t} \to \R^{B \times d_h}$}};
+    \node[box] (lin2) at (0, 0.5) {Linear$_2$ + SiLU\\{\scriptsize $\R^{B \times d_h} \to \R^{B \times d_h}$}};
+    \node[box, fill=red!10] (out_lin) at (0, -1) {Linear$_{\text{out}}$ \emph{(零初始化)}\\{\scriptsize $\R^{B \times d_h} \to \R^{B \times K}$}};
+    \node[box] (sm) at (0, -2.5) {$\softmax(\cdot / \tau, \text{dim}{=}{-}1)$};
+    \node[io] (out) at (0, -4) {$\mathbf{W} \in \R^{K \times B}$ {\scriptsize (转置)}};
+
+    \draw[arr] (t_in) -- (sinemb);
+    \draw[arr] (sinemb) -- (lin1);
+    \draw[arr] (lin1) -- (lin2);
+    \draw[arr] (lin2) -- (out_lin);
+    \draw[arr] (out_lin) -- (sm);
+    \draw[arr] (sm) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\textbf{关键观察}：与 adaLN/MLP Router 相比，Time Router\textbf{完全删除了文本分支}（c\_proj、AttnPool）以及融合层（adaLN 调制或 concat）。前向路径只有时间分支 + 输出分类头。
+
+\subsection{张量维度详解}
+
+\begin{center}
+\small
+\begin{tabular}{lcp{7.5cm}}
+\toprule
+\textbf{张量} & \textbf{形状} & \textbf{维度含义} \\
+\midrule
+\multicolumn{3}{l}{\textit{--- 输入 ---}} \\
+$\mathbf{t}$ & $(B,)$ & 每样本的 raw timestep 值（scheduler 原始尺度，e.g. 0--1000） \\
+\midrule
+\multicolumn{3}{l}{\textit{--- Time Branch ---}} \\
+SinusoidalEmb($\mathbf{t}$) & $(B, d_t)$ & 正弦位置编码（$d_t$=256，复用 \texttt{mixing\_d\_time}） \\
+$\mathbf{h}_1$ = Linear$_1$+SiLU & $(B, d_h)$ & 第一隐层（$d_h$=256，复用 \texttt{mixing\_hidden\_dim}） \\
+$\mathbf{h}_2$ = Linear$_2$+SiLU & $(B, d_h)$ & 第二隐层 \\
+\midrule
+\multicolumn{3}{l}{\textit{--- 输出 ---}} \\
+$\bm{\ell}$ = Linear$_{\text{out}}(\mathbf{h}_2)$ & $(B, K)$ & 未归一化 logits（输出层零初始化 → 起始权重 $1/K$） \\
+$\mathbf{W}$ & $(K, B)$ & softmax + transpose，$\sum_k W_{k,b} = 1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{注}：Time Router 不使用 \texttt{mixing\_d\_pool} 和 \texttt{mixing\_d\_seq}（无文本路径）。即使 config 中设置了这两个字段，模块也会忽略。
+
+\subsection{计算逻辑}
+
+\begin{align}
+\mathbf{e}_t &= \text{SinusoidalPosEmb}_{d_t}(\mathbf{t}) && \in \R^{B \times d_t} \\
+\mathbf{h}_1 &= \text{SiLU}(\text{Linear}_1(\mathbf{e}_t)) && \in \R^{B \times d_h} \\
+\mathbf{h}_2 &= \text{SiLU}(\text{Linear}_2(\mathbf{h}_1)) && \in \R^{B \times d_h} \\
+\bm{\ell} &= \text{Linear}_{\text{out}}(\mathbf{h}_2) && \in \R^{B \times K} \quad \text{(输出层零初始化)} \\
+W_{k,b} &= \softmax(\bm{\ell}_b / \tau)_k
+\end{align}
+
+\textbf{关键性质}：当 batch 内所有样本共享同一个 $t_b$ 时（典型 MoF 推理与训练 timestep 采样模式），$\mathbf{W}$ 的所有列相等。当 $t_b$ 在 batch 内不同时（少见），网络自然给出 $B$ 个不同的混合向量。
+
+\subsection{优化目标与梯度流}
+
+设训练 timestep 集合为 $\mathcal{T}_{\text{train}} = \{t_0, t_1, \ldots, t_{T-1}\}$。Time Router 的优化目标：
+
+\begin{equation}
+\min_{\theta_{\text{TR}}} \mathbb{E}_{(x, s, t) \sim \mathcal{D}} \left[
+    -A(x, s) \cdot \log p_{\theta_{\text{TR}}}(x \mid t)
+\right]
+\label{eq:time_router_obj}
+\end{equation}
+
+其中 $\theta_{\text{TR}} = \{\text{Linear}_1, \text{Linear}_2, \text{Linear}_{\text{out}}\}$ 为路由器权重，$p_{\theta_{\text{TR}}}(x|t)$ 表示用 $W_k(t; \theta_{\text{TR}})$ 混合 teacher 速度后的学生轨迹密度。
+
+由于 $W$ 完全由 $\theta_{\text{TR}}$ 控制（不依赖 $s$），所有 source 的样本梯度通过\textbf{同一组共享权重}流动：
+
+\begin{equation}
+\nabla_{\theta_{\text{TR}}} \mathcal{L}
+= \mathbb{E}_{(x, s, t)} \left[
+    A(x, s) \cdot \sum_{k=1}^K \frac{\partial \log p}{\partial W_k(t)} \cdot \nabla_{\theta_{\text{TR}}} W_k(t)
+\right]
+\label{eq:time_router_grad}
+\end{equation}
+
+注意 $\nabla_{\theta_{\text{TR}}} W_k(t)$ 只依赖 $t$——这表明 Time Router 的所有参数更新对所有 $t$ 同时生效（与 LUT-SA 中 $\Lambda(:,t)$ 仅由对应 timestep 的样本更新形成对照）。
+
+\subsection{假设空间分析}
+
+\subsubsection{在训练 timestep 上的等价性}
+
+形式上，Time Router 限制在训练 timestep 集合 $\mathcal{T}_{\text{train}}$ 上的输出空间满足：
+
+\begin{equation}
+\mathcal{H}_{\text{TR}}\big|_{\mathcal{T}_{\text{train}}} \subseteq \mathcal{H}_{\text{LUT-SA}}
+\label{eq:tr_subset_lut}
+\end{equation}
+
+LUT-SA 在 $\mathcal{T}_{\text{train}}$ 上有 $K \cdot T$ 个独立自由度；Time Router 受 NN 参数化约束，等效自由度更低（任何相邻 $t_i$ 的输出都通过共享权重耦合）。
+
+\subsubsection{在连续时间上的扩展性}
+
+但在 $\mathcal{T}_{\text{train}}$ 之外（连续 $t \in \R$）：
+
+\begin{equation}
+\mathcal{H}_{\text{TR}}\big|_{\R} \not\subseteq \mathcal{H}_{\text{LUT-SA}}
+\end{equation}
+
+LUT-SA 在 $\mathcal{T}_{\text{train}}$ 之外\textbf{完全没有定义}——它无法回答"$t = 0.5(t_3 + t_4)$ 时的混合权重应该是多少"。Time Router 通过 NN 自然外推：
+
+\begin{equation}
+W_{\text{TR}}(t^*) = \softmax\bigl(\text{MLP}_\theta(\text{SinusoidalEmb}(t^*)) / \tau\bigr), \quad \forall t^* \in \R
+\end{equation}
+
+这给了 Time Router 一个独有的优势：\textbf{推理时可以使用任意数量的 timestep}（即使训练时只用了 $T=10$，推理可以用 $T=20$ 或 $T=50$，无需重训）。
+
+\subsubsection{平滑性的归纳偏置}
+
+由于 NN 的 Lipschitz 连续性（线性层 + SiLU 激活），Time Router 隐式地对 $W(t)$ 施加平滑性约束。这是一把双刃剑：
+
+\begin{center}
+\begin{tabular}{p{6cm}|p{6cm}}
+\toprule
+\textbf{平滑性的好处} & \textbf{平滑性的代价} \\
+\midrule
+若最优混合策略本就随 $t$ 平滑变化（典型情况），NN 的归纳偏置作为\emph{隐式正则化}，在 RL 信号稀疏时（每 epoch 144 样本）抑制过拟合。 &
+若最优策略在某些 $t$ 处需要尖锐切换（e.g. 高 noise 区与低 noise 区使用完全不同的 teacher 集合），平滑 NN 在切换点附近的表达受限。 \\
+\midrule
+SinusoidalEmb 的多频率分量允许网络在需要时学到中等频率的振荡，缓解上述问题。 &
+极端的不连续（阶跃函数）仍难以精确刻画。
+\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{何时使用 Time Router}
+
+\begin{center}
+\small
+\begin{tabular}{p{4.2cm}|p{4.2cm}|p{4.2cm}}
+\toprule
+\textbf{推荐使用} & \textbf{中性} & \textbf{不推荐} \\
+\midrule
+推理需要灵活的 timestep 数量（训练 $T_{\text{train}}$，推理 $T_{\text{infer}} \neq T_{\text{train}}$） &
+RL 训练样本稀疏，需要平滑性正则化 &
+最优混合策略需要按 prompt 内容路由（e.g. teacher\_geneval 仅适用于含计数/物体的 prompt） \\
+\midrule
+作为\emph{简化对照}测试 prompt 路由必要性：若与 adaLN/MLP Router 性能持平，说明 prompt 不影响路由决策 &
+$K$ 较大（5--10）时，连续参数化能在不大幅增加参数下提升表达力 &
+最优策略在某些 $t$ 处有尖锐切换且训练 $T$ 足够密集（LUT-SA 此时更直接） \\
+\midrule
+模型部署时不希望路由器依赖文本编码器输出（解耦推理 pipeline） & & 训练数据极少（平滑 NN 的 132K 参数仍可能过拟合） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{参数量对比}
+
+\begin{center}
+\small
+\begin{tabular}{l|cc|c|c}
+\toprule
+\textbf{模块} & \textbf{形状} & \textbf{参数量}（K=3, T=10, S=3, $d_h$=256, $d_t$=256） & \textbf{vs LUT} & \textbf{vs adaLN} \\
+\midrule
+LUT (\texttt{lut}) & $(K, T, S)$ logits & $90$ & $1.0\times$ & $\sim 1/8800\times$ \\
+LUT-SA (\texttt{lut\_simple}) & $(K, T)$ logits & $30$ & $1/3 \times$ & $\sim 1/26000\times$ \\
+\textbf{Time Router} (\texttt{time\_router}) & 3 Linear & $\mathbf{\sim 132K}$ & $\sim 1500\times$ & $\sim 1/6 \times$ \\
+adaLN Router & adaLN + 2 branches & $\sim 790$K & $\sim 8800\times$ & $1.0\times$ \\
+MLP Router & concat + 3 Linear & $\sim 660$K & $\sim 7300\times$ & $\sim 5/6 \times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+具体计算（$K=3$, $d_t = d_h = 256$）：
+\begin{align}
+\text{Linear}_1: & \quad 256 \times 256 + 256 = 65{,}792 \\
+\text{Linear}_2: & \quad 256 \times 256 + 256 = 65{,}792 \\
+\text{Linear}_{\text{out}}: & \quad 256 \times 3 + 3 = 771 \\
+\text{Total}: & \quad 132{,}355 \approx 132\text{K}
+\end{align}
+
+参数节省主要来自删除了 c\_proj（$2048 \times 256 \approx 525$K params）和 AttnPool（如使用，约 $4096 \times 256 \approx 1$M params）。
+
+\subsection{与 reward 路由的协同}
+
+\textbf{关键不变量}：与 LUT-SA 一样，mixing 模块的源无关性\textbf{不影响} reward / advantage 的源感知性。三种"源无关 mixing + 源感知 reward"的组合：
+
+\begin{center}
+\begin{tabular}{l|c|c|c}
+\toprule
+\textbf{机制} & \textbf{Mixing 输入} & \textbf{时间 sharpness} & \textbf{推理 $T$} \\
+\midrule
+LUT-SA (\texttt{lut\_simple}) & 仅 $t$ (整数索引) & 任意 & 绑定训练 $T$ \\
+\textbf{Time Router (\texttt{time\_router})} & \textbf{仅 $t$ (连续)} & \textbf{隐式平滑} & \textbf{任意 $T$} \\
+adaLN/MLP Router & $t$ + prompt content & 隐式平滑 & 任意 $T$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不论选哪一种 mixing 模块，advantage 计算路径完全相同：
+
+\begin{equation}
+A(x_b, s_b) = a_{R_{\text{in}}(s_b)}(x_b) + \gamma \cdot \tfrac{1}{|J|}\textstyle\sum_{j \in J} a_j(x_b)
+\end{equation}
+
+Time Router 的训练流程：
+
+\begin{enumerate}
+    \item Sample：student 用当前 $W_k(t; \theta_{\text{TR}})$ 混合 teacher 速度，rollout 整条轨迹。
+    \item Reward：每个 reward 在自己的 \texttt{applicable\_sources} 子集上计算。
+    \item Advantage：按 source-aware 的 in-domain + γ·OOD 公式计算 $A_b$。
+    \item Loss：source-aware $A_b$ 反传到 source-agnostic $\theta_{\text{TR}}$，所有 timestep 的样本共享对路由器权重的更新。
+\end{enumerate}
+
+\subsection{实现要点}
+
+\begin{enumerate}
+    \item \textbf{类继承结构}：建议\textbf{不}继承自 \texttt{MoFRouterBase}，因为后者在 \texttt{\_\_init\_\_} 中强制构建 c\_proj（依赖 $d_{\text{pool}}$），会引入对 Time Router 不必要的字段依赖。直接继承 \texttt{nn.Module}，自包含 SinusoidalPosEmb + 时间 MLP + 输出头即可。
+    \item \textbf{Forward 签名兼容}：为与现有路由器调用点兼容，签名可设计为 \texttt{forward(t, prompt\_embeds=None, pooled\_prompt\_embeds=None)} 但忽略后两个参数。这样 \texttt{patched\_forward} 中的 \texttt{w\_i = router(t, prompt\_emb, pooled)} 调用无需修改。
+    \item \textbf{零初始化}：\texttt{Linear}$_{\text{out}}$ 的 weight 和 bias 都初始化为零 → 训练初期所有 teacher 均匀加权 $1/K$。这与 adaLN/MLP Router 的零初始化策略一致。
+    \item \textbf{无需文本配置}：模块创建时只读取 \texttt{mixing\_d\_time}（默认 256）和 \texttt{mixing\_hidden\_dim}（默认 256）；忽略 \texttt{mixing\_d\_pool} 和 \texttt{mixing\_d\_seq}。
+    \item \textbf{Checkpoint 元数据}：\texttt{router\_arch} 字典中 \texttt{d\_pool=None}, \texttt{d\_seq=None}, 其余字段（\texttt{K}, \texttt{d\_hidden}, \texttt{d\_time}, \texttt{tau}）正常填写。Distill 加载时识别出 \texttt{d\_pool=None} 即可重建 Time Router。
+    \item \textbf{推理时 timestep 灵活性}：$\texttt{num\_inference\_steps}$ 在训练和推理可不一致；调度器在推理时间用任何 $T_{\text{infer}}$ 离散化连续时间区间，把每个采样到的 $t$ 喂给 Time Router 即可获得对应混合权重。
+\end{enumerate}
+
+% ═══════════════════════════════════════════════════════════════════
 \section{架构 2：adaLN Router (MoFAdaLNRouter)}
 % ═══════════════════════════════════════════════════════════════════
 
@@ -487,28 +755,59 @@ W_{k,b} &= \softmax(\bm{\ell}_b / \tau)_k && \in \R^{K \times B}
 \textbf{与 adaLN 的区别}：时间和文本通过简单拼接而非乘法调制融合。交互能力完全依赖 MLP 隐式学习。
 
 % ═══════════════════════════════════════════════════════════════════
-\section{四种架构对比}
+\section{五种架构对比}
 % ═══════════════════════════════════════════════════════════════════
 
 \begin{center}
-\small
-\begin{tabular}{l|cccc}
+\scriptsize
+\begin{tabular}{l|ccccc}
 \toprule
-& \textbf{LUT} & \textbf{LUT-SA} & \textbf{adaLN Router} & \textbf{MLP Router} \\
+& \textbf{LUT} & \textbf{LUT-SA} & \textbf{Time Router} & \textbf{adaLN Router} & \textbf{MLP Router} \\
 \midrule
-\textbf{输入} & $t_{\text{idx}}, \mathbf{s}$ & $t_{\text{idx}}$ & $\mathbf{t}, \mathbf{H}$ & $\mathbf{t}, \mathbf{H}$ \\
-\textbf{输出} & $(K, B)$ & $(K, B)$ & $(K, B)$ & $(K, B)$ \\
-\textbf{参数量} (K=3, T=10, S=3) & 90 & \textbf{30} & $\sim$1.2M & $\sim$1.0M \\
-\textbf{时间-文本交互} & 无 & 无 & 显式乘法调制 & 隐式 MLP \\
-\textbf{Per-source 路由} (mixing) & \checkmark & ✗（边际化） & 隐式（经 prompt） & 隐式（经 prompt） \\
-\textbf{Per-source 路由} (advantage) & \checkmark & \checkmark & \checkmark & \checkmark \\
-\textbf{泛化能力} & 无 & 无 & 强 & 中 \\
-\textbf{初始化策略} & uniform/biased & uniform/biased & 零初始化+adaLN & 零初始化输出 \\
-\textbf{推理步数依赖} & 绑定 $T$ & 绑定 $T$ & 任意步数 & 任意步数 \\
-\textbf{per-prompt 适应} & 仅按 source 分组 & 全局共享 & 每个 prompt 独立 & 每个 prompt 独立 \\
-\textbf{训练稳定性} & 极稳定 & 极稳定 & 稳定 & 稳定 \\
+\textbf{输入} & $t_{\text{idx}}, \mathbf{s}$ & $t_{\text{idx}}$ & $\mathbf{t}$ & $\mathbf{t}, \mathbf{H}$ & $\mathbf{t}, \mathbf{H}$ \\
+\textbf{输出} & $(K, B)$ & $(K, B)$ & $(K, B)$ & $(K, B)$ & $(K, B)$ \\
+\textbf{参数量} (K=3, T=10, S=3) & 90 & 30 & \textbf{$\sim$132K} & $\sim$1.2M & $\sim$1.0M \\
+\textbf{时间-文本交互} & 无 & 无 & 无（仅时间） & 显式乘法调制 & 隐式 MLP \\
+\textbf{Per-source 路由} (mixing) & \checkmark & ✗（边际化） & ✗（边际化） & 隐式（经 prompt） & 隐式（经 prompt） \\
+\textbf{Per-source 路由} (advantage) & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+\textbf{时间 sharpness} & 任意（可跳跃） & 任意（可跳跃） & 隐式平滑 & 隐式平滑 & 隐式平滑 \\
+\textbf{初始化策略} & uniform/biased & uniform/biased & 零初始化输出 & 零初始化+adaLN & 零初始化输出 \\
+\textbf{训练 vs 推理 $T$} & 必须相等 & 必须相等 & \textbf{可不同} & 可不同 & 可不同 \\
+\textbf{per-prompt 适应} & 仅按 source 分组 & 全局共享 & 全局共享（按 $t$） & 每个 prompt 独立 & 每个 prompt 独立 \\
+\textbf{依赖文本编码器} & 否 & 否 & \textbf{否} & 是 & 是 \\
+\textbf{训练稳定性} & 极稳定 & 极稳定 & 稳定 & 稳定 & 稳定 \\
 \bottomrule
 \end{tabular}
+\end{center}
+
+\subsection{设计决策树}
+
+\begin{center}
+\begin{tikzpicture}[
+    decision/.style={draw, diamond, aspect=2, minimum width=3cm, align=center, fill=yellow!15},
+    leaf/.style={draw, rounded corners, minimum width=2.8cm, minimum height=0.8cm, align=center, fill=blue!8},
+    arr/.style={-{Stealth[length=2.5mm]}, thick},
+    node distance=1.5cm,
+]
+    \node[decision] (q1) at (0, 6) {推理 $T$ 是否需要\\与训练 $T$ 不同？};
+    \node[decision] (q2) at (-4, 3.5) {Prompt 内容是否\\影响最优混合？};
+    \node[decision] (q3) at (4, 3.5) {Prompt 内容是否\\影响最优混合？};
+    \node[decision] (q4) at (-4, 1) {不同 source 是否\\需要不同混合？};
+
+    \node[leaf] (lut) at (-7.5, -1.5) {\textbf{LUT}\\\texttt{lut}};
+    \node[leaf] (lutsa) at (-3, -1.5) {\textbf{LUT-SA}\\\texttt{lut\_simple}};
+    \node[leaf] (tr) at (1.5, -1.5) {\textbf{Time Router}\\\texttt{time\_router}};
+    \node[leaf] (full) at (5.5, 1) {\textbf{adaLN/MLP}\\Router};
+
+    \draw[arr] (q1) -- node[above left, font=\scriptsize]{否} (q2);
+    \draw[arr] (q1) -- node[above right, font=\scriptsize]{是} (q3);
+    \draw[arr] (q2) -- node[above left, font=\scriptsize]{否} (q4);
+    \draw[arr] (q2) -- node[right, font=\scriptsize, xshift=4mm]{是 → adaLN/MLP} (full.north west);
+    \draw[arr] (q3) -- node[left, font=\scriptsize]{否} (tr);
+    \draw[arr] (q3) -- node[right, font=\scriptsize]{是} (full);
+    \draw[arr] (q4) -- node[left, font=\scriptsize]{是} (lut);
+    \draw[arr] (q4) -- node[right, font=\scriptsize]{否} (lutsa);
+\end{tikzpicture}
 \end{center}
 
 % ═══════════════════════════════════════════════════════════════════
