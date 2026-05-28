@@ -16,7 +16,7 @@
 # Key advantage: generalizes to unseen prompts (no discrete source routing needed).
 #
 # d_hidden design rationale:
-#   - d_text=2048 (SD3.5 Medium pooled_prompt_embeds = CLIP-L[768] + OpenCLIP-G[1280])
+#   - d_pool=2048 (SD3.5 Medium pooled_prompt_embeds = CLIP-L[768] + OpenCLIP-G[1280])
 #   - d_hidden=256: ~8x bottleneck. Predicting K=3 weights requires minimal capacity;
 #     too large risks overfitting on sparse NFT reward signal.
 #   - Compare: SD3 transformer uses 1536-dim conditioning, but that drives a 2B-param
@@ -86,8 +86,8 @@ train:
 
   # ---- Mixing module: AdaLN Router ----
   mixing_module_type: "adaln_router"
-  mixing_d_text: 2048                       # SD3.5 Medium pooled_prompt_embeds dim (CLIP-L[768] + CLIP-G[1280])
-  mixing_hidden_dim: 256                    # Bottleneck: 8x smaller than d_text (K=3 output needs minimal capacity)
+  mixing_d_pool: 2048                       # SD3.5 Medium pooled_prompt_embeds dim (CLIP-L[768] + CLIP-G[1280])
+  mixing_hidden_dim: 256                    # Bottleneck: 8x smaller than d_pool (K=3 output needs minimal capacity)
   temperature: 1.0                          # Softmax temperature for weight normalization
 
   # ---- MoF core hyperparameters ----
