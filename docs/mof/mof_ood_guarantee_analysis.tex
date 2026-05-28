@@ -1,0 +1,1064 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{pifont}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\reward}{R}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\MoF}{\mathrm{MoF}}
+\newcommand{\dom}{\mathrm{dom}}
+\newcommand{\OOD}{\mathrm{OOD}}
+\newcommand{\const}{\mathrm{const}}
+\newcommand{\interior}[1]{#1^{\circ}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{example}{Example}
+
+\title{\textbf{MoF 的 OOD 严格超越保证：理论可证性分析}\\[0.3em]
+\large 为什么 ``OOD $>$ best single teacher'' 在一般情况下\textbf{不可证}}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+现有 MoF 理论给出两条保证：(i) Level-1 in-domain 保证（$\geq$ single teacher）
+是\emph{构造性}的；(ii) Level-2 in-domain 严格超越是\emph{条件性}的（依赖
+时间互补性）。本文系统分析\textbf{第三条 claim}：MoF 蒸馏后的 student 在
+OOD reward 上是否\emph{一定}严格超越最佳单 teacher 的 OOD baseline。
+
+\textbf{主要结论}：在一般情况下\textbf{无法理论保证 OOD 严格超越}。我们形式化
+三类\emph{根本性障碍}（vertex-maximum block、复合目标错位、reward conflict），
+给出三个反例证明负面结果，然后给出三类\emph{充分条件}（temporal
+complementarity for OOD、non-conflicting gradients、Pareto-improving 区域非空）
+描述何时能证明严格超越。最后讨论蒸馏阶段引入的额外损失如何进一步削弱保证。
+
+核心 insight：in-domain Level-1 的构造性保证依赖 $\delta_s$ 始终在搜索空间内
+（"退化到 single teacher $s$" 永远是 fallback）；OOD 没有对称的构造——
+"退化到 single teacher $j$"（$j \neq s$）会摧毁 in-domain，所以复合优化不会
+自发地落到那里。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{引言与问题陈述}
+\label{sec:intro}
+%% ============================================================
+
+\subsection{已有保证的回顾}
+
+记 prompt set $\mathcal{P}_s$、reward $R_j$（$j \in \{1, \ldots, |\mathcal{R}|\}$）、
+teacher $v^{(k)}$（$k \in \{1, \ldots, K\}$）。Stage 1 的 per-set MoF
+（\texttt{mof\_per\_set\_analysis.tex}）已证明：
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Level-1 (in-domain match)}：
+\begin{equation}
+\E_{p \in \mathcal{P}_s}[R_s(v_{\lambda_s^*})] \geq \E_{p \in \mathcal{P}_s}[R_s(v^{(s)})]
+\label{eq:level1_in}
+\end{equation}
+\textbf{构造性证明}：$\lambda_{k,i,s} = \delta_{k,s}$（即恒用 teacher $s$）
+在搜索空间 $(\Delta^K)^T$ 中，对应 $v_{\lambda_s} = v^{(s)}$。
+最优解不劣于此可行点。
+
+\item \textbf{Level-2 (in-domain strict)}：在\emph{时间互补性}假设下，
+\begin{equation}
+\E_{p \in \mathcal{P}_s}[R_s(v_{\lambda_s^*})] > \E_{p \in \mathcal{P}_s}[R_s(v^{(s)})]
+\label{eq:level2_in}
+\end{equation}
+但时间互补性是\emph{经验条件}而非定理。
+\end{itemize}
+
+\subsection{本文要回答的问题}
+
+\begin{tcolorbox}[colback=red!5,colframe=red!50,title=\textbf{核心问题}]
+能否在一般情况下\textbf{理论证明}：对任意 OOD reward $R_j$（$j \neq s$），
+\begin{equation}
+\boxed{
+\E_{p \in \mathcal{P}_s}[R_j(v^{\theta^*})] \;>\; \max_{k \in \{1, \ldots, K\}}
+\E_{p \in \mathcal{P}_s}[R_j(v^{(k)})] \quad ?
+}
+\label{eq:ood_strict_question}
+\end{equation}
+其中 $v^{\theta^*}$ 是 Stage 2 蒸馏完成的 student。
+\end{tcolorbox}
+
+\subsection{本文的主要贡献}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{负面定理}：构造性反例证明~\eqref{eq:ood_strict_question}
+不可在一般情况下成立（\S\ref{sec:negative}）。
+\item \textbf{三类形式化障碍}：vertex-maximum block、复合目标错位、reward
+conflict（\S\ref{sec:obstructions}）。
+\item \textbf{三类充分条件}：刻画\emph{何时} OOD 严格超越可证（\S\ref{sec:sufficient}）。
+\item \textbf{In-domain Level-1 的不对称性}：解释为什么 in-domain 有构造性
+保证而 OOD 没有（\S\ref{sec:asymmetry}）。
+\item \textbf{蒸馏阶段的额外损失}：finite-capacity 与 on-policy
+distribution shift 如何削弱保证（\S\ref{sec:distill_gap}）。
+\end{enumerate}
+
+%% ============================================================
+\section{形式化}
+\label{sec:formalize}
+%% ============================================================
+
+\subsection{符号与基本定义}
+
+\begin{definition}[Reward Functional on Mixing]
+\label{def:reward_functional}
+对 prompt set $\mathcal{P}_s$、reward $R_j$、混合参数
+$\lambda \in (\Delta^K)^T$，定义\textbf{reward functional}：
+\begin{equation}
+f_j^{(s)}(\lambda) \triangleq \E_{p \sim \mathcal{P}_s,\, x_T \sim \N(0, I)}\!\left[
+R_j\!\left(\mathrm{ODE}(v_\lambda;\, x_T,\, p)\right)
+\right]
+\label{eq:f_def}
+\end{equation}
+其中 $v_\lambda(x, t_i, p) = \sum_k \lambda_{k, i}\, v^{(k)}(x, t_i, p)$，
+$\mathrm{ODE}$ 表示从 $x_T$ 出发用 $v_\lambda$ 数值积分得到 $x_0$。
+\end{definition}
+
+注：$\lambda \in (\Delta^K)^T$ 省略了 $s$ 下标——这里固定一个 prompt set
+$\mathcal{P}_s$，混合参数为该 set 专属的 $\lambda_{:,:,s}$。
+
+\begin{definition}[Single-Teacher OOD Baseline]
+\label{def:ood_baseline}
+对 prompt set $\mathcal{P}_s$ 和 reward $R_j$，定义两种 single-teacher baseline：
+\begin{align}
+\rho_j^{(s),\const} &\triangleq \max_{k \in \{1, \ldots, K\}} f_j^{(s)}(\delta_k^\const)
+\quad\text{(constant single-teacher)} \label{eq:baseline_const}\\
+\rho_j^{(s),\text{step}} &\triangleq \max_{k:\{1,\ldots,T\}\to\{1,\ldots,K\}}
+f_j^{(s)}(\delta_{k(\cdot)}) \quad\text{(per-step single-teacher)} \label{eq:baseline_step}
+\end{align}
+其中：
+\begin{itemize}[leftmargin=1.5em]
+\item $\delta_k^\const \in (\Delta^K)^T$：对所有 $i$ 都取 $\lambda_{:,i} = \mathbf{e}_k$
+（恒用 teacher $k$）。
+\item $\delta_{k(\cdot)}$：在 timestep $i$ 上取 $\lambda_{:,i} = \mathbf{e}_{k(i)}$
+（每步可选不同 teacher，但每步只用一个 teacher）。
+\end{itemize}
+\end{definition}
+
+显然 $\rho_j^{(s),\const} \leq \rho_j^{(s),\text{step}}$。
+
+\begin{definition}[OOD 严格超越 claim]
+\label{def:ood_strict}
+对 prompt set $\mathcal{P}_s$ 和 OOD reward $R_j$（$j$ 不是 $\mathcal{P}_s$ 的
+in-domain reward），有以下三种由弱到强的 strict-improvement claim：
+
+\textbf{(C1) Match constant baseline}: $\;f_j^{(s)}(\lambda_s^*) \geq \rho_j^{(s),\const}$\\
+\textbf{(C2) Strictly exceed constant baseline}: $\;f_j^{(s)}(\lambda_s^*) > \rho_j^{(s),\const}$\\
+\textbf{(C3) Strictly exceed per-step baseline}: $\;f_j^{(s)}(\lambda_s^*) > \rho_j^{(s),\text{step}}$
+\end{definition}
+
+部署期推理使用单一 LoRA（无 per-step 切换），所以
+\textbf{实际可比的是 constant baseline}——(C2) 是用户所问的真正含义。
+
+\subsection{Stage 1 的优化目标}
+
+\texttt{common.py:prepare\_feedback} 实现的复合 reward objective：
+\begin{equation}
+F^{(s)}(\lambda) \triangleq f_s^{(s)}(\lambda) + \gamma \cdot \frac{1}{|\mathcal{R}_{\OOD}^{(s)}|}
+\sum_{j \in \mathcal{R}_{\OOD}^{(s)}} f_j^{(s)}(\lambda)
+\label{eq:composite_obj}
+\end{equation}
+（GDPO advantage normalization 不改变最优解的 argmax，因此这里直接用
+expected reward 表达。）Stage 1 的最优解：
+\begin{equation}
+\lambda_s^* \triangleq \arg\max_{\lambda \in (\Delta^K)^T} F^{(s)}(\lambda)
+\label{eq:stage1_opt}
+\end{equation}
+
+\subsection{Stage 2 蒸馏与 student}
+
+Stage 2 训练 student velocity $v^\theta$ 拟合 router-induced teacher
+$v^{\MoF^*} = v_{\lambda_s^*}$。设 $\theta^*$ 为蒸馏完成的 student。
+定义\textbf{蒸馏 gap}：
+\begin{equation}
+\epsilon_{\text{distill}}^{(s,j)} \triangleq f_j^{(s)}(\lambda_s^*) - f_j^{(s)}(\theta^*)
+\label{eq:distill_gap}
+\end{equation}
+（注：这里复用 $f_j^{(s)}$ 的定义，对 student 而言 $\lambda$ 退化为 student 的
+确定性 velocity 网络。）一般 $\epsilon_{\text{distill}} \neq 0$，可正可负。
+
+%% ============================================================
+\section{主结论：负面定理}
+\label{sec:negative}
+%% ============================================================
+
+\subsection{定理与证明纲要}
+
+\begin{theorem}[No General OOD Guarantee]
+\label{thm:no_general}
+存在合法的 MoF 实例
+$(K, T, \{v^{(k)}\}, \{R_j\}, \mathcal{P}_s, \gamma)$，
+使得对某个 OOD reward $R_j$（$j$ 不是 $\mathcal{P}_s$ 的 in-domain reward）：
+\begin{equation}
+f_j^{(s)}(\lambda_s^*) < \rho_j^{(s),\const}
+\label{eq:negative_main}
+\end{equation}
+即 Stage 1 的最优混合在 OOD 上\textbf{严格劣于}最佳 single-teacher baseline。
+进而，Stage 2 蒸馏后的 student 也 \textbf{无法保证}~\eqref{eq:ood_strict_question}。
+\end{theorem}
+
+\begin{proof}
+通过 Counter-example 1（\S\ref{subsec:counter1}）显式构造满足~\eqref{eq:negative_main}
+的实例。Stage 2 部分通过 $\epsilon_{\text{distill}} \geq 0$ 的可能性进一步加强
+（详见 \S\ref{sec:distill_gap}）。
+\end{proof}
+
+\begin{corollary}[OOD claim 的不可证性]
+\label{cor:ood_unprovable}
+不存在仅基于 MoF 框架的本身的 architectural / objective 性质（即不引入
+OOD-specific 的额外假设）的形式化推导能保证~\eqref{eq:ood_strict_question}。
+任何 OOD 严格超越的证明都必须引入：
+\begin{enumerate}[leftmargin=1.5em]
+\item OOD reward landscape 的结构假设（如 temporal complementarity for OOD），\textbf{或}
+\item Stage 1 复合目标与 OOD 之间的几何对齐假设（non-conflicting gradients），\textbf{或}
+\item Pareto-improving 区域非空假设。
+\end{enumerate}
+这些都是\emph{经验性条件}，不能从 MoF 的定义中推出。
+\end{corollary}
+
+\subsection{为什么这个结论是 unsurprising 的}
+
+回顾 in-domain Level-1 的构造性证明：
+\begin{equation}
+\delta_s^\const \in (\Delta^K)^T \;\Rightarrow\; v_{\lambda} = v^{(s)} \;\Rightarrow\;
+\max_\lambda F^{(s)}(\lambda) \geq F^{(s)}(\delta_s^\const) \geq f_s^{(s)}(\delta_s^\const)
+\label{eq:level1_construction}
+\end{equation}
+这个推理\textbf{严格依赖于} $\delta_s^\const$ 的两个性质：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Reachability}：$\delta_s^\const$ 在搜索空间 $(\Delta^K)^T$ 内。
+\item \textbf{Composite-friendly}：$\delta_s^\const$ 在 $f_s^{(s)}$ 上是高分（因为
+teacher $s$ 是 $R_s$ 的 in-domain teacher），所以即使 OOD 项不利，复合
+$F^{(s)}$ 也至少接近 $f_s^{(s)}(\delta_s^\const)$。
+\end{enumerate}
+
+OOD reward $R_j$（$j \neq s$）则没有对应的"safe vertex"：
+\begin{itemize}[leftmargin=1.5em]
+\item $\delta_j^\const$ 在 $f_j^{(s)}$ 上可能是高分（teacher $j$ 是 $R_j$
+专家），\textbf{但在 $f_s^{(s)}$ 上分数很低}（teacher $j$ 不是 $R_s$ 专家）。
+\item 因此 $F^{(s)}(\delta_j^\const) = f_s^{(s)}(\delta_j^\const) + \gamma\, f_j^{(s)}(\delta_j^\const)$
+通常\textbf{远低于} $F^{(s)}(\delta_s^\const)$（除非 $\gamma$ 极大）。
+\item 复合优化不会自发地把 $\lambda_s^*$ 推向 $\delta_j^\const$，
+所以 $f_j^{(s)}(\lambda_s^*) \neq f_j^{(s)}(\delta_j^\const)$。
+\end{itemize}
+
+\begin{tcolorbox}[colback=blue!5,colframe=blue!50!black,title=核心不对称性]
+\textbf{In-domain Level-1 的本质}：搜索空间总是包含 "退化到 in-domain teacher
+$s$" 的可行点 $\delta_s^\const$，且这个点在复合目标 $F^{(s)}$ 上也是相对优的，
+所以 Stage 1 的最优解不会比它差。
+
+\textbf{OOD 没有对称构造}：搜索空间确实包含 "退化到 OOD-reward 专家 $j$"
+的可行点 $\delta_j^\const$，\textbf{但} 这个点在复合目标上不优——它牺牲了
+in-domain。所以 Stage 1 不会主动选择它，即使它的 OOD 分数远高于 $\lambda_s^*$。
+\end{tcolorbox}
+
+%% ============================================================
+\section{三类形式化障碍}
+\label{sec:obstructions}
+%% ============================================================
+
+下面的三类障碍刻画"OOD 严格超越"为何在数学上面临根本困难。
+
+\subsection{障碍 1：Vertex-Maximum Block}
+
+\begin{proposition}[Convex-Hull Bound on Constant Vertices]
+\label{prop:vertex_block}
+设 $f_j^{(s)}: (\Delta^K)^T \to \R$ 在常数顶点子集
+$\{\delta_k^\const : k = 1, \ldots, K\}$ 上的最大值为 $\rho_j^{(s),\const}$。
+若 $f_j^{(s)}$ 是\textbf{quasi-concave}（凹的更强），且最大值在某个常数顶点
+$\delta_{k^*}^\const$ 取到，则对所有 $\lambda \in (\Delta^K)^T$：
+\begin{equation}
+f_j^{(s)}(\lambda) \leq f_j^{(s)}(\delta_{k^*}^\const) = \rho_j^{(s),\const}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Quasi-concave 函数在凸紧集上的最大值唯一/必然在极点取到。
+$(\Delta^K)^T$ 的极点是 $\{\delta_{k(\cdot)}\}$（per-step single teacher），
+若 $f_j^{(s)}$ 在某常数顶点 $\delta_{k^*}^\const$ 取到全局最大，则任何
+$\lambda \in (\Delta^K)^T$ 不优于它。
+\end{proof}
+
+\begin{remark}[何时 vertex-maximum 成立]
+$f_j^{(s)}$ 在常数顶点取最大的常见情形：
+\begin{enumerate}[leftmargin=1.5em]
+\item Teacher $k^*$ 在所有 timestep 上对 $R_j$ 都是 unique-best（典型情况：
+$R_j = R_{k^*}$，且 $k^*$ 完全特化于 $R_{k^*}$）。
+\item Teacher 之间的 LoRA residual 在 $R_j$ reward landscape 上单调对齐
+（即一种 teacher 总是在所有方向上都更好）。
+\end{enumerate}
+此时 \textbf{(C2) 不可达}（任何 mixing 都不严格超过 single-teacher constant）。
+\end{remark}
+
+\begin{remark}[何时可以绕过 vertex block]
+\begin{enumerate}[leftmargin=1.5em]
+\item $f_j^{(s)}$ 在\textbf{非常数顶点} $\delta_{k(\cdot)}$ 取最大（不同 timestep
+最优 teacher 不同）。但这只支持 (C2)，不超过 (C3)。
+\item $f_j^{(s)}$ 在\textbf{interior} 取最大。这要求 mixing 真正产生新的
+trajectory dynamics——理论上可能（Proposition 1 of \texttt{mof\_gradient\_analysis.tex}），
+经验上偶发。
+\end{enumerate}
+\end{remark}
+
+\subsection{障碍 2：复合目标错位}
+
+\begin{proposition}[Composite Misalignment]
+\label{prop:composite_misalign}
+设 $\lambda_s^* = \arg\max_\lambda F^{(s)}(\lambda)$ 为 Stage 1 复合最优。
+则在一般情况下：
+\begin{equation}
+\lambda_s^* \neq \arg\max_\lambda f_j^{(s)}(\lambda) \quad\text{for } j \neq s
+\label{eq:composite_misalign}
+\end{equation}
+特别地，在 KKT 条件下：
+\begin{equation}
+\nabla F^{(s)}(\lambda_s^*) = 0
+\;\;\Leftrightarrow\;\;
+\nabla f_s^{(s)}(\lambda_s^*) + \frac{\gamma}{|\mathcal{R}_{\OOD}^{(s)}|}\sum_{j' \in \mathcal{R}_{\OOD}^{(s)}} \nabla f_{j'}^{(s)}(\lambda_s^*) = 0
+\label{eq:kkt}
+\end{equation}
+对单个 $j \in \mathcal{R}_{\OOD}^{(s)}$，$\nabla f_j^{(s)}(\lambda_s^*) = 0$
+当且仅当 \emph{所有} OOD rewards 在该点同向，否则 $\lambda_s^*$ 不是 $f_j^{(s)}$ 的临界点。
+\end{proposition}
+
+\begin{remark}[$\gamma$ 调整的局限]
+直觉上"增大 $\gamma$ 推动 $\lambda_s^*$ 向 OOD 方向"看似可以解决问题，
+但有两个限制：
+\begin{enumerate}[leftmargin=1.5em]
+\item $\gamma$ 增大牺牲 in-domain。当 $\gamma$ 大到使 in-domain 退化时，
+违反 Level-1 保证。
+\item 即使 $\gamma \to \infty$，$\lambda_s^*$ 收敛到
+$\arg\max \sum_{j \in \mathcal{R}_{\OOD}^{(s)}} f_j^{(s)}(\lambda)$——
+\textbf{所有} OOD rewards 的平均最优，不是\emph{单个} $R_j$ 的最优。
+若 OOD rewards 互相冲突，单个 $R_j$ 在该点仍可能不优。
+\end{enumerate}
+\end{remark}
+
+\subsection{障碍 3：Reward Conflict}
+
+\begin{definition}[Reward Conflict at $\lambda$]
+\label{def:reward_conflict}
+称 reward $R_s$ 和 $R_j$ 在 $\lambda$ 处\textbf{冲突}，若：
+\begin{equation}
+\nabla f_s^{(s)}(\lambda) \cdot \nabla f_j^{(s)}(\lambda) < 0
+\label{eq:conflict}
+\end{equation}
+（梯度点积为负）。
+\end{definition}
+
+\begin{proposition}[Conflict Reduces OOD Achievable]
+\label{prop:conflict}
+若 $R_s$ 和 $R_j$ 在 $\delta_s^\const$ 周围有 reward conflict
+（Definition~\ref{def:reward_conflict}），则：
+\begin{equation}
+f_j^{(s)}(\lambda_s^*) \leq f_j^{(s)}(\lambda^{j,\text{free}})
+\quad\text{严格不等当 } \gamma < \gamma_{\text{critical}}
+\end{equation}
+其中 $\lambda^{j,\text{free}} = \arg\max f_j^{(s)}$ 是无约束 OOD 最优，
+$\gamma_{\text{critical}} = \frac{\nabla f_s \cdot \nabla f_j^{\perp}}{\|\nabla f_j\|^2}$
+是临界 OOD bonus 系数（依赖于 conflict 强度）。
+\end{proposition}
+
+\begin{tcolorbox}[colback=red!5,colframe=red!40,title=三类障碍的耦合关系]
+三类障碍并非独立——它们在 reward landscape 上相互作用：
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Vertex-max + Conflict}：最差情形。$f_j^{(s)}$ 顶点最大且
+$R_s, R_j$ 冲突。Mixing 既不能在 simplex 内找到改进，也不能通过 $\gamma$
+推到顶点（顶点被 conflict 阻止）。
+\item \textbf{Vertex-max + Aligned}：$f_j^{(s)}$ 顶点最大但 $R_s, R_j$
+对齐。$\lambda_s^*$ 接近 $\delta_s^\const$，OOD 接近 $f_j^{(s)}(\delta_s^\const)$，
+可能略好但不严格超过最佳 single teacher（除非 $\delta_s^\const$ 恰好是
+$R_j$ 的最佳 single teacher）。
+\item \textbf{Interior-max + Aligned}：最佳情形。Mixing 可严格超过任何 single
+teacher，复合优化与 OOD 同向，$\lambda_s^*$ 落在 interior 改进区。
+\end{itemize}
+\end{tcolorbox}
+
+%% ============================================================
+\section{反例库}
+\label{sec:counter}
+%% ============================================================
+
+\subsection{反例 1：单调 OOD reward}
+\label{subsec:counter1}
+
+\begin{example}[Monotonic OOD Block]
+\label{ex:monotonic}
+设 $K = 2$, $T = 1$, $S = 1$，$\lambda \in [0, 1]$（$\Delta^2$ 退化为单点参数）。
+设 $\mathcal{P}_s$ 上的两个 reward 满足：
+\begin{align}
+f_s^{(s)}(\lambda) &= \lambda \quad\text{(in-domain reward, max at } \lambda = 1\text{)}\\
+f_j^{(s)}(\lambda) &= 1 - \lambda \quad\text{(OOD reward, max at } \lambda = 0\text{)}
+\end{align}
+即 teacher 1 是 $R_s$ 专家，teacher 2 是 $R_j$ 专家，两个 reward 完全
+反相关。Single-teacher OOD baseline：$\rho_j^{(s),\const} = \max(f_j(0), f_j(1)) = 1$。
+
+复合目标：
+\begin{equation}
+F^{(s)}(\lambda) = \lambda + \gamma(1 - \lambda) = (1 - \gamma)\lambda + \gamma
+\end{equation}
+
+\textbf{分析}：
+\begin{itemize}[leftmargin=1.5em]
+\item 若 $\gamma < 1$：$\arg\max F^{(s)} = 1$（teacher 1）。
+$f_j^{(s)}(\lambda_s^*) = 0 < 1 = \rho_j^{(s),\const}$。\textbf{OOD 严格劣于 single teacher}。
+\item 若 $\gamma = 1$：$F^{(s)}$ 常数，optimum 不唯一。最差情况
+$f_j^{(s)} = 0$。仍可能严格劣。
+\item 若 $\gamma > 1$：$\arg\max F^{(s)} = 0$（teacher 2）。
+$f_j^{(s)}(\lambda_s^*) = 1 = \rho_j^{(s),\const}$。OOD \textbf{匹配但不严格超过}。
+\end{itemize}
+
+\textbf{结论}：此例下\textbf{OOD 严格超过 single teacher 不可能}（任何 $\gamma$）。
+\end{example}
+
+\begin{remark}[此例的现实意义]
+许多实际场景接近此结构。例如 GenEval reward 与 PickScore reward 在某些
+prompt 上可能近似反相关——精确的 object counting / spatial relations 与高度
+aestheticized 渲染可能互斥（前者要求清晰结构，后者倾向 stylization）。
+\end{remark}
+
+\subsection{反例 2：Vertex-Maximum 阻断}
+\label{subsec:counter2}
+
+\begin{example}[Vertex Maximum Block in Multi-Teacher Setting]
+\label{ex:vertex}
+设 $K = 3$, $T = 1$（单 timestep，简化），$\mathcal{P}_s$ 是 in-domain 为
+$R_s$ 的 prompt set（$s = 1$）。设：
+\begin{align}
+f_1^{(s)}(\lambda) &= \lambda_1 \\
+f_2^{(s)}(\lambda) &= \lambda_2 \\
+f_3^{(s)}(\lambda) &= \lambda_3
+\end{align}
+即每个 reward 只由对应 teacher 的"权重份额"决定，且这些 reward 都是
+\textbf{线性}于 $\lambda$（顶点最大）。约束 $\sum \lambda_k = 1$。
+
+OOD 是 $R_2, R_3$。Single-teacher baseline：
+$\rho_2^{(s),\const} = f_2(\delta_2) = 1$，$\rho_3^{(s),\const} = f_3(\delta_3) = 1$。
+
+复合目标（$|\mathcal{R}_{\OOD}^{(s)}| = 2$）：
+\begin{equation}
+F^{(s)}(\lambda) = \lambda_1 + \frac{\gamma}{2}(\lambda_2 + \lambda_3)
+= \lambda_1 + \frac{\gamma}{2}(1 - \lambda_1)
+= \left(1 - \frac{\gamma}{2}\right)\lambda_1 + \frac{\gamma}{2}
+\end{equation}
+
+\textbf{分析}：
+\begin{itemize}[leftmargin=1.5em]
+\item 若 $\gamma < 2$：$\arg\max F^{(s)} = (1, 0, 0)$。
+$f_2^{(s)}(\lambda_s^*) = 0 < 1$。OOD 严格劣。
+\item 若 $\gamma = 2$：$F^{(s)}$ 常数，optimum 不唯一。任何 $\lambda$ 都
+optimal，OOD 任意。
+\item 若 $\gamma > 2$：$\arg\max F^{(s)}$ 是 $\lambda_1 = 0$ + 任意
+$\lambda_2, \lambda_3 \geq 0$ 满足 $\lambda_2 + \lambda_3 = 1$ 的子集
+（由复合目标的 affine 结构决定）。
+\textbf{依然没有严格超越 single teacher}：$f_2 = \lambda_2 \leq 1$，等号当 $\lambda_2 = 1$
+（即 $\delta_2$）取得。
+\end{itemize}
+
+\textbf{结论}：当 $f_j^{(s)}$ 是 $\lambda$ 的线性函数（顶点最大）时，
+\textbf{对任意 $\gamma$ 和任意 reward 组合，OOD 严格超越 single teacher 都不可能}。
+\end{example}
+
+\subsection{反例 3：蒸馏 gap 抹消改进}
+\label{subsec:counter3}
+
+\begin{example}[Distillation Gap Erosion]
+\label{ex:distill_erode}
+设 Stage 1 实现了\emph{微小的} OOD 改进：
+\begin{equation}
+f_j^{(s)}(\lambda_s^*) = \rho_j^{(s),\const} + \Delta, \quad \Delta = 0.01
+\end{equation}
+但 Stage 2 的蒸馏 gap：
+\begin{equation}
+\epsilon_{\text{distill}}^{(s,j)} = f_j^{(s)}(\lambda_s^*) - f_j^{(s)}(\theta^*) = 0.05 > \Delta
+\end{equation}
+则 student 的 OOD 表现：
+\begin{equation}
+f_j^{(s)}(\theta^*) = \rho_j^{(s),\const} + 0.01 - 0.05 = \rho_j^{(s),\const} - 0.04 < \rho_j^{(s),\const}
+\end{equation}
+\textbf{严格劣于 single teacher}，尽管 Stage 1 的 mixing 严格优于。
+
+蒸馏 gap 来源：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Finite student capacity}：$v^\theta$ 是 LoRA 网络，无法精确
+拟合任意 $v^{\MoF^*}$。
+\item \textbf{On-policy distribution shift}：student trajectory $\{x_{t_i}^\theta\}$
+与 $v^{\MoF^*}$ 的 trajectory 不同；MSE 在 student trajectory 上 well-trained
+不保证 reward 一致。
+\item \textbf{Optimization underfit}：有限训练 epoch、有限 sample number。
+\end{enumerate}
+\end{example}
+
+\subsection{反例总结}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}p{4.5cm} p{4cm} p{5cm}@{}}
+\toprule
+\textbf{反例} & \textbf{核心机制} & \textbf{结论} \\
+\midrule
+1: Monotonic OOD &
+$f_j$ 在 simplex 顶点取最大（线性反相关）&
+任何 $\gamma$ 都无法严格超越 \\
+\midrule
+2: Vertex-Maximum Block &
+$f_j$ 是 $\lambda$ 线性函数 &
+mixing 永不严格超过 vertex \\
+\midrule
+3: Distillation Gap &
+Stage 2 拟合误差 &
+即使 Stage 1 严格超过，student 也可能劣于 single teacher \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{充分条件：何时 OOD 严格超越可证}
+\label{sec:sufficient}
+%% ============================================================
+
+虽然没有通用保证，下面给出三类\emph{充分条件}，描述何时能形式化推导
+OOD 严格超越。
+
+\subsection{条件 A：OOD 的时间互补性}
+
+\begin{definition}[Temporal Complementarity for OOD]
+\label{def:tc_ood}
+对 prompt set $\mathcal{P}_s$ 和 OOD reward $R_j$（$j \neq s$），称
+\textbf{OOD 时间互补性}成立，若存在 timestep $i_1 \neq i_2$ 和 teacher
+$k_1 \neq k_2$ 使得：
+\begin{equation}
+\arg\max_k\, \frac{\partial f_j^{(s)}}{\partial \lambda_{k, i_1}}
+\bigg|_{\lambda = \lambda_0} = k_1
+\quad\text{and}\quad
+\arg\max_k\, \frac{\partial f_j^{(s)}}{\partial \lambda_{k, i_2}}
+\bigg|_{\lambda = \lambda_0} = k_2
+\label{eq:tc_ood}
+\end{equation}
+对某个 reference $\lambda_0$（如 $\delta_s^\const$）。
+\end{definition}
+
+直观：在不同 timestep，对 OOD reward $R_j$ 贡献最大的 teacher 是\emph{不同}的。
+
+\begin{theorem}[OOD Strict Improvement under Temporal Complementarity + Pareto-Improving Region]
+\label{thm:tc_strict}
+设：
+\begin{enumerate}[leftmargin=1.5em]
+\item[(A1)] OOD 时间互补性成立（Definition~\ref{def:tc_ood}）。
+\item[(A2)] $f_s^{(s)}$ 和 $f_j^{(s)}$ 在 $(\Delta^K)^T$ 上 $C^1$ 连续。
+\item[(A3)] 存在 $\lambda^{\text{Pareto}} \in (\Delta^K)^T$ 满足：
+\begin{equation}
+f_s^{(s)}(\lambda^{\text{Pareto}}) \geq f_s^{(s)}(\delta_s^\const) \quad\text{和}\quad
+f_j^{(s)}(\lambda^{\text{Pareto}}) > \rho_j^{(s),\const}
+\label{eq:pareto_region}
+\end{equation}
+\item[(A4)] $\gamma > 0$ 足以使 Stage 1 局部最优偏离 $\delta_s^\const$
+（具体阈值依赖于 reward landscape 曲率）。
+\end{enumerate}
+则存在 $\gamma$ 区间 $(\gamma_{\min}, \gamma_{\max})$ 使得 Stage 1 最优解
+$\lambda_s^*$ 满足 $f_j^{(s)}(\lambda_s^*) > \rho_j^{(s),\const}$。
+\end{theorem}
+
+\begin{proof}[Proof Sketch]
+(A1) 保证 $f_j^{(s)}$ 不是常数顶点最大（否则梯度在 $i_1, i_2$ 上一致）。
+(A3) 保证 Pareto-improving 区域非空。(A4) 保证 $\lambda_s^* \neq \delta_s^\const$
+且接近 (A3) 的区域。具体：
+\begin{itemize}[leftmargin=1.5em]
+\item $\gamma$ 太小（$\gamma < \gamma_{\min}$）：$\lambda_s^*$ 仍接近
+$\delta_s^\const$，OOD 不显著超过 $f_j^{(s)}(\delta_s^\const)$（不一定超过
+$\rho_j^{(s),\const}$）。
+\item $\gamma$ 太大（$\gamma > \gamma_{\max}$）：$\lambda_s^*$ 偏离过多，
+in-domain 受损，可能离开 Pareto-improving 区域。
+\item 中间 $\gamma$：$\lambda_s^*$ 落在 Pareto-improving 区域内，OOD 严格超越。
+\end{itemize}
+\end{proof}
+
+\begin{remark}[条件 A1--A4 都需经验验证]
+\begin{enumerate}[leftmargin=1.5em]
+\item (A1) 时间互补性：需在训练前/中通过 per-teacher per-timestep 的 OOD
+gradient probing 估计。
+\item (A3) Pareto-improving 区域：需 grid search 或随机采样 mixing 配置后
+评估 reward 来验证非空。
+\item (A4) $\gamma$ 区间：依赖于 reward landscape，需消融实验确定。
+\end{enumerate}
+所以本定理是\textbf{条件性的}，不是无条件的 OOD 保证。
+\end{remark}
+
+\subsection{条件 B：Non-Conflicting Reward Gradients}
+
+\begin{theorem}[OOD Improvement under Aligned Gradients]
+\label{thm:aligned}
+设 $\delta_s^\const$ 处 $\nabla f_s^{(s)}$ 与 $\nabla f_j^{(s)}$ 之间的夹角
+$\theta \in (-\pi/2, \pi/2)$（即点积非负）。则对任意 $\gamma > 0$：
+\begin{equation}
+f_j^{(s)}(\lambda_s^*) \geq f_j^{(s)}(\delta_s^\const)
+\end{equation}
+即 OOD\textbf{至少不劣于} $\delta_s^\const$ 处（但不一定超过 $\rho_j^{(s),\const}$）。
+\end{theorem}
+
+\begin{proof}
+$\nabla F^{(s)} = \nabla f_s + \gamma\,\bar{\nabla f_{\OOD}}$。若 $\nabla f_s$
+与 $\nabla f_j$ 同向（点积非负），则 $\nabla F^{(s)}$ 与 $\nabla f_j$ 也大致
+同向。从 $\delta_s^\const$ 沿 $\nabla F^{(s)}$ 上升时，$f_j$ 也上升。
+$\lambda_s^* \neq \delta_s^\const$（因 $\nabla F \neq 0$），故 $f_j^{(s)}(\lambda_s^*) > f_j^{(s)}(\delta_s^\const)$。
+\end{proof}
+
+\begin{remark}[此定理的局限]
+保证 $f_j^{(s)}(\lambda_s^*) > f_j^{(s)}(\delta_s^\const)$，但 $\delta_s^\const$
+不一定是 $\rho_j^{(s),\const}$（最佳 single teacher）。例如 $\rho_j^{(s),\const}$
+可能由 teacher $j$ 实现：$\rho_j^{(s),\const} = f_j^{(s)}(\delta_j^\const)$。
+所以这个 weaker improvement 不蕴含 (C2)。
+\end{remark}
+
+\subsection{条件 C：Pareto-Improving 区域非空}
+
+\begin{theorem}[OOD Improvement via Pareto-Improving Set]
+\label{thm:pareto_set}
+定义 Pareto-improving 集合：
+\begin{equation}
+\mathcal{Q}_{j} \triangleq \big\{\lambda \in (\Delta^K)^T : f_s^{(s)}(\lambda) \geq f_s^{(s)}(\delta_s^\const) \;\text{ 且 }\; f_j^{(s)}(\lambda) > \rho_j^{(s),\const}\big\}
+\label{eq:Q_j}
+\end{equation}
+设：
+\begin{enumerate}[leftmargin=1.5em]
+\item[(C1)] $\mathcal{Q}_j \neq \varnothing$
+\item[(C2)] $F^{(s)}$ 在 $\mathcal{Q}_j$ 上某点取得 \emph{严格高于} $F^{(s)}(\delta_s^\const)$ 的值
+\item[(C3)] 优化算法收敛到全局或足够好的局部最优
+\end{enumerate}
+则 $f_j^{(s)}(\lambda_s^*) > \rho_j^{(s),\const}$。
+\end{theorem}
+
+\begin{remark}[条件 C 是无歧义的，但极难验证]
+(C1) 是 OOD 改进的\emph{存在性}前提。(C2)+(C3) 保证优化能到达。但：
+\begin{itemize}[leftmargin=1.5em]
+\item (C1) 的验证需要在 simplex interior 上做 reward evaluation——
+计算代价 $O((\Delta^K)^T$ 网格点 $\times$ trajectory cost)，非常大。
+\item (C3) 在非凸 reward landscape 下\textbf{无法保证}。MoF 的 reward
+landscape 通常是 highly non-convex（reward 来自 ODE 积分后的 nonlinear 函数）。
+\end{itemize}
+\end{remark}
+
+\subsection{三类充分条件的关系}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    box/.style={draw, rounded corners, minimum width=4cm, minimum height=1.2cm, align=center, fill=blue!8},
+    arrow/.style={-{Stealth[length=3mm]}, thick},
+]
+\node[box] (TC) at (0, 4) {\textbf{Condition A}\\Temporal Complementarity\\for OOD reward};
+\node[box] (NC) at (-5, 1) {\textbf{Condition B}\\Non-conflicting\\$\nabla f_s, \nabla f_j$};
+\node[box] (Q) at (5, 1) {\textbf{Condition C}\\$\mathcal{Q}_j \neq \varnothing$\\(Pareto-improving)};
+\node[box, fill=green!15, minimum width=5cm] (out) at (0, -2) {\textbf{OOD Strict Improvement}\\$f_j^{(s)}(\lambda_s^*) > \rho_j^{(s),\const}$};
+\draw[arrow] (TC) -- node[right, font=\scriptsize, xshift=0.2em, align=left]{$+$ Pareto-region (A3)} (out);
+\draw[arrow] (NC) -- node[left, font=\scriptsize, xshift=-0.5em, align=left]{弱版本：$\geq f_j(\delta_s)$\\不蕴含 (C2)} (out);
+\draw[arrow] (Q) -- node[right, font=\scriptsize, xshift=0.5em, align=left]{$+$ 收敛性} (out);
+\draw[arrow, dashed] (TC) -- node[above, font=\scriptsize, align=center]{蕴含} (Q);
+\end{tikzpicture}
+\end{center}
+
+\textbf{解读}：
+\begin{itemize}[leftmargin=1.5em]
+\item Condition A（OOD 时间互补性）配合 Pareto-region 假设是\textbf{最自然}的充分条件，
+但需经验验证。
+\item Condition B（梯度对齐）是\textbf{弱保证}（只超过 $f_j(\delta_s)$，不一定超过
+$\rho_j^{(s),\const}$）。
+\item Condition C（Pareto 区域非空 + 收敛）是\textbf{最强保证}但最难验证。
+\end{itemize}
+
+%% ============================================================
+\section{In-domain Level-1 vs OOD 的根本不对称性}
+\label{sec:asymmetry}
+%% ============================================================
+
+为什么 in-domain Level-1 有构造性证明，而 OOD 没有？这一节系统化这一不对称性。
+
+\subsection{Search Space Geometry}
+
+\begin{proposition}[In-Domain Vertex Coverage]
+\label{prop:in_domain_coverage}
+对每个 prompt set $\mathcal{P}_s$，
+$\delta_s^\const \in (\Delta^K)^T$\textbf{始终}是 \emph{合法的可行点}且
+\emph{对应的 reward 表现}就是 single teacher $s$ 在 $\mathcal{P}_s$ 上的
+in-domain 表现：
+\begin{equation}
+v_{\delta_s^\const} = v^{(s)} \;\Rightarrow\; f_s^{(s)}(\delta_s^\const) = \E_{p \in \mathcal{P}_s}[R_s(v^{(s)})]
+\end{equation}
+\textbf{且}此点是复合目标的"合理可行点"——$f_s^{(s)}(\delta_s^\const)$ 是
+in-domain 的最佳 single teacher 值（通常假设 teacher $s$ 是 $R_s$ 的专家）。
+\end{proposition}
+
+\begin{proposition}[OOD Lacks Symmetric Coverage]
+\label{prop:ood_no_coverage}
+对 OOD reward $R_j$（$j \neq s$）on $\mathcal{P}_s$，最佳 single teacher
+baseline 由某个 $k^* = \arg\max_k f_j^{(s)}(\delta_k^\const)$ 实现。但：
+\begin{enumerate}[leftmargin=1.5em]
+\item $\delta_{k^*}^\const$ 在搜索空间中（与 in-domain 一样有 reachability），
+\item \textbf{但} $\delta_{k^*}^\const$ 在复合目标 $F^{(s)}$ 上\emph{不优}（除非 $k^* = s$）：
+\begin{equation}
+F^{(s)}(\delta_{k^*}^\const) = f_s^{(s)}(\delta_{k^*}^\const) + \gamma \cdot \overline{f_{\OOD}}(\delta_{k^*}^\const)
+\end{equation}
+其中 $f_s^{(s)}(\delta_{k^*}^\const) \ll f_s^{(s)}(\delta_s^\const)$ 因为
+teacher $k^*$ 不是 $R_s$ 专家。
+\item 即使 $\gamma$ 增大，$F^{(s)}(\delta_{k^*}^\const)$ 也不一定超过
+$F^{(s)}(\delta_s^\const)$。
+\end{enumerate}
+所以 Stage 1 不会自发地 fall back 到 $\delta_{k^*}^\const$，OOD baseline\textbf{不被
+搜索空间中的"安全顶点"覆盖}。
+\end{proposition}
+
+\subsection{Construction-Comparison Table}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\footnotesize
+\begin{tabular}{@{}p{4cm} p{6cm} p{4.5cm}@{}}
+\toprule
+& \textbf{In-domain Level-1} & \textbf{OOD Strict Improvement} \\
+\midrule
+"Safe vertex" 是哪个？ &
+$\delta_s^\const$（teacher $s$）&
+$\delta_{k^*}^\const$（best OOD teacher）\\
+\midrule
+是否在搜索空间？ &
+\ding{51} &
+\ding{51} \\
+\midrule
+是否 composite-friendly？ &
+\ding{51}（teacher $s$ 是 $R_s$ 专家） &
+\ding{55}（teacher $k^*$ 不是 $R_s$ 专家）\\
+\midrule
+Stage 1 是否自然到达？ &
+\ding{51}（最差情形 fall back 到此）&
+\ding{55}（fall back 会破坏 in-domain）\\
+\midrule
+保证类型 &
+构造性（无需额外假设）&
+条件性（依赖 (A)/(B)/(C)）\\
+\midrule
+失败模式 &
+不存在 &
+Counter-example 1, 2, 3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{形式化的不对称性}
+
+\begin{theorem}[Asymmetry Theorem]
+\label{thm:asymmetry}
+对任意 MoF 实例和任意 $\gamma \geq 0$：
+\begin{enumerate}[leftmargin=1.5em]
+\item[(I)] (\textbf{In-domain Level-1 holds unconditionally})
+\begin{equation}
+F^{(s)}(\lambda_s^*) \geq F^{(s)}(\delta_s^\const)
+\;\Rightarrow\; f_s^{(s)}(\lambda_s^*) \geq f_s^{(s)}(\delta_s^\const) - \gamma \cdot \Delta_{\OOD}
+\end{equation}
+当 $\gamma$ 充分小，$\Delta_{\OOD}$ 可控，故 in-domain 至少弱保证。
+\item[(II)] (\textbf{OOD Strict Improvement requires extra structure})
+对于 $f_j^{(s)}(\lambda_s^*) > \rho_j^{(s),\const}$ 的成立，存在
+\emph{反例}（Examples~\ref{ex:monotonic}, \ref{ex:vertex}）使其失败。
+\end{enumerate}
+\end{theorem}
+
+\begin{tcolorbox}[colback=yellow!5,colframe=yellow!60!black,title=不对称性的根源]
+"In-domain Level-1 has a fallback to single teacher $s$" 这个性质是
+\textbf{Stage 1 复合目标设计的结构性偏好}——$R_s$ 在复合中权重最大
+（系数 1，OOD 系数 $\gamma/|\mathcal{R}_{\OOD}|$），所以单纯顶点
+$\delta_s^\const$ 总是相对优。
+
+OOD 则\emph{相反}：复合目标的设计本身\textbf{抑制}对 OOD 顶点的偏好。
+要逼出 OOD 改进，必须依赖 mixing landscape 的额外结构（temporal complementarity、
+Pareto-improving 区域等）——这些都是关于具体 reward / teacher / data 的
+\emph{偶然性质}，不是 MoF 框架的内禀保证。
+\end{tcolorbox}
+
+%% ============================================================
+\section{蒸馏阶段的额外损失}
+\label{sec:distill_gap}
+%% ============================================================
+
+即使 Stage 1 实现了 OOD 严格超越（$f_j^{(s)}(\lambda_s^*) > \rho_j^{(s),\const}$），
+Stage 2 蒸馏可能进一步削弱保证。
+
+\subsection{Distillation Gap 的两个来源}
+
+\begin{proposition}[Capacity-Induced Gap]
+\label{prop:capacity_gap}
+设 student $v^\theta$ 是 LoRA 参数化的网络。若 $v^{\MoF^*} = \sum_k \lambda_k^* v^{(k)}$
+不在 student 函数族 $\mathcal{F}_\theta = \{v^\theta : \theta \in \Theta\}$ 中，
+则存在最小拟合误差：
+\begin{equation}
+\epsilon_{\text{cap}} = \inf_{\theta \in \Theta}\, \E_{(x, t, c) \sim \mathcal{D}_{\text{train}}}
+\big\|v^\theta(x, t, c) - v^{\MoF^*}(x, t, c)\big\|_2^2 > 0
+\label{eq:capacity_gap}
+\end{equation}
+\end{proposition}
+
+\begin{remark}[何时 $\epsilon_{\text{cap}} = 0$]
+若 student LoRA rank 充分大且所有 $K$ 个 teacher LoRA 的 column space 之
+和能被 student LoRA 表示，理论上 $\epsilon_{\text{cap}} = 0$。但实践中 rank
+有限且训练有限。
+\end{remark}
+
+\begin{proposition}[On-Policy Distribution Shift]
+\label{prop:on_policy_shift}
+设 $\mathcal{D}_{\theta}$ 为 student trajectory 的 state distribution，
+$\mathcal{D}_{\MoF^*}$ 为 MoF mixing 的 state distribution。一般
+$\mathcal{D}_{\theta} \neq \mathcal{D}_{\MoF^*}$。即使 $\theta$ 在
+$\mathcal{D}_{\theta}$ 上完美匹配 $v^{\MoF^*}$（pointwise MSE = 0），也不
+保证 $\theta$ 的 \emph{trajectory-level} reward 等于 $v^{\MoF^*}$ 的
+trajectory-level reward。
+
+具体：
+\begin{equation}
+f_j^{(s)}(\theta^*) - f_j^{(s)}(\lambda_s^*) =
+\underbrace{\int (R_j \circ \mathrm{ODE})(v^\theta) - (R_j \circ \mathrm{ODE})(v^{\MoF^*})\,d\mu(p, x_T)}_{\text{trajectory-level discrepancy}}
+\end{equation}
+trajectory-level discrepancy 可以 \emph{大} 于 pointwise gap，因为 ODE 积分会
+\textbf{放大}小的 velocity error（butterfly effect）。
+\end{proposition}
+
+\subsection{蒸馏 gap 与 OOD 改进的相对大小}
+
+\begin{theorem}[Erosion Condition]
+\label{thm:erosion}
+设 Stage 1 OOD 改进幅度为
+$\Delta_{\text{Stage 1}} \triangleq f_j^{(s)}(\lambda_s^*) - \rho_j^{(s),\const} > 0$。
+若蒸馏 gap $\epsilon_{\text{distill}}^{(s,j)} > \Delta_{\text{Stage 1}}$，则：
+\begin{equation}
+f_j^{(s)}(\theta^*) < \rho_j^{(s),\const}
+\end{equation}
+即 student 的 OOD 反而劣于 single teacher。
+\end{theorem}
+
+\textbf{实践含义}：$\Delta_{\text{Stage 1}}$ 通常较小（因为 reward
+improvement 在 RL 中本就 marginal），$\epsilon_{\text{distill}}$ 在 LoRA 容量
+有限 + 有限训练时也可能 marginal——两者数量级接近时，erosion 很容易发生。
+
+\subsection{蒸馏削弱不可避免吗？}
+
+\begin{remark}[何时 $\epsilon_{\text{distill}}$ 接近 0]
+\begin{enumerate}[leftmargin=1.5em]
+\item Student LoRA rank $\geq$ 所有 teacher LoRA rank 之和。
+\item Stage 2 训练 epochs 充足（达到 fitting capacity）。
+\item Student trajectory $\mathcal{D}_\theta$ 接近 $\mathcal{D}_{\MoF^*}$
+（这通常通过\emph{多轮 self-distillation} 或 \emph{trajectory matching}
+loss 实现）。
+\end{enumerate}
+现实条件下三者通常不完全满足。
+\end{remark}
+
+%% ============================================================
+\section{实践含义与设计建议}
+\label{sec:practical}
+%% ============================================================
+
+\subsection{设计 takeaway}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{不要做无条件的 OOD 承诺}：MoF 框架不能保证 OOD 严格超过最佳
+single teacher。任何论文 / 报告中的此类 claim 必须基于\emph{实证测量}，
+不能仅依赖 framework architecture。
+
+\item \textbf{先实证验证 (A) 时间互补性}：在固定的 prompt set $\mathcal{P}_s$
+和 OOD reward $R_j$ 上，扫描 per-timestep "single teacher" 配置
+$\delta_{k(\cdot)}$，看 $f_j^{(s)}$ 是否在不同 $k(\cdot)$ 间显著变化。
+若不变化，OOD 改进无希望。
+
+\item \textbf{$\gamma$ 调整的双刃剑}：
+\begin{itemize}[leftmargin=1em]
+\item $\gamma$ 太小：复合目标几乎只看 in-domain，$\lambda_s^*$ 接近
+$\delta_s^\const$，OOD $\approx f_j^{(s)}(\delta_s^\const)$（不是
+single-teacher baseline）。
+\item $\gamma$ 太大：in-domain 退化，违反 Level-1 保证。
+\item 中间 $\gamma$：可能踩到 Pareto-improving 区域，但需要消融实验
+($\gamma \in \{0, 0.1, 0.2, 0.3, 0.5\}$) 找出区域边界。
+\end{itemize}
+
+\item \textbf{Per-set $\lambda$ 至少给出 in-domain Level-1}：相比 global
+$\lambda$，per-set $\lambda$ 的好处是 in-domain 不会被其他 set 的
+optimization 干扰。但这是 in-domain 的好处，OOD 不直接受益。
+
+\item \textbf{Stage 2 蒸馏 gap 不容忽视}：
+\begin{itemize}[leftmargin=1em]
+\item Student LoRA rank 应足够大（建议 $\geq$ teacher rank 总和的一半）。
+\item 监控 trajectory-level reward 而非 pointwise MSE——后者低不蕴含前者达标。
+\item 考虑 multi-round self-distillation：把 Stage 2 student 当 teacher
+重新跑 Stage 1 + Stage 2。
+\end{itemize}
+\end{enumerate}
+
+\subsection{What we CAN claim safely}
+
+基于现有理论和实证条件，可以\textbf{安全主张}的内容：
+
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=\textbf{Safe Claims}]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{In-domain Level-1}：MoF 蒸馏后的 student 在 in-domain reward
+上至少不显著低于 in-domain single teacher（受 distillation gap 限制）。
+\item \textbf{Conditional in-domain Level-2}：在时间互补性假设下，MoF
+\emph{可能}严格超越 in-domain single teacher（实证）。
+\item \textbf{Composite reward improvement}：MoF 在复合目标
+$F^{(s)} = f_s + \gamma\,\bar{f_{\OOD}}$ 上严格超过 $F^{(s)}(\delta_s^\const)$
+（因为 $\delta_s^\const$ 是可行点）——但这\textbf{不蕴含}单个 OOD reward 的改进。
+\item \textbf{Empirical OOD improvement on validation}：若实证看到
+$f_j^{(s)}(\theta^*) > \rho_j^{(s),\const}$，可以报告，但不能宣称
+"MoF 框架\emph{保证} OOD 改进"。
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{What we CANNOT claim}
+
+\begin{tcolorbox}[colback=red!5,colframe=red!40!black,title=\textbf{Unsafe Claims}]
+\begin{enumerate}[leftmargin=1.5em]
+\item ``MoF guarantees student outperforms any single teacher on OOD reward.'' --
+\textbf{FALSE in general} (Theorem~\ref{thm:no_general}).
+\item ``Increasing $\gamma$ guarantees OOD improvement.'' --
+\textbf{FALSE} (Examples~\ref{ex:monotonic}, \ref{ex:vertex}).
+\item ``Distillation preserves Stage 1's OOD improvement.'' --
+\textbf{NOT GUARANTEED} (Theorem~\ref{thm:erosion}).
+\item ``Per-set $\lambda$ improves OOD over global $\lambda$ unconditionally.'' --
+\textbf{ARCHITECTURALLY GIVES MORE FLEXIBILITY, NOT GUARANTEED OOD GAIN}.
+\end{enumerate}
+\end{tcolorbox}
+
+%% ============================================================
+\section{总结}
+\label{sec:summary}
+%% ============================================================
+
+\subsection{核心结论}
+
+\begin{tcolorbox}[colback=yellow!5,colframe=yellow!60!black,title=\textbf{对用户问题的直接回答}]
+\textbf{用户问题}：能否理论推导 ``OOD 部分的能力一定超过 single teacher'' 这个论断？
+
+\textbf{答案}：\ding{55} \textbf{在一般情况下不能}。
+
+\textbf{理由}：
+\begin{enumerate}[leftmargin=1.5em]
+\item Stage 1 的复合目标 $F^{(s)} = f_s + \gamma\,\bar{f_{\OOD}}$ 优化的不是
+单个 OOD reward $R_j$，而是 in-domain 与 OOD 的\emph{加权和}。其最优解
+$\lambda_s^*$ 一般\textbf{不}是 $f_j^{(s)}$ 的最优解。
+\item 三类形式化障碍（vertex-maximum、composite misalignment、reward conflict）
+\textbf{结构性地}阻止 OOD 严格超越的成立。
+\item 三个反例（Counter-examples 1, 2, 3）显式构造了 OOD 严格劣于 single
+teacher 的合法实例。
+\item 蒸馏阶段进一步引入 capacity gap 和 distribution shift，可能抹消 Stage 1
+的小幅改进。
+\item In-domain Level-1 的构造性证明依赖 $\delta_s^\const$ 这个"安全顶点"，
+\textbf{OOD 没有对称的构造}（Theorem~\ref{thm:asymmetry}）。
+\end{enumerate}
+
+\textbf{我们能保证什么}：
+\begin{itemize}[leftmargin=1.5em]
+\item In-domain Level-1（构造性，无条件）。
+\item OOD 严格超越在三类\emph{额外条件}（A/B/C, \S\ref{sec:sufficient}）下\emph{条件性可证}，
+但条件本身需经验验证。
+\end{itemize}
+\end{tcolorbox}
+
+\subsection{实质性 insight 总览}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{时间互补性是经验条件，不是定理}。它在 in-domain Level-2 上是
+sufficient condition，在 OOD 上同样需要（但还不够——还需 Pareto-improving
+区域非空假设）。
+
+\item \textbf{In-domain 与 OOD 的不对称性是 MoF 复合目标设计的内禀属性}。
+$R_s$ 系数 1 让 in-domain 顶点 $\delta_s^\const$ 是"safe fallback"；
+OOD 系数 $\gamma/|\mathcal{R}_{\OOD}|$ 远小于 1 让 OOD 顶点
+$\delta_{k^*}^\const$ 不是 "safe"。
+
+\item \textbf{Reward landscape 的几何决定 OOD 上限}。当 $f_j^{(s)}$ 是 simplex
+顶点最大（线性 / quasi-concave 单调），mixing 永远不严格超过 single teacher。
+当 $f_j^{(s)}$ 在 interior 取最大（mixing 产生新轨迹），mixing 才有可能严格超过。
+
+\item \textbf{蒸馏 gap 与 Stage 1 改进幅度的相对大小决定最终结果}。即使
+Stage 1 严格超越 single teacher 几个百分点，distillation 也可能侵蚀更多。
+所以 Stage 1 的 OOD margin 必须足够大（远大于经验观察到的 distillation gap）
+才能在 student 上观察到改进。
+
+\item \textbf{严肃论文应避免 "MoF guarantees OOD improvement" 类型的措辞}。
+正确的表述：``MoF \emph{enables} OOD improvement \emph{when} 时间互补性 +
+Pareto-improving region 同时成立，empirically observed in our experiments.''
+\end{enumerate}
+
+\subsection{开放问题}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item 能否设计一个\textbf{修改的 Stage 1 目标}，使 OOD 严格超越成为构造性
+保证？例如：约束优化 $\max f_s + \gamma f_j$ s.t.~$f_j \geq \rho_j^{(s),\const}$。
+此时 OOD baseline 作为 hard constraint，但优化收敛性变难。
+
+\item 能否在\textbf{shared-base LoRA setting}（teachers 都是同一 base 上的小 LoRA
+扰动）下证明更强的 OOD 保证？此时 $\delta_k^\const$ 之间的距离很小，可能改变
+landscape 几何。
+
+\item 能否设计一个 distillation loss（替代 vanilla MSE）来\textbf{保留 Stage 1
+的 OOD margin}？例如 reward-weighted MSE 或 trajectory matching。
+
+\item 能否量化\textbf{蒸馏 gap 的上界}？如 $\epsilon_{\text{distill}} \leq C \cdot \text{rank}_{\text{LoRA}}^{-1}$？
+\end{enumerate}
+
+%% ============================================================
+\section*{附录 A：与现有 docs 的关系}
+\label{app:relation}
+%% ============================================================
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{mof\_gradient\_analysis.tex} 给出 MoF 框架的基础梯度分析；
+本文沿用其符号但聚焦 OOD 可证性。
+\item \texttt{mof\_per\_set\_analysis.tex} 证明了 in-domain Level-1 构造性
+保证；本文揭示这一保证的 OOD 不对称性。
+\item \texttt{mof\_reward\_design.tex} 讨论 reward 设计但隐式假设 OOD
+improvement 是 architecture 的副产物；本文澄清这是\emph{条件性}成立。
+\item \texttt{mof\_two\_stage\_pipeline.tex} 给出 Stage 1 + Stage 2 的算法
+描述；本文是其\emph{理论限制}的补充分析。
+\end{itemize}
+
+\subsection*{建议引用}
+
+\begin{itemize}[leftmargin=1.5em]
+\item In-domain Level-1：\texttt{mof\_per\_set\_analysis.tex} Theorem 2.
+\item OOD claims：本文 Theorem~\ref{thm:no_general}（负面）+ \S\ref{sec:sufficient}
+（条件性正面）。
+\end{itemize}
+
+\end{document}
