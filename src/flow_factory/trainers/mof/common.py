@@ -791,26 +791,29 @@ class MoFTrainerBase(BaseTrainer):
             return self._mixing_module.logits
         else:
             # Router mode: create neural weight network
-            # `mixing_d_text` historically named the pooled-bypass dim (the
-            # path that's actually used in current configs). We now also
-            # accept `mixing_d_seq` for the optional AttnPool fallback.
-            d_pool = self.training_args.mixing_d_text
+            # `mixing_d_pool` is the pooled-bypass dim (the path that's actually
+            # used in current configs). `mixing_d_seq` is the optional AttnPool
+            # fallback (only needed if you call the router without
+            # pooled_prompt_embeds). All three (`mixing_d_pool`, `mixing_d_seq`,
+            # `mixing_d_time`) are first-class dataclass fields on
+            # MoFBaseTrainingArguments — read them directly without `getattr`.
+            d_pool = self.training_args.mixing_d_pool
             if d_pool is None:
                 # Auto-detect: try to get from adapter's text encoder config
                 # Default to 4096 (a safe choice for most CLIP/T5 pooled dims)
                 d_pool = 4096
                 logger.info(
-                    f"mixing_d_text not set, defaulting to {d_pool}. "
+                    f"mixing_d_pool not set, defaulting to {d_pool}. "
                     f"Set explicitly in config if this doesn't match your model."
                 )
-            d_seq = getattr(self.training_args, "mixing_d_seq", None)
+            d_seq = self.training_args.mixing_d_seq
 
             self._mixing_module = create_mixing_module(
                 module_type=module_type,
                 K=self.K,
                 d_pool=d_pool,
                 d_hidden=self.training_args.mixing_hidden_dim,
-                d_time=getattr(self.training_args, "mixing_d_time", 256),
+                d_time=self.training_args.mixing_d_time,
                 d_seq=d_seq,
                 temperature=self.training_args.temperature,
             ).to(self.accelerator.device)
@@ -1491,11 +1494,12 @@ class MoFTrainerBase(BaseTrainer):
         global_std = max(float(np.std(combined_advantages)), 1e-8)
         final_advantages = combined_advantages / global_std
 
-        # Apply clipping if configured
-        adv_clip = getattr(self.training_args, 'adv_clip_range', None)
-        if adv_clip is not None:
-            clip_min, clip_max = adv_clip[0], adv_clip[1]
-            final_advantages = np.clip(final_advantages, clip_min, clip_max)
+        # Apply clipping. `adv_clip_range` is a guaranteed dataclass field on
+        # MoFBaseTrainingArguments (default (-5.0, 5.0)) and is normalized by
+        # `_standardize_clip_range` in __post_init__, so it's always a valid
+        # (lo, hi) tuple — no None check needed.
+        clip_min, clip_max = self.training_args.adv_clip_range
+        final_advantages = np.clip(final_advantages, clip_min, clip_max)
 
         # Scatter back to local rank
         local_advantages = self.advantage_processor._to_local(final_advantages)
@@ -1698,17 +1702,19 @@ class MoFTrainerBase(BaseTrainer):
                 # Router mode: save full module state_dict + architecture
                 # metadata so consumers (distill, eval) can reconstruct the
                 # exact same network. Without this, a config drift in
-                # `mixing_d_text` / `mixing_hidden_dim` / `temperature`
+                # `mixing_d_pool` / `mixing_hidden_dim` / `temperature`
                 # silently changes router behavior at load time.
+                # `router` is guaranteed to be a MoFRouterBase subclass here,
+                # so all arch attrs are set in __init__ — read directly.
                 router = self._mixing_module_unwrapped
                 state['mixing_module_state_dict'] = router.state_dict()
                 state['router_arch'] = {
-                    'K': getattr(router, 'K', self.K),
-                    'd_pool': getattr(router, 'd_pool', None),
-                    'd_seq': getattr(router, 'd_seq', None),
-                    'd_hidden': getattr(router, 'd_hidden', None),
-                    'd_time': getattr(router, 'd_time', None),
-                    'tau': getattr(router, 'tau', None),
+                    'K': router.K,
+                    'd_pool': router.d_pool,
+                    'd_seq': router.d_seq,
+                    'd_hidden': router.d_hidden,
+                    'd_time': router.d_time,
+                    'tau': router.tau,
                 }
                 # Also save a dummy lambda_logits=None marker for compatibility
                 state['lambda_logits'] = None
@@ -1757,14 +1763,16 @@ class MoFTrainerBase(BaseTrainer):
             # message instead.
             saved_arch = state.get('router_arch')
             if saved_arch is not None:
+                # `router` is a MoFRouterBase subclass in router mode, so all
+                # arch attrs are set by its __init__ — read directly.
                 router = self._mixing_module_unwrapped
                 current_arch = {
-                    'K': getattr(router, 'K', None),
-                    'd_pool': getattr(router, 'd_pool', None),
-                    'd_seq': getattr(router, 'd_seq', None),
-                    'd_hidden': getattr(router, 'd_hidden', None),
-                    'd_time': getattr(router, 'd_time', None),
-                    'tau': getattr(router, 'tau', None),
+                    'K': router.K,
+                    'd_pool': router.d_pool,
+                    'd_seq': router.d_seq,
+                    'd_hidden': router.d_hidden,
+                    'd_time': router.d_time,
+                    'tau': router.tau,
                 }
                 mismatches = {
                     k: (saved_arch.get(k), current_arch.get(k))
@@ -1782,7 +1790,7 @@ class MoFTrainerBase(BaseTrainer):
                 logger.warning(
                     "MoF router checkpoint has no 'router_arch' metadata "
                     "(legacy format). Architecture consistency is not "
-                    "validated; verify mixing_d_text / mixing_hidden_dim / "
+                    "validated; verify mixing_d_pool / mixing_hidden_dim / "
                     "temperature match the training config manually."
                 )
 

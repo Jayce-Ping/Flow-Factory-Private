@@ -17,8 +17,8 @@
 # must learn the factorization from data.
 #
 # d_hidden design rationale:
-#   - d_text=2048 (SD3.5 Medium pooled_prompt_embeds = CLIP-L[768] + OpenCLIP-G[1280])
-#   - d_hidden=256: ~8x bottleneck from d_text. Since the MLP concatenates
+#   - d_pool=2048 (SD3.5 Medium pooled_prompt_embeds = CLIP-L[768] + OpenCLIP-G[1280])
+#   - d_hidden=256: ~8x bottleneck from d_pool. Since the MLP concatenates
 #     time+text (2*d_hidden=512 input), this keeps total capacity comparable
 #     to the AdaLN variant while staying well below the information capacity
 #     needed for just K=3 outputs.
@@ -89,8 +89,8 @@ train:
 
   # ---- Mixing module: MLP Router ----
   mixing_module_type: "mlp_router"
-  mixing_d_text: 2048                       # SD3.5 Medium pooled_prompt_embeds dim (CLIP-L[768] + CLIP-G[1280])
-  mixing_hidden_dim: 256                    # Bottleneck: 8x smaller than d_text
+  mixing_d_pool: 2048                       # SD3.5 Medium pooled_prompt_embeds dim (CLIP-L[768] + CLIP-G[1280])
+  mixing_hidden_dim: 256                    # Bottleneck: 8x smaller than d_pool
   temperature: 1.0                          # Softmax temperature for weight normalization
 
   # ---- MoF core hyperparameters ----

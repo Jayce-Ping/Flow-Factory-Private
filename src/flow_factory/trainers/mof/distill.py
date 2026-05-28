@@ -196,10 +196,14 @@ class MoFDistillTrainer(BaseTrainer):
         module_type = args.mof_module_type
 
         if module_type != "lut":
-            d_pool = args.mof_d_text or 4096
-            d_seq = getattr(args, "mof_d_seq", None)
+            # All these fields are first-class dataclass members on
+            # MoFDistillTrainingArguments with defined defaults; read them
+            # directly. `mof_d_pool=None` means "auto-default to 4096"; any
+            # other field is taken at its dataclass default if unset.
+            d_pool = args.mof_d_pool or 4096
+            d_seq = args.mof_d_seq
             d_hidden = args.mof_hidden_dim
-            d_time = getattr(args, "mof_d_time", 256)
+            d_time = args.mof_d_time
             temperature = args.mof_temperature
 
             # If the checkpoint records the router architecture, prefer
@@ -212,7 +216,7 @@ class MoFDistillTrainer(BaseTrainer):
                     and saved_arch.get("d_pool") != d_pool
                 ):
                     logger.warning(
-                        f"Distill: config mof_d_text={d_pool} differs from "
+                        f"Distill: config mof_d_pool={d_pool} differs from "
                         f"checkpoint d_pool={saved_arch['d_pool']}. Using "
                         f"checkpoint value."
                     )
@@ -259,7 +263,7 @@ class MoFDistillTrainer(BaseTrainer):
                 logger.warning(
                     "MoF router checkpoint has no 'router_arch' metadata "
                     "(legacy format). Building router from current config; "
-                    "verify mof_d_text / mof_hidden_dim / mof_temperature "
+                    "verify mof_d_pool / mof_hidden_dim / mof_temperature "
                     "match the training config manually."
                 )
 
