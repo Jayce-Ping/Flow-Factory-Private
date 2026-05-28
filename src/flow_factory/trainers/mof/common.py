@@ -58,7 +58,7 @@ from ..ensemble_eval.common import (
     cache_scheduler_step_signature,
     _build_scheduler_step_kwargs,
 )
-from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter
+from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter, validate_source_ratio
 
 logger = setup_logger(__name__)
 
@@ -857,6 +857,12 @@ class MoFTrainerBase(BaseTrainer):
         self._reward_running_mean: Dict[str, float] = {}
         self._reward_running_var: Dict[str, float] = {}
 
+        validate_source_ratio(
+            self.training_args.source_ratio,
+            self.training_args.num_batches_per_epoch,
+            self.train_dataloaders_by_source,
+        )
+
     # =========================================================================
     # Initialization (called by super().__init__ → _initialization)
     # =========================================================================
@@ -1568,8 +1574,11 @@ class MoFTrainerBase(BaseTrainer):
     # =========================================================================
 
     def _interleaved_source_iter(self):
-        """Round-robin iterator over per-source dataloaders. See mof/utils.py."""
-        yield from interleaved_source_iter(self.train_dataloaders_by_source)
+        """Block-cycle iterator over per-source dataloaders. See mof/utils.py."""
+        yield from interleaved_source_iter(
+            self.train_dataloaders_by_source,
+            source_ratio=self.training_args.source_ratio,
+        )
 
     # =========================================================================
     # Advantage Computation

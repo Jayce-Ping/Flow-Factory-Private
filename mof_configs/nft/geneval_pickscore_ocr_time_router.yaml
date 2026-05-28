@@ -145,6 +145,11 @@ train:
   per_device_batch_size: 8
   group_size: 16
   unique_sample_num_per_epoch: 144
+  # Per-source sampling weights. null → equal 1:1:1 round-robin (default).
+  # Example to mitigate PickScore dominance (see docs/mof/mof_pickscore_dominance_analysis.tex):
+  #   source_ratio: {geneval: 2.0, pickscore: 1.0, ocr: 2.0}
+  # Constraint: num_batches_per_epoch % int(sum(values)) must be 0.
+  source_ratio: null
   num_inner_epochs: 1
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
