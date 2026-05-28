@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch Flow-Factory-OPD-Experiments W&B metrics and emit docs/experiments.tex."""
+"""Fetch Flow-Factory-OPD-Experiments W&B metrics and emit docs/experiments/experiments.tex."""
 
 from __future__ import annotations
 
@@ -941,7 +941,7 @@ def main() -> None:
     parser.add_argument(
         "--write-tex",
         type=Path,
-        default=Path("docs/experiments.tex"),
+        default=Path("docs/experiments/experiments.tex"),
     )
     args = parser.parse_args()
 
