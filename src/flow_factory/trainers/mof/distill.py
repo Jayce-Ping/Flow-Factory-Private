@@ -44,7 +44,7 @@ from ...utils.logger_utils import setup_logger
 from ...utils.dist import reduce_loss_info
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..opd.common import load_teachers, cache_forward_signature, filter_forward_kwargs
-from .common import create_mixing_module
+from .common import create_mixing_module, _validate_teacher_order
 from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter
 
 logger = setup_logger(__name__, rank_zero_only=True)
@@ -182,6 +182,16 @@ class MoFDistillTrainer(BaseTrainer):
                 f"MoF checkpoint has K={self._mof_K} teachers but "
                 f"{self.K} teacher paths provided. Must match."
             )
+
+        # Validate teacher list ORDER (not just count). The K axis of the
+        # saved LUT/router is position-bound to ``teachers[k]``; if distill's
+        # teacher list is reordered relative to MoF training, the saved
+        # weights silently apply to the wrong teachers.
+        _validate_teacher_order(
+            saved_names=state.get("teacher_names"),
+            current_names=self._teacher_names,
+            context="MoF distill load",
+        )
 
         module_type = args.mof_module_type
 
