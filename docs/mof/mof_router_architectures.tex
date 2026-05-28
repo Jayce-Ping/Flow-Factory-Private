@@ -33,14 +33,15 @@
 \section{概述}
 % ═══════════════════════════════════════════════════════════════════
 
-MoF (Mixture-of-Flow) 使用一个\textbf{路由模块}来预测每个 denoising step 中各 teacher 的混合权重。系统实现了三种路由架构，共享相同的外部接口：
+MoF (Mixture-of-Flow) 使用一个\textbf{路由模块}来预测每个 denoising step 中各 teacher 的混合权重。系统实现了四种路由架构，共享相同的外部接口：
 
 \begin{center}
 \begin{tabular}{lll}
 \toprule
 \textbf{架构} & \textbf{配置名} & \textbf{核心思想} \\
 \midrule
-离散查找表 (LUT) & \texttt{lut} & 固定 $(K, T, S)$ 参数，按 index 查表 \\
+离散查找表 (LUT) & \texttt{lut} & 固定 $(K, T, S)$ 参数，按 source × timestep 查表 \\
+源无关 LUT (LUT-SA) & \texttt{lut\_simple} & 固定 $(K, T)$ 参数，仅按 timestep 查表 \\
 adaLN Router & \texttt{adaln\_router} & 时间调制文本，类 DiT 的 adaLN 模式 \\
 MLP Router & \texttt{mlp\_router} & 拼接时间+文本，简单 MLP 预测 \\
 \bottomrule
@@ -117,6 +118,188 @@ W_{k,b} = \frac{\exp(\Lambda_{k, t_{\text{idx}}, s_b} / \tau)}{\sum_{k'=1}^K \ex
 \end{equation}
 
 \textbf{特点}：无神经网络计算，纯查表 + softmax。$K \times T \times S$ 个可学习参数。
+
+% ═══════════════════════════════════════════════════════════════════
+\section{架构 1B：源无关 LUT (MoFMixingModuleSimple, ``LUT-SA'')}
+\label{sec:lut_sa}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{动机}
+
+源无关 LUT (\texttt{lut\_simple}) 是源感知 LUT 的简化版本：丢弃 $S$ 轴，只保留 $(K, T)$ 两个维度。
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!50, title=核心问题]
+\textbf{若不同 source 的最优 teacher 混合相似，是否仍需要为每个 source 单独学一组 logits？}
+\end{tcolorbox}
+
+LUT-SA 用一个共享的 $(K, T)$ 表回答这个问题：所有样本共享同一套 per-timestep 权重，但 \textbf{reward / advantage 仍然按 source 路由}（$A_b = a_{\text{in}}(s_b) + \gamma \cdot \text{mean}(a_{\text{ood}})$）。这给出了一个干净的对照实验：若 LUT-SA 与 LUT 性能持平，说明 per-source 维度对当前问题冗余；若 LUT 显著更好，说明 teacher 间存在需要按 source 区分的专长边界。
+
+\subsection{数据流图}
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners, minimum width=2.8cm, minimum height=0.8cm, align=center, fill=blue!8},
+    param/.style={draw, rounded corners, minimum width=2.5cm, minimum height=0.8cm, align=center, fill=orange!15},
+    io/.style={draw, rounded corners, minimum width=2.5cm, minimum height=0.8cm, align=center, fill=green!10},
+    arr/.style={-{Stealth[length=3mm]}, thick},
+]
+    % Inputs
+    \node[io] (tidx) at (0, 4) {$t_{\text{idx}} \in \mathbb{Z}$\\{\scriptsize timestep index}};
+
+    % Parameter
+    \node[param] (logits) at (0, 2.5) {$\bm{\Lambda} \in \R^{K \times T}$\\{\scriptsize learnable logits, no $S$}};
+
+    % Operations
+    \node[box] (index) at (0, 1) {Index: $\bm{\Lambda}[:, t_{\text{idx}}]$};
+    \node[box] (softmax) at (0, -0.5) {$\softmax(\cdot / \tau, \text{dim}=0)$};
+    \node[box, fill=yellow!15] (broad) at (0, -2) {Broadcast over $B$\\{\scriptsize $(K) \to (K, B)$}};
+
+    % Output
+    \node[io] (out) at (0, -3.5) {$\mathbf{W} \in \R^{K \times B}$\\{\scriptsize 所有列相同}};
+
+    % Arrows
+    \draw[arr] (tidx) -- (index);
+    \draw[arr] (logits) -- (index);
+    \draw[arr] (index) -- (softmax);
+    \draw[arr] (softmax) -- (broad);
+    \draw[arr] (broad) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\subsection{计算逻辑}
+
+\begin{align}
+W_{k,b} = W_k(t_{\text{idx}}) &= \frac{\exp(\Lambda_{k, t_{\text{idx}}} / \tau)}{\sum_{k'=1}^K \exp(\Lambda_{k', t_{\text{idx}}} / \tau)}, \quad \forall b \in [1, B]
+\label{eq:lut_sa_weight}
+\end{align}
+
+注意右侧不依赖 $b$（也不依赖 $s_b$、$\mathbf{c}_b$），所以 $\mathbf{W}$ 在 batch 内沿 $B$ 轴常数广播。
+
+\subsection{API 兼容性：广播到 $(K, T, S)$}
+
+为了让下游代码（按 \texttt{set\_ids} 高级索引）无需任何修改，\texttt{forward()} 输出形状仍为 $(K, T, S)$，但所有 $S$ 切片相等：
+
+\begin{equation}
+\mathbf{W}_{\text{out}}[k, t, s] = W_k(t), \quad \forall s \in [0, S{-}1]
+\end{equation}
+
+这是一个零成本的 \texttt{expand} 视图（不复制内存），参数仍只有 $K \cdot T$ 个。
+
+\subsection{优化目标与梯度流}
+
+考虑学生在第 $b$ 个样本上的 NFT/GRPO 损失，其优势 $A_b = A(x_b, s_b)$ 由 source-aware 的 advantage pipeline（in-domain + $\gamma \cdot$ mean(ood)）给出。logits $\bm{\Lambda}$ 的梯度为：
+
+\begin{equation}
+\nabla_{\Lambda_{k,t}} \mathcal{L}
+= \mathbb{E}_{(x, s) \sim \mathcal{D}} \left[
+    A(x, s) \cdot \nabla_{\Lambda_{k,t}} \log p_\theta(x \mid t)
+\right]
+\label{eq:lut_sa_grad}
+\end{equation}
+
+由于 $\Lambda_{k,t}$ 不依赖 $s$，所有 source 的样本梯度都流入\textbf{同一个} $\Lambda_{k,t}$ 参数。最优解满足：
+
+\begin{equation}
+\Lambda^*(:, t) = \arg\max_{\Lambda(:, t)} \;
+\mathbb{E}_{s \sim P(s)} \mathbb{E}_{x \sim p_\Lambda(\cdot \mid s, t)}
+\bigl[ R_s(x) + \gamma \cdot \tfrac{1}{|J|}\textstyle\sum_{j \in J} R_j(x) \bigr]
+\label{eq:lut_sa_optimal}
+\end{equation}
+
+其中 $J = \{j : j \neq R_{\text{in}}(s)\}$ 为 OOD reward 集合，$P(s)$ 为训练时 source 的边际分布。换言之，LUT-SA 学到的是\textbf{对 source 边际化}（marginalized over $s$）后的最优混合策略。
+
+\subsection{与源感知 LUT 的关系}
+
+LUT-SA 是源感知 LUT 在等约束 $\Lambda_{k,t,1} = \Lambda_{k,t,2} = \cdots = \Lambda_{k,t,S}$ 下的特殊解。从假设空间角度：
+
+\begin{equation}
+\mathcal{H}_{\text{LUT-SA}} \subsetneq \mathcal{H}_{\text{LUT}}
+\end{equation}
+
+\begin{itemize}
+    \item \textbf{LUT 能表达的，LUT-SA 不一定能}：当不同 source 的最优 teacher 混合差异显著时（例如 OCR 偏好 teacher-ocr，GenEval 偏好 teacher-geneval），LUT-SA 必须做妥协。
+    \item \textbf{LUT-SA 能表达的，LUT 总能精确复现}：将 LUT 的所有 $S$ 切片设为相等即可。
+\end{itemize}
+
+因此 LUT-SA 与 LUT 的性能差距，定量衡量了\textbf{per-source 路由收益}。
+
+\subsection{何时使用 LUT-SA}
+
+\begin{center}
+\small
+\begin{tabular}{p{4.2cm}|p{4.2cm}|p{4.2cm}}
+\toprule
+\textbf{推荐使用} & \textbf{中性} & \textbf{不推荐} \\
+\midrule
+Teacher 互补但不专业化（如多个 LoRA 共享一个底座、风格相近）&
+$K = 2$ 时（$S$ 维收益本就不明显）&
+Teacher 与 source 严格一一对应（hard-route 配置） \\
+\midrule
+作为 ablation baseline，定量评估 per-source 路由收益 &
+样本量 $N$ 较小时，参数减少有助于防止过拟合 &
+不同 source 间 reward scale 差异大且 $\gamma$ 较小 \\
+\midrule
+推理时希望 source 标签解耦（同 prompt 不同 source 标签得到相同输出）&
+& OOD 比例极小（$\gamma \to 0$ 时几乎退化为单 source 训练） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{参数量对比}
+
+\begin{center}
+\small
+\begin{tabular}{l|cc|c}
+\toprule
+\textbf{模块} & \textbf{形状} & \textbf{参数量}（$K{=}3, T{=}10, S{=}3$） & \textbf{vs LUT} \\
+\midrule
+LUT (\texttt{lut}) & $(K, T, S)$ & $90$ & $1.0\times$ \\
+\textbf{LUT-SA (\texttt{lut\_simple})} & $\mathbf{(K, T)}$ & $\mathbf{30}$ & $\mathbf{1/S \times}$ \\
+adaLN Router & 神经网络 & $\sim 790$K & $\sim 8800\times$ \\
+MLP Router & 神经网络 & $\sim 660$K & $\sim 7300\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+参数量随 $S$ 线性下降。当 $S$ 较大（例如 $S = 10$ 个 source 子集）时，LUT-SA 的参数节省更显著。
+
+\subsection{与 reward 路由的协同}
+
+\textbf{关键不变量}：mixing 模块源无关 $\not\Rightarrow$ reward 源无关。MoF 框架下二者解耦：
+
+\begin{center}
+\begin{tabular}{l|c|c}
+\toprule
+\textbf{机制} & \textbf{Mixing weights} & \textbf{Reward / Advantage} \\
+\midrule
+LUT (\texttt{lut}) & 源感知 ($\Lambda_{k,t,s}$) & 源感知 ($A_b = a_{\text{in}}(s_b) + \gamma\,\text{mean}(a_{\text{ood}})$) \\
+\textbf{LUT-SA (\texttt{lut\_simple})} & \textbf{源无关 ($\Lambda_{k,t}$)} & \textbf{源感知 (同上)} \\
+Router & 隐式源感知（经 $\mathbf{c}_b$） & 源感知 (同上) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+LUT-SA 训练流程（以 NFT 为例）：
+
+\begin{enumerate}
+    \item Sample：student 用当前 $W_k(t) = \softmax_k(\Lambda_{k,t}/\tau)$ 混合 teacher 速度，rollout 整条轨迹。
+    \item Reward：每个 reward $R_j$ 在自己的 \texttt{applicable\_sources} 子集上计算。
+    \item Advantage：按 \eqref{eq:lut_sa_grad} 中的 $A(x, s)$ 公式计算 source-aware advantage。
+    \item Loss：将 source-aware $A_b$ 反传到 source-agnostic $\Lambda$，每个 $\Lambda_{k,t}$ 累积所有 source 的梯度信号。
+\end{enumerate}
+
+\subsection{实现要点}
+
+\begin{enumerate}
+    \item \textbf{Logits 形状}：模块内部 $\bm{\Lambda} \in \R^{K \times T}$，无 $S$ 轴。
+    \item \textbf{Forward 输出广播}：\texttt{forward()} 返回 $(K, T, S)$，由 \texttt{logits.unsqueeze(-1).expand(K,T,S)} 实现（视图，不占额外内存）。
+    \item \textbf{初始化}：
+        \begin{itemize}
+            \item \texttt{uniform}：$\bm{\Lambda} = \mathbf{0}$，softmax 后每个 teacher $1/K$。
+            \item \texttt{teacher\_biased}：因无 $S$ 轴可独立偏置，将所有 source 的 in-domain teacher 偏置\emph{合并}到统一的 $\bm{\Lambda}$ 行（多 source 同一 teacher 时偏置叠加）。
+        \end{itemize}
+    \item \texttt{ema}、checkpoint、distill 加载：与源感知 LUT 共用代码路径；distill 加载时若发现 \texttt{lambda\_logits} 为 2D 张量，会自动 \texttt{unsqueeze(-1).expand} 到 $(K, T, S)$ 后再过 softmax。
+\end{enumerate}
 
 % ═══════════════════════════════════════════════════════════════════
 \section{架构 2：adaLN Router (MoFAdaLNRouter)}
@@ -304,24 +487,26 @@ W_{k,b} &= \softmax(\bm{\ell}_b / \tau)_k && \in \R^{K \times B}
 \textbf{与 adaLN 的区别}：时间和文本通过简单拼接而非乘法调制融合。交互能力完全依赖 MLP 隐式学习。
 
 % ═══════════════════════════════════════════════════════════════════
-\section{三种架构对比}
+\section{四种架构对比}
 % ═══════════════════════════════════════════════════════════════════
 
 \begin{center}
 \small
-\begin{tabular}{l|ccc}
+\begin{tabular}{l|cccc}
 \toprule
-& \textbf{LUT} & \textbf{adaLN Router} & \textbf{MLP Router} \\
+& \textbf{LUT} & \textbf{LUT-SA} & \textbf{adaLN Router} & \textbf{MLP Router} \\
 \midrule
-\textbf{输入} & $t_{\text{idx}}, \mathbf{s}$ (整数) & $\mathbf{t}, \mathbf{H}$ (连续) & $\mathbf{t}, \mathbf{H}$ (连续) \\
-\textbf{输出} & $(K, B)$ & $(K, B)$ & $(K, B)$ \\
-\textbf{参数量} (K=3, T=10, S=3) & 90 & $\sim$1.2M & $\sim$1.0M \\
-\textbf{时间-文本交互} & 无（独立查表） & 显式乘法调制 & 隐式 MLP \\
-\textbf{泛化能力} & 无（仅记忆） & 强（连续插值） & 中（依赖 MLP 容量） \\
-\textbf{初始化策略} & uniform/biased & 零初始化输出+adaLN & 零初始化输出 \\
-\textbf{推理步数依赖} & 绑定 $T$ & 任意步数 & 任意步数 \\
-\textbf{per-prompt 适应} & 仅按 source 分组 & 每个 prompt 独立 & 每个 prompt 独立 \\
-\textbf{训练稳定性} & 极稳定 & 稳定（零初始化保证） & 稳定 \\
+\textbf{输入} & $t_{\text{idx}}, \mathbf{s}$ & $t_{\text{idx}}$ & $\mathbf{t}, \mathbf{H}$ & $\mathbf{t}, \mathbf{H}$ \\
+\textbf{输出} & $(K, B)$ & $(K, B)$ & $(K, B)$ & $(K, B)$ \\
+\textbf{参数量} (K=3, T=10, S=3) & 90 & \textbf{30} & $\sim$1.2M & $\sim$1.0M \\
+\textbf{时间-文本交互} & 无 & 无 & 显式乘法调制 & 隐式 MLP \\
+\textbf{Per-source 路由} (mixing) & \checkmark & ✗（边际化） & 隐式（经 prompt） & 隐式（经 prompt） \\
+\textbf{Per-source 路由} (advantage) & \checkmark & \checkmark & \checkmark & \checkmark \\
+\textbf{泛化能力} & 无 & 无 & 强 & 中 \\
+\textbf{初始化策略} & uniform/biased & uniform/biased & 零初始化+adaLN & 零初始化输出 \\
+\textbf{推理步数依赖} & 绑定 $T$ & 绑定 $T$ & 任意步数 & 任意步数 \\
+\textbf{per-prompt 适应} & 仅按 source 分组 & 全局共享 & 每个 prompt 独立 & 每个 prompt 独立 \\
+\textbf{训练稳定性} & 极稳定 & 极稳定 & 稳定 & 稳定 \\
 \bottomrule
 \end{tabular}
 \end{center}
