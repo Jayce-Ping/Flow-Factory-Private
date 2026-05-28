@@ -845,9 +845,7 @@ class MoFBaseTrainingArguments(TrainingArguments):
             "help": (
                 "Pooled-text-embedding dimension for the router's pooled-bypass "
                 "path (e.g. 2048 for SD3.5 pooled_prompt_embeds, 768 for Flux). "
-                "Required when mixing_module_type is a router. Legacy alias "
-                "`mixing_d_text` is still accepted via __post_init__ migration "
-                "and emits a deprecation warning."
+                "Required when mixing_module_type is a router."
             )
         },
     )
@@ -964,24 +962,6 @@ class MoFBaseTrainingArguments(TrainingArguments):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
-
-        # Back-compat: legacy `mixing_d_text` is now `mixing_d_pool`. ArgABC.from_dict
-        # captures unknown YAML keys into `extra_kwargs` and warns. Migrate the old
-        # name into the new field so existing configs keep working with a clear
-        # deprecation message.
-        legacy_d_text = self.extra_kwargs.pop("mixing_d_text", None)
-        if legacy_d_text is not None:
-            if self.mixing_d_pool is not None and self.mixing_d_pool != legacy_d_text:
-                raise ValueError(
-                    f"Both `mixing_d_pool={self.mixing_d_pool}` and the deprecated "
-                    f"`mixing_d_text={legacy_d_text}` are set with conflicting values. "
-                    f"Remove `mixing_d_text` from the config."
-                )
-            logger.warning(
-                "`mixing_d_text` is deprecated; rename it to `mixing_d_pool`. "
-                "Auto-migrating for now."
-            )
-            self.mixing_d_pool = legacy_d_text
 
         # num_train_timesteps defaults to num_inference_steps for logits shape (K, T, S).
         # The timestep_range is handled by TimeSampler (selects which scheduler
@@ -1850,9 +1830,7 @@ class MoFDistillTrainingArguments(TrainingArguments):
             "help": (
                 "Pooled-text-embedding dimension for the router's pooled-bypass "
                 "path. Defaults to 4096 if None. Overridden by checkpoint's "
-                "router_arch metadata when present. Legacy alias `mof_d_text` "
-                "is still accepted via __post_init__ migration and emits a "
-                "deprecation warning."
+                "router_arch metadata when present."
             )
         },
     )
@@ -1894,22 +1872,6 @@ class MoFDistillTrainingArguments(TrainingArguments):
             raise ValueError(
                 "MoF distillation requires 'mof_checkpoint' path to a trained MoF state."
             )
-        # Back-compat: legacy `mof_d_text` is now `mof_d_pool`. Migrate the old
-        # name into the new field with a deprecation warning.
-        legacy_d_text = self.extra_kwargs.pop("mof_d_text", None)
-        if legacy_d_text is not None:
-            if self.mof_d_pool is not None and self.mof_d_pool != legacy_d_text:
-                raise ValueError(
-                    f"Both `mof_d_pool={self.mof_d_pool}` and the deprecated "
-                    f"`mof_d_text={legacy_d_text}` are set with conflicting values. "
-                    f"Remove `mof_d_text` from the config."
-                )
-            logger.warning(
-                "`mof_d_text` is deprecated; rename it to `mof_d_pool`. "
-                "Auto-migrating for now."
-            )
-            self.mof_d_pool = legacy_d_text
-
         # Resolve teachers (same logic as MoFBase)
         if self.teachers is not None:
             from .training_args import TeacherConfig
