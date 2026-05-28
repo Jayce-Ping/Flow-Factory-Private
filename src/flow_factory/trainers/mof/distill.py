@@ -218,6 +218,20 @@ class MoFDistillTrainer(BaseTrainer):
             weights = F.softmax(logits / args.mof_temperature, dim=0)  # (K, T, S)
             self._mof_weights = weights.to(self.accelerator.device)
             self._mof_router = None
+
+            # Validate T consistency: LUT columns are indexed by inference step
+            # (0..T-1), so the student's num_inference_steps must match the T
+            # the LUT was trained with — otherwise lookups are misaligned.
+            student_T = self.training_args.num_inference_steps
+            lut_T = self._mof_weights.shape[1]
+            if lut_T != student_T:
+                raise ValueError(
+                    f"MoF LUT has T={lut_T} columns but distill is configured "
+                    f"with num_inference_steps={student_T}. The LUT is indexed "
+                    f"by inference step, so these must match. Either re-run "
+                    f"MoF training with T={student_T} or set "
+                    f"num_inference_steps={lut_T} in the distill config."
+                )
             logger.info(
                 f"MoF distill: loaded LUT (K={self._mof_K}, T={self._mof_T}, S={self._mof_S}), "
                 f"source_map={self._mof_source_to_set_id}"
@@ -238,11 +252,31 @@ class MoFDistillTrainer(BaseTrainer):
         t: torch.Tensor,
         batch: Dict[str, Any],
         batch_samples: Optional[List[BaseSample]] = None,
+        timestep_index: Optional[int] = None,
     ) -> torch.Tensor:
         """Get per-sample MoF mixing weights (K, B).
 
-        LUT mode: route by (per-sample t → timestep_index, __source__ → set_id).
+        LUT mode: route by (timestep_index → LUT column, __source__ → set_id).
         Router mode: predict from (t, prompt_embeds).
+
+        IMPORTANT (LUT semantics): the MoF LUT was trained with the convention
+        that **column 0 corresponds to inference step 0 = highest t (most noisy
+        latent)**, and column T-1 corresponds to step T-1 = lowest t (cleanest).
+        See ``MoFTrainerBase._mof_inference_context`` and
+        ``_combine_velocities_per_sample`` in ``trainers/mof/common.py`` —
+        both index the LUT by the loop step counter, not by a normalized
+        timestep value. So distill must also use the loop variable
+        ``timestep_index`` (0..T-1) directly to query the LUT, NOT
+        ``t / TIMESTEP_MAX``, which would produce a reversed mapping
+        (e.g., t≈950 → column 8 instead of 0).
+
+        Args:
+            t: (B,) timestep values. Used by router mode only.
+            batch: stacked batch dict (provides prompt_embeds for router mode).
+            batch_samples: per-sample list (provides ``__source__`` for LUT
+                source routing).
+            timestep_index: scalar inference step index (0..T-1). Required
+                for LUT mode; ignored by router mode.
         """
         B = t.shape[0]
 
@@ -252,9 +286,15 @@ class MoFDistillTrainer(BaseTrainer):
             with torch.no_grad():
                 return self._mof_router(t, prompt_embeds, pooled)  # (K, B)
         else:
+            if timestep_index is None:
+                raise ValueError(
+                    "MoFDistillTrainer LUT mode requires `timestep_index` "
+                    "(the inference step counter 0..T-1). The LUT was trained "
+                    "with column-as-step semantics; deriving the column from "
+                    "the timestep value `t` produces a reversed mapping."
+                )
             T_w = self._mof_weights.shape[1]
-            t_normalized = t.float() / 1000.0  # → [0, 1]
-            t_indices = (t_normalized * (T_w - 1)).long().clamp(0, T_w - 1)  # (B,)
+            t_idx = max(0, min(int(timestep_index), T_w - 1))
 
             if batch_samples is not None:
                 set_ids = torch.tensor(
@@ -268,10 +308,9 @@ class MoFDistillTrainer(BaseTrainer):
                 set_id = self._mof_source_to_set_id.get(batch_source, 0)
                 set_ids = torch.full((B,), set_id, device=self._mof_weights.device, dtype=torch.long)
 
-            weights_per_sample = self._mof_weights[:, t_indices, :]  # (K, B, S)
-            weights_per_sample = weights_per_sample[
-                :, torch.arange(B, device=self._mof_weights.device), set_ids
-            ]  # (K, B)
+            # weights[:, t_idx, :] → (K, S); then index by per-sample set_ids
+            w_at_t = self._mof_weights[:, t_idx, :]  # (K, S)
+            weights_per_sample = w_at_t[:, set_ids]  # (K, B)
             return weights_per_sample
 
     # =========================================================================
@@ -587,7 +626,8 @@ class MoFDistillTrainer(BaseTrainer):
 
                         teacher_velocities = self._compute_teacher_velocities(forward_kwargs)
                         weights = self._get_mof_weights(
-                            t=t, batch=batch, batch_samples=batch_samples
+                            t=t, batch=batch, batch_samples=batch_samples,
+                            timestep_index=timestep_index,
                         )
                         v_target = self._combine_weighted(weights, teacher_velocities)
                         v_target_by_timestep.append(v_target)
