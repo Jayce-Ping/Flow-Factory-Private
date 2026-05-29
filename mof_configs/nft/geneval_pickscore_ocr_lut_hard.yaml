@@ -9,8 +9,15 @@
 #                                 "teacher_biased" + bias=2 → softmax≈(0.78,0.11,0.11))
 #   - normalize_weights: false   (was true; required because softmax cannot
 #                                 produce exact one-hot with finite logits)
-#   - adam_weight_decay: 0.0     (was 1.0e-4; required to preserve the hard
-#                                 init — L2 would pull initial 1.0 toward 0)
+#   - learning_rate: 0.01        (was 0.05; compensate for missing softmax
+#                                 Jacobian damping ~1/3 — so unnormalized
+#                                 weight-space lr matches base's effective lr)
+#   - adam_weight_decay: 1.0e-4  (kept same as base; codebase auto-zeros it
+#                                 when normalize_weights=true, but applies it
+#                                 in unnormalized mode for drift protection.
+#                                 Effect on initial 1.0 weights is gentle:
+#                                 ~5% loss over 10K steps, dominated by
+#                                 reward gradient.)
 #
 # Trade-off: in unnormalized mode, weights can drift to negative/>1 values
 # and the K weights are not constrained to sum to 1. This is acceptable for
@@ -86,8 +93,8 @@ train:
   nft_beta: 1.0
   off_policy: true
   logits_init: "hard"                       # exact one-hot per source at t=0
-  logits_init_bias: 2.0                     # ignored when init='hard'
-  learning_rate: 0.05                       # same as base lut.yaml; tune if drift is too fast
+  logits_init_bias: 2.0                     # ignored when logits_init='hard'
+  learning_rate: 0.01                       # 0.05 (base) ÷ 3 to compensate for missing softmax Jacobian damping (~1/3 spectral radius at uniform init)
   temperature: 1.0                          # ignored when normalize_weights=false
   normalize_weights: false                  # REQUIRED: logits ARE the weights (softmax can't be exact one-hot)
 
@@ -126,7 +133,7 @@ train:
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
   max_grad_norm: 1.0
-  adam_weight_decay: 0.0                    # REQUIRED: nonzero would pull initial 1.0 weights toward 0
+  adam_weight_decay: 1.0e-4                 # Drift protection (codebase applies wd only when normalize_weights=false). Pull on initial 1.0 weight is ~5e-6/step → 5% loss over 10K steps, negligible vs reward gradient.
   adam_epsilon: 1.0e-8
   ddp_find_unused_parameters: false
   max_epochs: 1000

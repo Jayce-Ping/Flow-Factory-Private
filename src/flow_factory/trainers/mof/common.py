@@ -194,9 +194,10 @@ class MoFMixingModule(nn.Module):
             elif init_mode == "hard":
                 # Exact one-hot per source: in-domain teacher gets weight 1.0,
                 # all off-domain teachers get 0.0. Requires teacher_set_mapping
-                # to define the source→teacher diagonal. Caller MUST also set
-                # adam_weight_decay=0 to prevent L2 regularization from pulling
-                # the initial 1.0 weights toward 0.
+                # to define the source→teacher diagonal. Note that L2 weight
+                # decay (active in unnormalized mode) gently pulls the initial
+                # 1.0 weights toward 0; this is by design (drift protection)
+                # and is dominated by reward gradient at non-trivial wd.
                 if not teacher_set_mapping:
                     raise ValueError(
                         "logits_init='hard' requires teacher_route_by_source=true "
