@@ -1518,6 +1518,23 @@ class TeacherConfig(ArgABC):
             )
         },
     )
+    guidance_scale: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-teacher classifier-free guidance scale used when this "
+                "teacher's frozen LoRA is forwarded for distillation targets. "
+                "When None (default), the teacher inherits the trainer's "
+                "global ``train.guidance_scale`` (i.e., the student's CFG). "
+                "Override on a per-teacher basis when a teacher was trained "
+                "with a different CFG than the student's deployment CFG — "
+                "e.g., DiffusionOPD's recipe sets the GenEval teacher to "
+                "guidance_scale=1.0 (no-CFG training distribution) while the "
+                "student rolls out at 4.5. Only consumed by OPD-family "
+                "trainers (``'opd'``, ``'diffusion-opd'``)."
+            )
+        },
+    )
 
 
 @dataclass
