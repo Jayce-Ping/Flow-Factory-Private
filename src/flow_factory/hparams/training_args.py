@@ -810,8 +810,8 @@ class MoFBaseTrainingArguments(TrainingArguments):
                 "'hard': exact one-hot per source — in-domain teacher gets weight "
                 "1.0, off-domain 0.0. Requires normalize_weights=false (softmax "
                 "cannot produce exact one-hot) and teacher_route_by_source=true. "
-                "Set adam_weight_decay=0 to preserve the hard init from L2 "
-                "regularization pulling weights toward 0."
+                "Compensate for the missing softmax Jacobian damping by lowering "
+                "learning_rate by ~3× vs the softmax-mode baseline."
             )
         },
     )
