@@ -75,7 +75,7 @@ zero contribution in expectation under the teacher-as-target setting, so
 OOD gain, and \emph{averaging} loses in-domain by Jensen's inequality with
 only a small OOD bonus.
 
-\textbf{(iii)} We can construct a \emph{better target} by taking a learnable
+\textbf{(iii)} We can construct a \emph{potentially better target} by taking a learnable
 convex combination $v_\lambda = \sum_k \lambda_{k,t,s,c}\,v^{(k)}$ with weights
 conditioned on (teacher, time, source, prompt). Because the convex
 combination of valid flow-matching velocities is itself a valid flow-matching
