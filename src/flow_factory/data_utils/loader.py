@@ -16,7 +16,7 @@
 import json
 import os
 import shutil
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -373,6 +373,28 @@ def _load_per_source_dataloaders(
     return result
 
 
+def _max_eval_guidance_scale(eval_args) -> float:
+    """Largest CFG value any eval pass might use.
+
+    Walks both the global ``eval.guidance_scale`` and per-test-set
+    ``test_sets[*].guidance_scale`` overrides. Used to guarantee negative
+    prompt embeds are cached during preprocessing whenever any eval
+    configuration could request CFG > 1.0, even when training itself
+    runs no-CFG (e.g., distilling no-CFG teachers but evaluating with
+    deployment-style CFG > 1.0).
+
+    Returns 1.0 (no-CFG sentinel) if nothing is configured.
+    """
+    candidates: List[float] = []
+    if eval_args.guidance_scale is not None:
+        candidates.append(eval_args.guidance_scale)
+    if eval_args.test_sets:
+        for ts in eval_args.test_sets:
+            if ts.guidance_scale is not None:
+                candidates.append(ts.guidance_scale)
+    return max(candidates) if candidates else 1.0
+
+
 def get_dataloader(
     config: Arguments,
     accelerator: Accelerator,
@@ -427,7 +449,14 @@ def get_dataloader(
         # Use algorithm-aware guidance scale for preprocessing — ensures negative
         # prompts are encoded when any optimizer-time CFG scale needs them
         # (e.g., DGPO kl_cfg > 1.0 with training guidance_scale = 1.0).
-        train_preprocess_kwargs["guidance_scale"] = training_args.get_preprocess_guidance_scale()
+        # Also widen to cover any eval-time CFG override in test_sets so that
+        # no-CFG training with with-CFG eval still has negative_prompt_embeds
+        # cached at preprocess time (otherwise the adapter would silently
+        # disable CFG at eval time when negatives are missing).
+        train_preprocess_kwargs["guidance_scale"] = max(
+            training_args.get_preprocess_guidance_scale(),
+            _max_eval_guidance_scale(eval_args),
+        )
         train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
 
         if data_args.dataset_dirs:
