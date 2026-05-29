@@ -1,0 +1,222 @@
+# MoF (Mixture-of-Flow): 3-teacher with AdaLN Router.
+#
+# Uses a lightweight AdaLN-style network to predict per-sample mixing weights
+# conditioned on (timestep, pooled_prompt_embeds). The time embedding modulates
+# the text embedding via adaptive layer norm (gamma, beta), following the DiT
+# conditioning pattern used by SD3/Flux.
+#
+# Router architecture:
+#   pooled_prompt_embeds (2048) → c_proj → c (256)
+#   timestep → sinusoidal → time_mlp → t (256)
+#   t → adaLN_modulation → (gamma, beta)
+#   h = gamma * c + beta
+#   h → MLP → K=3 logits → softmax → weights
+#
+# Total router params: ~600K (vs LUT's 252 logits).
+# Key advantage: generalizes to unseen prompts (no discrete source routing needed).
+#
+# d_hidden design rationale:
+#   - d_pool=2048 (SD3.5 Medium pooled_prompt_embeds = CLIP-L[768] + OpenCLIP-G[1280])
+#   - d_hidden=256: ~8x bottleneck. Predicting K=3 weights requires minimal capacity;
+#     too large risks overfitting on sparse NFT reward signal.
+#   - Compare: SD3 transformer uses 1536-dim conditioning, but that drives a 2B-param
+#     network. Our router drives 3 scalar outputs — aggressive compression is correct.
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (3 prompt sets)
+data:
+  dataset_dir: "dataset/ocr"
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/pickscore"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_adaln-router"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: false
+
+# Training Configuration
+train:
+  trainer_type: 'mof-nft'
+
+  # ---- Teacher configuration ----
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]
+      reward_name: "geneval"
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]
+      reward_name: "pick_score"
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"
+
+  teacher_route_by_source: false            # Router handles per-sample routing from text content
+  teacher_param_device: 'cuda'
+
+  # ---- Mixing module: AdaLN Router ----
+  mixing_module_type: "adaln_router"
+  mixing_d_pool: 2048                       # SD3.5 Medium pooled_prompt_embeds dim (CLIP-L[768] + CLIP-G[1280])
+  mixing_hidden_dim: 256                    # Bottleneck: 8x smaller than d_pool (K=3 output needs minimal capacity)
+  temperature: 1.0                          # Softmax temperature for weight normalization
+
+  # ---- MoF core hyperparameters ----
+  nft_beta: 1.0                             # NFT loss interpolation (1.0 = full DiffusionNFT)
+  off_policy: true                          # Sample with EMA weights, train with current (stabilizes RL)
+  learning_rate: 1.0e-3                     # Router LR: ~600K params needs smaller LR than LUT's 252 params
+  normalize_weights: true                   # Softmax normalization on router output
+
+  # ---- EMA schedule ----
+  ema_decay_schedule: "piecewise_linear"
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.5
+  ema_update_interval: 1
+  ema_device: "cuda"
+
+  # ---- Per-set reward design ----
+  eval_teachers_at_start: true
+  ood_bonus_gamma: 0.2                      # OOD bonus: encourage cross-teacher discovery
+
+  # ---- Advantage computation ----
+  advantage_aggregation: "gdpo"
+  adv_clip_range: [-5.0, 5.0]
+  global_std: true
+
+  # ---- Timestep control ----
+  time_sampling_strategy: "discrete"
+  timestep_range: 0.9
+  num_inference_steps: 10
+
+  # ---- Optimization ----
+  per_device_batch_size: 7
+  group_size: 16
+  unique_sample_num_per_epoch: 112 # 48 + 16 + 48
+  # Per-source sampling weights. null → equal 1:1:1 round-robin (default).
+  # Example to mitigate PickScore dominance (see docs/mof/mof_pickscore_dominance_analysis.tex):
+  #   source_ratio: {geneval: 2.0, pickscore: 1.0, ocr: 2.0}
+  # Constraint: num_batches_per_epoch % int(sum(values)) must be 0.
+  source_ratio: {geneval: 3.0, pickscore: 1.0, ocr: 3.0}
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 1000
+  seed: 42
+
+  # ---- KL penalty ----
+  kl_beta: 0.0
+  kl_type: 'v-based'
+
+  # ---- Generation settings ----
+  resolution: 512
+  guidance_scale: 1.0
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+
+# Evaluation rewards
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
