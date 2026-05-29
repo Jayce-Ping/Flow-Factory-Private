@@ -85,6 +85,16 @@ class DiffusionOPDTrainer(BaseTrainer):
         self._teacher_sources: List[Set[str]] = [
             set(tc.sources) for tc in self.training_args.teachers
         ]
+        # Per-teacher CFG override: each teacher may declare its own
+        # ``guidance_scale``; None falls back to the trainer-global student CFG.
+        # This mirrors the DiffusionOPD reference recipe where, e.g., the
+        # GenEval teacher is queried at gs=1.0 (its no-CFG training
+        # distribution) while the student rolls out at gs=4.5.
+        student_gs = self.training_args.guidance_scale
+        self._teacher_guidance_scales: List[float] = [
+            float(tc.guidance_scale) if tc.guidance_scale is not None else float(student_gs)
+            for tc in self.training_args.teachers
+        ]
         self.num_tasks = len(self._teacher_names)
 
         # Cache timesteps (constant across training)
@@ -126,7 +136,9 @@ class DiffusionOPDTrainer(BaseTrainer):
             f"DiffusionOPDTrainer initialized: {self.num_tasks} task(s), "
             f"{self._num_steps} timesteps, "
             f"sources={sorted(available_sources)}, "
-            f"pathwise_coef={self.training_args.pathwise_coef}"
+            f"pathwise_coef={self.training_args.pathwise_coef}, "
+            f"student_gs={self.training_args.guidance_scale}, "
+            f"teacher_gs={self._teacher_guidance_scales}"
         )
 
     # ========================= Balanced Sampling =========================
@@ -251,12 +263,17 @@ class DiffusionOPDTrainer(BaseTrainer):
                                     )
                                 mu_S = student_out.next_latents_mean
 
-                                # Teacher forward (no grad, frozen)
+                                # Teacher forward (no grad, frozen). Each teacher
+                                # uses its own ``guidance_scale`` (DiffusionOPD
+                                # recipe — see __init__ for the rationale); the
+                                # student's CFG is the trainer-global value.
+                                teacher_gs = self._teacher_guidance_scales[m]
                                 with torch.no_grad():
                                     with self._teacher_frozen_context(teacher_name):
                                         teacher_fwd = self._build_forward_kwargs(
                                             batch, t, t_next, x,
                                             return_kwargs=["next_latents_mean"],
+                                            guidance_scale_override=teacher_gs,
                                         )
                                         teacher_out = self.adapter.forward(**teacher_fwd)
                                 if teacher_out.next_latents_mean is None:
@@ -333,8 +350,15 @@ class DiffusionOPDTrainer(BaseTrainer):
         t_next: torch.Tensor,
         latents: torch.Tensor,
         return_kwargs: List[str],
+        guidance_scale_override: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Assemble per-step adapter.forward kwargs."""
+        """Assemble per-step adapter.forward kwargs.
+
+        ``guidance_scale_override`` (when not None) replaces the trainer-global
+        ``train.guidance_scale`` *after* the spread of ``self.training_args``.
+        Used by the teacher forward path to apply per-teacher CFG (see
+        ``TeacherConfig.guidance_scale``).
+        """
         full_kwargs = {
             **self.training_args,
             "t": t,
@@ -345,6 +369,8 @@ class DiffusionOPDTrainer(BaseTrainer):
             "noise_level": 0.0,
             **batch,
         }
+        if guidance_scale_override is not None:
+            full_kwargs["guidance_scale"] = guidance_scale_override
         forward_kwargs = filter_forward_kwargs(
             full_kwargs, self._fwd_params, self._fwd_var_kwargs,
         )

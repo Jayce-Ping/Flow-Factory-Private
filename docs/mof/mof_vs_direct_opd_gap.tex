@@ -1,0 +1,914 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{pifont}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,decorations.pathreplacing}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\reward}{R}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\MoF}{\mathrm{MoF}}
+\newcommand{\dom}{\mathrm{dom}}
+\newcommand{\OOD}{\mathrm{OOD}}
+\newcommand{\const}{\mathrm{const}}
+\newcommand{\OPD}{\mathrm{OPD}}
+\newcommand{\PG}{\mathrm{PG}}
+\newcommand{\Path}{\mathrm{path}}
+\newcommand{\ODE}{\mathrm{ODE}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{定义}
+\newtheorem{remark}{注}
+\newtheorem{proposition}{命题}
+\newtheorem{corollary}{推论}
+\newtheorem{lemma}{引理}
+\newtheorem{theorem}{定理}
+\newtheorem{example}{例}
+
+\title{\textbf{MoF$\to$Distill 与直接 Multi-Teacher OPD 的范式 Gap 分析}\\[0.3em]
+\large 两种 Multi-Teacher 蒸馏路线的形式化对比与理论 Gap 推导}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文严格对比两种 Multi-Teacher 蒸馏范式：
+\textbf{Paradigm A}（MoF$\to$Distill）先用可学习的混合权重把 $K$ 个 teacher
+融合为单个虚拟 teacher $v^{\MoF^*}$，再把后者直接蒸馏到 student；
+\textbf{Paradigm B}（route-by-source OPD）则在每个 data source 上用对应
+的 in-domain teacher 直接监督 student。两者最终都得到一个 student LoRA，
+但其\emph{最优 target 函数}、\emph{搜索空间}、\emph{reward landscape}
+均不同。本文给出：
+\textbf{(1)} 两个范式的形式化定义与最优解刻画；
+\textbf{(2)} target velocity field 的精确 gap 公式
+$\Delta v = \sum_{k \neq s(c)} \lambda_k^*\,(v^{(k)} - v^{(s(c))})$；
+\textbf{(3)} 一阶 reward gap 推导（沿 ODE 轨迹的功能性导数）；
+\textbf{(4)} 搜索空间的严格包含关系 $\mathcal{T}_B \subsetneq \mathcal{T}_A$；
+\textbf{(5)} in-domain 与 OOD 上 gap 的符号分析（in-domain
+$A \geq B$ 由 Level-1 保证；OOD 符号由复合优化方向决定）；
+\textbf{(6)} 蒸馏 gap 的二阶差异（$T_A$ 在 $c$ 上连续平滑、$T_B$ 在
+source 边界处不连续）；
+\textbf{(7)} 三种边界情形（degenerate $\to A = B$、generic $\to A \neq B$、
+temporal complementarity $\to A > B$）的精确条件。
+
+核心结论：Paradigm A 是 Paradigm B 的\emph{严格泛化}——B 的 target 函数
+集合严格包含于 A 的 target 函数集合，所以 A 的 reward 上限不低于 B。
+但实际\emph{获得}的 reward 取决于 Stage 1 RL 优化质量与 Stage 2 蒸馏
+gap，存在三类典型抹消情形。最有可能让 $A > B$ 严格成立的场景是
+\emph{时间互补性}（不同 timestep 上不同 teacher 各有所长）。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{引言}
+\label{sec:intro}
+%% ============================================================
+
+\subsection{两种范式的高层对比}
+
+我们已有 $K$ 个 specialized 扩散 teacher $\{v^{(k)}\}_{k=1}^K$（典型如
+GenEval / OCR / PickScore），各自在自己的 prompt set $\mathcal{P}_s$
+上训练。目标是蒸馏出单个 student $v^\theta$。两种范式分别如下。
+
+\begin{tcolorbox}[colback=blue!5, colframe=blue!50, title=\textbf{Paradigm A: MoF$\to$Distill（本工作）}]
+\textbf{Stage 1}：在小型混合参数空间 $\psi$ 上做 RL，找出最优的混合
+权重 $\lambda_k(t, s, c; \psi^*)$，构造 router-induced teacher
+\begin{equation*}
+v^{\MoF^*}(x, t, c) = \sum_{k=1}^K \lambda_k(t, s(c), c; \psi^*)\,v^{(k)}(x, t, c).
+\end{equation*}
+\textbf{Stage 2}：用纯 pathwise MSE 把 $v^{\MoF^*}$ 蒸馏到 student
+$v^\theta$。
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=red!5, colframe=red!50, title=\textbf{Paradigm B: 直接 multi-teacher OPD（route-by-source, OPDTrainer）}]
+单阶段：对每个 prompt $p \in \mathcal{P}_s$，让 student 直接拟合
+对应 in-domain teacher $v^{(s)}$：
+\begin{equation*}
+\loss_B(\theta) = \sum_{s=1}^S \pi_s\,\E_{p \in \mathcal{P}_s,\,(x_t, t) \sim q_\theta}\bigl[
+\|v^\theta(x_t, t, c_p) - v^{(s)}(x_t, t, c_p)\|^2
+\bigr].
+\end{equation*}
+\end{tcolorbox}
+
+\textbf{核心问题}：这两个范式得到的 student 在 in-domain / OOD reward
+上能差多少？这个 gap 由什么因素决定？
+
+\subsection{本文的贡献结构}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \S\ref{sec:formalize}：两个范式的精确形式化与各自的最优解刻画。
+\item \S\ref{sec:target_gap}：target velocity field 的精确 gap 公式
+（命题~\ref{prop:target_gap}）。
+\item \S\ref{sec:space_inclusion}：搜索空间的严格包含关系
+$\mathcal{T}_B \subsetneq \mathcal{T}_A$（命题~\ref{prop:inclusion}）。
+\item \S\ref{sec:reward_gap}：reward gap 的一阶推导
+（定理~\ref{thm:linear_reward_gap}）。
+\item \S\ref{sec:in_vs_ood}：in-domain（A 不劣于 B）与 OOD（符号
+依赖）的差异化分析。
+\item \S\ref{sec:distill_diff}：蒸馏 gap 的二阶差异（连续平滑 vs.\@
+源边界跳变）。
+\item \S\ref{sec:cases}：三种边界情形与 $A \gtreqless B$ 的精确条件。
+\end{enumerate}
+
+%% ============================================================
+\section{形式化}
+\label{sec:formalize}
+%% ============================================================
+
+\subsection{符号与 reward functional}
+
+记 prompt set $\{\mathcal{P}_s\}_{s=1}^S$，source 频率
+$\pi_s = \Pr(p \in \mathcal{P}_s)$，prompt $p$ 的 source 标签 $s(p)$，
+prompt embedding $c_p$。Teacher 集合 $\{v^{(k)}(x, t, c)\}_{k=1}^K$ 全部
+冻结。Reward 集合 $\{R_j\}_{j=1}^J$。
+
+为简化 notation，把 $f_j^{(s)}(\lambda)$ 定义为：在使用混合参数 $\lambda$
+（关于 $t, s, c$ 的函数）生成轨迹时，prompt set $\mathcal{P}_s$ 上的
+reward $R_j$ 期望：
+\begin{equation}
+f_j^{(s)}(\lambda) \;\triangleq\; \E_{p \sim \mathcal{P}_s,\,x_T \sim \N(0, I)}\!\left[R_j\!\left(\ODE\!\left(v_\lambda;\,x_T,\,p\right)\right)\right].
+\label{eq:f_def}
+\end{equation}
+
+对单 teacher，$f_j^{(s)}(v^{(k)}) := \E_p[R_j(\ODE(v^{(k)}; x_T, p))]$。
+
+\subsection{Paradigm A 的形式化}
+
+\begin{definition}[Paradigm A: MoF$\to$Distill]
+\label{def:paradigm_A}
+\textbf{Stage 1}（在 mixing 参数 $\psi$ 上优化复合 reward）：
+\begin{equation}
+\psi^* \;=\; \arg\max_\psi\;\E_{p}\!\left[F^{(s(p))}\!\left(\lambda(\cdot;\psi)\right)\right],\quad
+F^{(s)}(\lambda) = f_s^{(s)}(\lambda) + \gamma\,\frac{1}{|\mathcal{R}_{\OOD}^{(s)}|}\sum_{j \in \mathcal{R}_{\OOD}^{(s)}} f_j^{(s)}(\lambda).
+\label{eq:stage1_obj}
+\end{equation}
+定义 \textbf{router-induced teacher}
+\begin{equation}
+T_A(x, t, c) \;\triangleq\; v^{\MoF^*}(x, t, c) \;=\; \sum_{k=1}^K \lambda_k\!\big(t, s(c), c;\,\psi^*\big)\,v^{(k)}(x, t, c).
+\label{eq:T_A_def}
+\end{equation}
+
+\textbf{Stage 2}（直接 pathwise MSE 蒸馏）：
+\begin{equation}
+\theta_A^* \;=\; \arg\min_\theta\;\E_{p,\,(x_t, t) \sim q_\theta}\!\left[\big\|v^\theta(x_t, t, c_p) - T_A(x_t, t, c_p)\big\|_2^2\right].
+\label{eq:stage2_obj}
+\end{equation}
+\end{definition}
+
+\textbf{Stage 2 最优解}（在 student 容量足够、训练充分的理想假设下）：
+\begin{equation}
+v^{\theta_A^*}(x, t, c) \;=\; T_A(x, t, c) - \xi_A(x, t, c),
+\label{eq:theta_A_opt}
+\end{equation}
+其中 $\xi_A$ 是\textbf{蒸馏残差}（capacity gap + on-policy distribution
+shift），$\E_{q_\theta}\!\big[\|\xi_A\|^2\big]$ 在理想条件下趋零。
+
+\subsection{Paradigm B 的形式化}
+
+\begin{definition}[Paradigm B: route-by-source OPD]
+\label{def:paradigm_B}
+单阶段优化：
+\begin{equation}
+\theta_B^* \;=\; \arg\min_\theta\;\sum_{s=1}^S \pi_s\,\E_{p \in \mathcal{P}_s,\,(x_t, t) \sim q_\theta}\!\left[\big\|v^\theta(x_t, t, c_p) - v^{(s)}(x_t, t, c_p)\big\|_2^2\right].
+\label{eq:paradigm_B_obj}
+\end{equation}
+等价地，定义 \textbf{routing target}
+\begin{equation}
+T_B(x, t, c) \;\triangleq\; v^{(s(c))}(x, t, c),
+\label{eq:T_B_def}
+\end{equation}
+则 $\loss_B(\theta) = \E_{(x_t, t, c)}\!\big[\|v^\theta - T_B\|^2\big]$，
+最优解
+\begin{equation}
+v^{\theta_B^*}(x, t, c) \;=\; T_B(x, t, c) - \xi_B(x, t, c),
+\label{eq:theta_B_opt}
+\end{equation}
+$\xi_B$ 为对应的蒸馏残差。
+\end{definition}
+
+\subsection{对照表}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\footnotesize
+\begin{tabular}{@{}p{3.5cm} p{5cm} p{5.5cm}@{}}
+\toprule
+\textbf{维度} & \textbf{Paradigm A (MoF$\to$Distill)} & \textbf{Paradigm B (route-by-source OPD)} \\
+\midrule
+阶段数 & 两阶段（RL + 蒸馏）& 单阶段（仅蒸馏）\\
+\midrule
+可学习参数 & Stage 1: $\psi \in \R^{|\psi|}$（$\sim 10^2$--$10^6$）\newline
+Stage 2: $\theta \in \R^{|\theta|}$（LoRA） &
+$\theta \in \R^{|\theta|}$（LoRA） \\
+\midrule
+Target 函数 $T(x, t, c)$ & $\sum_k \lambda_k^*(t, s(c), c)\,v^{(k)}$ & $v^{(s(c))}$ \\
+\midrule
+Target 在 $c$ 上连续性 & 平滑（router 输出连续函数） & 在 source 边界
+不连续 \\
+\midrule
+Target 关于 reward & Stage 1 优化得到 & 固定（直接由 source 决定） \\
+\midrule
+Reward 上界 & $\sup_\psi F^{(s)}(\lambda(\psi))$ & $f_s^{(s)}(v^{(s)})$ \\
+\midrule
+能否超越 single teacher & 可以（条件性，见 \S\ref{sec:cases}） & 不能 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{Target Velocity Field 的精确 Gap}
+\label{sec:target_gap}
+%% ============================================================
+
+\subsection{命题：target gap 公式}
+
+\begin{proposition}[Target velocity field gap]
+\label{prop:target_gap}
+对任意 $(x, t, c)$ 三元组（$c$ 来自 source $s = s(c)$）：
+\begin{equation}
+\boxed{
+\Delta v(x, t, c) \;\triangleq\; T_A(x, t, c) - T_B(x, t, c) \;=\; \sum_{k \neq s} \lambda_k^*(t, s, c)\,\bigl[v^{(k)}(x, t, c) - v^{(s)}(x, t, c)\bigr].
+}
+\label{eq:Delta_v}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+\begin{align}
+\Delta v &= T_A - T_B \;=\; \sum_{k=1}^K \lambda_k^* v^{(k)} - v^{(s)} \\
+&= \lambda_s^* v^{(s)} + \sum_{k \neq s} \lambda_k^* v^{(k)} - v^{(s)} \\
+&= (\lambda_s^* - 1) v^{(s)} + \sum_{k \neq s} \lambda_k^* v^{(k)} \\
+&\stackrel{(\star)}{=} -\sum_{k \neq s} \lambda_k^* v^{(s)} + \sum_{k \neq s} \lambda_k^* v^{(k)} \\
+&= \sum_{k \neq s} \lambda_k^* (v^{(k)} - v^{(s)}),
+\end{align}
+其中 $(\star)$ 用了归一化约束 $\sum_k \lambda_k^* = 1 \Rightarrow
+\lambda_s^* - 1 = -\sum_{k \neq s} \lambda_k^*$。\qed
+\end{proof}
+
+\subsection{解读：gap 的几何意义}
+
+\begin{itemize}[leftmargin=1.5em]
+\item $\Delta v$ 是 $K - 1$ 个"OOD 方向" $\{v^{(k)} - v^{(s)}\}_{k \neq s}$
+的非负加权和，权重为 $\lambda_k^*$。
+\item 当 $\lambda_s^*(t, s, c) = 1$（即 mixing 退化为 in-domain teacher）：
+$\Delta v = 0$，两个范式 target 完全一致。
+\item 当 $\lambda_s^* < 1$（mixing 引入了至少一个其他 teacher）：
+$\Delta v$ 沿"远离 in-domain teacher"的方向偏移。
+\item 偏移方向由 Stage 1 的复合 reward 优化决定——这是 A 与 B 的所有
+后续差异的根源。
+\end{itemize}
+
+\textbf{LoRA-shared-base 简化}：若 teacher 都是同一 base 上的 LoRA
+（$v^{(k)} = v_{\text{base}} + \delta^{(k)}$），则
+\begin{equation}
+\Delta v \;=\; \sum_{k \neq s} \lambda_k^* (\delta^{(k)} - \delta^{(s)}),
+\label{eq:Delta_v_lora}
+\end{equation}
+即 $\Delta v$ 是 LoRA residual 之间 difference 的混合，$v_{\text{base}}$
+被消去。
+
+\subsection{$\Delta v$ 的范数估计}
+
+由 Cauchy-Schwarz：
+\begin{equation}
+\|\Delta v\| \;\leq\; \sum_{k \neq s} \lambda_k^* \|v^{(k)} - v^{(s)}\|
+\;\leq\; (1 - \lambda_s^*)\,\max_{k \neq s} \|v^{(k)} - v^{(s)}\|.
+\end{equation}
+
+记 $D_s := \max_{k \neq s} \|v^{(k)} - v^{(s)}\|_{L^2(p_t \times c)}$ 为
+"在 source $s$ 视角下，其他 teacher 与 in-domain teacher 的最大距离"。
+则
+\begin{equation}
+\boxed{
+\|\Delta v\|_{L^2} \;\leq\; (1 - \E[\lambda_s^*])\,D_s.
+}
+\label{eq:Delta_v_bound}
+\end{equation}
+
+含义：当 $\lambda_s^* \to 1$（mixing 几乎不偏离 in-domain teacher）时，
+两范式 target 几乎相同；只有当 $\lambda_s^*$ 显著小于 $1$ 时，A 与 B
+才有实质差异。
+
+%% ============================================================
+\section{搜索空间的严格包含关系}
+\label{sec:space_inclusion}
+%% ============================================================
+
+\subsection{两个范式可表达的 target 函数类}
+
+\begin{definition}[Paradigm B 的 target 函数类]
+\label{def:T_B}
+\begin{equation}
+\mathcal{T}_B \;\triangleq\; \big\{T : T(x, t, c) = v^{(s(c))}(x, t, c)\big\}.
+\end{equation}
+（仅一个函数，由 source mapping 唯一确定。）
+
+\textbf{扩展}（允许任意 source-to-teacher 映射 $r: \{1, \ldots, S\} \to \{1, \ldots, K\}$）：
+\begin{equation}
+\mathcal{T}_B^{\text{ext}} \;\triangleq\; \big\{T_r : T_r(x, t, c) = v^{(r(s(c)))}(x, t, c),\;r: \{1, \ldots, S\} \to \{1, \ldots, K\}\big\}.
+\end{equation}
+$|\mathcal{T}_B^{\text{ext}}| = K^S$（有限离散集）。
+\end{definition}
+
+\begin{definition}[Paradigm A 的 target 函数类]
+\label{def:T_A}
+\begin{equation}
+\mathcal{T}_A \;\triangleq\; \Bigl\{T : T(x, t, c) = \sum_{k=1}^K \lambda_k(t, s(c), c)\,v^{(k)}(x, t, c),\;\lambda_k \geq 0,\;\sum_k \lambda_k = 1\Bigr\}.
+\end{equation}
+（每个时空-prompt 点上的混合系数都可独立选择，是无穷大的函数空间。）
+\end{definition}
+
+\begin{proposition}[严格包含]
+\label{prop:inclusion}
+$\mathcal{T}_B^{\text{ext}} \subsetneq \mathcal{T}_A$。
+\end{proposition}
+
+\begin{proof}
+对任意 $T_r \in \mathcal{T}_B^{\text{ext}}$，取 $\lambda_k(t, s, c) =
+\mathbb{1}[k = r(s)]$（单纯形顶点 one-hot），即可得 $T_r \in \mathcal{T}_A$。
+反之，对任意非 one-hot 的 $\lambda$（如 $\lambda = (1/K, \ldots, 1/K)$），
+对应的 $T \in \mathcal{T}_A \setminus \mathcal{T}_B^{\text{ext}}$。\qed
+\end{proof}
+
+\subsection{Reward 上界的对应包含}
+
+\begin{corollary}[Reward 上界包含]
+\label{cor:reward_upper}
+对任意 prompt set $\mathcal{P}_s$ 和任意 reward $R_j$：
+\begin{equation}
+\sup_{T \in \mathcal{T}_A}\,f_j^{(s)}(T) \;\geq\; \sup_{T \in \mathcal{T}_B^{\text{ext}}}\,f_j^{(s)}(T) \;=\; \max_{k}\,f_j^{(s)}(v^{(k)}).
+\end{equation}
+\end{corollary}
+
+\textbf{直接含义}：A 的最优 target 在任意 reward 上至少不劣于 B 的
+（best routing）最优 target。这是 A 相对 B 的\emph{结构性优势}的来源。
+
+\textbf{何时严格不等}：当存在某个 $\lambda^{\text{int}}$（interior 而非
+vertex）使 $f_j^{(s)}(\lambda^{\text{int}}) > \max_k f_j^{(s)}(v^{(k)})$
+时，严格不等成立。这正是\emph{时间互补性}假设
+（\texttt{mof\_ood\_guarantee\_analysis.tex} 条件 A）。
+
+\subsection{但 reward 上界 $\neq$ 实际获得的 reward}
+
+\textbf{重要警告}：Corollary~\ref{cor:reward_upper} 只说\emph{搜索空间
+扩大不会让上界变小}，但并不说\emph{Stage 1 RL 优化必然能找到这个上界}。
+Stage 1 优化的是\emph{复合} reward $F^{(s)} = f_s + \gamma \bar f_{\OOD}$，
+而非单一 reward $R_j$。因此 $\psi^*$ 给出的 $T_A$ 在某个具体 OOD reward
+$R_j$ 上可能\emph{劣于} $\max_k f_j^{(s)}(v^{(k)})$（正是
+\texttt{mof\_ood\_guarantee\_analysis.tex} 的负面定理）。
+
+%% ============================================================
+\section{Reward Gap 的一阶推导}
+\label{sec:reward_gap}
+%% ============================================================
+
+\subsection{ODE 解关于 velocity 的功能性导数}
+
+固定 prompt $p$ 和 noise $x_T$。记 $\phi_v(t)$ 为 velocity field $v$ 下
+ODE $\dot{x}(\tau) = v(x(\tau), \tau, c_p)$ 从 $x_T$ 出发到时刻 $t$ 的解。
+最终图像 $x_0 = \phi_v(0)$。Reward 函数 $R_j(x_0)$。
+
+定义 \textbf{adjoint state}（reward 关于 velocity 的功能性导数）：
+\begin{equation}
+G_j(\tau, x; v) \;\triangleq\; \frac{\delta R_j(\phi_v(0))}{\delta v(\cdot, \tau, c_p)}\bigg|_{\phi_v(\tau) = x}.
+\label{eq:adjoint}
+\end{equation}
+
+由变分原理，对 velocity 的小扰动 $v \to v + \epsilon \Delta v$：
+\begin{equation}
+R_j(\phi_{v + \epsilon \Delta v}(0)) - R_j(\phi_v(0)) \;=\; \epsilon\,\int_T^0 \langle G_j(\tau, \phi_v(\tau); v),\,\Delta v(\phi_v(\tau), \tau, c_p)\rangle\,d\tau \;+\; O(\epsilon^2).
+\label{eq:reward_taylor}
+\end{equation}
+
+\subsection{主定理：reward gap 一阶展开}
+
+\begin{theorem}[Reward Gap First-Order]
+\label{thm:linear_reward_gap}
+设 $T_A = T_B + \Delta v$，其中 $\Delta v$ 由命题~\ref{prop:target_gap}
+给出。在 $\|\Delta v\|$ 足够小的范围内，
+\begin{equation}
+R_j^{(s)}(T_A) - R_j^{(s)}(T_B)
+\;\approx\;
+\E_{p \in \mathcal{P}_s,\,x_T}\!\left[
+\int_T^0 \!\sum_{k \neq s} \lambda_k^*(\tau, s, c_p)\,\langle G_j(\tau, \phi_B(\tau); T_B),\,v^{(k)} - v^{(s)}\rangle\,d\tau
+\right],
+\label{eq:linear_reward_gap}
+\end{equation}
+其中 $\phi_B(\tau)$ 是 Paradigm B 在 prompt $p$ 上的 ODE 轨迹。
+\end{theorem}
+
+\begin{proof}
+直接代入命题~\ref{prop:target_gap} 的 $\Delta v = \sum_{k \neq s}
+\lambda_k^*\,(v^{(k)} - v^{(s)})$ 到~\eqref{eq:reward_taylor}，并取
+对 $p$ 与 $x_T$ 的期望即可。\qed
+\end{proof}
+
+\subsection{解读：gap 的三个因素}
+
+公式~\eqref{eq:linear_reward_gap} 中每个 $(t, k)$ pair 的贡献由三因素
+决定：
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{混合权重} $\lambda_k^*(\tau, s, c_p)$：Stage 1 优化决定。
+若 $\lambda_k^* = 0$，该 teacher 完全不贡献到 gap。
+\item \textbf{Reward sensitivity} $G_j(\tau, \phi_B(\tau); T_B)$：reward
+$R_j$ 对 timestep $\tau$ 处 velocity 扰动的灵敏度（adjoint）。
+\item \textbf{Teacher 偏移方向} $v^{(k)} - v^{(s)}$：teacher $k$ 与
+in-domain teacher 在 velocity 空间的差异方向。
+\end{enumerate}
+
+\textbf{符号决定因素}：内积 $\langle G_j, v^{(k)} - v^{(s)}\rangle$ 的
+符号决定该 $(t, k)$ pair 对 gap 的贡献是正是负。
+\begin{itemize}[leftmargin=1.5em]
+\item 若 teacher $k$ 的 velocity 偏移方向与"提升 $R_j$ 的方向"对齐
+（$\langle G_j, v^{(k)} - v^{(s)}\rangle > 0$）：A 在 $R_j$ 上比 B 好。
+\item 若反向（$\langle G_j, v^{(k)} - v^{(s)}\rangle < 0$）：A 在 $R_j$
+上比 B 差。
+\item 若正交：无贡献。
+\end{itemize}
+
+\subsection{二次项与全局误差}
+
+定理~\ref{thm:linear_reward_gap} 是一阶近似。完整 reward gap 为：
+\begin{equation}
+\Delta R_j^{(s)} = \underbrace{R_j^{(s)}(T_A) - R_j^{(s)}(T_B)}_{\text{linear}}
++ \underbrace{O(\|\Delta v\|^2)}_{\text{nonlinear}}.
+\end{equation}
+
+二次项可能 dominant 当 $\|\Delta v\|$ 较大时。但由
+\eqref{eq:Delta_v_bound}，$\|\Delta v\| \leq (1 - \lambda_s^*) D_s$，
+所以当 $\lambda_s^*$ 接近 $1$（A 几乎不偏离 B）时，一阶近似精确。
+
+\subsection{$\Delta v$ 与 Stage 1 KKT 条件的关联}
+
+Stage 1 的 KKT 条件（$\psi^* = \arg\max F^{(s)}$）为：
+\begin{equation}
+\nabla_\psi f_s^{(s)}(\lambda(\psi^*)) + \frac{\gamma}{|\mathcal{R}_{\OOD}^{(s)}|}\sum_{j \in \mathcal{R}_{\OOD}^{(s)}}\nabla_\psi f_j^{(s)}(\lambda(\psi^*)) \;=\; 0.
+\label{eq:kkt_stage1}
+\end{equation}
+
+利用功能性导数链式法则
+\begin{equation}
+\nabla_\psi f_j^{(s)} = \E_{p, \tau}\!\left[\langle G_j(\tau; v_\psi),\,\nabla_\psi v_\psi(\tau)\rangle\right],
+\end{equation}
+代入~\eqref{eq:kkt_stage1} 后整理可得：
+\begin{equation}
+\E_{p, \tau, k}\!\left[\nabla_\psi \lambda_k\,\Bigl\{\langle G_s, v^{(k)} - \bar{v}\rangle + \frac{\gamma}{|\mathcal{R}_{\OOD}|}\sum_{j \in \mathcal{R}_{\OOD}}\langle G_j, v^{(k)} - \bar{v}\rangle\Bigr\}\right] = 0.
+\label{eq:kkt_expanded}
+\end{equation}
+
+\textbf{KKT 含义}：在 $\psi^*$ 处，每个 teacher 的 in-domain 投影
+$\langle G_s, v^{(k)} - \bar{v}\rangle$ 与 OOD 投影
+$\langle G_j, v^{(k)} - \bar{v}\rangle$ 按 $\gamma$ 加权后总和为零（在
+$\nabla_\psi \lambda_k$ 的方向上）。这就是\emph{所有} reward 信号在 Stage 1
+平衡的精确条件。
+
+%% ============================================================
+\section{In-domain vs.\ OOD 上 Gap 的差异化分析}
+\label{sec:in_vs_ood}
+%% ============================================================
+
+\subsection{In-domain：Level-1 保证下 $A \geq B$}
+
+\begin{theorem}[In-domain reward 不弱于 B]
+\label{thm:in_domain_geq}
+对任意 source $s$，
+\begin{equation}
+f_s^{(s)}(T_A) \;\geq\; f_s^{(s)}(T_B) - \gamma \cdot |\Delta_{\OOD}|,
+\end{equation}
+其中 $|\Delta_{\OOD}|$ 是 OOD 项变化的有界量。当 $\gamma = 0$（纯
+in-domain reward）：$f_s^{(s)}(T_A) \geq f_s^{(s)}(T_B)$。
+\end{theorem}
+
+\begin{proof}
+$T_B = v^{(s)}$ 对应 mixing $\lambda = \delta_s^{\const}$，是 Stage 1
+搜索空间内的可行点。Stage 1 最优 $\psi^*$ 使 $F^{(s)}(\lambda^*) \geq
+F^{(s)}(\delta_s^{\const}) = f_s^{(s)}(v^{(s)}) + \gamma\,\bar f_{\OOD}^{(s)}(v^{(s)})$。
+变量分离后即得。\qed
+\end{proof}
+
+\textbf{含义}：在合理 $\gamma$ 下，A 的 in-domain reward 至少不显著
+劣于 B。这是 Paradigm A 的\emph{基本保证}。
+
+\subsection{OOD：符号依赖于 Stage 1 优化方向}
+
+将定理~\ref{thm:linear_reward_gap} 应用到 OOD reward $R_j$（$j \neq s$）：
+\begin{equation}
+\Delta R_j^{(s)} \;\approx\; \E_{p, \tau}\!\left[\sum_{k \neq s} \lambda_k^*(\tau, s, c_p)\,\langle G_j(\tau), v^{(k)} - v^{(s)}\rangle\right].
+\label{eq:ood_gap}
+\end{equation}
+
+由 Stage 1 KKT~\eqref{eq:kkt_expanded}：$\lambda_k^*$ 由 in-domain
+$G_s$ 与 OOD 平均 $\bar G_{\OOD}$ 的加权平衡决定。具体地：
+
+\begin{proposition}[OOD gap 符号分析]
+\label{prop:ood_sign}
+$\Delta R_j^{(s)}$ 的符号与下式一致（局部一阶意义下）：
+\begin{equation}
+\mathrm{sign}(\Delta R_j^{(s)}) \;=\; \mathrm{sign}\!\left(\E_{p, \tau, k \neq s}\!\left[\lambda_k^*\,\langle G_j(\tau), v^{(k)} - v^{(s)}\rangle\right]\right).
+\end{equation}
+
+由 Stage 1 KKT 条件，$\lambda_k^* \neq 0$ 当且仅当 $\langle G_s + \gamma' \bar G_{\OOD}, v^{(k)} - v^{(s)}\rangle$ 在 $\psi^*$ 邻域有非平凡的方向性。
+
+\textbf{三种典型情形}：
+\begin{enumerate}[leftmargin=1.5em]
+\item $\langle G_j, v^{(k)} - v^{(s)}\rangle$ 与
+$\langle G_s, v^{(k)} - v^{(s)}\rangle$ 同号
+（reward $j$ 与 $s$ 在 teacher $k$ 偏移方向上协同）：$\Delta R_j^{(s)} > 0$。
+\item 异号且 $\gamma$ 较小：Stage 1 主要受 $G_s$ 主导，$\lambda^*$ 选择
+让 $\langle G_s, v^{(k)} - v^{(s)}\rangle > 0$ 的 teacher，可能让
+$\langle G_j, v^{(k)} - v^{(s)}\rangle < 0$，故 $\Delta R_j^{(s)} < 0$。
+\item 异号但 $\gamma$ 大：$\lambda^*$ 倾向选择 $\langle G_j, v^{(k)} - v^{(s)}\rangle > 0$
+的 teacher，但代价是 in-domain 退化。
+\end{enumerate}
+\end{proposition}
+
+\textbf{核心 insight}：在 OOD 上，A 与 B 的 gap 符号
+\emph{无 framework 内的通用保证}——它取决于 reward landscape 的几何
+（$G_j$ 与 $G_s$ 的相对方向）与 Stage 1 优化的 trade-off
+（$\gamma$ 选择）。这与
+\texttt{mof\_ood\_guarantee\_analysis.tex} 的负面定理一致。
+
+\subsection{对比表：A vs.\ B 的预期 gap}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\footnotesize
+\begin{tabular}{@{}p{3.2cm}cccc@{}}
+\toprule
+\textbf{Reward 类型} & \textbf{A 期望} & \textbf{B 期望} & \textbf{Gap 方向（理论）} & \textbf{Gap 符号 conditional on}\\
+\midrule
+In-domain $R_s$ on $\mathcal{P}_s$ &
+$\geq f_s^{(s)}(v^{(s)})$ &
+$= f_s^{(s)}(v^{(s)})$ &
+$A \geq B$ &
+$\gamma$ 不太大 (Thm.~\ref{thm:in_domain_geq}) \\
+\midrule
+OOD $R_j$ on $\mathcal{P}_s$, $j \neq s$ &
+取决于 $\lambda^*$ &
+$= f_j^{(s)}(v^{(s)})$ &
+\textbf{符号未定} &
+reward landscape 几何 (Prop.~\ref{prop:ood_sign}) \\
+\midrule
+Best-OOD-teacher reward &
+通常 $< \max_k f_j^{(s)}(v^{(k)})$ &
+$= f_j^{(s)}(v^{(s)}) \leq \max_k$ &
+两者都\emph{未必}达到顶点最大 &
+非平凡 \\
+\midrule
+复合 reward $F^{(s)}$ &
+$\sup_\psi F^{(s)}$ &
+$F^{(s)}(\delta_s^{\const})$ &
+$A \geq B$（构造性）&
+不依赖任何额外假设 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{蒸馏 Gap 的二阶差异}
+\label{sec:distill_diff}
+%% ============================================================
+
+前面的分析假定 Stage 2 的蒸馏完美无损（$\xi_A = 0, \xi_B = 0$）。本节
+讨论\emph{蒸馏残差} $\xi_A, \xi_B$ 的差异及其对最终 reward 的影响。
+
+\subsection{Target 函数的连续性差异}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{$T_A(x, t, c)$ 的 $c$-连续性}：$T_A = \sum_k \lambda_k(t, s(c), c) v^{(k)}(x, t, c)$。当 router 用 $c$ 的 embedding 输出连续 $\lambda_k$ 时，$T_A$ 在 $c$ 上 Lipschitz 连续（除了 source 标签 $s(c)$ 在 source 边界跳变这一点）。
+
+\item \textbf{$T_B(x, t, c)$ 的 $c$-连续性}：$T_B = v^{(s(c))}$。当 prompt $c$ 跨越 source 边界时，target 函数从一个 LoRA 跳到另一个 LoRA，\textbf{不连续}。
+\end{itemize}
+
+\textbf{典型分布偏移}：在多 source mixture 数据集上训练 student，每个 mini-batch 同时含多 source 样本。Paradigm B 的 target 在 batch 内出现 step jump，Paradigm A 的 target 在 batch 内（除 source 标签外）平滑。
+
+\subsection{Capacity gap 的对比}
+
+\begin{proposition}[Capacity gap 的渐进比较]
+\label{prop:capacity}
+对一阶 LoRA student（$v^\theta = v_{\text{base}} + \delta^\theta$，
+$\delta^\theta$ 的 representation 函数族为 $\mathcal{F}_\theta$），
+\begin{equation}
+\epsilon_A^{\text{cap}} := \inf_{\theta} \E\!\big[\|v^\theta - T_A\|^2\big] \;=\; \inf_{\delta^\theta \in \mathcal{F}_\theta}\E\!\Big[\Big\|\delta^\theta - \sum_k \lambda_k^* \delta^{(k)}\Big\|^2\Big],
+\end{equation}
+\begin{equation}
+\epsilon_B^{\text{cap}} := \inf_{\theta} \E\!\big[\|v^\theta - T_B\|^2\big] \;=\; \inf_{\delta^\theta \in \mathcal{F}_\theta}\E\!\Big[\Big\|\delta^\theta - \delta^{(s(c))}\Big\|^2\Big].
+\end{equation}
+两者无统一大小关系，依赖具体 $\mathcal{F}_\theta$ 与
+$\{\delta^{(k)}, \lambda^*\}$ 几何。
+\end{proposition}
+
+\subsection{两种典型情形分析}
+
+\paragraph{情形 1：$\mathcal{F}_\theta$ 表达力充足。}
+若 student LoRA rank 足够，$\mathcal{F}_\theta$ 既能表达每个 $\delta^{(k)}$，又能表达任意凸组合 $\sum_k \lambda_k \delta^{(k)}$。此时 $\epsilon_A^{\text{cap}} \approx \epsilon_B^{\text{cap}} \approx 0$，两范式蒸馏 gap 均可忽略。
+
+\paragraph{情形 2：$\mathcal{F}_\theta$ 受限（小 LoRA rank）。}
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{B 的目标}：把 $S$ 个不同的 LoRA $\delta^{(s)}$ 都嵌入到 $\mathcal{F}_\theta$ 中，由 $c$ 触发 source-aware switching。如果 $\mathcal{F}_\theta$ 容量小于 $S$ 个 LoRA 的 column space 之和，必然损失。
+\item \textbf{A 的目标}：把 $S$ 个不同的"混合 LoRA" $\sum_k \lambda_k^*(t, s, c) \delta^{(k)}$ 嵌入到 $\mathcal{F}_\theta$。由于 $\lambda^*$ 在 $(t, c)$ 上变化平滑，$T_A$ 在 $c$-空间是 Lipschitz 平滑的，对小容量函数族更友好。
+\end{itemize}
+
+\textbf{粗略经验排序}：在小 LoRA rank regime下，
+$\epsilon_A^{\text{cap}} \lesssim \epsilon_B^{\text{cap}}$，因为：
+\begin{itemize}[leftmargin=1.5em]
+\item B 需要表达 $S$ 个独立的 LoRA + 边界跳变；
+\item A 需要表达\emph{平滑过渡} 的 LoRA mixture，函数复杂度更低。
+\end{itemize}
+
+\subsection{Distillation 残差对 reward 的影响}
+
+把 \eqref{eq:theta_A_opt}\eqref{eq:theta_B_opt} 代入 reward：
+\begin{align}
+R_j^{(s)}(\theta_A^*) &\approx R_j^{(s)}(T_A) - \epsilon_A^{\text{distill}, j, s}, \\
+R_j^{(s)}(\theta_B^*) &\approx R_j^{(s)}(T_B) - \epsilon_B^{\text{distill}, j, s},
+\end{align}
+其中 $\epsilon^{\text{distill}, j, s}$ 是\emph{投影到 reward 空间}的
+distillation gap：
+\begin{equation}
+\epsilon^{\text{distill}, j, s} \;\approx\; \E\!\left[\int \langle G_j(\tau), \xi(\tau)\rangle d\tau\right] + O(\|\xi\|^2).
+\end{equation}
+
+最终 student-level reward gap：
+\begin{equation}
+\boxed{
+\Delta R_j^{(s)}(\theta) \;=\; \underbrace{[R_j^{(s)}(T_A) - R_j^{(s)}(T_B)]}_{\text{target-level gap}} \;-\; \underbrace{[\epsilon_A^{\text{distill}, j, s} - \epsilon_B^{\text{distill}, j, s}]}_{\text{distillation 差异}}.
+}
+\label{eq:full_gap}
+\end{equation}
+
+\subsection{Erosion 风险对比}
+
+\begin{itemize}[leftmargin=1.5em]
+\item Paradigm B 的 target 已经是 single teacher，蒸馏几乎不会"超过"
+该 teacher 水平；distillation gap 主要来源是 $\mathcal{F}_\theta$ 容量
+不足。
+\item Paradigm A 的 target $T_A$ 可能在 reward 上严格超过任何单 teacher
+（Level-2 in-domain 严格超越 / OOD 互补），但这\emph{超越部分}容易被
+distillation gap 抹消（参见
+\texttt{mof\_ood\_guarantee\_analysis.tex} 中关于 distillation gap
+erosion 的相关分析）。
+\end{itemize}
+
+%% ============================================================
+\section{三种边界情形与精确条件}
+\label{sec:cases}
+%% ============================================================
+
+下面给出 $A \gtreqless B$ 的精确条件，按 Stage 1 收敛位置分类。
+
+\subsection{情形 I：$A = B$（Stage 1 退化）}
+
+\begin{proposition}[退化情形]
+\label{prop:degenerate}
+若 Stage 1 收敛到 $\lambda_s^*(t, s, c) = 1$ 对所有 $(t, c)$ 成立（即
+in-domain teacher 在每个 timestep / prompt 上都最优），则 $T_A = T_B$，
+两范式 student 在 capacity 充足下行为一致：$\theta_A^* = \theta_B^*$。
+\end{proposition}
+
+\textbf{发生条件}：
+\begin{itemize}[leftmargin=1.5em]
+\item In-domain teacher 在所有 timestep 上对复合 reward 都最优（\emph{无}时间互补性，$\gamma$ 不足以激励偏离 $\delta_s^{\const}$）；
+\item 或 Stage 1 优化未收敛（局部最优陷在 $\delta_s^{\const}$ 邻域）；
+\item 或 OOD reward 与 in-domain reward 完全冲突（$\gamma$ 选不动 $\lambda$）。
+\end{itemize}
+
+\textbf{含义}：当 Paradigm A 退化为 B 时，两阶段流水线的 RL 阶段是
+"无效"的——但仍\emph{不劣于} B。
+
+\subsection{情形 II：$A \neq B$ 但 reward 持平（generic 偏移）}
+
+\begin{proposition}[Generic 偏移但 reward 持平]
+\label{prop:generic_neutral}
+若 $\lambda^* \neq \delta_s^{\const}$（A 引入了非平凡混合）但
+$\langle G_j(\tau), \sum_{k \neq s} \lambda_k^*(v^{(k)} - v^{(s)})\rangle = 0$
+（gap velocity 在 reward $R_j$ 的灵敏度方向上正交），则
+$\Delta R_j^{(s)} \approx 0$（一阶）但 distillation gap 可能不同：
+\begin{equation}
+R_j^{(s)}(\theta_A^*) - R_j^{(s)}(\theta_B^*) \;\approx\; -[\epsilon_A^{\text{distill}, j, s} - \epsilon_B^{\text{distill}, j, s}].
+\end{equation}
+\end{proposition}
+
+\textbf{含义}：在该情形下，差异完全由\emph{蒸馏精度}主导。如果 A 的
+target 更平滑（导致 $\epsilon_A^{\text{cap}} < \epsilon_B^{\text{cap}}$），
+A 略胜；反之 B 略胜。
+
+\subsection{情形 III：$A > B$（时间互补性 + Stage 1 找到正向 mixing）}
+
+\begin{theorem}[A 严格优于 B 的充分条件]
+\label{thm:A_strict_better}
+$R_j^{(s)}(\theta_A^*) > R_j^{(s)}(\theta_B^*)$ 当以下条件同时满足：
+\begin{enumerate}[leftmargin=1.5em]
+\item[(C1)] \textbf{时间互补性}（target-level）：存在 $(\tau^*, k^*)$ 使
+$\lambda_{k^*}^*(\tau^*, s, c) > 0$ 且
+$\langle G_j(\tau^*; T_B), v^{(k^*)} - v^{(s)}\rangle > 0$。
+\item[(C2)] \textbf{Reward 协同}（Stage 1 复合优化方向）：满足 (C1) 的 $(\tau^*, k^*)$ 处 $\langle G_s, v^{(k^*)} - v^{(s)}\rangle$ 的负贡献小于其在 $R_j$ 上的正贡献的 $1/\gamma'$ 倍（$\gamma'$ 是 Stage 1 OOD 系数）。
+\item[(C3)] \textbf{蒸馏不抹消}：
+$\epsilon_A^{\text{distill}} - \epsilon_B^{\text{distill}} < R_j^{(s)}(T_A) - R_j^{(s)}(T_B)$。
+\end{enumerate}
+\end{theorem}
+
+\textbf{解读}：
+\begin{itemize}[leftmargin=1.5em]
+\item (C1) 是\emph{结构性}条件（teacher 之间确实存在跨 timestep 协同）。
+\item (C2) 是 Stage 1 优化能"发现"该 mixing 的条件（KKT 平衡下 $\lambda^*$ 不退化）。
+\item (C3) 是 Stage 2 不抹消该增益的条件。
+\end{itemize}
+
+三个条件全部满足时，A 在 OOD reward 上严格优于 B。\emph{任何一个不
+满足，A 都可能不优于 B}。
+
+\subsection{情形 IV：$A < B$（罕见但可能）}
+
+\begin{proposition}[A 劣于 B 的情形]
+\label{prop:A_worse}
+$R_j^{(s)}(\theta_A^*) < R_j^{(s)}(\theta_B^*)$ 当：
+\begin{enumerate}[leftmargin=1.5em]
+\item Stage 1 在复合优化中为提升其他 reward 而降低 $R_j$（trade-off
+on Pareto 前沿）；
+\item 且蒸馏 gap 不足以补偿。
+\end{enumerate}
+具体地，当 OOD reward $R_j$ 与 in-domain $R_s$ 在 mixing 方向上反相关
+（$\langle G_j, v^{(k)} - v^{(s)}\rangle < 0$ 而
+$\langle G_s, v^{(k)} - v^{(s)}\rangle > 0$）时，Stage 1 选择
+$\lambda_k^* > 0$ 提升 $R_s$，但同时降低 $R_j$。结果：
+\begin{equation}
+R_j^{(s)}(T_A) < R_j^{(s)}(T_B), \quad \text{即 A 在 } R_j \text{ 上劣于 B}.
+\end{equation}
+\end{proposition}
+
+\textbf{警示}：Paradigm A 不是"安全"选择——在某些 OOD reward 上可能比
+直接 OPD 更差。这与
+\texttt{mof\_ood\_guarantee\_analysis.tex} 的负面定理一致。
+
+%% ============================================================
+\section{综合 Gap 公式与决策树}
+\label{sec:summary}
+%% ============================================================
+
+\subsection{综合 reward gap 公式}
+
+把 \eqref{eq:full_gap} 与定理~\ref{thm:linear_reward_gap} 合并：
+\begin{equation}
+\boxed{
+\Delta R_j^{(s)}(\theta_A^*, \theta_B^*) \;\approx\;
+\E_{p, \tau, k}\!\left[\lambda_k^*\,\langle G_j(\tau), v^{(k)} - v^{(s)}\rangle\right]
+\;-\;
+\bigl[\epsilon_A^{\text{distill}, j, s} - \epsilon_B^{\text{distill}, j, s}\bigr].
+}
+\label{eq:summary_gap}
+\end{equation}
+
+\textbf{第一项}（target-level reward gap）由 Stage 1 RL 优化决定，符号
+依赖于 reward landscape 几何与 $\gamma$ 选择。
+\textbf{第二项}（distillation 差异）依赖 student 容量与 target 平滑性。
+
+\subsection{决策树：何时选 A，何时选 B}
+
+\begin{tcolorbox}[colback=green!5, colframe=green!50, title=\textbf{选择 A（MoF$\to$Distill）的条件}]
+\begin{itemize}[leftmargin=1.5em]
+\item Teacher 之间在不同 timestep 上有可观察的互补性
+（早 / 中 / 晚 denoising 阶段各有所长）；
+\item 至少有一个 OOD reward 是优化目标，且 reward landscape 不强烈反相关；
+\item Student LoRA 容量充足，能拟合 router-induced mixture 的平滑过渡；
+\item 计算预算允许两阶段（Stage 1 + Stage 2）。
+\end{itemize}
+\end{tcolorbox}
+
+\begin{tcolorbox}[colback=red!5, colframe=red!50, title=\textbf{选择 B（route-by-source OPD）的条件}]
+\begin{itemize}[leftmargin=1.5em]
+\item Teacher 高度专家化（每个 teacher 仅在自己的 source 上有意义）；
+\item 不关心 OOD reward 改进（仅要 in-domain match teacher）；
+\item 计算预算紧张（避免 Stage 1 RL 开销）；
+\item Student 容量足以表达 source-conditioned LoRA 切换。
+\end{itemize}
+\end{tcolorbox}
+
+\subsection{综合结论}
+
+\begin{tcolorbox}[colback=yellow!5, colframe=yellow!60!black, title=\textbf{核心结论}]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{结构性优势}：$\mathcal{T}_B^{\text{ext}} \subsetneq \mathcal{T}_A$，
+所以 A 的 reward 上界总不低于 B（Corollary~\ref{cor:reward_upper}）。
+但\emph{上界不等于实际获得}，A 是否实际超过 B 取决于 Stage 1 优化。
+
+\item \textbf{Target-level gap 公式}：
+$\Delta v = \sum_{k \neq s(c)} \lambda_k^*\,(v^{(k)} - v^{(s)})$
+（命题~\ref{prop:target_gap}），bound by $(1 - \lambda_s^*) D_s$。
+
+\item \textbf{Reward gap 一阶展开}：
+$\Delta R_j^{(s)} \approx \E[\sum_{k \neq s}\lambda_k^*\,\langle G_j, v^{(k)} - v^{(s)}\rangle]$
+（定理~\ref{thm:linear_reward_gap}）。每个 $(t, k)$ pair 的贡献符号
+由\emph{adjoint sensitivity}与\emph{teacher 偏移方向}的内积决定。
+
+\item \textbf{In-domain $\geq$ B}：定理~\ref{thm:in_domain_geq} 给出
+A 在 in-domain 上不弱于 B（构造性，仅需 $\gamma$ 不太大）。这是
+\emph{无条件保证}。
+
+\item \textbf{OOD 符号依赖}：A 在 OOD reward 上既可能优于、等于、也
+可能劣于 B（命题~\ref{prop:ood_sign}, \ref{prop:A_worse}）。framework
+本身\emph{不提供} OOD 上 $A > B$ 的保证。
+
+\item \textbf{蒸馏 gap 差异}：A 的 target 在 prompt 空间连续平滑、B
+的 target 在 source 边界跳变。在小 student 容量下，A 通常更易拟合
+（$\epsilon_A^{\text{cap}} \lesssim \epsilon_B^{\text{cap}}$）。
+
+\item \textbf{综合公式}：student-level reward gap =
+target-level gap $-$ distillation 差异。两者都需要实证测量。
+
+\item \textbf{何时 $A > B$ 严格成立}（定理~\ref{thm:A_strict_better}）：
+需要时间互补性 + Stage 1 reward 协同 + 蒸馏 gap 不抹消，三个条件同时
+满足。
+
+\item \textbf{何时 $A = B$}（命题~\ref{prop:degenerate}）：Stage 1 退化
+到 $\lambda^* = \delta_s^{\const}$。
+
+\item \textbf{何时 $A < B$}（命题~\ref{prop:A_worse}）：复合 reward
+trade-off 牺牲 OOD $R_j$ 来提升其他项。
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{开放问题}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item 能否在 Stage 1 的复合 reward 中引入\emph{硬约束}
+$f_j^{(s)} \geq \rho_j^{(s), \const}$，使 OOD 严格不劣于 B 成为
+构造性保证？（约束优化 + Lagrangian 求解）
+\item 能否设计 Stage 2 的蒸馏 loss（替代 vanilla MSE）来\emph{保留}
+Stage 1 的 reward margin？例如 reward-weighted MSE 或 trajectory
+matching。
+\item 能否量化\emph{何时}时间互补性会自然浮现？（teacher 训练数据集
+的相关性 / LoRA rank / base model 的稀疏激活模式）
+\item Multi-round self-distillation：Paradigm A → student → 重新作 base
+training 新一组 teachers → 再做 Paradigm A，能否 escape Stage 2 的
+erosion？
+\end{enumerate}
+
+%% ============================================================
+\appendix
+\section{Adjoint Sensitivity 的精确计算}
+\label{app:adjoint}
+%% ============================================================
+
+为了让定理~\ref{thm:linear_reward_gap} 中的 $G_j(\tau)$ 可计算，给出
+adjoint ODE 形式。
+
+ODE: $\dot x(\tau) = v(x(\tau), \tau, c)$，逆向积分 $\tau: 1 \to 0$。
+设 $a(\tau) := \partial R_j(x(0)) / \partial x(\tau)$ 为 adjoint state。
+由 chain rule，$a(\tau)$ 满足逆向 adjoint ODE：
+\begin{equation}
+\dot a(\tau) \;=\; -\bigl(\partial_x v(x(\tau), \tau, c)\bigr)^\top\,a(\tau),
+\qquad a(0) = \nabla_{x(0)} R_j.
+\end{equation}
+
+Adjoint 变量与 functional derivative 的关系：
+\begin{equation}
+G_j(\tau, x; v) \;=\; a(\tau)\quad\text{（在轨迹 } x(\tau) \text{ 处）}.
+\end{equation}
+
+因此定理~\ref{thm:linear_reward_gap} 中的 $\langle G_j, v^{(k)} - v^{(s)}\rangle$
+就是 adjoint state 与 teacher 偏移方向的内积，可以通过反向 ODE 数值
+积分得到。
+
+%% ============================================================
+\section{与已有 docs 的关系}
+\label{app:relation}
+%% ============================================================
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{mof\_per\_set\_analysis.tex}：给出 Paradigm A 的 Stage 1
+理论（Level-1 / Level-2 in-domain 保证）。本文复用其符号。
+\item \texttt{mof\_ood\_guarantee\_analysis.tex}：分析 Paradigm A 的 OOD
+不保证；本文从 A vs.\ B 对比角度复用了那里的反例与充分条件。
+\item \texttt{mof\_two\_stage\_pipeline.tex}：给出 Paradigm A 的算法
+实现；本文是其\emph{相对 B 的理论 gap}补充。
+\item \texttt{mof\_notes.tex}：综合 notes；本文是其 \S 2.4 与 \S 4.3
+的更深推导。
+\end{itemize}
+
+\end{document}
