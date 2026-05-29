@@ -122,9 +122,9 @@ class MoFMixingModule(nn.Module):
         T: Number of denoising timesteps.
         S: Number of prompt sets.
         temperature: Softmax temperature (lower = sharper selection).
-        init_mode: One of 'zeros', 'random', 'teacher_biased'.
+        init_mode: One of 'zeros', 'random', 'teacher_biased', 'hard'.
         init_bias: Bias strength for 'teacher_biased' init.
-        teacher_set_mapping: Dict mapping set_id → teacher_index for biased init.
+        teacher_set_mapping: Dict mapping set_id → teacher_index for biased / hard init.
     """
 
     def __init__(
@@ -157,6 +157,13 @@ class MoFMixingModule(nn.Module):
                 if teacher_set_mapping:
                     for s_id, k_idx in teacher_set_mapping.items():
                         data[k_idx, :, s_id] = init_bias
+            elif init_mode == "hard":
+                raise ValueError(
+                    "logits_init='hard' produces exact one-hot weights, which "
+                    "cannot be represented by softmax with finite logits. "
+                    "Set normalize_weights=false (logits used directly as "
+                    "weights) when using 'hard' init."
+                )
             else:
                 raise ValueError(f"Invalid logits_init: {init_mode!r}")
         else:
@@ -184,6 +191,21 @@ class MoFMixingModule(nn.Module):
                         logit_s[k_idx] = init_bias
                         w_s = F.softmax(logit_s / temperature, dim=0)
                         data[:, :, s_id] = w_s.unsqueeze(1).expand(K, T)
+            elif init_mode == "hard":
+                # Exact one-hot per source: in-domain teacher gets weight 1.0,
+                # all off-domain teachers get 0.0. Requires teacher_set_mapping
+                # to define the source→teacher diagonal. Caller MUST also set
+                # adam_weight_decay=0 to prevent L2 regularization from pulling
+                # the initial 1.0 weights toward 0.
+                if not teacher_set_mapping:
+                    raise ValueError(
+                        "logits_init='hard' requires teacher_route_by_source=true "
+                        "with each source having an in-domain teacher (non-empty "
+                        "teacher_set_mapping)."
+                    )
+                data = torch.zeros(K, T, S)
+                for s_id, k_idx in teacher_set_mapping.items():
+                    data[k_idx, :, s_id] = 1.0
             else:
                 raise ValueError(f"Invalid logits_init: {init_mode!r}")
 

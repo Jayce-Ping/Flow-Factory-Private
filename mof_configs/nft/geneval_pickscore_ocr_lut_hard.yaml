@@ -1,0 +1,217 @@
+# MoF (Mixture-of-Flow) — LUT with HARD (one-hot) initialization.
+#
+# GenEval + PickScore + OCR teachers, source-aware K×T×S routing.
+# Initial weights start at exact (1, 0, 0); (0, 1, 0); (0, 0, 1) per source —
+# each prompt set is hard-routed to its in-domain teacher at t=0 of training.
+#
+# Difference from `geneval_pickscore_ocr_lut.yaml` (base):
+#   - logits_init: "hard"        (was "uniform" with effective ~1/3 each, or
+#                                 "teacher_biased" + bias=2 → softmax≈(0.78,0.11,0.11))
+#   - normalize_weights: false   (was true; required because softmax cannot
+#                                 produce exact one-hot with finite logits)
+#   - adam_weight_decay: 0.0     (was 1.0e-4; required to preserve the hard
+#                                 init — L2 would pull initial 1.0 toward 0)
+#
+# Trade-off: in unnormalized mode, weights can drift to negative/>1 values
+# and the K weights are not constrained to sum to 1. This is acceptable for
+# initial-condition experiments (e.g. ablating the warm-start effect of
+# soft-biased init) but should be evaluated carefully for production use.
+#
+# Learnable params: K=3 × T=28 × S=3 = 252 weights (treated directly).
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (3 prompt sets)
+data:
+  dataset_dir: "dataset/ocr"
+  dataset_dirs:
+    - "dataset/geneval"                     # source "geneval" → set 0
+    - "dataset/pickscore"                   # source "pickscore" → set 1
+    - "dataset/ocr"                         # source "ocr" → set 2
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_lut_hard"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: false
+
+# Training Configuration
+train:
+  trainer_type: 'mof-nft'
+
+  # Per-source teacher configuration: 3 teachers × 3 prompt sets.
+  # The diagonal (k=s) is what 'hard' init pins to weight 1.0 at t=0.
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]
+      reward_name: "geneval"
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]
+      reward_name: "pick_score"
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"
+
+  teacher_route_by_source: true             # required: 'hard' init needs S>1 diagonal
+  teacher_param_device: 'cuda'
+
+  # ---- MoF core hyperparameters ----
+  nft_beta: 1.0
+  off_policy: true
+  logits_init: "hard"                       # exact one-hot per source at t=0
+  logits_init_bias: 2.0                     # ignored when init='hard'
+  learning_rate: 0.05                       # same as base lut.yaml; tune if drift is too fast
+  temperature: 1.0                          # ignored when normalize_weights=false
+  normalize_weights: false                  # REQUIRED: logits ARE the weights (softmax can't be exact one-hot)
+
+  # ---- EMA schedule (aligned with NFT default) ----
+  ema_decay_schedule: "piecewise_linear"
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.5
+  ema_update_interval: 1
+  ema_device: "cuda"
+
+  # ---- Per-set reward design ----
+  eval_teachers_at_start: true
+  ood_bonus_gamma: 0.2
+
+  # ---- Advantage computation ----
+  advantage_aggregation: "gdpo"
+  adv_clip_range: [-5.0, 5.0]
+  global_std: true
+
+  # ---- Timestep control ----
+  time_sampling_strategy: "discrete"
+  timestep_range: 0.9
+  num_inference_steps: 10                   # T=10 (logits shape: 3 × 10 × 3 = 90)
+
+  # ---- Optimization ----
+  per_device_batch_size: 8
+  group_size: 16
+  unique_sample_num_per_epoch: 144
+  # Per-source sampling weights. null → equal 1:1:1 round-robin (default).
+  # Example to mitigate PickScore dominance (see docs/mof/mof_pickscore_dominance_analysis.tex):
+  #   source_ratio: {geneval: 2.0, pickscore: 1.0, ocr: 2.0}
+  # Constraint: num_batches_per_epoch % int(sum(values)) must be 0.
+  source_ratio: null
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 0.0                    # REQUIRED: nonzero would pull initial 1.0 weights toward 0
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 1000
+  seed: 42
+
+  # ---- KL penalty (disabled initially) ----
+  kl_beta: 0.0
+  kl_type: 'v-based'
+
+  # ---- Generation settings ----
+  resolution: 512
+  guidance_scale: 1.0
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+
+# Evaluation rewards
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
