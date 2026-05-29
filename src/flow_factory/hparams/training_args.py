@@ -1020,11 +1020,30 @@ class MoFBaseTrainingArguments(TrainingArguments):
             )
 
         # Validate MoF-specific fields
-        if self.logits_init not in ["uniform", "random", "teacher_biased"]:
+        valid_logits_init = ["uniform", "random", "teacher_biased", "hard"]
+        if self.logits_init not in valid_logits_init:
             raise ValueError(
                 f"Invalid logits_init: {self.logits_init!r}. "
-                f"Valid options are: ['uniform', 'random', 'teacher_biased']."
+                f"Valid options are: {valid_logits_init}."
             )
+        if self.logits_init == "hard":
+            # 'hard' produces exact one-hot per source, which only makes sense
+            # for the source-aware K×T×S LUT and only when raw logits are used
+            # as weights (softmax cannot be exact one-hot with finite logits).
+            if self.normalize_weights:
+                raise ValueError(
+                    "logits_init='hard' produces exact one-hot weights, which "
+                    "cannot be represented by softmax with finite logits. "
+                    "Set normalize_weights=false (logits used directly as "
+                    "weights) when using 'hard' init."
+                )
+            if self.mixing_module_type != "lut":
+                raise ValueError(
+                    f"logits_init='hard' is only supported with "
+                    f"mixing_module_type='lut' (the source-aware K×T×S LUT). "
+                    f"Got mixing_module_type={self.mixing_module_type!r}, "
+                    f"which has no per-source diagonal to one-hot-init."
+                )
         if self.temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {self.temperature}")
         if self.ood_bonus_gamma < 0:
