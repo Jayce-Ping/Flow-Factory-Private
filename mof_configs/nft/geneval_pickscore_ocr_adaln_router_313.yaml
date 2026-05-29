@@ -55,7 +55,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_adaln-router"
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_adaln-router_313"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -119,7 +119,7 @@ train:
   num_inference_steps: 10
 
   # ---- Optimization ----
-  per_device_batch_size: 7
+  per_device_batch_size: 8
   group_size: 16
   unique_sample_num_per_epoch: 112 # 48 + 16 + 48
   # Per-source sampling weights. null → equal 1:1:1 round-robin (default).
