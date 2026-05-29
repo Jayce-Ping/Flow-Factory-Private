@@ -1,0 +1,236 @@
+# MoF (Mixture-of-Flow): 3-teacher Source-Agnostic LUT (LUT-SA) experiment.
+#
+# Simplified LUT variant: drops the per-source S axis from the mixing logits.
+# Logits shape is (K, T) instead of (K, T, S) — every sample uses the same
+# per-timestep teacher mixture regardless of its source.
+#
+# Learnable params: K=3 × T=10 = 30 logits  (vs full LUT's 3×10×3 = 90).
+#
+# Key invariant — mixing source-agnostic, reward / advantage source-aware:
+#   * Mixing weights W_k(t) are shared across all samples (no s_b dependence).
+#   * Per-sample advantage  A_b = a_in(s_b) + γ · mean(a_ood)  is still
+#     computed using the sample's __source__ label and applicable_sources
+#     metadata on each reward. Gradients from all sources flow into the
+#     same shared Λ(:, t), so the optimum is the source-marginalized
+#     teacher mixture (see docs/mof/mof_router_architectures.tex §1B).
+#
+# When to use:
+#   * As an ablation baseline against the full (K, T, S) LUT to quantify
+#     the empirical benefit of per-source mixing.
+#   * When teachers are globally complementary rather than source-specialized
+#     (the optimal mix is similar across sources).
+#   * Parameter-efficient when S is large.
+#
+# When NOT to use:
+#   * Hard-routing scenarios where each source must use exactly one teacher
+#     (use mof_configs/distill/geneval_pickscore_ocr_hard_route_baseline.yaml
+#     instead).
+#   * When per-source optimal mixes diverge significantly (use the full LUT).
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (3 prompt sets, advantage still uses source labels)
+data:
+  dataset_dir: "dataset/ocr"               # Fallback single-source (used by eval/test if no dataset_dirs)
+  dataset_dirs:                             # Multi-source: source labels feed advantage routing
+    - "dataset/geneval"                     # Source "geneval" (composition/counting prompts)
+    - "dataset/pickscore"                   # Source "pickscore" (general aesthetics prompts)
+    - "dataset/ocr"                         # Source "ocr" (text rendering prompts)
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32                             # LoRA rank (must match teacher checkpoints)
+  lora_alpha: 64                            # LoRA alpha scaling
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null                         # Set to checkpoint path to resume training
+  resume_type: null
+
+log:
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_lut-simple"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20                             # Save checkpoint every N epochs
+  save_model_only: false                    # Save full MoF state (logits + EMA + reward stats)
+
+# Training Configuration
+train:
+  trainer_type: 'mof-nft'                    # Mixture-of-Flow trainer (NFT optimization)
+
+  # ---- Teachers (same as full LUT — sources/reward_name only used for advantage routing) ----
+  # In LUT-SA mode the teacher's `sources` field is consumed ONLY by:
+  #   1. _source_to_set_id / _set_id_to_source mapping (for advantage)
+  #   2. _source_to_reward_name (for in-domain reward selection)
+  # The mixing weights themselves are NOT routed by source.
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]
+      reward_name: "geneval"
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]
+      reward_name: "pick_score"
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"
+
+  teacher_route_by_source: false            # Moot for lut_simple (no S axis anyway); kept false for clarity
+  teacher_param_device: 'cuda'              # GPU storage for fast weight swapping (~1-2ms per teacher)
+
+  # ---- Mixing module: Source-Agnostic LUT ----
+  mixing_module_type: "lut_simple"          # NEW: K×T logits, broadcast over S at forward time
+  temperature: 1.0                          # Softmax temperature
+  normalize_weights: true                   # softmax(Λ/τ) over K-axis
+
+  # ---- MoF core hyperparameters ----
+  nft_beta: 1.0                             # NFT loss interpolation (1.0 = full DiffusionNFT)
+  off_policy: true                          # Sample with EMA logits, train with current
+  logits_init: "uniform"                    # Start from 1/K — let RL signal break symmetry
+  logits_init_bias: 2.0                     # Only used when logits_init='teacher_biased'; in LUT-SA the
+                                            # per-source bias is merged across sources (see SA-LUT init logic).
+  learning_rate: 0.05                       # Same as full LUT — only 30 params, fast convergence
+
+  # ---- EMA schedule (aligned with NFT default) ----
+  ema_decay_schedule: "piecewise_linear"
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.5
+  ema_update_interval: 1
+  ema_device: "cuda"
+
+  # ---- Per-set reward design (UNCHANGED — still source-aware) ----
+  # advantage(b) = a_R_in(s_b)(x_b) + γ · mean_{j ≠ R_in(s_b)} a_j(x_b)
+  # The source-aware advantage routes gradients into the source-agnostic Λ.
+  eval_teachers_at_start: true              # Evaluate each teacher baseline at epoch 0
+  ood_bonus_gamma: 0.2                      # OOD bonus coefficient (0=pure in-domain, 0.2=recommended)
+
+  # ---- Advantage computation ----
+  advantage_aggregation: "gdpo"             # GDPO: per-group centered, globally std-normalized
+  adv_clip_range: [-5.0, 5.0]               # Clip extreme advantages to prevent logit jumps
+  global_std: true                          # Use global std across all samples for normalization
+
+  # ---- Timestep control ----
+  time_sampling_strategy: "discrete"        # Match scheduler's discrete grid (1:1 logits column mapping)
+  timestep_range: 0.9                       # Cover 90% of denoising trajectory
+  num_inference_steps: 10                   # T=10 denoising steps (logits shape: 3 × 10 = 30)
+
+  # ---- Optimization ----
+  per_device_batch_size: 8                  # Micro-batch per GPU (small due to K teacher forwards per step)
+  group_size: 16                            # Samples per prompt for within-group advantage
+  unique_sample_num_per_epoch: 112 # 48 + 16 + 48
+  # Per-source sampling weights. null → equal 1:1:1 round-robin (default).
+  # Example to mitigate PickScore dominance (see docs/mof/mof_pickscore_dominance_analysis.tex):
+  #   source_ratio: {geneval: 3.0, pickscore: 1.0, ocr: 3.0}
+  # Constraint: num_batches_per_epoch % int(sum(values)) must be 0.
+  source_ratio: {geneval: 3.0, pickscore: 1.0, ocr: 3.0}
+  num_inner_epochs: 1                       # Single pass over samples per epoch
+  gradient_step_per_epoch: 1                # Gradient steps per epoch (aligned with NFT)
+  gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts (NFT pattern)
+  max_grad_norm: 1.0                        # Gradient clipping on (K, T) logits tensor
+  adam_weight_decay: 1.0e-4                 # Weight decay (effective only under normalize_weights=false)
+  adam_epsilon: 1.0e-8                      # Adam epsilon for numerical stability
+  ddp_find_unused_parameters: false         # MoF only trains logits; no conditional branches need tracking
+  max_epochs: 1000
+  seed: 42
+
+  # ---- KL penalty (disabled initially) ----
+  kl_beta: 0.0                              # Enable (e.g. 0.01) to anchor toward base model if needed
+  kl_type: 'v-based'                        # MSE between combined velocity and base model velocity
+
+  # ---- Generation settings ----
+  resolution: 512                           # Training image resolution
+  guidance_scale: 1.0                       # NFT requires no CFG (guidance_scale=1.0)
+  enable_gradient_checkpointing: false      # Not needed (only 30 params trained)
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"                      # NFT requires ODE dynamics (no SDE noise)
+  noise_level: 0.0                          # Pure ODE: sigma=0
+  seed: 42
+
+# Evaluation settings
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0                       # NFT: no CFG during eval
+  num_inference_steps: 40                   # Higher T for clean eval samples
+  eval_freq: 10                             # Eval every 10 epochs
+  seed: 42
+  test_sets:
+    - name: geneval                         # GenEval: composition accuracy
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore                       # PickScore: aesthetics
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: ocr                             # OCR: text accuracy
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards — each reward specifies which sources it applies to.
+# Samples from non-applicable sources get NaN (skipped in per-reward z-score).
+# This is what enables source-aware advantage even with source-agnostic mixing.
+rewards:
+  - name: "geneval"                         # GenEval accuracy: counting, spatial, color attributes
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32                          # GenEval needs float32 for accuracy
+    async_reward: false
+    applicable_sources: [geneval]           # In-domain for source 'geneval'
+  - name: "pick_score"                      # PickScore: learned aesthetic preference model
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]  # Universal: contributes to OOD term for non-pickscore sources
+  - name: "ocr"                             # OCR: text rendering accuracy via OCR model
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]               # In-domain for source 'ocr'
+
+# Evaluation rewards (used during eval only)
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
