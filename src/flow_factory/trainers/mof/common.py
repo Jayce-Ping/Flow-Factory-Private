@@ -1363,12 +1363,23 @@ class MoFTrainerBase(BaseTrainer):
             yield
 
     @contextmanager
-    def _mof_inference_context(self, set_id: int = 0):
+    def _mof_inference_context(self, set_id: int = 0, num_inference_steps: Optional[int] = None):
         """Patch adapter.forward to return lambda-combined teacher velocity.
 
         Args:
             set_id: Which prompt set's weights to use for this inference pass.
                     Only used in LUT mode; router mode ignores this (uses prompt_embeds).
+            num_inference_steps: Effective number of denoising steps for this
+                    inference pass. When this differs from ``num_train_timesteps``
+                    in LUT modes, the (K, T_train) weights for ``set_id`` are
+                    linearly resampled along T to (K, T_effective) so each
+                    inference step uses the correct interpolated mixture
+                    (instead of the legacy step-index-clamped lookup which
+                    collapses all steps beyond T_train to the last column).
+                    None defaults to ``num_train_timesteps`` (no resampling) —
+                    correct for training rollouts where train and inference T
+                    coincide. Router modes ignore this since they accept
+                    continuous t directly.
 
         During sampling (rollout), replaces adapter.forward so each denoising
         step:
@@ -1380,16 +1391,33 @@ class MoFTrainerBase(BaseTrainer):
         original_forward = self.adapter.forward
         step_counter = [0]
         is_router = self._is_router_mode
+        effective_T = (
+            num_inference_steps
+            if num_inference_steps is not None
+            else self.num_train_timesteps
+        )
 
         # Precompute weights for LUT mode (detached since sampling under no_grad)
         set_weights = None
         if not is_router:
             with torch.no_grad():
-                weights = self._get_lambda_weights(self._lambda_logits)  # (K, T, S)
-                set_weights = weights[:, :, set_id]  # (K, T)
+                weights = self._get_lambda_weights(self._lambda_logits)  # (K, T_train, S)
+                set_weights = weights[:, :, set_id]  # (K, T_train)
+                if effective_T != self.num_train_timesteps:
+                    # Linearly resample along T so eval-time inference at a
+                    # finer (or coarser) grid uses physically-aligned weights
+                    # rather than colliding all extra steps into the last LUT
+                    # column. align_corners=True pins the trajectory endpoints
+                    # (step 0 ↔ step 0, step T-1 ↔ step T-1).
+                    set_weights = F.interpolate(
+                        set_weights.unsqueeze(0),  # (1, K, T_train)
+                        size=effective_T,
+                        mode="linear",
+                        align_corners=True,
+                    ).squeeze(0)  # (K, T_effective)
 
         def patched_forward(**kwargs):
-            t_idx = min(step_counter[0], self.num_train_timesteps - 1)
+            t_idx = min(step_counter[0], effective_T - 1)
             step_counter[0] += 1
 
             # Get noise_pred from each teacher
@@ -1696,7 +1724,9 @@ class MoFTrainerBase(BaseTrainer):
                 batch = next(data_iter)
                 set_id = self._get_batch_set_id(batch)
 
-                with self._mof_inference_context(set_id):
+                with self._mof_inference_context(
+                    set_id, num_inference_steps=self.training_args.num_inference_steps
+                ):
                     sample_kwargs = self._build_sample_kwargs(batch)
                     sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                     sample_batch = self.adapter.inference(**sample_kwargs)
@@ -1940,7 +1970,9 @@ class MoFTrainerBase(BaseTrainer):
         log_pfx = self._eval_log_prefix(test_set_name)
         eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
 
-        with torch.no_grad(), self.autocast(), self._mof_inference_context(set_id):
+        with torch.no_grad(), self.autocast(), self._mof_inference_context(
+            set_id, num_inference_steps=merged_eval.num_inference_steps
+        ):
             all_samples = self._run_eval_inference_batches(test_set_name, merged_eval, eval_seed)
             gathered_rewards = self._gather_eval_rewards()
             gathered_tags = self._gather_eval_tags(all_samples)
