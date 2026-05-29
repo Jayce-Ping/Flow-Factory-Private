@@ -798,7 +798,7 @@ class MoFBaseTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Use EMA of logits for sampling (off-policy)."},
     )
-    logits_init: Literal["uniform", "random", "teacher_biased"] = field(
+    logits_init: Literal["uniform", "random", "teacher_biased", "hard"] = field(
         default="teacher_biased",
         metadata={
             "help": (
@@ -806,7 +806,12 @@ class MoFBaseTrainingArguments(TrainingArguments):
                 "'uniform': equal weight 1/K per teacher. "
                 "'random': small Gaussian noise around uniform (std=0.01). "
                 "'teacher_biased': each set biased toward its in-domain teacher "
-                "with strength logits_init_bias."
+                "with strength logits_init_bias (soft, gradient-friendly). "
+                "'hard': exact one-hot per source — in-domain teacher gets weight "
+                "1.0, off-domain 0.0. Requires normalize_weights=false (softmax "
+                "cannot produce exact one-hot) and teacher_route_by_source=true. "
+                "Set adam_weight_decay=0 to preserve the hard init from L2 "
+                "regularization pulling weights toward 0."
             )
         },
     )
