@@ -1,0 +1,229 @@
+# OPD pathwise distillation — our 3 custom teachers (geneval, pickscore, ocr).
+#
+# Distills three per-source teacher LoRAs into one student LoRA via the
+# existing OPD trainer with pure pathwise MSE (mirrors DiffusionOPD Algorithm 1):
+#   - dynamics_type: ODE (deterministic Euler rollout, σ_t=1 → plain MSE)
+#   - teacher_route_by_source: true (each teacher only sees its source's samples)
+#   - data.dataset_dirs: multi-source (geneval, pickscore, ocr)
+#   - reinforce_coef: 0 (pure pathwise; ODE has no log_prob)
+#
+# Differences from opd_configs/reproduce_diffusion_opd/via_opd_route_by_source.yaml:
+#   1. teachers swapped to our DPPO-trained per-source checkpoints (same as
+#      mof_configs/nft/geneval_pickscore_ocr_lut.yaml).
+#   2. train.guidance_scale: 1.0 — our teachers are no-CFG, so the student
+#      sampling path during distillation is also no-CFG (matched distribution).
+#   3. eval.test_sets lists each dataset twice with different guidance_scale
+#      (1.0 and 4.0) so we can compare deployment behavior at both CFGs.
+#      no_cfg test_sets: 512×512, per_device_batch_size=16 (defaults).
+#      cfg=4.0 test_sets override resolution → 1024×1024 and
+#      per_device_batch_size → 4 (CFG inference at 1024 is more memory-heavy).
+#
+# Note on data preprocessing: even though training is no-CFG, the loader
+# now widens the preprocessing CFG to max(train_cfg, max_eval_cfg) so that
+# negative_prompt_embeds are cached at preprocess time. This is required
+# for the cfg=4.0 eval test_sets to actually use CFG (otherwise the
+# adapter would silently fall back to no-CFG with a warning). Triggers a
+# one-time re-preprocessing of the train datasets on first run.
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (each dir becomes a __source__ tag)
+data:
+  dataset_dir: "dataset/ocr"   # Fallback for eval/test
+  dataset_dirs:
+    - "dataset/geneval"        # __source__ = "geneval"
+    - "dataset/pickscore"      # __source__ = "pickscore"
+    - "dataset/ocr"            # __source__ = "ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "ours_opd_3teacher_pathwise"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+# Training Configuration
+train:
+  trainer_type: 'opd'
+
+  # Per-source teacher routing (DiffusionOPD Algorithm 1 equivalent).
+  # Same checkpoints as mof_configs/nft/geneval_pickscore_ocr_lut.yaml.
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]
+      reward_name: "geneval"
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]
+      reward_name: "pick_score"
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"
+
+  teacher_route_by_source: true    # Strict per-source routing (Algorithm 1)
+  teacher_param_device: 'cuda'
+  teacher_aggregation: 'sum'       # Sum per-teacher losses → single backward
+
+  # Pure pathwise MSE (no REINFORCE — ODE has no log_prob)
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  normalize_d_k: false             # ODE: σ²=1 → plain MSE
+  reinforce_future_reduction: "sum"
+  reinforce_group_center: false
+
+  kl_beta: 0.0
+  kl_type: 'x-based'
+
+  # ODE rollout — no CFG during training (our teachers are no-CFG)
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 1.0
+
+  per_device_batch_size: 8
+  group_size: 1
+  unique_sample_num_per_epoch: 576   # 24 samples/source/GPU × 3 sources × 8 GPUs
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  num_inner_epochs: 1
+
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  max_epochs: 200
+  seed: 42
+
+# Scheduler — ODE (deterministic, no stochastic SDE steps)
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# Evaluation — each dataset evaluated TWICE: with cfg=1.0 (matches training
+# distribution) and cfg=4.0 (deployment-style CFG). Per-set guidance_scale
+# overrides eval.guidance_scale. Metrics land at eval/{name}/reward_*.
+eval:
+  resolution: 512
+  per_device_batch_size: 16    # default for no_cfg @ 512×512; cfg4 overrides to 4 @ 1024×1024
+  guidance_scale: 1.0          # global default; per-set overrides below
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval_no_cfg
+      dataset_dir: dataset/geneval
+      split: test
+      guidance_scale: 1.0
+      eval_reward_names: [geneval, pick_score]
+    - name: geneval_cfg4
+      dataset_dir: dataset/geneval
+      split: test
+      guidance_scale: 4.0
+      resolution: 1024
+      per_device_batch_size: 4
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore_no_cfg
+      dataset_dir: dataset/pickscore
+      split: test
+      guidance_scale: 1.0
+      eval_reward_names: [pick_score]
+    - name: pickscore_cfg4
+      dataset_dir: dataset/pickscore
+      split: test
+      guidance_scale: 4.0
+      resolution: 1024
+      per_device_batch_size: 4
+      eval_reward_names: [pick_score]
+    - name: ocr_no_cfg
+      dataset_dir: dataset/ocr
+      split: test
+      guidance_scale: 1.0
+      eval_reward_names: [ocr, pick_score]
+    - name: ocr_cfg4
+      dataset_dir: dataset/ocr
+      split: test
+      guidance_scale: 4.0
+      resolution: 1024
+      per_device_batch_size: 4
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards — per-source (only used by reward-based losses; OPD
+# pathwise does not consume them but the trainer still requires the list
+# to validate teacher reward_name matches a defined reward).
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [pickscore]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+
+# Eval rewards — per-test-set selection via eval_reward_names above.
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
