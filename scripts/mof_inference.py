@@ -432,7 +432,7 @@ def mof_denoise(
         if use_router:
             assert router is not None
             B = latents.shape[0]
-            t_batch = t.float().expand(B).to(device)
+            t_batch = t.to(dtype=dtype, device=device).expand(B)
             w = router(t_batch, prompt_embeds, pooled_prompt_embeds)  # (K, B)
             w = w[:, 0]  # (K,) — single-sample batch
         else:
