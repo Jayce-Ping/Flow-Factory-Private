@@ -2,11 +2,14 @@
 """MoF (Mixture-of-Flow) inference script.
 
 Given teacher LoRA paths and a MoF checkpoint, perform mixed inference using
-the learned per-timestep lambda weights. Supports CFG guidance scale and
-comparison visualization.
+the learned mixing weights. Supports both LUT (lookup table) and neural
+network router checkpoints, CFG guidance scale, and comparison visualization.
+
+The checkpoint type (LUT vs router) is auto-detected from the saved
+``mixing_module_type`` field and the presence of ``mixing_module_state_dict``.
 
 Usage:
-    # Basic: single prompt
+    # Basic: single prompt (works for both LUT and router checkpoints)
     python scripts/mof_inference.py \
         --mof-checkpoint saves/checkpoint-100/ \
         --teachers jieliu/SD3.5M-FlowGRPO-GenEval jieliu/SD3.5M-FlowGRPO-PickScore \
@@ -31,7 +34,7 @@ Usage:
         --set-id 2 \
         --num-steps 28 --cfg-scale 5.0
 
-    # Use EMA weights instead of current logits
+    # Use EMA weights instead of current weights
     python scripts/mof_inference.py \
         --mof-checkpoint saves/checkpoint-100/ \
         --teachers ... \
@@ -42,56 +45,56 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from PIL import Image, ImageDraw, ImageFont
 
 
-def load_mof_weights(
-    checkpoint_path: str,
-    set_id: int = 0,
-    temperature: float = 1.0,
-    use_ema: bool = False,
-    teacher_names: Optional[List[str]] = None,
-    strict_teacher_order: bool = True,
-) -> torch.Tensor:
-    """Load and compute lambda weights from MoF checkpoint.
+_LUT_MODULE_TYPES = ("lut", "lut_simple")
 
-    Args:
-        teacher_names: Display names for each teacher (k=0,1,...).
-            Must match the order of --teachers (i.e., training order).
-            If None, reads from checkpoint's 'teacher_names' field.
-        strict_teacher_order: If True (default), raise on any mismatch between
-            user-supplied --teacher-names and the checkpoint's teacher_names.
-            Set to False to allow renaming teachers at inference time at the
-            user's own risk.
 
-    Returns:
-        weights: Tensor of shape (K, T) for the specified set.
-    """
+@dataclass
+class MoFCheckpointInfo:
+    """Loaded MoF checkpoint — either LUT weights or a neural router module."""
+    is_router: bool
+    lut_weights: Optional[torch.Tensor]
+    router: Optional[nn.Module]
+    K: int
+    teacher_names: Optional[List[str]]
+    mixing_module_type: str
+
+
+def _load_mof_state(checkpoint_path: str) -> dict:
+    """Load raw MoF state dict from a checkpoint path (dir or file)."""
     path = Path(checkpoint_path)
     if path.is_dir():
         candidates = [path / "mof_state.pt", path / "motv_state.pt"]
         for c in candidates:
             if c.exists():
-                state = torch.load(c, map_location="cpu", weights_only=False)
-                break
-        else:
-            raise FileNotFoundError(
-                f"No mof_state.pt found in {path}. Contents: {list(path.iterdir())}"
-            )
-    else:
-        state = torch.load(path, map_location="cpu", weights_only=False)
+                return torch.load(c, map_location="cpu", weights_only=False)
+        raise FileNotFoundError(
+            f"No mof_state.pt found in {path}. Contents: {list(path.iterdir())}"
+        )
+    return torch.load(path, map_location="cpu", weights_only=False)
 
-    # Resolve teacher names: user-provided vs checkpoint-stored
+
+def _validate_teacher_names(
+    teacher_names: Optional[List[str]],
+    state: dict,
+    strict_teacher_order: bool,
+) -> Optional[List[str]]:
+    """Validate and resolve teacher names against checkpoint's stored names."""
     ckpt_teacher_names = state.get("teacher_names", None)
     if not teacher_names:
-        teacher_names = ckpt_teacher_names
-    elif ckpt_teacher_names and list(teacher_names) != list(ckpt_teacher_names):
+        return ckpt_teacher_names
+
+    if ckpt_teacher_names and list(teacher_names) != list(ckpt_teacher_names):
         msg = (
             f"--teacher-names {list(teacher_names)} does not match the "
             f"checkpoint's teacher_names {list(ckpt_teacher_names)}. The K "
@@ -105,51 +108,217 @@ def load_mof_weights(
                 "training order, or pass --no-strict-teacher-order to "
                 "override (for renaming/debugging only)."
             )
-        else:
-            print(f"  WARNING: {msg} Continuing because "
-                  f"--no-strict-teacher-order was set.")
+        print(f"  WARNING: {msg} Continuing because "
+              f"--no-strict-teacher-order was set.")
 
-    # Get logits
+    return teacher_names
+
+
+def _load_lut_checkpoint(
+    state: dict,
+    teacher_names: Optional[List[str]],
+    set_id: int,
+    temperature: float,
+    use_ema: bool,
+) -> MoFCheckpointInfo:
+    """Load LUT checkpoint and compute (K, T) weights for a given set_id."""
     if use_ema and "logits_ema" in state:
         ema_state = state["logits_ema"]
         if "ema_parameters" in ema_state and len(ema_state["ema_parameters"]) > 0:
             logits = ema_state["ema_parameters"][0]
-            print(f"  Using EMA logits (epoch {state.get('epoch', '?')})")
+            print(f"  Using EMA logits")
         else:
             logits = state["lambda_logits"]
             print(f"  Warning: EMA requested but no EMA params found, using current logits")
     else:
         logits = state["lambda_logits"]
 
+    if logits is None:
+        raise ValueError(
+            "Checkpoint has lambda_logits=None — this is a router-mode "
+            f"checkpoint (mixing_module_type={state.get('mixing_module_type')!r}) "
+            "but was incorrectly dispatched to the LUT loader."
+        )
+
+    # lut_simple saves (K, T); broadcast to (K, T, 1) for uniform handling
+    if logits.ndim == 2:
+        logits = logits.unsqueeze(-1)
+
     K, T, S = logits.shape
-    print(f"  MoF checkpoint: K={K} teachers, T={T} timesteps, S={S} sets")
-    print(f"  Epoch: {state.get('epoch', '?')}, Step: {state.get('step', '?')}")
+    print(f"  LUT checkpoint: K={K} teachers, T={T} timesteps, S={S} sets")
 
     source_map = state.get("source_to_set_id", {})
     if source_map:
         set_to_source = {v: k for k, v in source_map.items()}
-        print(f"  Source→set_id map (S dimension): {source_map}")
+        print(f"  Source->set_id map (S dimension): {source_map}")
         if set_id in set_to_source:
-            print(f"  Using set_id={set_id} → weights optimized for '{set_to_source[set_id]}' prompts")
-    print(f"  NOTE: K dimension (teacher axis) follows --teachers order, NOT source_map order")
+            print(f"  Using set_id={set_id} -> weights optimized for "
+                  f"'{set_to_source[set_id]}' prompts")
+    print(f"  NOTE: K dimension (teacher axis) follows --teachers order, "
+          f"NOT source_map order")
 
     if set_id >= S:
         raise ValueError(f"set_id={set_id} out of range (S={S})")
 
-    # Compute softmax weights
-    weights = F.softmax(logits / temperature, dim=0)  # (K, T, S)
-    set_weights = weights[:, :, set_id]  # (K, T)
+    weights = F.softmax(logits / temperature, dim=0)
+    set_weights = weights[:, :, set_id]
 
-    # Print weight summary (k indexes teacher in training order)
     for k in range(K):
-        if teacher_names and k < len(teacher_names):
-            name = teacher_names[k]
-        else:
-            name = f"teacher_{k}"
+        name = (teacher_names[k]
+                if teacher_names and k < len(teacher_names)
+                else f"teacher_{k}")
         w = set_weights[k]
-        print(f"    [k={k}] {name}: mean={w.mean():.4f}, min={w.min():.4f}, max={w.max():.4f}")
+        print(f"    [k={k}] {name}: mean={w.mean():.4f}, "
+              f"min={w.min():.4f}, max={w.max():.4f}")
 
-    return set_weights
+    return MoFCheckpointInfo(
+        is_router=False,
+        lut_weights=set_weights,
+        router=None,
+        K=K,
+        teacher_names=teacher_names,
+        mixing_module_type=state.get("mixing_module_type", "lut"),
+    )
+
+
+def _load_router_checkpoint(
+    state: dict,
+    mixing_module_type: str,
+    teacher_names: Optional[List[str]],
+    use_ema: bool,
+    device: str,
+    dtype: torch.dtype,
+) -> MoFCheckpointInfo:
+    """Reconstruct and load a neural router from checkpoint state."""
+    from flow_factory.trainers.mof.common import create_mixing_module
+
+    if "mixing_module_state_dict" not in state:
+        raise ValueError(
+            f"Router checkpoint (mixing_module_type={mixing_module_type!r}) "
+            f"missing 'mixing_module_state_dict'. Available keys: "
+            f"{list(state.keys())}"
+        )
+
+    router_arch = state.get("router_arch")
+    if router_arch is None:
+        raise ValueError(
+            "Router checkpoint missing 'router_arch' metadata. "
+            "Cannot reconstruct router architecture. This may be a "
+            "legacy checkpoint; re-save from training to include arch info."
+        )
+
+    K = router_arch["K"]
+    d_hidden = router_arch["d_hidden"]
+    d_time = router_arch["d_time"]
+    tau = router_arch["tau"]
+    d_pool = router_arch.get("d_pool")
+    d_seq = router_arch.get("d_seq")
+
+    print(f"  Router checkpoint: type={mixing_module_type}, K={K}")
+    print(f"    d_hidden={d_hidden}, d_time={d_time}, tau={tau}")
+    if d_pool is not None:
+        print(f"    d_pool={d_pool}, d_seq={d_seq}")
+
+    router = create_mixing_module(
+        module_type=mixing_module_type,
+        K=K,
+        d_pool=d_pool if d_pool is not None else 4096,
+        d_hidden=d_hidden,
+        d_time=d_time,
+        temperature=tau,
+        d_seq=d_seq,
+    )
+
+    if use_ema and "logits_ema" in state:
+        ema_state = state["logits_ema"]
+        ema_params = ema_state.get("ema_parameters", [])
+        router_params = list(router.parameters())
+        if len(ema_params) == len(router_params):
+            for p, ema_p in zip(router_params, ema_params):
+                p.data.copy_(ema_p)
+            print(f"  Applied EMA parameters to router "
+                  f"({len(ema_params)} tensors)")
+        else:
+            print(
+                f"  Warning: EMA param count ({len(ema_params)}) != router "
+                f"param count ({len(router_params)}), loading regular "
+                f"state_dict instead"
+            )
+            router.load_state_dict(state["mixing_module_state_dict"])
+    else:
+        router.load_state_dict(state["mixing_module_state_dict"])
+        print(f"  Loaded router state_dict")
+
+    router = router.to(device=device, dtype=dtype)
+    router.eval()
+
+    param_count = sum(p.numel() for p in router.parameters())
+    print(f"  Router parameters: {param_count:,}")
+
+    if teacher_names:
+        for k in range(K):
+            name = (teacher_names[k]
+                    if k < len(teacher_names)
+                    else f"teacher_{k}")
+            print(f"    [k={k}] {name}")
+
+    return MoFCheckpointInfo(
+        is_router=True,
+        lut_weights=None,
+        router=router,
+        K=K,
+        teacher_names=teacher_names,
+        mixing_module_type=mixing_module_type,
+    )
+
+
+def load_mof_checkpoint(
+    checkpoint_path: str,
+    set_id: int = 0,
+    temperature: float = 1.0,
+    use_ema: bool = False,
+    teacher_names: Optional[List[str]] = None,
+    strict_teacher_order: bool = True,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> MoFCheckpointInfo:
+    """Load MoF checkpoint, auto-detecting LUT vs neural router.
+
+    For LUT checkpoints: returns pre-computed (K, T) weights for the given
+    set_id.  For router checkpoints: reconstructs the nn.Module, loads
+    state_dict, and optionally applies EMA parameters.
+
+    Args:
+        checkpoint_path: Path to checkpoint directory or mof_state.pt file.
+        set_id: Which prompt set's weights to use (LUT mode only).
+        temperature: Softmax temperature (LUT mode only; router uses saved tau).
+        use_ema: Use EMA parameters instead of current parameters.
+        teacher_names: Display names for each teacher (k=0,1,...).
+        strict_teacher_order: Raise on teacher name mismatch if True.
+        device: Target device for the router module (router mode only).
+        dtype: Target dtype for the router module (router mode only).
+
+    Returns:
+        MoFCheckpointInfo with either lut_weights or router populated.
+    """
+    state = _load_mof_state(checkpoint_path)
+    teacher_names = _validate_teacher_names(
+        teacher_names, state, strict_teacher_order,
+    )
+
+    mixing_module_type = state.get("mixing_module_type", "lut")
+    is_router = mixing_module_type not in _LUT_MODULE_TYPES
+
+    print(f"  Epoch: {state.get('epoch', '?')}, Step: {state.get('step', '?')}")
+    print(f"  Mixing module type: {mixing_module_type}")
+
+    if is_router:
+        return _load_router_checkpoint(
+            state, mixing_module_type, teacher_names, use_ema, device, dtype,
+        )
+    return _load_lut_checkpoint(
+        state, teacher_names, set_id, temperature, use_ema,
+    )
 
 
 def build_pipeline(
@@ -200,7 +369,6 @@ def load_teacher_loras(
 def mof_denoise(
     pipe,
     teacher_adapter_names: List[str],
-    mof_weights: torch.Tensor,  # (K, T)
     prompt_embeds: torch.Tensor,
     pooled_prompt_embeds: torch.Tensor,
     latents: torch.Tensor,
@@ -210,43 +378,79 @@ def mof_denoise(
     negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    mof_weights: Optional[torch.Tensor] = None,
+    router: Optional[nn.Module] = None,
 ) -> torch.Tensor:
     """Run the MoF denoising loop: combine teacher velocities per timestep.
+
+    Supports two weight modes (exactly one must be provided):
+
+    - **LUT** (``mof_weights``): Pre-computed ``(K, T)`` weights indexed by
+      denoising step.
+    - **Router** (``router``): ``nn.Module`` called per-step with
+      ``(t, prompt_embeds, pooled_prompt_embeds)`` to produce dynamic
+      ``(K, B)`` weights.
 
     Args:
         pipe: SD3.5 pipeline with teacher LoRAs loaded.
         teacher_adapter_names: List of adapter names (length K).
-        mof_weights: (K, T) learned lambda weights for the chosen set.
-        prompt_embeds: Text encoder outputs.
-        pooled_prompt_embeds: Pooled text encoder outputs.
+        prompt_embeds: Text encoder outputs (positive only).
+        pooled_prompt_embeds: Pooled text encoder outputs (positive only).
         latents: Initial noise latents.
         num_inference_steps: Number of denoising steps.
         guidance_scale: CFG scale. 1.0 = no guidance.
         negative_prompt_embeds: Negative text embeddings (for CFG).
-        negative_pooled_prompt_embeds: Negative pooled text embeddings (for CFG).
+        negative_pooled_prompt_embeds: Negative pooled text embeddings.
+        device: Inference device.
+        dtype: Inference dtype.
+        mof_weights: ``(K, T)`` LUT weights. Mutually exclusive with router.
+        router: Neural router module. Mutually exclusive with mof_weights.
 
     Returns:
         Denoised latents.
     """
-    K = len(teacher_adapter_names)
-    T_weights = mof_weights.shape[1]
+    if (mof_weights is None) == (router is None):
+        raise ValueError(
+            "Exactly one of mof_weights (LUT) or router (neural) must be "
+            f"provided, got mof_weights={'set' if mof_weights is not None else 'None'}, "
+            f"router={'set' if router is not None else 'None'}"
+        )
 
-    # Setup scheduler
+    K = len(teacher_adapter_names)
+    use_router = router is not None
+    T_weights: int = (
+        mof_weights.shape[1] if mof_weights is not None else 0
+    )
+
     pipe.scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = pipe.scheduler.timesteps
 
     do_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
 
     for i, t in enumerate(tqdm(timesteps, desc="MoF Denoising")):
-        # Map step index to weight index
-        weight_idx = min(int(i * T_weights / num_inference_steps), T_weights - 1)
-        w = mof_weights[:, weight_idx].to(device)  # (K,)
+        # 1. Compute mixing weights for this step
+        if use_router:
+            assert router is not None
+            B = latents.shape[0]
+            t_batch = t.float().expand(B).to(device)
+            w = router(t_batch, prompt_embeds, pooled_prompt_embeds)  # (K, B)
+            w = w[:, 0]  # (K,) — single-sample batch
+        else:
+            assert mof_weights is not None
+            weight_idx = min(
+                int(i * T_weights / num_inference_steps), T_weights - 1,
+            )
+            w = mof_weights[:, weight_idx].to(device)  # (K,)
 
-        # Prepare CFG inputs
+        # 2. Prepare CFG inputs
         if do_cfg:
             latent_model_input = torch.cat([latents, latents], dim=0)
-            prompt_embeds_cfg = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            pooled_cfg = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+            prompt_embeds_cfg = torch.cat(
+                [negative_prompt_embeds, prompt_embeds], dim=0,
+            )
+            pooled_cfg = torch.cat(
+                [negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0,
+            )
             timestep_input = t.expand(latent_model_input.shape[0])
         else:
             latent_model_input = latents
@@ -254,7 +458,7 @@ def mof_denoise(
             pooled_cfg = pooled_prompt_embeds
             timestep_input = t.expand(latent_model_input.shape[0])
 
-        # Get combined velocity from all teachers
+        # 3. Get combined velocity from all teachers
         combined_noise_pred = None
 
         for k, adapter_name in enumerate(teacher_adapter_names):
@@ -270,14 +474,18 @@ def mof_denoise(
 
             if do_cfg:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
 
             if combined_noise_pred is None:
                 combined_noise_pred = w[k] * noise_pred
             else:
                 combined_noise_pred = combined_noise_pred + w[k] * noise_pred
 
-        latents = pipe.scheduler.step(combined_noise_pred, t, latents, return_dict=False)[0]
+        latents = pipe.scheduler.step(
+            combined_noise_pred, t, latents, return_dict=False,
+        )[0]
 
     return latents
 
@@ -517,14 +725,17 @@ def main():
 
     # MoF settings
     parser.add_argument("--set-id", type=int, default=0,
-                        help="Which prompt set's weights to use (default: 0)")
+                        help="Which prompt set's weights to use "
+                             "(LUT mode only, default: 0)")
     parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Softmax temperature for lambda weights")
+                        help="Softmax temperature for lambda weights "
+                             "(LUT mode only; router uses saved tau)")
     parser.add_argument("--use-ema", action="store_true",
-                        help="Use EMA logits instead of current logits")
+                        help="Use EMA weights instead of current weights")
 
     # Model settings
-    parser.add_argument("--model", type=str, default="stabilityai/stable-diffusion-3.5-medium",
+    parser.add_argument("--model", type=str,
+                        default="stabilityai/stable-diffusion-3.5-medium",
                         help="Base model path or HF repo")
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float32", "float16", "bfloat16"],
@@ -547,55 +758,80 @@ def main():
 
     args = parser.parse_args()
 
-    # ─── Setup ───
-    dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    # 0. Setup
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
     dtype = dtype_map[args.dtype]
 
     print("=" * 60)
     print("  MoF Inference" + (" (Comparison Mode)" if args.compare else ""))
     print("=" * 60)
 
-    # ─── Load MoF weights ───
-    print("\n[1/4] Loading MoF weights...")
+    # 1. Load MoF checkpoint (auto-detects LUT vs router)
+    print("\n[1/4] Loading MoF checkpoint...")
 
-    # Teacher display names for weight summary and comparison grid
     if args.teacher_names:
         teacher_display_names = args.teacher_names
     else:
-        teacher_display_names = [f"teacher-{i}" for i in range(len(args.teachers))]
+        teacher_display_names = [
+            f"teacher-{i}" for i in range(len(args.teachers))
+        ]
 
-    mof_weights = load_mof_weights(
+    ckpt = load_mof_checkpoint(
         args.mof_checkpoint,
         set_id=args.set_id,
         temperature=args.temperature,
         use_ema=args.use_ema,
         teacher_names=teacher_display_names,
         strict_teacher_order=not args.no_strict_teacher_order,
+        device=args.device,
+        dtype=dtype,
     )
 
-    K_weights = mof_weights.shape[0]
-    if K_weights != len(args.teachers):
+    if ckpt.is_router:
+        if args.set_id != 0:
+            print(f"  NOTE: --set-id={args.set_id} is ignored for router "
+                  f"checkpoints (routers are source-agnostic)")
+        if args.temperature != 1.0:
+            print(f"  NOTE: --temperature={args.temperature} is ignored for "
+                  f"router checkpoints (tau is baked into the saved "
+                  f"architecture)")
+
+    if ckpt.K != len(args.teachers):
         raise ValueError(
-            f"MoF checkpoint has K={K_weights} teachers but {len(args.teachers)} "
-            f"teacher paths were provided. They must match."
+            f"MoF checkpoint has K={ckpt.K} teachers but "
+            f"{len(args.teachers)} teacher paths were provided. "
+            f"They must match."
         )
 
-    # ─── Build pipeline ───
+    # 2. Build pipeline
     print(f"\n[2/4] Loading base model: {args.model}")
     pipe = build_pipeline(args.model, dtype=dtype, device=args.device)
 
-    # ─── Load teacher LoRAs ───
+    # 3. Load teacher LoRAs
     print(f"\n[3/4] Loading {len(args.teachers)} teacher LoRA(s)...")
-    teacher_adapter_names = load_teacher_loras(pipe, args.teachers, device=args.device)
+    teacher_adapter_names = load_teacher_loras(
+        pipe, args.teachers, device=args.device,
+    )
 
-    # ─── Generate ───
+    # 4. Generate
     print(f"\n[4/4] Generating images...")
     print(f"  CFG scale: {args.cfg_scale}")
     print(f"  Steps: {args.num_steps}")
     print(f"  Resolution: {args.resolution}x{args.resolution}")
     print(f"  Seed: {args.seed}")
+    weight_mode = (
+        f"Router ({ckpt.mixing_module_type})"
+        if ckpt.is_router
+        else "LUT"
+    )
+    print(f"  Weight mode: {weight_mode}")
     if args.compare:
-        print(f"  Mode: Comparison (Base + {len(args.teachers)} teachers + MoF)")
+        print(f"  Mode: Comparison "
+              f"(Base + {len(args.teachers)} teachers + MoF)")
 
     # Gather prompts
     if args.prompt:
@@ -617,14 +853,21 @@ def main():
             for i in range(len(prompts))
         ]
 
+    # Shared kwargs for mof_denoise (either LUT weights or router, not both)
+    mof_denoise_kwargs = dict(
+        mof_weights=ckpt.lut_weights,
+        router=ckpt.router,
+    )
+
     # Generate
     for idx, prompt in enumerate(prompts):
-        print(f"\n  [{idx+1}/{len(prompts)}] \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
+        print(f"\n  [{idx+1}/{len(prompts)}] "
+              f"\"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
 
-        # Use a fresh generator per prompt for reproducibility
-        generator = torch.Generator(device=args.device).manual_seed(args.seed + idx)
+        generator = torch.Generator(device=args.device).manual_seed(
+            args.seed + idx,
+        )
 
-        # Encode prompt
         do_cfg = args.cfg_scale > 1.0
         prompt_embeds, neg_embeds, pooled_embeds, neg_pooled = encode_prompt(
             pipe,
@@ -635,7 +878,6 @@ def main():
             dtype=dtype,
         )
 
-        # Generate initial noise (shared across all modes for fair comparison)
         num_channels = pipe.transformer.config.in_channels
         latent_h = args.resolution // pipe.vae_scale_factor
         latent_w = args.resolution // pipe.vae_scale_factor
@@ -655,7 +897,6 @@ def main():
         )
 
         if args.compare:
-            # ─── Comparison mode ───
             images = []
             labels = []
 
@@ -674,7 +915,11 @@ def main():
 
             # 2. Each teacher individually
             for k, adapter_name in enumerate(teacher_adapter_names):
-                display_name = teacher_display_names[k] if k < len(teacher_display_names) else f"teacher-{k}"
+                display_name = (
+                    teacher_display_names[k]
+                    if k < len(teacher_display_names)
+                    else f"teacher-{k}"
+                )
                 print(f"    Generating: {display_name}...")
                 teacher_latents = single_teacher_denoise(
                     pipe,
@@ -693,32 +938,30 @@ def main():
             mof_latents = mof_denoise(
                 pipe=pipe,
                 teacher_adapter_names=teacher_adapter_names,
-                mof_weights=mof_weights,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_embeds,
                 latents=init_latents.clone(),
                 num_inference_steps=args.num_steps,
                 **cfg_kwargs,
+                **mof_denoise_kwargs,
             )
             images.append(decode_latents(pipe, mof_latents))
             labels.append("MoF")
 
-            # Create grid and save
             grid = create_comparison_grid(images, labels)
             grid.save(output_paths[idx])
             print(f"    Saved comparison grid: {output_paths[idx]}")
 
         else:
-            # ─── Normal mode (MoF only) ───
             latents = mof_denoise(
                 pipe=pipe,
                 teacher_adapter_names=teacher_adapter_names,
-                mof_weights=mof_weights,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_embeds,
                 latents=init_latents.clone(),
                 num_inference_steps=args.num_steps,
                 **cfg_kwargs,
+                **mof_denoise_kwargs,
             )
             image = decode_latents(pipe, latents)
             image.save(output_paths[idx])
