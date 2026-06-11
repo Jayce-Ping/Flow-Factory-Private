@@ -90,12 +90,16 @@ def load_mof_state(path: str) -> dict:
         return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def compute_weights(logits: torch.Tensor, temperature: float = 1.0, normalize: bool = True) -> torch.Tensor:
-    """Compute mixing weights from logits."""
-    if normalize:
+def compute_weights(logits: torch.Tensor, temperature: float = 1.0, mode: str = "softmax") -> torch.Tensor:
+    """Compute mixing weights from logits ('softmax' | 'affine' | 'none')."""
+    if mode == "softmax":
         return F.softmax(logits / temperature, dim=0)
-    else:
+    elif mode == "affine":
+        K = logits.shape[0]
+        return logits - (logits.sum(dim=0, keepdim=True) - 1.0) / K
+    elif mode == "none":
         return logits
+    raise ValueError(f"Invalid weight normalization mode: {mode!r}")
 
 
 def print_header(text: str, width: int = 72):
@@ -112,6 +116,10 @@ def print_meta(state: dict):
     print(f"  K:          {state.get('K', '?')} teachers")
     print(f"  T:          {state.get('T', '?')} timesteps")
     print(f"  S:          {state.get('S', '?')} prompt sets")
+    print(f"  Version:    {state.get('mof_state_version', 1)}")
+    print(f"  Weight norm: {state.get('weight_normalization', '? (legacy — assumed softmax)')}")
+    if state.get("temperature") is not None:
+        print(f"  Temperature: {state['temperature']}")
 
     source_map = state.get("source_to_set_id", {})
     if source_map:
@@ -432,10 +440,16 @@ def plot_weights(
 def main():
     parser = argparse.ArgumentParser(description="Inspect MoF checkpoint weights")
     parser.add_argument("path", help="Path to mof_state.pt or checkpoint directory")
-    parser.add_argument("--temperature", "-t", type=float, default=1.0,
-                        help="Softmax temperature (default: 1.0)")
+    parser.add_argument("--temperature", "-t", type=float, default=None,
+                        help="Softmax temperature (default: checkpoint's "
+                             "recorded value, else 1.0)")
+    parser.add_argument("--weight-normalization", type=str, default="auto",
+                        choices=["auto", "softmax", "affine", "none"],
+                        help="Logits→weights mapping. 'auto' (default) reads "
+                             "the checkpoint's 'weight_normalization' field "
+                             "(legacy fallback: softmax).")
     parser.add_argument("--no-normalize", action="store_true",
-                        help="Treat logits as raw weights (unnormalized mode)")
+                        help="DEPRECATED alias for --weight-normalization none")
     parser.add_argument("--show-init", action="store_true",
                         help="Also show what teacher-biased init would look like")
     parser.add_argument("--compact", action="store_true",
@@ -458,16 +472,31 @@ def main():
         set_to_source = {v: k for k, v in source_map.items()}
         teacher_names = [set_to_source.get(k, f"teacher_{k}") for k in range(K)]
 
-    normalize = not args.no_normalize
+    # Resolve normalization mode: explicit flag > checkpoint > legacy softmax
+    if args.no_normalize:
+        mode = "none"
+    elif args.weight_normalization != "auto":
+        mode = args.weight_normalization
+    else:
+        mode = state.get("weight_normalization", None)
+        if mode is None:
+            mode = "softmax"
+            print("  NOTE: legacy checkpoint without 'weight_normalization' "
+                  "metadata — assuming softmax (override with "
+                  "--weight-normalization).")
+    temperature = args.temperature
+    if temperature is None:
+        temperature = state.get("temperature", 1.0)
 
     # Print metadata
     print_meta(state)
+    print(f"  Interpreting weights as: {mode} (temperature={temperature})")
 
     # Print raw logits info
     print_logits_info(logits)
 
     # Compute weights
-    weights = compute_weights(logits, temperature=args.temperature, normalize=normalize)
+    weights = compute_weights(logits, temperature=temperature, mode=mode)
 
     # Print summary
     print_weight_summary(weights, source_map, teacher_names)
@@ -495,7 +524,7 @@ def main():
                     if name == src:
                         init_logits[k, :, s_id] = 2.0  # default bias
                         break
-        init_weights = compute_weights(init_logits, temperature=args.temperature, normalize=normalize)
+        init_weights = compute_weights(init_logits, temperature=temperature, mode=mode)
         print_weights_table(init_weights, source_map, teacher_names, title="Initial Weights (teacher_biased, C=2.0)")
 
     # EMA info
@@ -503,7 +532,7 @@ def main():
         ema_state = state["logits_ema"]
         if "ema_parameters" in ema_state and len(ema_state["ema_parameters"]) > 0:
             ema_logits = ema_state["ema_parameters"][0]
-            ema_weights = compute_weights(ema_logits, temperature=args.temperature, normalize=normalize)
+            ema_weights = compute_weights(ema_logits, temperature=temperature, mode=mode)
             if not args.compact:
                 print_weights_table(ema_weights, source_map, teacher_names, title="EMA Mixing Weights")
             else:

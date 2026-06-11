@@ -111,7 +111,7 @@ train:
   # text branch and will warn-then-ignore if they're set. Omit them entirely
   # to keep the config clean.
   temperature: 1.0
-  normalize_weights: true                   # Softmax on router output (always true for routers)
+  weight_normalization: softmax             # softmax | affine | none (routers honor all modes now)
 
   # ---- MoF core hyperparameters ----
   nft_beta: 1.0

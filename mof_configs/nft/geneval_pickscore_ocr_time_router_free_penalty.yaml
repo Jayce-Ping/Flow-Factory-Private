@@ -1,3 +1,15 @@
+# ===========================================================================
+# ABLATION ARM: weight_normalization = 'none' + weight_sum_penalty = 0.01
+#
+# Free linear mixing w = logits, with a soft Σw≈1 anchor:
+#   loss += 0.01 · mean_b((Σ_k w_k(b) − 1)²)
+# Removes softmax's mean-subtraction Jacobian → gradient ∝ g·v_k (largest
+# signal; see docs/mof/mof_per_set_analysis.tex §13–14, Solution D). The
+# penalty suppresses the common-mode drift of Σw that would rescale the
+# combined velocity field. learning_rate lowered ~3x vs the softmax
+# baseline to compensate for the missing softmax Jacobian damping.
+# Monitor train/weight_sum_mean ≈ 1.0 and train/weight_sum_penalty ↓.
+# ===========================================================================
 # MoF (Mixture-of-Flow): 3-teacher Time Router experiment.
 #
 # Time Router is the simplest continuous-time router: a small 2-layer MLP
@@ -72,7 +84,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_time-router"
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_time-router-free-penalty"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -111,12 +123,13 @@ train:
   # text branch and will warn-then-ignore if they're set. Omit them entirely
   # to keep the config clean.
   temperature: 1.0
-  weight_normalization: softmax             # softmax | affine | none (see *_unnorm ablation configs)
+  weight_normalization: none                # ablation arm (see header)
+  weight_sum_penalty: 0.01                  # soft Σw≈1 anchor (only active with weight_normalization: none)
 
   # ---- MoF core hyperparameters ----
   nft_beta: 1.0
   off_policy: true                          # Sample with EMA weights, train with current
-  learning_rate: 1.0e-3                     # Same as adaLN/MLP routers (~100K-class NN regime)
+  learning_rate: 3.0e-4                     # ~3x below softmax baseline (no softmax-Jacobian damping)
 
   # ---- EMA schedule ----
   ema_decay_schedule: "piecewise_linear"
@@ -154,7 +167,7 @@ train:
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
   max_grad_norm: 1.0
-  adam_weight_decay: 1.0e-4
+  adam_weight_decay: 1.0e-4                 # NOTE: ignored for the MoF mixing module (decay→0 anchor is wrong; see _init_optimizer)
   adam_epsilon: 1.0e-8
   ddp_find_unused_parameters: false
   max_epochs: 1000

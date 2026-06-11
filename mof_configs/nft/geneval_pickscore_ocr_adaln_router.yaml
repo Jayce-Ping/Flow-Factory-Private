@@ -94,7 +94,7 @@ train:
   nft_beta: 1.0                             # NFT loss interpolation (1.0 = full DiffusionNFT)
   off_policy: true                          # Sample with EMA weights, train with current (stabilizes RL)
   learning_rate: 1.0e-3                     # Router LR: ~600K params needs smaller LR than LUT's 252 params
-  normalize_weights: true                   # Softmax normalization on router output
+  weight_normalization: softmax             # softmax | affine | none (see *_affine / *_free* ablation configs)
 
   # ---- EMA schedule ----
   ema_decay_schedule: "piecewise_linear"

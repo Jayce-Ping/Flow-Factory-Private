@@ -45,7 +45,13 @@ from ...utils.dist import reduce_loss_info
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..opd.common import load_teachers, cache_forward_signature, filter_forward_kwargs
 from .common import create_mixing_module, _validate_teacher_order
-from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter, validate_source_ratio
+from .utils import (
+    apply_weight_normalization,
+    bypass_ddp_for_weight_swap,
+    interleaved_source_iter,
+    resolve_weight_normalization,
+    validate_source_ratio,
+)
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -199,6 +205,16 @@ class MoFDistillTrainer(BaseTrainer):
             context="MoF distill load",
         )
 
+        # Resolve logits→weights semantics: explicit config override >
+        # checkpoint metadata > legacy 'softmax' fallback (with warning).
+        # Router branches further prefer router_arch['weight_normalization']
+        # when present (it is the value the module was actually built with).
+        weight_norm = resolve_weight_normalization(
+            ckpt_value=state.get("weight_normalization"),
+            override=args.mof_weight_normalization,
+            context="MoF distill load",
+        )
+
         module_type = args.mof_module_type
 
         if module_type == "time_router":
@@ -242,6 +258,17 @@ class MoFDistillTrainer(BaseTrainer):
                         f"Using checkpoint value."
                     )
                     temperature = saved_arch["tau"]
+                if (
+                    saved_arch.get("weight_normalization") is not None
+                    and saved_arch.get("weight_normalization") != weight_norm
+                ):
+                    logger.warning(
+                        f"Distill: resolved weight_normalization={weight_norm!r}"
+                        f" differs from checkpoint router_arch value "
+                        f"{saved_arch['weight_normalization']!r}. Using "
+                        f"checkpoint value (the router was built with it)."
+                    )
+                    weight_norm = saved_arch["weight_normalization"]
             else:
                 logger.warning(
                     "MoF time_router checkpoint has no 'router_arch' metadata "
@@ -256,6 +283,7 @@ class MoFDistillTrainer(BaseTrainer):
                 d_hidden=d_hidden,
                 d_time=d_time,
                 temperature=temperature,
+                weight_normalization=weight_norm,
             )
             if "mixing_module_state_dict" in state:
                 router.load_state_dict(state["mixing_module_state_dict"])
@@ -269,7 +297,7 @@ class MoFDistillTrainer(BaseTrainer):
             logger.info(
                 f"MoF distill: loaded time_router "
                 f"(K={self._mof_K}, d_hidden={d_hidden}, d_time={d_time}, "
-                f"tau={temperature})"
+                f"tau={temperature}, weight_normalization={weight_norm})"
             )
         elif module_type not in ("lut", "lut_simple"):
             # All these fields are first-class dataclass members on
@@ -335,6 +363,17 @@ class MoFDistillTrainer(BaseTrainer):
                         f"with this temperature)."
                     )
                     temperature = saved_arch["tau"]
+                if (
+                    saved_arch.get("weight_normalization") is not None
+                    and saved_arch.get("weight_normalization") != weight_norm
+                ):
+                    logger.warning(
+                        f"Distill: resolved weight_normalization={weight_norm!r}"
+                        f" differs from checkpoint router_arch value "
+                        f"{saved_arch['weight_normalization']!r}. Using "
+                        f"checkpoint value (the router was built with it)."
+                    )
+                    weight_norm = saved_arch["weight_normalization"]
             else:
                 logger.warning(
                     "MoF router checkpoint has no 'router_arch' metadata "
@@ -351,6 +390,7 @@ class MoFDistillTrainer(BaseTrainer):
                 d_time=d_time,
                 d_seq=d_seq,
                 temperature=temperature,
+                weight_normalization=weight_norm,
             )
             if "mixing_module_state_dict" in state:
                 router.load_state_dict(state["mixing_module_state_dict"])
@@ -364,7 +404,8 @@ class MoFDistillTrainer(BaseTrainer):
             logger.info(
                 f"MoF distill: loaded {module_type} router "
                 f"(K={self._mof_K}, d_pool={d_pool}, d_seq={d_seq}, "
-                f"d_hidden={d_hidden}, d_time={d_time}, tau={temperature})"
+                f"d_hidden={d_hidden}, d_time={d_time}, tau={temperature}, "
+                f"weight_normalization={weight_norm})"
             )
         else:
             if args.mof_use_ema and "logits_ema" in state:
@@ -390,7 +431,22 @@ class MoFDistillTrainer(BaseTrainer):
                     # similar despite being source-agnostic. Still safe.
                     pass
 
-            weights = F.softmax(logits / args.mof_temperature, dim=0)  # (K, T, S)
+            # Temperature: prefer the value recorded at train time over the
+            # distill config (the logits were optimized against it).
+            temperature = state.get("temperature", args.mof_temperature)
+            if abs(temperature - args.mof_temperature) > 1e-9:
+                logger.warning(
+                    f"Distill: config mof_temperature={args.mof_temperature} "
+                    f"differs from checkpoint temperature={temperature}. "
+                    f"Using checkpoint value."
+                )
+
+            # Honor the recorded logits→weights semantics. Unconditional
+            # softmax here used to silently corrupt 'none'-mode checkpoints
+            # (e.g. hard-route one-hot [1,0,0] → softmax → [.58,.21,.21]).
+            weights = apply_weight_normalization(
+                logits, weight_norm, temperature, dim=0
+            )  # (K, T, S)
             self._mof_weights = weights.to(self.accelerator.device)
             self._mof_router = None
 
@@ -410,6 +466,7 @@ class MoFDistillTrainer(BaseTrainer):
             kind = "LUT-SA (source-agnostic)" if module_type == "lut_simple" else "LUT"
             logger.info(
                 f"MoF distill: loaded {kind} (K={self._mof_K}, T={self._mof_T}, S={self._mof_S}), "
+                f"weight_normalization={weight_norm}, "
                 f"source_map={self._mof_source_to_set_id}"
             )
             for k in range(self.K):

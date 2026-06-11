@@ -83,7 +83,7 @@ train:
   logits_init_bias: 2.0                     # Bias strength: softmax(2,0,0) ≈ (0.78, 0.11, 0.11) for K=3
   learning_rate: 0.05                       # Learning rate for lambda logits (large: only 252 params)
   temperature: 1.0                          # Softmax temp: 1.0=standard, <1=sharper, >1=softer mixing
-  normalize_weights: true                   # Enable softmax: use raw logits as weights (avoids gradient vanishing)
+  weight_normalization: softmax             # softmax | affine | none (logits → weights mapping)
 
   # ---- EMA schedule (aligned with NFT default) ----
   ema_decay_schedule: "piecewise_linear"    # Decay schedule: constant, power, linear, piecewise_linear, cosine
@@ -122,7 +122,7 @@ train:
   gradient_step_per_epoch: 1                # Gradient steps per epoch (aligned with NFT)
   gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts (NFT pattern)
   max_grad_norm: 1.0                        # Gradient clipping on (K,T,S) logits tensor
-  adam_weight_decay: 1.0e-4                 # Weight decay (only effective when normalize_weights=false; ignored under softmax)
+  adam_weight_decay: 1.0e-4                 # NOTE: ignored for the MoF mixing module in all modes (see _init_optimizer)
   adam_epsilon: 1.0e-8                      # Adam epsilon for numerical stability
   ddp_find_unused_parameters: false         # MoF only trains logits; no conditional branches need tracking
   max_epochs: 1000                           # More epochs for 3-set convergence

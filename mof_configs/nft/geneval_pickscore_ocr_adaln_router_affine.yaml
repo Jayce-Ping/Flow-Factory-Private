@@ -1,43 +1,36 @@
-# MoF (Mixture-of-Flow): 3-teacher Time Router experiment.
+# ===========================================================================
+# ABLATION ARM: weight_normalization = 'affine' (hard Σw=1 projection)
 #
-# Time Router is the simplest continuous-time router: a small 2-layer MLP
-# that maps a raw timestep t ∈ R to mixing weights W ∈ Δ^{K-1}, with NO
-# text conditioning (no prompt_embeds / pooled_prompt_embeds branch).
+# w = logits − (Σ logits − 1)/K. CFG-strict analogue: weights stay on the
+# Σw=1 hyperplane but may leave [0,1] (extrapolation beyond the teacher
+# convex hull). Isolates the CONVEXITY constraint from the SUM constraint:
+# vs softmax, only w∈[0,1] is lifted. NOTE: the Σ=1 constraint still implies
+# the mean-subtraction gradient (∝ g·(v_k − v̄)) — gradient magnitude is
+# expected to stay in the softmax regime, hence the unchanged learning rate.
+# ===========================================================================
+# MoF (Mixture-of-Flow): 3-teacher with AdaLN Router.
 #
-# Architecture:
-#   t (B,) → SinusoidalPosEmb(d_time)
-#         → Linear(d_time → d_hidden) + SiLU
-#         → Linear(d_hidden → d_hidden) + SiLU
-#         → Linear(d_hidden → K) [zero-init]
-#         → softmax(/τ, dim=-1) → W ∈ R^{K × B}
+# Uses a lightweight AdaLN-style network to predict per-sample mixing weights
+# conditioned on (timestep, pooled_prompt_embeds). The time embedding modulates
+# the text embedding via adaptive layer norm (gamma, beta), following the DiT
+# conditioning pattern used by SD3/Flux.
 #
-# Total params: ~132K (K=3, d_time=d_hidden=256). Compare:
-#   LUT       (K, T, S):              90 params
-#   LUT-SA    (K, T):                 30 params
-#   Time Router:                      ~132K params
-#   adaLN Router (with text branch):  ~790K params
-#   MLP Router (with text branch):    ~660K params
+# Router architecture:
+#   pooled_prompt_embeds (2048) → c_proj → c (256)
+#   timestep → sinusoidal → time_mlp → t (256)
+#   t → adaLN_modulation → (gamma, beta)
+#   h = gamma * c + beta
+#   h → MLP → K=3 logits → softmax → weights
 #
-# Key invariants — see docs/mof/mof_router_architectures.tex §1C:
-#   * Mixing weights W_k(t) depend ONLY on t (not on s_b or prompt content).
-#   * Reward / advantage is still source-aware:
-#         A_b = a_in(s_b) + γ · mean(a_ood)
-#     Source-aware gradients flow into source-agnostic NN weights θ_TR.
-#   * H_TR|_T_train ⊆ H_LUT-SA  (lower effective DOF on training timesteps)
-#     H_TR|_R     ⊄ H_LUT-SA  (TR extrapolates to ANY t ∈ R)
+# Total router params: ~600K (vs LUT's 252 logits).
+# Key advantage: generalizes to unseen prompts (no discrete source routing needed).
 #
-# When to use:
-#   * Inference at a different num_inference_steps than training (TR's
-#     unique advantage; LUT/LUT-SA cannot do this without retraining).
-#   * Smoothness inductive bias helps under sparse RL signal.
-#   * Ablation against full routers: if Time Router ≈ adaLN/MLP, prompt
-#     content carries no routing signal — the optimal policy is purely
-#     time-dependent.
-#
-# When NOT to use:
-#   * Optimal mixing depends on prompt content → use adaln_router/mlp_router.
-#   * Optimal weights have sharp t-domain transitions → LUT-SA is more
-#     direct (no smoothness regularization).
+# d_hidden design rationale:
+#   - d_pool=2048 (SD3.5 Medium pooled_prompt_embeds = CLIP-L[768] + OpenCLIP-G[1280])
+#   - d_hidden=256: ~8x bottleneck. Predicting K=3 weights requires minimal capacity;
+#     too large risks overfitting on sparse NFT reward signal.
+#   - Compare: SD3 transformer uses 1536-dim conditioning, but that drives a 2B-param
+#     network. Our router drives 3 scalar outputs — aggressive compression is correct.
 
 # Environment Configuration
 launcher: "accelerate"
@@ -46,7 +39,7 @@ num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
 
-# Data Configuration — multi-source (3 prompt sets, source labels feed advantage routing)
+# Data Configuration — multi-source (3 prompt sets)
 data:
   dataset_dir: "dataset/ocr"
   dataset_dirs:
@@ -72,7 +65,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_time-router"
+  run_name: "nft_sd3-5_mof_geneval_pickscore_ocr_adaln-router-affine"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -83,9 +76,7 @@ log:
 train:
   trainer_type: 'mof-nft'
 
-  # ---- Teachers (sources/reward_name only used for advantage routing) ----
-  # Time Router does NOT consume teacher.sources for mixing — sources are
-  # used purely to populate _source_to_set_id (advantage path).
+  # ---- Teacher configuration ----
   teachers:
     - name: "teacher-geneval"
       path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
@@ -100,23 +91,20 @@ train:
       sources: [ocr]
       reward_name: "ocr"
 
-  teacher_route_by_source: false            # Mixing handled per-timestep, not per-source
+  teacher_route_by_source: false            # Router handles per-sample routing from text content
   teacher_param_device: 'cuda'
 
-  # ---- Mixing module: Time Router ----
-  mixing_module_type: "time_router"         # NEW: continuous-time MLP, no text input
-  mixing_hidden_dim: 256                    # MLP hidden dim
-  mixing_d_time: 256                        # Sinusoidal time embedding dim (default; explicit for clarity)
-  # NOTE: mixing_d_pool and mixing_d_seq are NOT set — Time Router has no
-  # text branch and will warn-then-ignore if they're set. Omit them entirely
-  # to keep the config clean.
-  temperature: 1.0
-  weight_normalization: softmax             # softmax | affine | none (see *_unnorm ablation configs)
+  # ---- Mixing module: AdaLN Router ----
+  mixing_module_type: "adaln_router"
+  mixing_d_pool: 2048                       # SD3.5 Medium pooled_prompt_embeds dim (CLIP-L[768] + CLIP-G[1280])
+  mixing_hidden_dim: 256                    # Bottleneck: 8x smaller than d_pool (K=3 output needs minimal capacity)
+  temperature: 1.0                          # Softmax temperature for weight normalization
 
   # ---- MoF core hyperparameters ----
-  nft_beta: 1.0
-  off_policy: true                          # Sample with EMA weights, train with current
-  learning_rate: 1.0e-3                     # Same as adaLN/MLP routers (~100K-class NN regime)
+  nft_beta: 1.0                             # NFT loss interpolation (1.0 = full DiffusionNFT)
+  off_policy: true                          # Sample with EMA weights, train with current (stabilizes RL)
+  learning_rate: 1.0e-3                     # Router LR: ~600K params needs smaller LR than LUT's 252 params
+  weight_normalization: affine              # ablation arm (see header)
 
   # ---- EMA schedule ----
   ema_decay_schedule: "piecewise_linear"
@@ -126,10 +114,9 @@ train:
   ema_update_interval: 1
   ema_device: "cuda"
 
-  # ---- Per-set reward design (UNCHANGED — still source-aware) ----
-  # advantage(b) = a_R_in(s_b)(x_b) + γ · mean_{j ≠ R_in(s_b)} a_j(x_b)
+  # ---- Per-set reward design ----
   eval_teachers_at_start: true
-  ood_bonus_gamma: 0.2
+  ood_bonus_gamma: 0.2                      # OOD bonus: encourage cross-teacher discovery
 
   # ---- Advantage computation ----
   advantage_aggregation: "gdpo"
@@ -139,7 +126,7 @@ train:
   # ---- Timestep control ----
   time_sampling_strategy: "discrete"
   timestep_range: 0.9
-  num_inference_steps: 10                   # Training T. Eval can use a different T (Time Router's edge).
+  num_inference_steps: 10
 
   # ---- Optimization ----
   per_device_batch_size: 8
@@ -154,37 +141,33 @@ train:
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
   max_grad_norm: 1.0
-  adam_weight_decay: 1.0e-4
+  adam_weight_decay: 1.0e-4                 # NOTE: ignored for the MoF mixing module (decay→0 anchor is wrong; see _init_optimizer)
   adam_epsilon: 1.0e-8
   ddp_find_unused_parameters: false
   max_epochs: 1000
   seed: 42
 
-  # ---- KL penalty (disabled initially) ----
+  # ---- KL penalty ----
   kl_beta: 0.0
   kl_type: 'v-based'
 
   # ---- Generation settings ----
   resolution: 512
-  guidance_scale: 1.0                       # NFT requires no CFG
+  guidance_scale: 1.0
   enable_gradient_checkpointing: false
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "ODE"                      # NFT requires ODE dynamics
+  dynamics_type: "ODE"
   noise_level: 0.0
   seed: 42
 
 # Evaluation settings
-# NOTE: Time Router's unique advantage — eval num_inference_steps can differ
-# from training. Here we deliberately use 40 (vs train's 10) to demonstrate
-# the continuous-time extrapolation. For a tighter LUT/LUT-SA comparison,
-# set this to 10 instead.
 eval:
   resolution: 512
   per_device_batch_size: 8
   guidance_scale: 1.0
-  num_inference_steps: 40                   # Eval at higher T (training was at 10)
+  num_inference_steps: 40
   eval_freq: 10
   seed: 42
   test_sets:

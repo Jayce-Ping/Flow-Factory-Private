@@ -156,9 +156,10 @@ class MoFGRPOTrainer(MoFTrainerBase):
                             )  # (K, B, C, H, W)
 
                             # 3. Combine with CURRENT weights (differentiable)
-                            v_combined = self._compute_combined_velocity(
+                            v_combined, w_kb = self._compute_combined_velocity(
                                 teacher_velocities, t, batch,
                                 timestep_index=timestep_index, set_ids=set_ids,
+                                return_weights=True,
                             )  # (B, C, H, W) — gradient flows through mixing weights
 
                             # 4. Compute new log_prob via scheduler step
@@ -230,6 +231,19 @@ class MoFGRPOTrainer(MoFTrainerBase):
                                 policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                             loss = policy_loss
+
+                            # Soft Σw≈1 anchor (weight_normalization='none'
+                            # only) — same regularizer as MoF-NFT.
+                            if self._sum_penalty_active:
+                                sum_penalty = (
+                                    self.training_args.weight_sum_penalty
+                                    * self._weight_sum_penalty_value(w_kb)
+                                )
+                                loss = loss + sum_penalty
+                                loss_info['weight_sum_penalty'].append(
+                                    sum_penalty.detach()
+                                )
+                            self._append_weight_stats(loss_info, w_kb)
 
                             # 6. Logging
                             loss_info['ratio'].append(ratio.detach())

@@ -808,10 +808,11 @@ class MoFBaseTrainingArguments(TrainingArguments):
                 "'teacher_biased': each set biased toward its in-domain teacher "
                 "with strength logits_init_bias (soft, gradient-friendly). "
                 "'hard': exact one-hot per source — in-domain teacher gets weight "
-                "1.0, off-domain 0.0. Requires normalize_weights=false (softmax "
-                "cannot produce exact one-hot) and teacher_route_by_source=true. "
-                "Compensate for the missing softmax Jacobian damping by lowering "
-                "learning_rate by ~3× vs the softmax-mode baseline."
+                "1.0, off-domain 0.0. Requires weight_normalization='none' or "
+                "'affine' (softmax cannot produce exact one-hot) and "
+                "teacher_route_by_source=true. Compensate for the missing "
+                "softmax Jacobian damping by lowering learning_rate by ~3× vs "
+                "the softmax-mode baseline."
             )
         },
     )
@@ -833,12 +834,58 @@ class MoFBaseTrainingArguments(TrainingArguments):
         default=True,
         metadata={
             "help": (
-                "Whether to apply softmax normalization to mixing weights. "
-                "True (default): weights = softmax(logits/τ) — normalized, sum=1. "
-                "False: weights = logits directly (unnormalized additive mixing). "
-                "Unnormalized mode avoids gradient vanishing from softmax's "
-                "mean-subtraction Jacobian when teachers share a base model. "
-                "Init adjusts automatically: 'zeros'→1/K, 'teacher_biased'→softmax values."
+                "DEPRECATED alias for weight_normalization (kept for config "
+                "backward compatibility). True→'softmax', False→'none'. "
+                "Ignored when weight_normalization is set explicitly."
+            )
+        },
+    )
+    weight_normalization: Optional[Literal["softmax", "affine", "none"]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "How raw mixing logits map to teacher mixing weights. "
+                "'softmax': w = softmax(logits/τ) — convex combination (Σw=1, "
+                "w∈[0,1]); gradient ∝ g·(v_k − v̄) (mean-subtraction → vanishes "
+                "for LoRA teachers sharing a base). "
+                "'affine': w = logits − (Σlogits−1)/K — hard projection onto "
+                "Σw=1 (CFG-style: allows w<0 / w>1); the Σ=1 constraint still "
+                "implies mean-subtraction gradients. "
+                "'none': w = logits — free linear combination; largest gradient "
+                "(∝ g·v_k) but Σw can drift, rescaling the combined velocity; "
+                "pair with weight_sum_penalty (recommended 0.01) and lower "
+                "learning_rate ~3x vs the softmax baseline. "
+                "None (default): derived from the deprecated normalize_weights "
+                "bool (True→'softmax', False→'none'). "
+                "Init adjusts automatically per mode (see logits_init)."
+            )
+        },
+    )
+    weight_sum_penalty: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Coefficient for the soft sum-to-one regularizer, only active "
+                "with weight_normalization='none': "
+                "loss += weight_sum_penalty * mean_b((Σ_k w_k(b) − 1)²), "
+                "computed on the per-sample mixing weights at every trained "
+                "timestep and backpropagated together with the policy loss. "
+                "Anchors free mixtures to the affine (CFG-like) family Σw≈1 "
+                "without softmax/affine's mean-subtraction gradient damping. "
+                "Recommended 0.01 for 'none' runs; 0 disables."
+            )
+        },
+    )
+    weight_clamp_range: Optional[Tuple[float, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Hard clamp [low, high] applied to mixing weights during EVAL "
+                "inference only — never during training rollouts or the "
+                "gradient pass (clamping kills gradients and would create a "
+                "train/sample policy mismatch). None disables. Intended for "
+                "weight_normalization='none'/'affine'; under softmax, weights "
+                "are already in [0,1]."
             )
         },
     )
@@ -1019,6 +1066,32 @@ class MoFBaseTrainingArguments(TrainingArguments):
                 "MoF requires at least one teacher (via 'teachers' or 'teacher_paths')."
             )
 
+        # ---- Resolve weight_normalization (3-mode enum) from the deprecated
+        # normalize_weights bool. After this block, all downstream code reads
+        # only self.weight_normalization; normalize_weights is kept in sync
+        # as a read-only compatibility mirror (True iff mode == 'softmax').
+        valid_normalization = ["softmax", "affine", "none"]
+        if self.weight_normalization is None:
+            self.weight_normalization = (
+                "softmax" if self.normalize_weights else "none"
+            )
+        elif self.weight_normalization not in valid_normalization:
+            raise ValueError(
+                f"Invalid weight_normalization: {self.weight_normalization!r}. "
+                f"Valid options are: {valid_normalization}."
+            )
+        elif not self.normalize_weights and self.weight_normalization != "none":
+            # normalize_weights=False is a non-default value, so it was set
+            # explicitly; flag the disagreement. (The default True cannot be
+            # distinguished from "unset", so 'affine'/'none' with the default
+            # stays silent.)
+            logger.warning(
+                f"weight_normalization={self.weight_normalization!r} "
+                f"disagrees with the deprecated normalize_weights=False; "
+                f"weight_normalization takes precedence."
+            )
+        self.normalize_weights = self.weight_normalization == "softmax"
+
         # Validate MoF-specific fields
         valid_logits_init = ["uniform", "random", "teacher_biased", "hard"]
         if self.logits_init not in valid_logits_init:
@@ -1029,13 +1102,15 @@ class MoFBaseTrainingArguments(TrainingArguments):
         if self.logits_init == "hard":
             # 'hard' produces exact one-hot per source, which only makes sense
             # for the source-aware K×T×S LUT and only when raw logits are used
-            # as weights (softmax cannot be exact one-hot with finite logits).
-            if self.normalize_weights:
+            # as weights (softmax cannot be exact one-hot with finite logits;
+            # 'affine' is fine — one-hot already lies on the Σw=1 hyperplane,
+            # so the projection is the identity at init).
+            if self.weight_normalization == "softmax":
                 raise ValueError(
                     "logits_init='hard' produces exact one-hot weights, which "
                     "cannot be represented by softmax with finite logits. "
-                    "Set normalize_weights=false (logits used directly as "
-                    "weights) when using 'hard' init."
+                    "Set weight_normalization='none' (or 'affine') when using "
+                    "'hard' init."
                 )
             if self.mixing_module_type != "lut":
                 raise ValueError(
@@ -1046,6 +1121,43 @@ class MoFBaseTrainingArguments(TrainingArguments):
                 )
         if self.temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {self.temperature}")
+        if self.weight_normalization != "softmax" and self.temperature != 1.0:
+            logger.warning(
+                f"temperature={self.temperature} is ignored with "
+                f"weight_normalization={self.weight_normalization!r} — raw "
+                f"logits are used as weights without the /τ scaling."
+            )
+        if self.weight_sum_penalty < 0:
+            raise ValueError(
+                f"weight_sum_penalty must be >= 0, got {self.weight_sum_penalty}."
+            )
+        if self.weight_sum_penalty > 0 and self.weight_normalization != "none":
+            logger.warning(
+                f"weight_sum_penalty={self.weight_sum_penalty} is a no-op with "
+                f"weight_normalization={self.weight_normalization!r} (Σw ≡ 1 "
+                f"by construction); it only applies to 'none'."
+            )
+        if self.weight_normalization == "none" and self.weight_sum_penalty == 0:
+            logger.warning(
+                "weight_normalization='none' with weight_sum_penalty=0: Σw is "
+                "unconstrained and can drift away from 1, which rescales the "
+                "combined velocity field (effective time reparameterization). "
+                "Consider weight_sum_penalty=0.01. Monitor 'weight_sum_mean' "
+                "in the training logs."
+            )
+        if self.weight_clamp_range is not None:
+            lo, hi = float(self.weight_clamp_range[0]), float(self.weight_clamp_range[1])
+            if not lo < hi:
+                raise ValueError(
+                    f"weight_clamp_range must satisfy low < high, got ({lo}, {hi})."
+                )
+            self.weight_clamp_range = (lo, hi)
+            if self.weight_normalization == "softmax":
+                logger.warning(
+                    "weight_clamp_range is set but weight_normalization="
+                    "'softmax' already bounds weights to [0,1] — the clamp is "
+                    "a near no-op."
+                )
         if self.ood_bonus_gamma < 0:
             raise ValueError(f"ood_bonus_gamma must be >= 0, got {self.ood_bonus_gamma}.")
 
@@ -1866,6 +1978,19 @@ class MoFDistillTrainingArguments(TrainingArguments):
     mof_use_ema: bool = field(
         default=False,
         metadata={"help": "Use EMA logits from MoF checkpoint (only for LUT mode)."},
+    )
+    mof_weight_normalization: Optional[Literal["softmax", "affine", "none"]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "How the MoF checkpoint's logits map to mixing weights. "
+                "None (default): read 'weight_normalization' from mof_state.pt; "
+                "legacy checkpoints without the key fall back to 'softmax' "
+                "with a loud warning. Set explicitly only to override a "
+                "mislabeled legacy checkpoint (e.g. 'none' for an old "
+                "unnormalized/hard-route LUT checkpoint)."
+            )
+        },
     )
 
     # ---- Router mode settings ----

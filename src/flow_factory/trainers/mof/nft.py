@@ -190,9 +190,10 @@ class MoFNFTTrainer(MoFTrainerBase):
                             teacher_velocities = all_teacher_velocities[t_idx]
 
                             # Compute new combined velocity with current weights
-                            new_v_pred = self._compute_combined_velocity(
+                            new_v_pred, w_kb = self._compute_combined_velocity(
                                 teacher_velocities, t_flat, batch,
                                 timestep_index=t_idx, set_ids=set_ids,
+                                return_weights=True,
                             )
 
                             # NFT loss computation
@@ -245,6 +246,21 @@ class MoFNFTTrainer(MoFTrainerBase):
                                 loss = loss + kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
                                 loss_info['kl_loss'].append(kl_loss.detach())
+
+                            # Soft Σw≈1 anchor (weight_normalization='none'
+                            # only): keeps the free linear mixture close to
+                            # the affine/CFG family without softmax's
+                            # mean-subtraction gradient damping.
+                            if self._sum_penalty_active:
+                                sum_penalty = (
+                                    self.training_args.weight_sum_penalty
+                                    * self._weight_sum_penalty_value(w_kb)
+                                )
+                                loss = loss + sum_penalty
+                                loss_info['weight_sum_penalty'].append(
+                                    sum_penalty.detach()
+                                )
+                            self._append_weight_stats(loss_info, w_kb)
 
                             loss_info['policy_loss'].append(policy_loss.detach())
                             loss_info['unweighted_policy_loss'].append(

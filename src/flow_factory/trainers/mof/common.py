@@ -58,7 +58,12 @@ from ..ensemble_eval.common import (
     cache_scheduler_step_signature,
     _build_scheduler_step_kwargs,
 )
-from .utils import bypass_ddp_for_weight_swap, interleaved_source_iter, validate_source_ratio
+from .utils import (
+    apply_weight_normalization,
+    bypass_ddp_for_weight_swap,
+    interleaved_source_iter,
+    validate_source_ratio,
+)
 
 logger = setup_logger(__name__)
 
@@ -113,7 +118,8 @@ def _validate_teacher_order(
 class MoFMixingModule(nn.Module):
     """Learnable per-timestep, per-set teacher mixing weights.
 
-    Encapsulates the (K, T, S) logits tensor and softmax normalization.
+    Encapsulates the (K, T, S) logits tensor and the logits→weights mapping
+    (see ``utils.apply_weight_normalization`` for the mode semantics).
     Being a proper nn.Module, it is compatible with DeepSpeed ZeRO
     (params discoverable via named_parameters()).
 
@@ -122,7 +128,9 @@ class MoFMixingModule(nn.Module):
         T: Number of denoising timesteps.
         S: Number of prompt sets.
         temperature: Softmax temperature (lower = sharper selection).
-        init_mode: One of 'zeros', 'random', 'teacher_biased', 'hard'.
+            Only used with weight_normalization='softmax'.
+        weight_normalization: 'softmax' | 'affine' | 'none'.
+        init_mode: One of 'uniform', 'random', 'teacher_biased', 'hard'.
         init_bias: Bias strength for 'teacher_biased' init.
         teacher_set_mapping: Dict mapping set_id → teacher_index for biased / hard init.
     """
@@ -133,7 +141,7 @@ class MoFMixingModule(nn.Module):
         T: int,
         S: int,
         temperature: float = 1.0,
-        normalize_weights: bool = True,
+        weight_normalization: str = "softmax",
         init_mode: str = "teacher_biased",
         init_bias: float = 2.0,
         teacher_set_mapping: Optional[Dict[int, int]] = None,
@@ -143,10 +151,10 @@ class MoFMixingModule(nn.Module):
         self.T = T
         self.S = S
         self.temperature = temperature
-        self.normalize_weights = normalize_weights
+        self.weight_normalization = weight_normalization
 
         # Initialize logits
-        if normalize_weights:
+        if weight_normalization == "softmax":
             # Softmax mode: logits are in log-space, softmax produces weights
             if init_mode == "uniform":
                 data = torch.zeros(K, T, S)
@@ -161,13 +169,15 @@ class MoFMixingModule(nn.Module):
                 raise ValueError(
                     "logits_init='hard' produces exact one-hot weights, which "
                     "cannot be represented by softmax with finite logits. "
-                    "Set normalize_weights=false (logits used directly as "
-                    "weights) when using 'hard' init."
+                    "Set weight_normalization='none' or 'affine' when using "
+                    "'hard' init."
                 )
             else:
                 raise ValueError(f"Invalid logits_init: {init_mode!r}")
         else:
-            # Unnormalized mode: logits ARE the weights directly.
+            # 'affine' / 'none': logits ARE the weights (affine projects them
+            # onto Σ=1 at forward time; every init below already sums to 1,
+            # so the projection is the identity at init).
             # Init to produce same effective weights as softmax mode would.
             if init_mode == "uniform":
                 # Uniform: each teacher gets 1/K
@@ -194,10 +204,9 @@ class MoFMixingModule(nn.Module):
             elif init_mode == "hard":
                 # Exact one-hot per source: in-domain teacher gets weight 1.0,
                 # all off-domain teachers get 0.0. Requires teacher_set_mapping
-                # to define the source→teacher diagonal. Note that L2 weight
-                # decay (active in unnormalized mode) gently pulls the initial
-                # 1.0 weights toward 0; this is by design (drift protection)
-                # and is dominated by reward gradient at non-trivial wd.
+                # to define the source→teacher diagonal. The optimizer applies
+                # no weight decay to mixing params (see _init_optimizer); use
+                # weight_sum_penalty to anchor Σw at 1 in 'none' mode.
                 if not teacher_set_mapping:
                     raise ValueError(
                         "logits_init='hard' requires teacher_route_by_source=true "
@@ -216,14 +225,12 @@ class MoFMixingModule(nn.Module):
         """Compute mixing weights from logits.
 
         Returns:
-            Tensor of shape (K, T, S).
-            If normalize_weights=True: softmax over K (dim=0).
-            If normalize_weights=False: raw logits (unnormalized).
+            Tensor of shape (K, T, S), normalized over K (dim=0) according
+            to ``self.weight_normalization``.
         """
-        if self.normalize_weights:
-            return F.softmax(self.logits / self.temperature, dim=0)
-        else:
-            return self.logits
+        return apply_weight_normalization(
+            self.logits, self.weight_normalization, self.temperature, dim=0
+        )
 
     def get_weights(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute mixing weights from an arbitrary logits tensor.
@@ -238,10 +245,9 @@ class MoFMixingModule(nn.Module):
         Returns:
             Tensor of shape (K, T, S) with the same normalization as forward().
         """
-        if self.normalize_weights:
-            return F.softmax(logits / self.temperature, dim=0)
-        else:
-            return logits
+        return apply_weight_normalization(
+            logits, self.weight_normalization, self.temperature, dim=0
+        )
 
     def get_weights_for_set(self, set_id: int) -> torch.Tensor:
         """Get (K, T) weights for a specific prompt set."""
@@ -282,8 +288,9 @@ class MoFMixingModuleSimple(nn.Module):
             :class:`MoFMixingModule`. Used only to broadcast the
             ``(K, T)`` logits along an S-axis at ``forward`` time.
         temperature: Softmax temperature (lower = sharper selection).
-        normalize_weights: If True, ``softmax`` over K. If False, raw
-            logits are used as weights directly.
+            Only used with weight_normalization='softmax'.
+        weight_normalization: 'softmax' | 'affine' | 'none' (see
+            ``utils.apply_weight_normalization``).
         init_mode: One of 'uniform', 'random', 'teacher_biased'.
             'teacher_biased' is interpreted as "favor the union of
             in-domain teachers across all known sources" (since there is
@@ -300,7 +307,7 @@ class MoFMixingModuleSimple(nn.Module):
         T: int,
         S: int = 1,
         temperature: float = 1.0,
-        normalize_weights: bool = True,
+        weight_normalization: str = "softmax",
         init_mode: str = "uniform",
         init_bias: float = 2.0,
         teacher_set_mapping: Optional[Dict[int, int]] = None,
@@ -310,10 +317,10 @@ class MoFMixingModuleSimple(nn.Module):
         self.T = T
         self.S = S  # advertised S; logits do NOT include this axis
         self.temperature = temperature
-        self.normalize_weights = normalize_weights
+        self.weight_normalization = weight_normalization
 
         # ---- Initialization (K, T only) ----
-        if normalize_weights:
+        if weight_normalization == "softmax":
             if init_mode == "uniform":
                 data = torch.zeros(K, T)
             elif init_mode == "random":
@@ -332,7 +339,9 @@ class MoFMixingModuleSimple(nn.Module):
             else:
                 raise ValueError(f"Invalid logits_init: {init_mode!r}")
         else:
-            # Unnormalized mode: logits ARE the weights.
+            # 'affine' / 'none': logits ARE the weights (each init below
+            # sums to 1 over K, so the affine projection is the identity
+            # at init).
             if init_mode == "uniform":
                 data = torch.full((K, T), 1.0 / K)
             elif init_mode == "random":
@@ -360,10 +369,9 @@ class MoFMixingModuleSimple(nn.Module):
             (advanced indexing by ``set_ids``, slicing by ``set_id``)
             works identically to :class:`MoFMixingModule`.
         """
-        if self.normalize_weights:
-            w_kt = F.softmax(self.logits / self.temperature, dim=0)
-        else:
-            w_kt = self.logits
+        w_kt = apply_weight_normalization(
+            self.logits, self.weight_normalization, self.temperature, dim=0
+        )
         # Broadcast (K, T) -> (K, T, S). expand returns a view, no extra params.
         return w_kt.unsqueeze(-1).expand(self.K, self.T, self.S)
 
@@ -377,10 +385,9 @@ class MoFMixingModuleSimple(nn.Module):
             Tensor of shape ``(K, T, S)`` with the same broadcast behavior
             as :meth:`forward`.
         """
-        if self.normalize_weights:
-            w_kt = F.softmax(logits / self.temperature, dim=0)
-        else:
-            w_kt = logits
+        w_kt = apply_weight_normalization(
+            logits, self.weight_normalization, self.temperature, dim=0
+        )
         return w_kt.unsqueeze(-1).expand(self.K, self.T, self.S)
 
     def get_weights_for_set(self, set_id: int) -> torch.Tensor:
@@ -389,10 +396,54 @@ class MoFMixingModuleSimple(nn.Module):
         Source-agnostic: returns the same weights regardless of ``set_id``.
         """
         del set_id  # source-agnostic
-        if self.normalize_weights:
-            return F.softmax(self.logits / self.temperature, dim=0)
-        else:
-            return self.logits
+        return apply_weight_normalization(
+            self.logits, self.weight_normalization, self.temperature, dim=0
+        )
+
+
+def _router_output_bias_init(
+    K: int,
+    weight_normalization: str,
+    init_mode: str = "uniform",
+    init_bias: float = 2.0,
+    temperature: float = 1.0,
+    teacher_set_mapping: Optional[Dict[int, int]] = None,
+) -> torch.Tensor:
+    """Initial bias vector for a router's zero-init output layer.
+
+    The output layer's weight matrix is always zero-initialized, so the
+    initial mixing weights equal ``normalize(bias)`` for every input. The
+    bias therefore fully determines the starting mixture:
+
+    - 'softmax' mode: bias = 0 → uniform 1/K after softmax (the standard
+      adaLN-zero pattern; ``init_mode`` is intentionally ignored to preserve
+      the historical router behavior — routers have no per-source axis, so
+      logits_init semantics are LUT-specific in softmax mode).
+    - 'affine' / 'none' mode: the bias IS the initial weight vector, so it
+      must be nonzero (an all-zero bias would give v_mix = 0 — every teacher
+      silently muted). Initialized per ``init_mode`` in weight space, mirroring
+      the source-agnostic LUT (:class:`MoFMixingModuleSimple`): 'uniform' →
+      1/K, 'random' → 1/K + noise, 'teacher_biased' → softmax-equivalent
+      profile aggregated over sources. All variants sum to 1, so the affine
+      projection is the identity at init.
+    """
+    if weight_normalization == "softmax":
+        return torch.zeros(K)
+    if init_mode == "uniform":
+        return torch.full((K,), 1.0 / K)
+    if init_mode == "random":
+        return torch.full((K,), 1.0 / K) + torch.randn(K) * 0.01
+    if init_mode == "teacher_biased":
+        logit_init = torch.zeros(K)
+        if teacher_set_mapping:
+            for _s_id, k_idx in teacher_set_mapping.items():
+                logit_init[k_idx] += init_bias
+        return F.softmax(logit_init / temperature, dim=0)
+    raise ValueError(
+        f"logits_init={init_mode!r} is not supported for router modules "
+        f"(routers have no per-source axis; valid: 'uniform', 'random', "
+        f"'teacher_biased')."
+    )
 
 
 class MoFRouterBase(nn.Module):
@@ -405,8 +456,11 @@ class MoFRouterBase(nn.Module):
         built only if ``d_seq`` is provided. Used when ``pooled_prompt_embeds``
         is None at forward time.
       - Sinusoidal timestep embedding + projection.
-      - Output softmax normalization.
-      - Zero-init on output layer for uniform weights at start.
+      - Output normalization per ``weight_normalization`` ('softmax' |
+        'affine' | 'none' — see ``utils.apply_weight_normalization``).
+      - Zero-init output-layer weight; output bias per mode (0 for softmax →
+        uniform; 1/K-style weight-space profile for 'affine'/'none' so the
+        initial mixture is nonzero and sums to 1).
 
     Note on dimensions (CRITICAL):
         SD3.5 / Flux / etc. provide TWO text representations whose dims differ:
@@ -428,6 +482,7 @@ class MoFRouterBase(nn.Module):
         d_time: int = 256,
         tau: float = 1.0,
         d_seq: Optional[int] = None,
+        weight_normalization: str = "softmax",
     ):
         super().__init__()
         self.K = K
@@ -436,6 +491,7 @@ class MoFRouterBase(nn.Module):
         self.d_hidden = d_hidden
         self.d_time = d_time
         self.tau = tau
+        self.weight_normalization = weight_normalization
 
         # ---- Pooled-bypass projection (always built) ----
         self.c_proj = nn.Linear(d_pool, d_hidden)
@@ -545,12 +601,15 @@ class MoFRouterBase(nn.Module):
             pooled_prompt_embeds: (B, d_pool) optional; bypasses AttnPool if provided.
 
         Returns:
-            weights: (K, B) softmax-normalized mixing weights.
+            weights: (K, B) mixing weights, normalized over K according to
+            ``self.weight_normalization``.
         """
         c = self._pool_text(prompt_embeds, pooled_prompt_embeds)
         t_hidden = self._embed_time(t)
         logits = self._fuse_and_predict(c, t_hidden)  # (B, K)
-        weights = F.softmax(logits / self.tau, dim=-1)  # (B, K)
+        weights = apply_weight_normalization(
+            logits, self.weight_normalization, self.tau, dim=-1
+        )  # (B, K)
         return weights.T  # (K, B) to match velocity stacking convention
 
 
@@ -571,8 +630,15 @@ class MoFAdaLNRouter(MoFRouterBase):
         d_time: int = 256,
         tau: float = 1.0,
         d_seq: Optional[int] = None,
+        weight_normalization: str = "softmax",
+        init_mode: str = "uniform",
+        init_bias: float = 2.0,
+        teacher_set_mapping: Optional[Dict[int, int]] = None,
     ):
-        super().__init__(K, d_pool, d_hidden, d_time, tau, d_seq=d_seq)
+        super().__init__(
+            K, d_pool, d_hidden, d_time, tau, d_seq=d_seq,
+            weight_normalization=weight_normalization,
+        )
 
         self.adaLN_modulation = nn.Linear(d_hidden, 2 * d_hidden)
         self.mlp = nn.Sequential(
@@ -582,11 +648,24 @@ class MoFAdaLNRouter(MoFRouterBase):
             nn.Linear(d_hidden, K),
         )
 
-        # Zero-init for uniform weights at start
+        # Output layer: zero weight + mode-dependent bias, so the initial
+        # mixture is input-independent and exactly uniform (softmax: logits 0;
+        # affine/none: weights 1/K — an all-zero bias would mute every teacher).
         nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        with torch.no_grad():
+            self.mlp[-1].bias.copy_(_router_output_bias_init(
+                K, weight_normalization, init_mode, init_bias, tau,
+                teacher_set_mapping,
+            ))
+        # adaLN modulation: identity init (gamma=1, beta=0 via zero weight +
+        # structured bias). The historical all-zero init made gamma=beta=0,
+        # multiplying the text conditioning c by zero and blocking gradients
+        # into c_proj/adaLN until mlp[-1] moved off zero; the output layer's
+        # zero init alone already guarantees a uniform initial mixture.
         nn.init.zeros_(self.adaLN_modulation.weight)
-        nn.init.zeros_(self.adaLN_modulation.bias)
+        with torch.no_grad():
+            self.adaLN_modulation.bias.zero_()
+            self.adaLN_modulation.bias[:d_hidden].fill_(1.0)  # gamma half
 
     def _fuse_and_predict(self, c: torch.Tensor, t_hidden: torch.Tensor) -> torch.Tensor:
         gamma, beta = self.adaLN_modulation(t_hidden).chunk(2, dim=-1)
@@ -611,8 +690,15 @@ class MoFMLPRouter(MoFRouterBase):
         d_time: int = 256,
         tau: float = 1.0,
         d_seq: Optional[int] = None,
+        weight_normalization: str = "softmax",
+        init_mode: str = "uniform",
+        init_bias: float = 2.0,
+        teacher_set_mapping: Optional[Dict[int, int]] = None,
     ):
-        super().__init__(K, d_pool, d_hidden, d_time, tau, d_seq=d_seq)
+        super().__init__(
+            K, d_pool, d_hidden, d_time, tau, d_seq=d_seq,
+            weight_normalization=weight_normalization,
+        )
 
         self.mlp = nn.Sequential(
             nn.Linear(2 * d_hidden, d_hidden),
@@ -622,9 +708,14 @@ class MoFMLPRouter(MoFRouterBase):
             nn.Linear(d_hidden, K),
         )
 
-        # Zero-init for uniform weights at start
+        # Zero weight + mode-dependent bias → input-independent uniform
+        # mixture at start in every normalization mode.
         nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        with torch.no_grad():
+            self.mlp[-1].bias.copy_(_router_output_bias_init(
+                K, weight_normalization, init_mode, init_bias, tau,
+                teacher_set_mapping,
+            ))
 
     def _fuse_and_predict(self, c: torch.Tensor, t_hidden: torch.Tensor) -> torch.Tensor:
         h = torch.cat([t_hidden, c], dim=-1)  # (B, 2*d_hidden)
@@ -661,8 +752,8 @@ class MoFTimeRouter(nn.Module):
         t ∈ R^B  →  SinusoidalPosEmb(d_time)
                  →  Linear(d_time → d_hidden) + SiLU
                  →  Linear(d_hidden → d_hidden) + SiLU
-                 →  Linear(d_hidden → K)  [zero-init]
-                 →  softmax(/τ, dim=-1)
+                 →  Linear(d_hidden → K)  [zero-init weight, mode-init bias]
+                 →  weight normalization (softmax(/τ) | affine | none)
                  →  W ∈ R^{K × B}  (transposed)
 
     Param count (K=3, d_time=d_hidden=256): ~132K (~5x smaller than full
@@ -683,12 +774,17 @@ class MoFTimeRouter(nn.Module):
         d_hidden: int = 256,
         d_time: int = 256,
         tau: float = 1.0,
+        weight_normalization: str = "softmax",
+        init_mode: str = "uniform",
+        init_bias: float = 2.0,
+        teacher_set_mapping: Optional[Dict[int, int]] = None,
     ):
         super().__init__()
         self.K = K
         self.d_hidden = d_hidden
         self.d_time = d_time
         self.tau = tau
+        self.weight_normalization = weight_normalization
         # Markers used by save/load arch-mismatch checks: TimeRouter has
         # no text branch, so these dims are recorded as None in
         # ``router_arch`` and serve as the "this is a Time Router"
@@ -715,12 +811,17 @@ class MoFTimeRouter(nn.Module):
             nn.SiLU(),
         )
 
-        # Output classifier — zero-init so initial logits are 0 and
-        # softmax produces the uniform mixture 1/K. Aligns with the
-        # zero-init strategy used by adaLN/MLP routers.
+        # Output classifier — zero weight + mode-dependent bias so the
+        # initial mixture is uniform in every normalization mode (softmax:
+        # zero logits; affine/none: bias 1/K — an all-zero bias would mute
+        # every teacher). Aligns with the init strategy of adaLN/MLP routers.
         self.out_proj = nn.Linear(d_hidden, K)
         nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        with torch.no_grad():
+            self.out_proj.bias.copy_(_router_output_bias_init(
+                K, weight_normalization, init_mode, init_bias, tau,
+                teacher_set_mapping,
+            ))
 
     def forward(
         self,
@@ -741,15 +842,19 @@ class MoFTimeRouter(nn.Module):
             pooled_prompt_embeds: IGNORED.
 
         Returns:
-            ``(K, B)`` mixing weights with ``∑_k W_{k,b} = 1`` for every
-            ``b``. When all ``t_b`` in the batch are equal (typical MoF
-            inference), all columns of the output are equal.
+            ``(K, B)`` mixing weights, normalized over K according to
+            ``self.weight_normalization`` (``∑_k W_{k,b} = 1`` under
+            'softmax'/'affine'; unconstrained under 'none'). When all
+            ``t_b`` in the batch are equal (typical MoF inference), all
+            columns of the output are equal.
         """
         del prompt_embeds, pooled_prompt_embeds  # explicit "unused" signal
         e = self.time_embed(t)                            # (B, d_time)
         h = self.time_mlp(e)                               # (B, d_hidden)
         logits = self.out_proj(h)                          # (B, K)
-        weights = F.softmax(logits / self.tau, dim=-1)     # (B, K)
+        weights = apply_weight_normalization(
+            logits, self.weight_normalization, self.tau, dim=-1
+        )                                                  # (B, K)
         return weights.transpose(0, 1).contiguous()        # (K, B)
 
 
@@ -763,6 +868,10 @@ def create_mixing_module(
     d_time: int = 256,
     temperature: float = 1.0,
     d_seq: Optional[int] = None,
+    weight_normalization: str = "softmax",
+    init_mode: str = "uniform",
+    init_bias: float = 2.0,
+    teacher_set_mapping: Optional[Dict[int, int]] = None,
     **lut_kwargs,
 ) -> nn.Module:
     """Factory function for creating mixing weight modules.
@@ -785,39 +894,65 @@ def create_mixing_module(
             bypass path. adaLN/MLP router only; ignored for "time_router".
         d_hidden: Hidden dimension for router networks.
         d_time: Time embedding dim. Router only.
-        temperature: Softmax temperature.
+        temperature: Softmax temperature (weight_normalization='softmax' only).
         d_seq: Per-token text-embedding dim, e.g. 4096 for SD3.5
             ``prompt_embeds`` (T5-XXL). Optional; only required if you want
             the AttnPool fallback path. adaLN/MLP router only; ignored for
             "time_router".
-        **lut_kwargs: Additional kwargs for LUT modules (normalize_weights,
-            init_mode, init_bias, teacher_set_mapping).
+        weight_normalization: 'softmax' | 'affine' | 'none' — logits→weights
+            mapping, forwarded to every module type (see
+            ``utils.apply_weight_normalization``).
+        init_mode: logits_init mode ('uniform' / 'random' / 'teacher_biased' /
+            'hard'). LUTs init their logits tensor with it; routers init their
+            output bias with it in 'affine'/'none' mode (ignored by routers
+            in 'softmax' mode — uniform start).
+        init_bias: Bias strength for 'teacher_biased' init.
+        teacher_set_mapping: Dict mapping set_id → teacher_index for
+            biased / hard init.
+        **lut_kwargs: Additional kwargs forwarded to LUT modules only.
 
     Returns:
         nn.Module with appropriate interface.
     """
     if module_type == "lut":
         return MoFMixingModule(
-            K=K, T=T, S=S, temperature=temperature, **lut_kwargs
+            K=K, T=T, S=S, temperature=temperature,
+            weight_normalization=weight_normalization,
+            init_mode=init_mode, init_bias=init_bias,
+            teacher_set_mapping=teacher_set_mapping,
+            **lut_kwargs,
         )
     elif module_type == "lut_simple":
         return MoFMixingModuleSimple(
-            K=K, T=T, S=S, temperature=temperature, **lut_kwargs
+            K=K, T=T, S=S, temperature=temperature,
+            weight_normalization=weight_normalization,
+            init_mode=init_mode, init_bias=init_bias,
+            teacher_set_mapping=teacher_set_mapping,
+            **lut_kwargs,
         )
     elif module_type == "time_router":
         # No text branch — d_pool / d_seq deliberately not forwarded.
         return MoFTimeRouter(
             K=K, d_hidden=d_hidden, d_time=d_time, tau=temperature,
+            weight_normalization=weight_normalization,
+            init_mode=init_mode, init_bias=init_bias,
+            teacher_set_mapping=teacher_set_mapping,
         )
     elif module_type == "adaln_router":
         return MoFAdaLNRouter(
             K=K, d_pool=d_pool, d_hidden=d_hidden, d_time=d_time,
             tau=temperature, d_seq=d_seq,
+            weight_normalization=weight_normalization,
+            init_mode=init_mode, init_bias=init_bias,
+            teacher_set_mapping=teacher_set_mapping,
         )
     elif module_type == "mlp_router":
         return MoFMLPRouter(
             K=K, d_pool=d_pool, d_hidden=d_hidden, d_time=d_time,
             tau=temperature, d_seq=d_seq,
+            weight_normalization=weight_normalization,
+            init_mode=init_mode, init_bias=init_bias,
+            teacher_set_mapping=teacher_set_mapping,
         )
     else:
         raise ValueError(
@@ -899,27 +1034,29 @@ class MoFTrainerBase(BaseTrainer):
         Since teacher velocities are always .detach()'ed, no gradient will
         flow to adapter params regardless.
 
-        Weight decay policy:
-        - normalize_weights=True (softmax): weight_decay forced to 0 because
-          softmax already bounds outputs to [0,1]. L2 penalty on logits would
-          push toward uniform mixing, counteracting teacher-biased init.
-        - normalize_weights=False (unnormalized): weight_decay applied as
-          configured to prevent unbounded weight drift.
+        Weight decay policy: always 0 for the mixing module, in every
+        weight_normalization mode.
+        - 'softmax': L2 on logits pulls toward 0 = uniform mixture,
+          counteracting teacher-biased init.
+        - 'affine'/'none': logits ARE the weights; L2 pulls them toward 0,
+          i.e. shrinks Σw and rescales the combined velocity field — the
+          wrong anchor entirely. Use `weight_sum_penalty` (anchors Σw at 1)
+          instead.
         """
-        weight_decay = self.training_args.adam_weight_decay
-        if self.training_args.normalize_weights:
-            if weight_decay > 0:
-                logger.info(
-                    f"normalize_weights=True: overriding adam_weight_decay={weight_decay} → 0.0 "
-                    f"(softmax bounds output, weight decay would push logits toward uniform)."
-                )
-            weight_decay = 0.0
+        if self.training_args.adam_weight_decay > 0:
+            logger.info(
+                f"MoF mixing module: ignoring adam_weight_decay="
+                f"{self.training_args.adam_weight_decay} → 0.0. Decay toward "
+                f"0 is the wrong anchor for mixing weights (uniform-bias under "
+                f"softmax; velocity-field shrinkage under 'affine'/'none'). "
+                f"Use weight_sum_penalty to anchor Σw≈1 in 'none' mode."
+            )
 
         self.optimizer = torch.optim.AdamW(
             self._mixing_module.parameters(),
             lr=self.training_args.learning_rate,
             betas=self.training_args.adam_betas,
-            weight_decay=weight_decay,
+            weight_decay=0.0,
             eps=self.training_args.adam_epsilon,
         )
         return self.optimizer
@@ -1084,26 +1221,26 @@ class MoFTrainerBase(BaseTrainer):
         accelerator.prepare() for DeepSpeed ZeRO compatibility.
         """
         module_type = self.training_args.mixing_module_type
+        weight_normalization = self.training_args.weight_normalization
+
+        # Build teacher→set mapping for biased init. LUTs use it per source;
+        # routers (no per-source axis) use it for the source-aggregated
+        # 'teacher_biased' output-bias profile in 'affine'/'none' mode.
+        teacher_set_mapping: Dict[int, int] = {}
+        for src, s_id in self._source_to_set_id.items():
+            for k, teacher_srcs in enumerate(self._teacher_sources):
+                if teacher_srcs is not None and src in teacher_srcs:
+                    teacher_set_mapping[s_id] = k
+                    break
 
         if module_type in ("lut", "lut_simple"):
-            # Build teacher→set mapping for biased init.
-            # For "lut_simple" the LUT itself has no per-source axis, but
-            # the mapping is still consumed by the init helper to decide
-            # which teacher rows receive the +init_bias kick.
-            teacher_set_mapping: Dict[int, int] = {}
-            for src, s_id in self._source_to_set_id.items():
-                for k, teacher_srcs in enumerate(self._teacher_sources):
-                    if teacher_srcs is not None and src in teacher_srcs:
-                        teacher_set_mapping[s_id] = k
-                        break
-
             self._mixing_module = create_mixing_module(
                 module_type=module_type,
                 K=self.K,
                 T=self.training_args.num_inference_steps,
                 S=self.S,
                 temperature=self.training_args.temperature,
-                normalize_weights=self.training_args.normalize_weights,
+                weight_normalization=weight_normalization,
                 init_mode=self.training_args.logits_init,
                 init_bias=self.training_args.logits_init_bias,
                 teacher_set_mapping=teacher_set_mapping,
@@ -1112,7 +1249,8 @@ class MoFTrainerBase(BaseTrainer):
             n_params = sum(p.numel() for p in self._mixing_module.parameters())
             logger.info(
                 f"MoF {module_type}: K={self.K}, T={self.training_args.num_inference_steps}, "
-                f"S={self.S}, params={n_params:,} "
+                f"S={self.S}, params={n_params:,}, "
+                f"weight_normalization={weight_normalization} "
                 f"(source-{'aware' if module_type == 'lut' else 'agnostic'})"
             )
             return self._mixing_module.logits
@@ -1138,13 +1276,19 @@ class MoFTrainerBase(BaseTrainer):
                 d_hidden=self.training_args.mixing_hidden_dim,
                 d_time=self.training_args.mixing_d_time,
                 temperature=self.training_args.temperature,
+                weight_normalization=weight_normalization,
+                init_mode=self.training_args.logits_init,
+                init_bias=self.training_args.logits_init_bias,
+                teacher_set_mapping=teacher_set_mapping,
             ).to(self.accelerator.device)
             n_params = sum(p.numel() for p in self._mixing_module.parameters())
             logger.info(
                 f"MoF time_router: K={self.K}, "
                 f"d_hidden={self.training_args.mixing_hidden_dim}, "
                 f"d_time={self.training_args.mixing_d_time}, "
-                f"params={n_params:,} (source-agnostic, text-agnostic)"
+                f"params={n_params:,}, "
+                f"weight_normalization={weight_normalization} "
+                f"(source-agnostic, text-agnostic)"
             )
             # Router mode: no single logits parameter
             return None
@@ -1175,11 +1319,16 @@ class MoFTrainerBase(BaseTrainer):
                 d_time=self.training_args.mixing_d_time,
                 d_seq=d_seq,
                 temperature=self.training_args.temperature,
+                weight_normalization=weight_normalization,
+                init_mode=self.training_args.logits_init,
+                init_bias=self.training_args.logits_init_bias,
+                teacher_set_mapping=teacher_set_mapping,
             ).to(self.accelerator.device)
 
             logger.info(
                 f"MoF router ({module_type}): K={self.K}, d_pool={d_pool}, "
                 f"d_seq={d_seq}, d_hidden={self.training_args.mixing_hidden_dim}, "
+                f"weight_normalization={weight_normalization}, "
                 f"params={sum(p.numel() for p in self._mixing_module.parameters()):,}"
             )
             # Router mode: no single logits parameter
@@ -1240,7 +1389,8 @@ class MoFTrainerBase(BaseTrainer):
         batch: Any,
         timestep_index: int = 0,
         set_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_weights: bool = False,
+    ):
         """Compute combined velocity using current mixing weights (differentiable).
 
         Dispatches between LUT and router mode.
@@ -1251,22 +1401,71 @@ class MoFTrainerBase(BaseTrainer):
             batch: Stacked BaseSample batch (must contain 'prompt_embeds' for router mode).
             timestep_index: Index into T dimension (only used in LUT mode).
             set_ids: (B,) integer set IDs (only used in LUT mode).
+            return_weights: Also return the per-sample (K, B) weight matrix
+                (differentiable — used for the weight_sum_penalty regularizer
+                and for weight statistics logging).
 
         Returns:
             v_combined: (B, *latent_dims) with gradients through mixing weights.
+            If ``return_weights``: tuple of (v_combined, w_kb) with w_kb (K, B).
         """
         if self._is_router_mode:
-            weights = self._compute_router_weights(
+            w_kb = self._compute_router_weights(
                 t, batch['prompt_embeds'], batch.get('pooled_prompt_embeds')
             )  # (K, B)
-            n_spatial = teacher_velocities.ndim - 2
-            w_expanded = weights.view(self.K, -1, *([1] * n_spatial))
-            return (w_expanded * teacher_velocities).sum(dim=0)
         else:
             current_weights = self._get_lambda_weights(self._lambda_logits)
-            return self._combine_velocities_per_sample(
-                teacher_velocities, timestep_index, current_weights, set_ids
-            )
+            # (K, T, S)[:, t_idx, :] → (K, S); gather per-sample → (K, B)
+            w_kb = current_weights[:, timestep_index, :][:, set_ids]
+
+        n_spatial = teacher_velocities.ndim - 2
+        w_expanded = w_kb.view(self.K, -1, *([1] * n_spatial))
+        v_combined = (w_expanded * teacher_velocities).sum(dim=0)
+        if return_weights:
+            return v_combined, w_kb
+        return v_combined
+
+    @staticmethod
+    def _weight_sum_penalty_value(w_kb: torch.Tensor) -> torch.Tensor:
+        """Soft sum-to-one regularizer value: mean_b((Σ_k w_kb − 1)²).
+
+        Only meaningful with weight_normalization='none' (under 'softmax' /
+        'affine' the column sums are 1 by construction). Computed in float32
+        to avoid bf16 rounding on the small (Σ−1)² residual.
+
+        Args:
+            w_kb: (K, B) differentiable per-sample mixing weights.
+        """
+        return ((w_kb.float().sum(dim=0) - 1.0) ** 2).mean()
+
+    def _append_weight_stats(self, loss_info: Dict[str, list], w_kb: torch.Tensor) -> None:
+        """Append per-step mixing-weight statistics for logging.
+
+        Records the batch Σ_k w distribution (drift monitor for
+        weight_normalization='none') and per-teacher batch-mean weights
+        (covers router mode, which has no LUT logits table to dump).
+
+        Note: these scalars are later averaged across ranks/timesteps by
+        ``reduce_loss_info``, so 'min'/'max' become means of per-step extrema
+        — adequate for drift monitoring.
+        """
+        w = w_kb.detach().float()
+        col_sums = w.sum(dim=0)  # (B,)
+        loss_info['weight_sum_mean'].append(col_sums.mean())
+        loss_info['weight_sum_min'].append(col_sums.min())
+        loss_info['weight_sum_max'].append(col_sums.max())
+        loss_info['weight_min'].append(w.min())
+        loss_info['weight_max'].append(w.max())
+        for k_i, name in enumerate(self._teacher_names):
+            loss_info[f'lambda_{name}_batch_mean'].append(w[k_i].mean())
+
+    @property
+    def _sum_penalty_active(self) -> bool:
+        """Whether the Σw≈1 soft penalty applies this run."""
+        return (
+            self.training_args.weight_normalization == "none"
+            and self.training_args.weight_sum_penalty > 0
+        )
 
     @property
     def enable_kl_loss(self) -> bool:
@@ -1363,12 +1562,22 @@ class MoFTrainerBase(BaseTrainer):
             yield
 
     @contextmanager
-    def _mof_inference_context(self, set_id: int = 0, num_inference_steps: Optional[int] = None):
+    def _mof_inference_context(
+        self,
+        set_id: int = 0,
+        num_inference_steps: Optional[int] = None,
+        clamp_range: Optional[tuple] = None,
+    ):
         """Patch adapter.forward to return lambda-combined teacher velocity.
 
         Args:
             set_id: Which prompt set's weights to use for this inference pass.
                     Only used in LUT mode; router mode ignores this (uses prompt_embeds).
+            clamp_range: Optional (low, high) hard clamp on the mixing weights,
+                    for EVAL inference only (training rollouts must pass None:
+                    clamping has no gradient and would make the sampling policy
+                    diverge from the optimized one). Safety bound for
+                    weight_normalization='none'/'affine' extrapolation.
             num_inference_steps: Effective number of denoising steps for this
                     inference pass. When this differs from ``num_train_timesteps``
                     in LUT modes, the (K, T_train) weights for ``set_id`` are
@@ -1415,6 +1624,8 @@ class MoFTrainerBase(BaseTrainer):
                         mode="linear",
                         align_corners=True,
                     ).squeeze(0)  # (K, T_effective)
+                if clamp_range is not None:
+                    set_weights = set_weights.clamp(*clamp_range)
 
         def patched_forward(**kwargs):
             t_idx = min(step_counter[0], effective_T - 1)
@@ -1446,6 +1657,8 @@ class MoFTrainerBase(BaseTrainer):
                 if t_val.dim() == 0:
                     t_val = t_val.expand(prompt_emb.shape[0])
                 w_i = self._mixing_module_unwrapped(t_val, prompt_emb, pooled)  # (K, B)
+                if clamp_range is not None:
+                    w_i = w_i.clamp(*clamp_range)
                 n_spatial = stacked.ndim - 2
                 w_expanded = w_i.view(self.K, -1, *([1] * n_spatial))
                 combined_noise_pred = (w_expanded * stacked).sum(dim=0)
@@ -1971,7 +2184,9 @@ class MoFTrainerBase(BaseTrainer):
         eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
 
         with torch.no_grad(), self.autocast(), self._mof_inference_context(
-            set_id, num_inference_steps=merged_eval.num_inference_steps
+            set_id,
+            num_inference_steps=merged_eval.num_inference_steps,
+            clamp_range=self.training_args.weight_clamp_range,
         ):
             all_samples = self._run_eval_inference_batches(test_set_name, merged_eval, eval_seed)
             gathered_rewards = self._gather_eval_rewards()
@@ -2101,6 +2316,17 @@ class MoFTrainerBase(BaseTrainer):
                 'reward_running_mean': self._reward_running_mean,
                 'reward_running_var': self._reward_running_var,
                 'mixing_module_type': self.training_args.mixing_module_type,
+                # v2 metadata: logits→weights semantics. Consumers (resume,
+                # distill, inference/inspection scripts) MUST honor these
+                # instead of unconditionally softmaxing — raw 'none'/'affine'
+                # weights pushed through softmax are silently wrong.
+                'mof_state_version': 2,
+                'weight_normalization': self.training_args.weight_normalization,
+                'temperature': float(self.training_args.temperature),
+                # Back-compat bool for pre-v2 readers (True iff softmax;
+                # 'affine' did not exist before v2, so old readers never
+                # encounter it from their own checkpoints).
+                'normalize_weights': self.training_args.weight_normalization == 'softmax',
             }
 
             if self._is_router_mode:
@@ -2120,6 +2346,7 @@ class MoFTrainerBase(BaseTrainer):
                     'd_hidden': router.d_hidden,
                     'd_time': router.d_time,
                     'tau': router.tau,
+                    'weight_normalization': router.weight_normalization,
                 }
                 # Also save a dummy lambda_logits=None marker for compatibility
                 state['lambda_logits'] = None
@@ -2153,6 +2380,41 @@ class MoFTrainerBase(BaseTrainer):
             context="MoF resume",
         )
 
+        # Validate logits→weights semantics: resuming a 'none'/'affine' run
+        # under 'softmax' (or vice versa) silently reinterprets every saved
+        # logit. Hard-error on recorded mismatch; legacy checkpoints (no key)
+        # only get a warning since their semantics cannot be verified.
+        saved_norm = state.get('weight_normalization')
+        if saved_norm is not None:
+            if saved_norm != self.training_args.weight_normalization:
+                raise ValueError(
+                    f"MoF resume: checkpoint was trained with "
+                    f"weight_normalization={saved_norm!r} but the current "
+                    f"config uses "
+                    f"{self.training_args.weight_normalization!r}. Resuming "
+                    f"under different weight semantics silently changes the "
+                    f"optimization; set the config to match the checkpoint."
+                )
+            saved_temp = state.get('temperature')
+            if (
+                saved_temp is not None
+                and saved_norm == 'softmax'
+                and abs(saved_temp - self.training_args.temperature) > 1e-9
+            ):
+                raise ValueError(
+                    f"MoF resume: checkpoint temperature={saved_temp} != "
+                    f"current temperature={self.training_args.temperature}. "
+                    f"The saved logits were trained against the checkpoint "
+                    f"temperature; set the config to match."
+                )
+        else:
+            logger.warning(
+                f"MoF resume: checkpoint has no 'weight_normalization' "
+                f"metadata (legacy format). Assuming it matches the current "
+                f"config ({self.training_args.weight_normalization!r}, "
+                f"temperature={self.training_args.temperature})."
+            )
+
         if self._is_router_mode:
             # Router mode: load module state_dict
             if 'mixing_module_state_dict' not in state:
@@ -2178,6 +2440,7 @@ class MoFTrainerBase(BaseTrainer):
                     'd_hidden': router.d_hidden,
                     'd_time': router.d_time,
                     'tau': router.tau,
+                    'weight_normalization': router.weight_normalization,
                 }
                 mismatches = {
                     k: (saved_arch.get(k), current_arch.get(k))

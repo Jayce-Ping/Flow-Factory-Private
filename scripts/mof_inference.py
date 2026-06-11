@@ -58,6 +58,7 @@ def load_mof_weights(
     use_ema: bool = False,
     teacher_names: Optional[List[str]] = None,
     strict_teacher_order: bool = True,
+    weight_normalization: str = "auto",
 ) -> torch.Tensor:
     """Load and compute lambda weights from MoF checkpoint.
 
@@ -69,6 +70,9 @@ def load_mof_weights(
             user-supplied --teacher-names and the checkpoint's teacher_names.
             Set to False to allow renaming teachers at inference time at the
             user's own risk.
+        weight_normalization: 'auto' (default — read 'weight_normalization'
+            from the checkpoint, legacy fallback 'softmax' with a warning),
+            or an explicit override: 'softmax' | 'affine' | 'none'.
 
     Returns:
         weights: Tensor of shape (K, T) for the specified set.
@@ -136,8 +140,44 @@ def load_mof_weights(
     if set_id >= S:
         raise ValueError(f"set_id={set_id} out of range (S={S})")
 
-    # Compute softmax weights
-    weights = F.softmax(logits / temperature, dim=0)  # (K, T, S)
+    # Resolve logits→weights semantics (explicit > checkpoint > legacy softmax)
+    ckpt_norm = state.get("weight_normalization")
+    if weight_normalization == "auto":
+        if ckpt_norm is not None:
+            norm_mode = ckpt_norm
+        else:
+            norm_mode = "softmax"
+            print(
+                "  WARNING: checkpoint has no 'weight_normalization' metadata "
+                "(legacy format); assuming 'softmax'. If this checkpoint was "
+                "trained unnormalized (e.g. hard-route LUT), pass "
+                "--weight-normalization none."
+            )
+    else:
+        norm_mode = weight_normalization
+        if ckpt_norm is not None and ckpt_norm != norm_mode:
+            print(
+                f"  WARNING: overriding checkpoint weight_normalization="
+                f"{ckpt_norm!r} with {norm_mode!r}."
+            )
+    # Temperature recorded at train time wins over the CLI default.
+    ckpt_temp = state.get("temperature")
+    if ckpt_temp is not None and abs(ckpt_temp - temperature) > 1e-9:
+        print(
+            f"  Using checkpoint temperature={ckpt_temp} "
+            f"(CLI --temperature {temperature} ignored)."
+        )
+        temperature = ckpt_temp
+    print(f"  Weight normalization: {norm_mode}")
+
+    if norm_mode == "softmax":
+        weights = F.softmax(logits / temperature, dim=0)  # (K, T, S)
+    elif norm_mode == "affine":
+        weights = logits - (logits.sum(dim=0, keepdim=True) - 1.0) / K
+    elif norm_mode == "none":
+        weights = logits
+    else:
+        raise ValueError(f"Invalid weight_normalization: {norm_mode!r}")
     set_weights = weights[:, :, set_id]  # (K, T)
 
     # Print weight summary (k indexes teacher in training order)
@@ -519,9 +559,18 @@ def main():
     parser.add_argument("--set-id", type=int, default=0,
                         help="Which prompt set's weights to use (default: 0)")
     parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Softmax temperature for lambda weights")
+                        help="Softmax temperature for lambda weights "
+                             "(overridden by the checkpoint's recorded value "
+                             "when present)")
     parser.add_argument("--use-ema", action="store_true",
                         help="Use EMA logits instead of current logits")
+    parser.add_argument("--weight-normalization", type=str, default="auto",
+                        choices=["auto", "softmax", "affine", "none"],
+                        help="Logits→weights mapping. 'auto' (default) reads "
+                             "the checkpoint's 'weight_normalization' field "
+                             "(legacy fallback: softmax, with a warning). "
+                             "Explicit values override a mislabeled "
+                             "checkpoint.")
 
     # Model settings
     parser.add_argument("--model", type=str, default="stabilityai/stable-diffusion-3.5-medium",
@@ -571,6 +620,7 @@ def main():
         use_ema=args.use_ema,
         teacher_names=teacher_display_names,
         strict_teacher_order=not args.no_strict_teacher_order,
+        weight_normalization=args.weight_normalization,
     )
 
     K_weights = mof_weights.shape[0]

@@ -12,17 +12,19 @@
 #   - learning_rate: 0.01        (was 0.05; compensate for missing softmax
 #                                 Jacobian damping ~1/3 — so unnormalized
 #                                 weight-space lr matches base's effective lr)
-#   - adam_weight_decay: 1.0e-4  (kept same as base; codebase auto-zeros it
-#                                 when normalize_weights=true, but applies it
-#                                 in unnormalized mode for drift protection.
-#                                 Effect on initial 1.0 weights is gentle:
-#                                 ~5% loss over 10K steps, dominated by
-#                                 reward gradient.)
+#   - weight_sum_penalty: 0.01   (soft Σw≈1 anchor. The MoF optimizer now
+#                                 zeros adam_weight_decay in ALL modes —
+#                                 decay toward 0 shrinks Σw and rescales the
+#                                 combined velocity, the wrong anchor — so
+#                                 this penalty replaces the old wd-based
+#                                 "drift protection". One-hot init already
+#                                 satisfies Σw=1, so the penalty is 0 at t=0.)
 #
-# Trade-off: in unnormalized mode, weights can drift to negative/>1 values
-# and the K weights are not constrained to sum to 1. This is acceptable for
-# initial-condition experiments (e.g. ablating the warm-start effect of
-# soft-biased init) but should be evaluated carefully for production use.
+# Trade-off: in unnormalized mode, weights can drift to negative/>1 values;
+# the soft penalty keeps Σw≈1 but does not bound individual weights. This is
+# acceptable for initial-condition experiments (e.g. ablating the warm-start
+# effect of soft-biased init) but should be evaluated carefully for
+# production use.
 #
 # Learnable params: K=3 × T=28 × S=3 = 252 weights (treated directly).
 
@@ -95,8 +97,9 @@ train:
   logits_init: "hard"                       # exact one-hot per source at t=0
   logits_init_bias: 2.0                     # ignored when logits_init='hard'
   learning_rate: 0.01                       # 0.05 (base) ÷ 3 to compensate for missing softmax Jacobian damping (~1/3 spectral radius at uniform init)
-  temperature: 1.0                          # ignored when normalize_weights=false
-  normalize_weights: false                  # REQUIRED: logits ARE the weights (softmax can't be exact one-hot)
+  temperature: 1.0                          # ignored when weight_normalization != softmax
+  weight_normalization: none                # REQUIRED: logits ARE the weights (softmax can't be exact one-hot)
+  weight_sum_penalty: 0.01                  # soft Σw≈1 anchor (replaces the removed weight-decay drift protection)
 
   # ---- EMA schedule (aligned with NFT default) ----
   ema_decay_schedule: "piecewise_linear"
@@ -133,7 +136,7 @@ train:
   gradient_step_per_epoch: 1
   gradient_accumulation_steps: auto
   max_grad_norm: 1.0
-  adam_weight_decay: 1.0e-4                 # Drift protection (codebase applies wd only when normalize_weights=false). Pull on initial 1.0 weight is ~5e-6/step → 5% loss over 10K steps, negligible vs reward gradient.
+  adam_weight_decay: 1.0e-4                 # NOTE: ignored for the MoF mixing module in all modes (decay→0 is the wrong anchor); weight_sum_penalty handles drift instead.
   adam_epsilon: 1.0e-8
   ddp_find_unused_parameters: false
   max_epochs: 1000

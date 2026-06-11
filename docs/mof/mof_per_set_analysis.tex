@@ -1355,7 +1355,7 @@ Bandit gradient \eqref{eq:bandit_gradient_simple} 依赖于：
 \end{itemize}
 \textbf{完全不依赖 teacher velocity 差异 $\|v^{(j)} - \bar{v}\|$}。
 
-对比 NFT gradient \eqref{eq:grad_dot_product}：
+对比 NFT gradient \eqref{eq:final_gradient_derivation}：
 \begin{center}
 \renewcommand{\arraystretch}{1.3}
 \begin{tabular}{lcc}
@@ -1529,6 +1529,50 @@ After GAS: $\sim 3.4 \times 10^{-8}$. Grad norm: $\sim 10^{-7}$.
 \item Level~1 保证（$\geq$ single teacher）不再自动成立——需额外约束 $\sum_k \alpha_k \approx 1$
 \item 实际收益有限（$\sim 10^{3}\times$ 改善仍不如 Solution A 的 $\sim 10^{8}\times$）
 \end{itemize}
+\end{remark}
+
+\begin{remark}[量级核算的修正：cos 因子应对称计入]
+\label{rem:bookkeeping}
+上文 Step~5 对 softmax 路径的估计在 $\sim 3.5\times 10^{-6}$（per
+timestep, before GAS）之后额外乘了``$|\cos\theta|$ 实际更小''的 1--2 个数
+量级压缩得到 $10^{-9}$--$10^{-10}$，而本节对 unnormalized 路径的估计
+（$\sim 2.7\times 10^{-6}$，GAS 后 $10^{-7}$）\textbf{未}乘同款因子——同一
+高维 dot-product 对齐论证对两者同样适用，逐项对照时应统一。两条路径真正
+的\textbf{系统性}差异只有两项：(i) softmax Jacobian 的
+$\lambda_j(1-\lambda_j)/\tau \leq 1/(4\tau)$ 衰减因子（且在收敛到近
+one-hot 时 $\to 0$，造成额外的 late-stage 梯度淬灭）；(ii) 方向向量是
+$\delta^{(j)}-\bar\delta$（teacher 残差互减）还是 $\delta^{(j)}$（残差本
+身）——当各 teacher 的 LoRA 残差彼此相似（同向 RL 微调）时
+$\|\delta^{(j)}-\bar\delta\| \ll \|\delta^{(j)}\|$，这是主要收益来源；若
+残差彼此近正交则两者同量级，Solution D 的收益缩小到仅剩 (i)。
+\end{remark}
+
+\begin{remark}[实现注记：直接形式 vs.\ 残差形式，及 sum-penalty 的插值作用]
+\label{rem:impl_form}
+本节的 Solution D 定义为\textbf{残差形式}
+$v = v_{\mathrm{base}} + \sum_k \alpha_k \delta^{(k)}$（隐含 base 的有效
+权重 $1-\sum_k\alpha_k$ 进入，整体仍满足仿射 $\Sigma=1$），梯度为
+$\mathbf{g}^\top\delta^{(j)}$。而代码中
+\texttt{weight\_normalization='none'}（旧 \texttt{normalize\_weights=false}）
+实现的是\textbf{直接形式} $v=\sum_k w_k v^{(k)}$（无 base/残差拆分），其梯度为
+\begin{equation}
+\frac{\partial\loss}{\partial \ell_j} = \mathbf{g}^\top v^{(j)}
+= \underbrace{\mathbf{g}^\top v_{\mathrm{base}}}_{\text{共模分量（对所有 } j \text{ 几乎相同）}}
+\;+\; \underbrace{\mathbf{g}^\top \delta^{(j)}}_{\text{判别分量}},
+\end{equation}
+即 Step~3 估计的 $\sim 0.05$ 量级（含完整 base 内积，比残差形式大
+$\sim\|v_{\mathrm{base}}\|/\|\delta\|$ 倍）。代价是：共模分量同向推动所有
+$w_j$，驱动 $\sum_k w_k$ 漂移——这正是速度场整体缩放（时间重参数化）的
+来源。加入 soft sum penalty
+$\beta_\Sigma\,(\sum_k w_k - 1)^2$ 后，其梯度
+$2\beta_\Sigma(\sum_k w_k - 1)$ 恰好只作用于共模方向：
+$\beta_\Sigma$ 较大时共模自由度被锁死、动力学退化为仿射子空间内的
+mean-subtraction 梯度（与 affine 硬投影一致）；$\beta_\Sigma\to 0$ 时恢复
+完整 $\mathbf{g}^\top v^{(j)}$ 信号但放任 $\Sigma$ 漂移。因此
+$\beta_\Sigma$ 在``Solution-D 式大梯度''与``仿射约束的有效性保证''之间
+连续插值，推荐从 $\beta_\Sigma = 0.01$ 起调。另注意：直接形式下 AdamW
+weight decay（朝 $0$ 衰减）会系统性压低 $\sum_k w_k$，是错误的锚点——
+实现中已对 mixing 参数禁用 weight decay，由 sum penalty 取代。
 \end{remark}
 
 \subsection{Solution 对比总表}

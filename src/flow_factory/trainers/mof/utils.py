@@ -21,6 +21,112 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Optional
 
+import torch
+import torch.nn.functional as F
+
+from ...utils.logger_utils import setup_logger
+
+logger = setup_logger(__name__)
+
+#: Valid weight-normalization modes for the mixing module.
+#:   'softmax': weights = softmax(logits / temperature) — convex combination,
+#:              Σw=1, w∈[0,1]. Gradient has the mean-subtraction property
+#:              (∝ g·(v_k − v̄)), which vanishes for LoRA teachers sharing a
+#:              base model (docs/mof/mof_per_set_analysis.tex §13).
+#:   'affine':  weights = logits − (Σ logits − 1)/K — hard projection onto the
+#:              Σw=1 hyperplane. CFG-style: allows w<0 and w>1, preserving FM
+#:              validity under shared-marginal teachers, but the Σw=1
+#:              constraint still implies the mean-subtraction gradient.
+#:   'none':    weights = logits — free linear combination. Largest gradient
+#:              (∝ g·v_k, no mean subtraction) but Σw can drift away from 1,
+#:              which rescales the combined velocity field (an effective time
+#:              reparameterization). Pair with `weight_sum_penalty` to softly
+#:              anchor Σw≈1.
+WEIGHT_NORMALIZATION_MODES = ("softmax", "affine", "none")
+
+
+def apply_weight_normalization(
+    logits: torch.Tensor,
+    mode: str,
+    temperature: float = 1.0,
+    dim: int = 0,
+) -> torch.Tensor:
+    """Map raw mixing logits to mixing weights — single source of truth.
+
+    Used by every producer and consumer of MoF mixing weights (LUT modules,
+    routers, stage-2 distill, inference/inspection scripts) so that the
+    logits→weights semantics can never silently diverge between them.
+
+    Args:
+        logits: Raw logits tensor; the teacher axis is ``dim``.
+        mode: One of :data:`WEIGHT_NORMALIZATION_MODES`.
+        temperature: Softmax temperature. Only used for mode='softmax';
+            'affine' and 'none' treat logits as weights directly.
+        dim: Teacher (K) axis of ``logits``.
+
+    Returns:
+        Mixing weights with the same shape as ``logits``.
+    """
+    if mode == "softmax":
+        return F.softmax(logits / temperature, dim=dim)
+    elif mode == "affine":
+        K = logits.shape[dim]
+        return logits - (logits.sum(dim=dim, keepdim=True) - 1.0) / K
+    elif mode == "none":
+        return logits
+    raise ValueError(
+        f"Invalid weight_normalization mode: {mode!r}. "
+        f"Valid: {list(WEIGHT_NORMALIZATION_MODES)}."
+    )
+
+
+def resolve_weight_normalization(
+    ckpt_value: Optional[str],
+    override: Optional[str],
+    context: str = "MoF",
+) -> str:
+    """Resolve the weight-normalization mode for a loaded MoF checkpoint.
+
+    Precedence: explicit ``override`` (warn if it contradicts a recorded
+    checkpoint value) > checkpoint value > legacy default 'softmax' with a
+    loud warning (checkpoints written before the mode was persisted).
+
+    Args:
+        ckpt_value: ``state.get('weight_normalization')`` from mof_state.pt
+            (None for legacy checkpoints).
+        override: Explicit user override (e.g. ``mof_weight_normalization``
+            config field); None means "use the checkpoint value".
+        context: Label for log messages.
+
+    Returns:
+        One of :data:`WEIGHT_NORMALIZATION_MODES`.
+    """
+    for label, value in (("checkpoint", ckpt_value), ("override", override)):
+        if value is not None and value not in WEIGHT_NORMALIZATION_MODES:
+            raise ValueError(
+                f"{context}: invalid weight_normalization from {label}: "
+                f"{value!r}. Valid: {list(WEIGHT_NORMALIZATION_MODES)}."
+            )
+    if override is not None:
+        if ckpt_value is not None and ckpt_value != override:
+            logger.warning(
+                f"{context}: overriding checkpoint weight_normalization="
+                f"{ckpt_value!r} with explicit {override!r}. The mixing "
+                f"weights will be interpreted differently than at train time "
+                f"— only do this for mislabeled checkpoints."
+            )
+        return override
+    if ckpt_value is not None:
+        return ckpt_value
+    logger.warning(
+        f"{context}: checkpoint has no 'weight_normalization' metadata "
+        f"(legacy format). Assuming 'softmax'. If this checkpoint was "
+        f"trained with normalize_weights=false (e.g. a hard-route LUT), "
+        f"set the explicit override to 'none' — otherwise the raw weights "
+        f"will be incorrectly softmaxed."
+    )
+    return "softmax"
+
 
 @contextmanager
 def bypass_ddp_for_weight_swap(adapter):

@@ -133,6 +133,12 @@ def main():
         # Reward stats are unused by distill loading but kept for format parity.
         "reward_running_mean": {},
         "reward_running_var": {},
+        # v2 metadata: this builder encodes one-hot via large logits THROUGH
+        # softmax (not raw 'none'-mode weights), so 'softmax' is correct.
+        "mof_state_version": 2,
+        "weight_normalization": "softmax",
+        "temperature": 1.0,
+        "normalize_weights": True,
     }
 
     out_path = Path(args.output).expanduser()
