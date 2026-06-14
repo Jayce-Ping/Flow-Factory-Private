@@ -1,0 +1,764 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{pifont}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\adv}{\mathcal{A}}
+\newcommand{\reward}{R}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\MoF}{\mathrm{MoF}}
+\newcommand{\OOD}{\mathrm{OOD}}
+\newcommand{\const}{\mathrm{const}}
+\newcommand{\score}{s}
+\newcommand{\PoE}{\mathrm{PoE}}
+\newcommand{\resp}{r}
+\newcommand{\dataD}{\mathcal{D}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{example}{Example}
+\newtheorem{criterion}{Criterion}
+
+\title{\textbf{MoF 混合质量的本质判据}\\[0.3em]
+\large 跳出 Reward 自循环：用分布层面的 Reward-Free 准则衡量多 Teacher 混合}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+MoF 用同一组 reward $\{R_k\}$ 既训练 teacher $\{v^{(k)}\}$、又选择混合权重
+$\lambda$、还评判混合好坏——这是一个\textbf{自循环}：评价"最好的混合"的尺子,
+恰好就是定义 teacher 的那把尺子。本文形式化这一自循环及其四类病理(reward
+盲区、放大"万能/可刷"reward、饱和后"更高分$\neq$更好"、无有效性概念),并提出
+一个认知跃迁:\textbf{"好的混合"不应由标量 reward 定义,而应由"混合诱导的
+\emph{分布}是否是我们想要的那个"来定义}。上升到分布层面后,我们给出两条本质
+视角:(i) 在 Gaussian 路径下 velocity 与 score 仿射相关,因此 \textbf{affine
+velocity 混合}($\sum_k\lambda_k=1$)\textbf{在几何上等价于 score 求和,即
+Product-of-Experts(AND/共识)};而\textbf{分布混合}(OR)$\sum_k\lambda_k p^{(k)}$
+的正确 velocity 是 responsibility-weighted 的——当前 softmax 凸组合偏向"软选择/
+OR",与多技能想要的"AND 共识"存在\emph{与 reward 无关}的结构性错配。(ii) 给出
+四个\textbf{因果上独立于训练 reward}的度量(留出真实数据的 FM 残差/似然、marginal
+一致性/off-manifold 漂移、teacher skill-residual 干涉、多样性/precision-recall),
+它们以\emph{数据分布}而非 reward 代理为 ground truth。最后把 "best mixing"
+重新定义为三类分布层面目标(mixture / product / barycenter)的选择问题,并给出
+一套纯诊断(无需训练 student)的实验顺序。本文是
+\texttt{mof\_reward\_design.tex} 与 \texttt{mof\_ood\_guarantee\_analysis.tex}
+的补充,聚焦"评价准则"而非"优化目标"。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{引言与问题陈述}
+\label{sec:intro}
+%% ============================================================
+
+\subsection{自循环}
+\label{ssec:selfloop}
+
+MoF 的两阶段流水线(\texttt{mof\_two\_stage\_pipeline.tex})与 reward 的关系
+可以画成一个闭环:
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.0cm and 1.6cm,
+    box/.style={draw, rounded corners, minimum width=3.4cm, minimum height=1.0cm, align=center, fill=blue!8},
+    rbox/.style={draw, rounded corners, minimum width=3.4cm, minimum height=1.0cm, align=center, fill=red!8},
+    arrow/.style={-{Stealth[length=3mm]}, thick},
+]
+\node[rbox] (R) {\textbf{Reward} $\{R_k\}$};
+\node[box, below left=1.4cm and 0.4cm of R] (T) {Teacher $v^{(k)}$\\($=\arg\max R_k$)};
+\node[box, below right=1.4cm and 0.4cm of R] (L) {Mixing $\lambda$\\($=\arg\max \sum_k$-comp)};
+\node[box, below=3.0cm of R] (J) {"\,好坏\,"判定};
+\draw[arrow] (R) -- (T) node[midway, left, font=\scriptsize]{train};
+\draw[arrow] (R) -- (L) node[midway, right, font=\scriptsize]{Stage 1};
+\draw[arrow] (T) -- (L);
+\draw[arrow] (L) -- (J);
+\draw[arrow] (R) -- (J) node[midway, right, font=\scriptsize]{evaluate};
+\draw[arrow, dashed] (J.west) to[bend left=55] node[left, font=\scriptsize]{同一把尺子} (R.west);
+\end{tikzpicture}
+\end{center}
+
+形式化地:
+\begin{enumerate}[leftmargin=1.5em]
+\item teacher $v^{(k)} \approx \arg\max_{v} \E_{p \sim \mathcal{P}_k}[R_k(\mathrm{ODE}(v; p))]$;
+\item 混合 $\lambda^* = \arg\max_\lambda F(\lambda)$,其中复合目标
+$F(\lambda)=f_s(\lambda)+\gamma\,\overline{f_{\OOD}}(\lambda)$ 完全由
+$\{R_k\}$ 构成(\texttt{mof\_notes.tex} eq.~advantage);
+\item 报告"混合比 single teacher 好"时,用的还是 $\{R_k\}$。
+\end{enumerate}
+
+于是"最好的混合 $=$ reward 最高的混合"成为\emph{同义反复}:我们从未引入一个
+独立于 $\{R_k\}$ 的信号去判断混合\emph{究竟}变好了,还是仅仅在同一代理指标上
+爬得更高。
+
+\subsection{两条来自本项目内部的证据}
+\label{ssec:internal_evidence}
+
+自循环并非纯理论顾虑——MoF 自己的实验记录里已有两处征兆,说明
+$\{R_k\}$ 在峰值附近\emph{不是}质量的可靠 ground truth:
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{保守 checkpoint 选择}(\texttt{mof\_notes.tex} \S Teacher
+training)。三个 teacher 的 frozen 快照都\emph{故意取在 reward 峰值之前}:
+"later checkpoints continue to climb in reward but exhibit qualitative
+degradation (especially OCR overfitting to text-detection heuristics at the
+cost of overall image quality)"。这等于\textbf{已经承认}:在峰值附近,
+$R_k$ 继续升高对应的是 reward hacking 而非质量提升。
+\item \textbf{PickScore-dominance}(\texttt{mof\_notes.tex} \S
+pickscore\_dominance)。neural router 把\emph{所有}样本(包括 OCR prompt)都
+路由到 PickScore teacher,\textbf{并非因为图更好},而是因为 PickScore 的
+\texttt{applicable\_sources} 覆盖全集,信号覆盖率最高
+($F_{\text{pick}}/F_{\text{ocr}}=1.4$)。优化器学到的是 reward 的\emph{结构},
+不是图像质量。
+\end{itemize}
+
+把同一个 $\{R_k\}$ 再用于"评价混合好坏",与上面这个保守选择是\emph{自相矛盾}的:
+Stage 1 正是在用那把已被判定为"峰值附近不可信"的尺子,把混合往更高分推。
+
+\subsection{本文贡献}
+\label{ssec:contrib}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{自循环的形式化}与四类病理(\S\ref{sec:pathology})。
+\item \textbf{本质视角一}(\S\ref{sec:or_and}):证明在共享 Gaussian 路径下,
+affine velocity 混合 $\equiv$ score 求和 $\equiv$ Product-of-Experts(AND);
+mixture 分布(OR)需要 responsibility-weighted velocity。由此揭示
+softmax/affine/none 三种模式的\emph{分布语义谱},以及当前实现与"多技能共识"
+目标之间与 reward 无关的结构性错配。
+\item \textbf{本质视角二}(\S\ref{sec:metrics}):四个 reward-free 度量及其在
+本仓库的估计方式。
+\item \textbf{打破循环的 reward 用法}(\S\ref{sec:break_loop})与
+\textbf{"best mixing"的分布层面再定义}(\S\ref{sec:synthesis})。
+\item \textbf{纯诊断实验顺序}(\S\ref{sec:relation}),全部无需训练 student。
+\end{enumerate}
+
+%% ============================================================
+\section{背景与代码地图(简)}
+\label{sec:background}
+%% ============================================================
+
+\subsection{符号表}
+\label{ssec:notation}
+
+本表汇总全文符号,可随时回查。\textbf{三处重载需特别注意}:$s$——作为下标 /
+$\mathcal{P}_s$ 时是 \emph{source(prompt set)},作为 $(x,t)$ 的函数 $s(x,t)$ 时是
+\emph{score};$A$——无参数的 $A$ 是 \emph{advantage},$A(t)$ 是 velocity-score
+仿射系数;$\rho$——无下标的 $\rho$ 是 \emph{外推幅度},$\rho_j^{(s),\const}$ 是
+single-teacher baseline。
+
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}l@{\quad}p{11cm}@{}}
+\toprule
+\textbf{符号} & \textbf{含义} \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{模型与速度场}}\\
+$K,\ k$ & teacher 数量与索引($k=1,\dots,K$)\\
+$v^{(k)}(x,t,c)$ & 第 $k$ 个 teacher 的速度场(冻结 LoRA 快照)\\
+$v_{\text{base}}$ & base 模型速度场(无 LoRA,经 \texttt{use\_ref\_parameters})\\
+$v_\lambda$ & 常权混合速度 $\sum_k\lambda_k v^{(k)}$(MoF 实际使用)\\
+$\tilde v_\lambda$ & responsibility-weighted 速度 $\sum_k\resp_k(x)v^{(k)}$(mixture/OR 的\emph{正确}场)\\
+$\bar v$ & 均匀平均 $\frac1K\sum_k v^{(k)}$\\
+$\Delta v^{(k)}$ & teacher 残差 $v^{(k)}-v_{\text{base}}$(skill 方向)\\
+$\hat x_0^{(k)}$ & teacher $k$ 隐式预测的干净图 $x_t-\sigma v^{(k)}$\\
+\addlinespace
+\multicolumn{2}{@{}l}{\textit{混合权重}}\\
+$\lambda,\ \lambda_k$ & 混合权重 $\lambda_k=\lambda_k(t,s(c),c)$,$\sum_k\lambda_k=1$\\
+$\lambda^*$ & Stage 1 优化得到的混合\\
+$\delta_s^{\const}$ & 恒取 teacher $s$ 的 one-hot 权重(退化为 single teacher $s$)\\
+$\ell,\ \tau$ & 原始 logits;softmax 温度\\
+$\Delta^{K-1}$ & 概率单纯形($\lambda_k\ge0,\ \sum_k\lambda_k=1$)\\
+$\resp_k(x)$ & responsibility(责任)权 $\lambda_k p^{(k)}(x)/\sum_j\lambda_j p^{(j)}(x)$\\
+\addlinespace
+\multicolumn{2}{@{}l}{\textit{概率与 score}}\\
+$p_{\text{data}}$ & 真实数据分布\\
+$p_t,\ p_t^{(k)}$ &(teacher $k$ 的)时刻 $t$ marginal 分布\\
+$p_\lambda^{\PoE}$ & Product-of-Experts $\propto\prod_k(p^{(k)})^{\lambda_k}$(AND/共识)\\
+$p_\lambda^{\text{mix}}$ & 分布混合 $\sum_k\lambda_k p^{(k)}$(OR/并集)\\
+$s(x,t)$ & \textbf{score} $\nabla_x\log p_t(x)$(作为 $(x,t)$ 的函数时)\\
+$s^{(k)},\ s_\lambda,\ s^{\text{mix}}$ & teacher score、score 加权和、mixture 的 score\\
+$A(t),\ B(t)$ & velocity-score 仿射系数(Lemma~\ref{lem:affine},\textbf{带 $t$})\\
+\addlinespace
+\multicolumn{2}{@{}l}{\textit{时间、样本、采样}}\\
+$x_0$ & 干净数据样本($t=0$ 端)\\
+$x_1,\ \epsilon$ & 噪声样本($t=1$ 端),$\epsilon\sim\N(0,I)$\\
+$x_t$ & 加噪 latent $(1-t)x_0+t\epsilon$\\
+$t,\ \sigma$ & flow 时间 $\in[0,1]$;噪声水平(本约定下 $\sigma=t$)\\
+$c,\ p$ & prompt 的 embedding;prompt 本身\\
+$\mathrm{ODE}(v;x_T,p)$ & 用速度场 $v$ 从噪声 $x_T$ 积分采样\\
+\addlinespace
+\multicolumn{2}{@{}l}{\textit{索引与集合}}\\
+$s,\ S$ & \textbf{source}(prompt set)索引与数量;$s(c)$ = prompt $c$ 的 source\\
+$T$ & 推理 timestep 数(logits 的 $T$ 维)\\
+$j$ & reward 索引(常指 OOD,$j\neq s$)\\
+$\mathcal{P}_s$ & source $s$ 的 prompt set\\
+$J,\ |J|$ & 某样本的 OOD reward 集合及其大小\\
+\addlinespace
+\multicolumn{2}{@{}l}{\textit{Reward 与目标}}\\
+$R_k,\ R_j,\ \{R_k\}$ & reward 函数(训练 teacher 所用)\\
+$R_{\text{in}(s)}$ & source $s$ 的 in-domain reward\\
+$a_j,\ A$ & $R_j$ 的归一化 advantage 分量;复合 advantage(\textbf{无参数} $A$)\\
+$f_j^{(s)}(\lambda)$ & 混合 $\lambda$ 在 $\mathcal{P}_s$ 上的期望 reward $R_j$\\
+$F(\lambda),\ F^{(s)}$ & 复合目标 $f_s+\gamma\,\overline{f_{\OOD}}$\\
+$\gamma$ & OOD bonus 系数\\
+$\rho_j^{(s),\const}$ & $R_j$ 在 $\mathcal{P}_s$ 上的最佳 single-teacher baseline\\
+\addlinespace
+\multicolumn{2}{@{}l}{\textit{本文判据量}}\\
+$Q,\ Q_{\text{train}},\ Q_{\text{judge}}$ & 评价混合质量的泛函(训练用 / 独立裁判)\\
+$\Delta_{\text{train}},\ \Delta_{\text{judge}}$ & 相对 $\delta_s^{\const}$ 的分数提升\\
+$\mathrm{FMres}(v_\lambda)$ & 留出真实数据上的 FM 残差(度量 A)\\
+$D(x,t)$ & teacher 分歧加权方差(度量 B,off-manifold 风险)\\
+$d_{\text{OR}}$ & 到 OR 目标距离 $\|v_\lambda-\tilde v_\lambda\|$\\
+$\rho$ & 外推幅度 $\max_k(\lambda_k-1)_++\max_k(-\lambda_k)_+$(\textbf{无下标} $\rho$)\\
+$\dataD_s^{\text{real}}$ & source $s$ 的留出真实图像集\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{混合构造与代码地图}
+\label{ssec:construction}
+
+记 teacher $v^{(k)}$($k=1,\ldots,K$,均为同一 base flow model 的冻结 LoRA
+快照)、prompt set $\mathcal{P}_s$、reward $R_j$。MoF 的混合构造
+(\texttt{mof\_notes.tex} eq.~mof\_def):
+\begin{equation}
+v_\lambda(x,t,c) = \sum_{k=1}^{K} \lambda_k(t, s(c), c)\, v^{(k)}(x,t,c),
+\qquad \textstyle\sum_k \lambda_k = 1.
+\label{eq:mof}
+\end{equation}
+$\lambda$ 是\emph{唯一}可学对象(LUT 模式约 $K{\cdot}T{\cdot}S\sim 10^2$ 个参数,
+router 模式约 $10^6$ 个)。logits$\to$weights 由 \texttt{weight\_normalization} 决定
+(\texttt{trainers/mof/utils.py:apply\_weight\_normalization}):
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{softmax}: $\lambda=\softmax(\ell/\tau)\in\Delta^{K-1}$,凸组合,
+$v_\lambda$ 落在 teacher velocity 的\emph{凸包内}(插值/软选择);
+\item \texttt{affine}: $\lambda=\ell-(\sum_k\ell_k-1)/K$,只要 $\sum\lambda=1$,
+允许 $\lambda<0,>1$,可\emph{外推到凸包外}(CFG 即此类);
+\item \texttt{none}: $\lambda=\ell$ 自由线性组合,靠 \texttt{weight\_sum\_penalty}
+软约束 $\sum\lambda\approx 1$。
+\end{itemize}
+
+\paragraph{Reward 进入点.} Stage 1 用 DiffusionNFT,把 per-set composite
+advantage $A=a_{R_{\text{in}(s)}}+\gamma\cdot\frac{1}{|J|}\sum_{j\in J}a_j$
+折进自归一化 MSE(\texttt{trainers/mof/nft.py:200--231})。Stage 2 把
+$v_{\lambda^*}$ 用纯 velocity MSE 蒸馏进单个 student LoRA。
+
+\paragraph{混合发生的代码位置.}
+\begin{itemize}[leftmargin=1.5em]
+\item Stage 1 rollout: \texttt{common.py:\_mof\_inference\_context} 的
+\texttt{patched\_forward}——先跑 $K$ 个 teacher,再按当前 $\lambda$ 合成;
+\item Stage 1 optimize: \texttt{common.py:\_combine\_velocities\_per\_sample};
+\item Stage 2 distill: \texttt{distill.py:\_combine\_weighted}。
+\end{itemize}
+
+\paragraph{有效性细节(承上启下).} 凸/affine velocity 平均\emph{并不}采样
+"分布的混合" $\sum_k\lambda_k p^{(k)}$。后者的正确传输场是 density-weighted 的
+(\texttt{mof\_notes.tex} eq.~density\_weighted)。只有在\textbf{shared marginals}
+(teacher 是同一 base 的 LoRA)下 $v_\lambda$ 才近似合法。下一节把这个细节
+推到底,得到本文第一条本质判据。
+
+%% ============================================================
+\section{Reward 自循环的形式化与四类病理}
+\label{sec:pathology}
+%% ============================================================
+
+\begin{definition}[Reward 自循环]
+\label{def:selfloop}
+设评价混合质量的泛函 $Q(\lambda)$ 仅是训练 teacher 所用 reward 集合
+$\{R_k\}$ 的函数。则 $Q$ 与 teacher 的定义\textbf{因果不独立}:不存在
+$\{R_k\}$ 之外的信号进入 $Q$。称此为\emph{reward 自循环}。
+\end{definition}
+
+\begin{proposition}[四类病理]
+\label{prop:pathology}
+在 Definition~\ref{def:selfloop} 下,$Q=$ composite reward 至少有四类失效:
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{Reward 盲区}。$\{R_k\}$ 未捕捉的质量维度(真实感、分布覆盖、
+多样性、校准)在 $Q$ 中\emph{不存在},因此对它们既不奖励也不惩罚。
+\item \textbf{放大"万能/可刷"reward}。若某 $R_{k_0}$ 的 applicable 范围更广
+或更易优化,则它在 $Q$ 中的有效梯度覆盖率最高,$\lambda^*$ 会系统性偏向
+$k_0$——这\emph{不}由图像质量驱动。PickScore-dominance(\S\ref{ssec:internal_evidence})
+是其实例。
+\item \textbf{饱和后"更高分 $\neq$ 更好"}。teacher 已 plateau 且选点在峰值前
+(\S\ref{ssec:internal_evidence});$Q$ 继续把 $\lambda$ 推向更高
+$\{R_k\}$,大概率进入 hacking 区而非质量区。
+\item \textbf{无有效性概念}。affine/none 模式可外推到所有 teacher 流形之外
+(\S\ref{sec:background});只要碰巧刷分,$Q$ 不会惩罚"跑到无人区"的混合。
+\end{enumerate}
+\end{proposition}
+
+\begin{remark}[与 OOD 不可证性的关系]
+\texttt{mof\_ood\_guarantee\_analysis.tex} 已证明:复合 reward 的 argmax 与
+单个 $R_j$ 的 argmax 一般不一致,故 OOD 严格超越不可证。那是\emph{在 reward
+内部}讨论"能不能更高分"。本文更进一步:\textbf{即便分更高,reward 这把尺子
+本身是否度量了我们真正想要的东西},是一个 reward 内部无法回答的问题——必须
+引入外部信号。
+\end{remark}
+
+%% ============================================================
+\section{本质视角一：从标量 Reward 到分布层面(OR vs AND)}
+\label{sec:or_and}
+%% ============================================================
+
+认知跃迁:\textbf{"好的混合"应当用"$v_\lambda$ 诱导的\emph{分布}是不是我们想要
+的那个"来定义,而非一个标量分数}。一旦上升到分布层面,"如何混合"会分裂成几个
+\emph{数学上精确、且都与 reward 无关}的算子。
+
+\subsection{Velocity 与 score 的仿射关系}
+\label{ssec:v_s_affine}
+
+采用本仓库约定(\texttt{nft.py}):$x_0\sim p_{\text{data}}$,
+$\epsilon\sim\N(0,I)$,$x_t=(1-t)x_0+t\,\epsilon$,FM 速度目标
+$v=\epsilon-x_0$。marginal $p_t$ 是 Gaussian 路径(给定 $x_0$,
+$x_t\mid x_0\sim\N((1-t)x_0,\,t^2 I)$)。
+
+\begin{lemma}[Velocity 仿射于 score]
+\label{lem:affine}
+记 $s(x,t)=\nabla_x\log p_t(x)$。则
+\begin{equation}
+v(x,t) \;=\; -\frac{1}{1-t}\,x \;-\; \frac{t}{1-t}\,s(x,t)
+\;\triangleq\; A(t)\,x + B(t)\,s(x,t),
+\label{eq:affine}
+\end{equation}
+即 velocity 是 score 的\emph{仿射函数},系数 $A(t),B(t)$ 是只依赖 $t$ 的标量。
+\end{lemma}
+
+\begin{proof}
+速度场是条件期望 $v(x,t)=\E[\epsilon-x_0\mid x_t=x]$。对 Gaussian 路径
+$x_t=(1-t)x_0+t\epsilon$,Tweedie 公式给出
+$\E[\epsilon\mid x_t=x]=-t\,s$ 和
+$\E[x_0\mid x_t=x]=\frac{x-t\,\E[\epsilon\mid x]}{1-t}=\frac{x+t^2 s}{1-t}$。
+代入:
+\[
+v=\E[\epsilon\mid x]-\E[x_0\mid x]
+=-t s-\frac{x+t^2 s}{1-t}
+=-\frac{x}{1-t}-s\Big(t+\frac{t^2}{1-t}\Big)
+=-\frac{x}{1-t}-\frac{t}{1-t}s. \qedhere
+\]
+\end{proof}
+
+关键在于:所有 teacher 共享同一 base scheduler,故共享同一 $(A(t),B(t))$;
+它们的差别全在各自的 score $s^{(k)}=\nabla\log p^{(k)}_t$。
+
+\subsection{Affine velocity 混合 $\equiv$ Score 求和 $\equiv$ Product-of-Experts}
+\label{ssec:and}
+
+\begin{proposition}[AND/共识 语义]
+\label{prop:poe}
+设 $\sum_k\lambda_k=1$(affine 约束)。则混合速度
+\begin{equation}
+v_\lambda=\sum_k\lambda_k v^{(k)}
+= A(t)\,x\underbrace{\textstyle\sum_k\lambda_k}_{=1}+B(t)\sum_k\lambda_k s^{(k)}
+= A(t)\,x + B(t)\,s_\lambda,
+\qquad s_\lambda\triangleq\sum_k\lambda_k s^{(k)},
+\label{eq:score_sum}
+\end{equation}
+即 $v_\lambda$ 恰好是\emph{有效 score 为 $s_\lambda=\sum_k\lambda_k s^{(k)}$}
+的速度场。而 score 的加权和正是
+\begin{equation}
+\sum_k\lambda_k s^{(k)}=\nabla_x\log\prod_k \big(p^{(k)}(x)\big)^{\lambda_k},
+\end{equation}
+即(未归一化的)\textbf{Product-of-Experts / 几何池化} $p_\lambda^{\PoE}\propto
+\prod_k (p^{(k)})^{\lambda_k}$ 的 score。
+\end{proposition}
+
+\begin{proof}
+\eqref{eq:score_sum} 由 Lemma~\ref{lem:affine} 逐项代入 + $\sum_k\lambda_k=1$
+保住 $A(t)x$ 项不被缩放。score 求和等于对数密度求和的梯度,即乘积分布的 score。
+\end{proof}
+
+\begin{remark}[$\sum\lambda=1$ 的几何意义]
+若 $\sum_k\lambda_k=c\neq 1$,则 $x$ 项变成 $A(t)\,c\,x$——速度场被整体缩放,
+等价于时间重参数化,把样本推离 marginal path。这与 \texttt{mof\_notes.tex}
+Remark~affine\_vs\_convex 的连续性方程论证\emph{完全一致},只是换到 score
+空间看:\textbf{affine 约束的本质是"只动 score、不动几何缩放项"}。
+\end{remark}
+
+\subsection{Mixture 分布(OR)需要 responsibility-weighted velocity}
+\label{ssec:or}
+
+\begin{proposition}[OR/混合 语义]
+\label{prop:mixture}
+分布混合 $p_\lambda^{\text{mix}}=\sum_k\lambda_k p^{(k)}$($\lambda_k\ge 0,
+\sum\lambda_k=1$)的 score 是 responsibility-weighted 的:
+\begin{equation}
+s^{\text{mix}}=\sum_k \resp_k(x)\,s^{(k)},\qquad
+\resp_k(x)=\frac{\lambda_k p^{(k)}(x)}{\sum_j\lambda_j p^{(j)}(x)},
+\end{equation}
+对应速度场
+\begin{equation}
+\tilde v_\lambda=\sum_k \resp_k(x)\,v^{(k)}(x,t)
+\quad(\text{data-dependent weights } \resp_k(x)),
+\label{eq:resp_v}
+\end{equation}
+\textbf{这正是} \texttt{mof\_notes.tex} eq.~density\_weighted 的 $\tilde v_\lambda$。
+\end{proposition}
+
+\begin{proof}
+$\nabla\log\sum_k\lambda_k p^{(k)}=\frac{\sum_k\lambda_k\nabla p^{(k)}}
+{\sum_k\lambda_k p^{(k)}}=\frac{\sum_k\lambda_k p^{(k)}s^{(k)}}
+{\sum_k\lambda_k p^{(k)}}=\sum_k \resp_k s^{(k)}$;再用 Lemma~\ref{lem:affine}
+与 $\sum_k \resp_k=1$ 得 \eqref{eq:resp_v}。
+\end{proof}
+
+\begin{tcolorbox}[colback=blue!5,colframe=blue!50!black,title=\textbf{核心对照：常权 vs 责任权}]
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{AND(product / 共识)}:$v_\lambda=\sum_k\lambda_k v^{(k)}$,
+权重 $\lambda_k$ 是\emph{常数}(不依赖 $x$)。语义:采样\emph{同时}被所有
+teacher 视作高密度的区域(交集)。\textbf{这正是 MoF 现在做的}。
+\item \textbf{OR(mixture / 并集)}:$\tilde v_\lambda=\sum_k \resp_k(x) v^{(k)}$,
+权重 $\resp_k(x)$ 随 $x$ 变化(责任)。语义:采样"时而像 A、时而像 B"
+(并集 / 多样性)。\textbf{MoF 现在并未实现这个}。
+\end{itemize}
+两者仅在 teacher 一致($p^{(k)}$ 重合,$\resp_k\to\lambda_k$)时重合。
+\end{tcolorbox}
+
+\subsection{分布语义谱与结构性错配}
+\label{ssec:spectrum}
+
+\begin{corollary}[三种 weight\_normalization 的分布语义]
+\label{cor:spectrum}
+在共享 Gaussian 路径近似下:
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{none}(自由线性,$\sum\lambda$ 可漂):一般\emph{破坏几何}(缩放
+$A(t)x$ 项),除非 \texttt{weight\_sum\_penalty} 把 $\sum\lambda$ 拉回 $1$,
+此时退化为下一条;
+\item \texttt{affine}($\sum\lambda=1$,允许负/超一):\textbf{完整 PoE / CFG}——
+可强化共识(把某 teacher 权重抬过 1、别的压负),正是"AND 的锐化";
+\item \texttt{softmax}($\lambda\in\Delta^{K-1}$):被限制在单纯形内的
+\textbf{受约束 PoE}——只能"软选择 / 几何插值",无法外推。其行为介于纯 AND 与
+"软 OR-like 选择"之间,但\emph{本质仍是常权,不是责任权}。
+\end{itemize}
+\end{corollary}
+
+\begin{tcolorbox}[colback=orange!5,colframe=orange!60!black,title=\textbf{与 reward 无关的结构性错配}]
+多技能合成("一张图\emph{同时}构图对、文字准、好看")在语义上要的是
+\textbf{AND / 共识(乘积)}——这与 affine/none(完整 PoE)对齐,而与 softmax
+凸组合(受约束、偏"软选择")\emph{不完全}对齐。
+
+反过来,若目标是"\emph{覆盖}多个域的并集 / 保多样性"(OR),则需要
+\textbf{responsibility-weighted $\tilde v_\lambda$},这\emph{当前根本没有实现}
+——常权 softmax 永远给不出 data-dependent 的责任权。
+
+无论哪种情况,错配都是\textbf{算子层面}的,\emph{先于}任何 reward 调参。仅靠
+调 $\gamma$、调温度、换 router 都无法修复"算子语义对错"的问题。
+\end{tcolorbox}
+
+\begin{remark}[对"naive averaging"失效的新解释]
+\texttt{mof\_notes.tex} 用 Jensen 不等式解释 $\bar v=\frac1K\sum_k v^{(k)}$ 的
+in-domain 退化。Proposition~\ref{prop:poe} 给出\emph{另一个}视角:均匀平均其实
+是\textbf{均匀 PoE} $\prod_k (p^{(k)})^{1/K}$。当 teacher 分歧时,乘积集中在它们
+的\emph{狭窄交集}上,并压低各自"高密度但不共享"的区域——in-domain 自然下降。
+这与 Jensen 解释互补,且\emph{不依赖 reward}。
+\end{remark}
+
+\subsection{适用边界}
+\label{ssec:shared_marginal}
+
+Lemma~\ref{lem:affine} 用了\emph{共享路径}($A,B$ 同一);Proposition~\ref{prop:poe}
+的"$s_\lambda$ 是 PoE 的 score"在\emph{未归一化}意义下严格成立(采样 ODE 不需要
+归一化常数)。两条都在 shared marginals 下精确,对 LoRA-finetuned teacher 是
+\emph{一阶近似}(误差随 teacher 间 marginal gap 增长)——与 \texttt{mof\_notes.tex}
+Remark~affine\_vs\_convex 的适用范围相同。因此本节结论应读作:\textbf{当 teacher
+足够接近(小 LoRA 扰动)时,MoF 的 affine 混合在分布上就是 Product-of-Experts}。
+
+\subsection{由此得到的第一个 reward-free 判据}
+\label{ssec:crit_semantic}
+
+\begin{criterion}[语义目标距离]
+\label{crit:semantic}
+对一批轨迹访问点 $(x_t,t,c)$,同时计算
+\begin{itemize}[leftmargin=1.5em]
+\item 到 OR 目标的距离 $d_{\text{OR}}=\|v_\lambda-\tilde v_\lambda\|$
+(责任权由 $\resp_k\propto\lambda_k p^{(k)}$ 给出;实践用 \S\ref{ssec:crit_consistency}
+的可计算代理);
+\item 到 AND 目标的吻合度(由构造,affine 模式下 $v_\lambda$ \emph{就是} PoE,
+故度量"是否仍在凸包内 / 外推幅度" $\rho=\max_k(\lambda_k-1)_+ + \max_k(-\lambda_k)_+$)。
+\end{itemize}
+\textbf{用途}:在不看 reward 的前提下,判定当前 $\lambda$ 到底在逼近哪种分布语义、
+以及外推到凸包外多远。若你想要"共识"却发现 $\lambda$ 停在单纯形内部(softmax
+的天花板),说明算子选错了,而非 reward 没调好。
+\end{criterion}
+
+%% ============================================================
+\section{本质视角二：四个 Reward-Free 度量}
+\label{sec:metrics}
+%% ============================================================
+
+把"好混合"从 reward 解耦,真正的 ground truth 是\textbf{数据分布},reward 只是它
+的有损代理。下列度量\emph{因果上独立于}训练 reward,且都可用本仓库已有能力估计
+(teacher 经 \texttt{use\_named\_parameters} 取得,base 经 \texttt{use\_ref\_parameters}
+取得)。
+
+\subsection{度量 A：留出真实数据的 FM 残差 / 似然(覆盖 + 有效性)}
+\label{ssec:crit_fm}
+
+\begin{criterion}[Held-out real-data FM residual]
+\label{crit:fm}
+取每个域一小批\emph{留出真实图像} $x_0\sim\dataD_s^{\text{real}}$ 及其 prompt
+$c$。采样 $t\sim U(0,1)$,$\epsilon\sim\N(0,I)$,$x_t=(1-t)x_0+t\epsilon$,定义
+\begin{equation}
+\mathrm{FMres}(v_\lambda)=\E_{s,\,x_0,\,t,\,\epsilon}
+\big\|v_\lambda(x_t,t,c)-(\epsilon-x_0)\big\|_2^2.
+\end{equation}
+\textbf{越小}说明 $v_\lambda$ 越是\emph{真实数据并集}的合法速度场。把
+$\mathrm{FMres}$ 在以下三种 $\lambda$ 上对比:
+\[
+\delta_s^{\const}\ (\text{单 teacher}),\qquad
+\lambda=\tfrac1K\ (\text{均匀}),\qquad
+\lambda^*\ (\text{学到的}).
+\]
+若 $\lambda^*$ 的 $\mathrm{FMres}$ 不优于最优单 teacher,则"它更好"是 reward 错觉。
+\end{criterion}
+
+\begin{remark}[精确似然(更贵)]
+若要分布层面的硬证据,可用 probability-flow ODE + Hutchinson 迹估计算
+$\log p_\lambda(x_0)$(瞬时变量替换)。\textbf{好混合 $=$ 对各域留出真实数据的
+$\log p_\lambda$ 高于任何单 teacher}。代价高于 FM 残差,建议先用残差筛,再对
+候选 $\lambda$ 算似然。无配对真实图时,可用该域的通用真实图集合近似覆盖性。
+\end{remark}
+
+\subsection{度量 B：Marginal 一致性 / Off-manifold 漂移}
+\label{ssec:crit_consistency}
+
+\paragraph{先讲清"manifold"和"off-manifold".}
+这里的"manifold(流形)"指\emph{真实/teacher 可信图像所在的低维区域}——每个 teacher
+$v^{(k)}$ 都把噪声往\emph{自己}学到的图像分布 $p^{(k)}_0$ 上推,那个分布的支撑就是它
+的 manifold。"off-manifold"就是\emph{落到所有 teacher 的分布都没有支撑的区域}(没有
+真实图像长那样)。下面说明常权混合\emph{为什么}会掉进去。
+
+\paragraph{核心逻辑:混合 velocity $\equiv$ 平均"预测的干净图".}
+代码里干净图预测与速度场的关系是 $\hat x_0=x_t-\sigma v$(\texttt{nft.py})。故在某个
+$(x_t,t)$,每个 teacher 隐式预测一张干净图 $\hat x_0^{(k)}=x_t-\sigma v^{(k)}$;而常权
+混合(因 $\sum_k\lambda_k=1$)对应
+\begin{equation}
+\hat x_0^{\lambda}=x_t-\sigma v_\lambda=\sum_k\lambda_k\,\hat x_0^{(k)},
+\label{eq:x0_avg}
+\end{equation}
+即\textbf{混合 velocity = 对各 teacher"想画的那张干净图"做加权平均}。于是:
+\begin{itemize}[leftmargin=1.5em]
+\item teacher \emph{一致}(都想画同一张图):平均仍是那张图 $\Rightarrow$ 落在数据流形上,安全;
+\item teacher \emph{分歧}(想画不同的图):不同图的平均 = 重影 / 双曝光 = \textbf{不是任何
+一张真实图} $\Rightarrow$ off-manifold。
+\end{itemize}
+采样是 ODE 积分:一旦踩进 off-manifold 区域,teacher 在那里的预测都是\emph{外推}(从没
+见过这种输入),误差在后续步里被放大(butterfly effect),最终出 artifact。(类比:两条
+导航在岔路口一个说"左转"、一个说"右转",取平均 = 直冲中间的田。)
+
+\begin{criterion}[Teacher 分歧加权漂移]
+\label{crit:drift}
+上述风险的可计算代理,是 teacher 速度(等价地 $\hat x_0^{(k)}$)围绕混合值的
+\textbf{加权方差}:
+\begin{equation}
+D(x,t)=\sum_k \lambda_k\,\big\|v^{(k)}(x,t)-v_\lambda(x,t)\big\|_2^2.
+\end{equation}
+$D\to 0$ ⟺ teacher 一致 ⟺ $v_\lambda\approx$ 每个 $v^{(k)}$ ⟺ 在流形上;$D$ 大 ⟺ 分歧 ⟺
+混合是"谁都不是"的折中 ⟺ off-manifold 风险高。沿采样轨迹累计 $D$ 得一个\textbf{off-manifold
+风险分};它\emph{只需已有的 teacher 速度,零额外数据}。
+\end{criterion}
+
+\begin{remark}[为什么 $D$ 能代理"到正确混合 $\tilde v_\lambda$ 的差距"]
+\label{rmk:drift_bound}
+分歧处\emph{正确}的做法是 responsibility 权 $\tilde v_\lambda=\sum_k\resp_k(x)v^{(k)}$
+(Prop.~\ref{prop:mixture}):它\textbf{选}当前 $x$ 实际靠近的那条 teacher 流形
+($\resp_k\to1$,其余 $\to0$),从而留在流形上;常权 $v_\lambda$ 则不管 $x$ 靠近谁、一律
+盲混。利用 $\sum_k(\lambda_k-\resp_k)=0$ 把两者之差改写并放缩:
+\begin{equation}
+v_\lambda-\tilde v_\lambda=\sum_k(\lambda_k-\resp_k)\big(v^{(k)}-v_\lambda\big)
+\;\Rightarrow\;
+\big\|v_\lambda-\tilde v_\lambda\big\|\le\sum_k|\lambda_k-\resp_k|\,\big\|v^{(k)}-v_\lambda\big\|.
+\end{equation}
+$D=0$(teacher 一致)时该差距必为 $0$;分歧越大、$\|v^{(k)}-v_\lambda\|$ 越大,差距上界
+越大。算 $\tilde v_\lambda$ 需要密度 $p^{(k)}$(拿不到),而 $D$ 只用 teacher 速度——所以
+$D$ 是这个差距的\emph{廉价、density-free}代理。
+\end{remark}
+
+\begin{remark}
+$D$ 还能定位"$\lambda$ 在哪些 $(t)$ 段做了高风险外推"——天然适合和
+\texttt{mof\_notes.tex} \S temporal analysis 的 per-timestep $\lambda$ 可视化叠加。
+\end{remark}
+
+\subsection{度量 C：Teacher Skill-Residual 干涉(可组合性上限)}
+\label{ssec:crit_interference}
+
+teacher 共享 base $v_{\text{base}}$,贡献是残差 $\Delta v^{(k)}=v^{(k)}-v_{\text{base}}$。
+由 $\sum_k\lambda_k=1$:
+\begin{equation}
+v_\lambda=v_{\text{base}}+\sum_k\lambda_k\,\Delta v^{(k)},
+\end{equation}
+即混合是 velocity 空间里的\textbf{task arithmetic}(只作用在残差上)。
+
+\begin{criterion}[残差干涉]
+\label{crit:interference}
+在轨迹访问点上算两两 cosine
+$\cos\angle(\Delta v^{(j)},\Delta v^{(k)})$:
+\begin{itemize}[leftmargin=1.5em]
+\item 近\emph{正交} $\Rightarrow$ 技能可叠加,混合有希望(可组合性高);
+\item \emph{负相关}(破坏性干涉)$\Rightarrow$ 技能冲突,\textbf{任何} $\lambda$ 都
+救不了——这是混合质量的\emph{硬上限},与 reward 无关。
+\end{itemize}
+\end{criterion}
+
+\begin{remark}[与梯度消失的呼应]
+\texttt{mof\_notes.tex} \S Limitations 提到 LoRA 残差很小、softmax 均值消减让梯度
+$\sim 10^{-10}$。Criterion~\ref{crit:interference} 正是该现象的"健康检查":残差不仅
+要够大,还要\emph{方向互补}。两者都是 teacher 集合的内禀属性,训练前即可测。
+\end{remark}
+
+\subsection{度量 D：多样性 / Precision-Recall(模式坍塌)}
+\label{ssec:crit_diversity}
+
+\begin{criterion}[分布的保真与覆盖]
+\label{crit:pr}
+纯刷 reward(尤偏好类如 PickScore)极易牺牲多样性。在特征空间(如 DINO/CLIP)上,
+对 $\lambda$ 生成集合算 improved precision-recall:precision $=$ 保真(样本落在
+真实流形内的比例),recall $=$ 覆盖(真实模式被覆盖的比例)。\textbf{好混合应在不
+显著降低 recall 的前提下提升或维持 precision};若 reward 升而 recall 掉,即模式
+坍塌——一种典型 reward hacking。
+\end{criterion}
+
+%% ============================================================
+\section{若仍用 Reward：如何打破循环}
+\label{sec:break_loop}
+%% ============================================================
+
+有时仍需一个标量来排序候选 $\lambda$。此时\textbf{必须引入因果独立于训练 reward
+的信号}:
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{独立裁判}。训练用 reward 与评判用 reward/judge \emph{必须不同}
+(留出 reward、更强 VLM、或人评)。判据:
+\begin{equation}
+\Delta_{\text{train}}=Q_{\text{train}}(\lambda^*)-Q_{\text{train}}(\delta_s^\const),\quad
+\Delta_{\text{judge}}=Q_{\text{judge}}(\lambda^*)-Q_{\text{judge}}(\delta_s^\const).
+\end{equation}
+\textbf{$\Delta_{\text{train}}>0$ 而 $\Delta_{\text{judge}}\le 0$ $=$ reward hacking};
+这个 gap 本身是一阶诊断量。
+\item \textbf{跨 reward 一致性}。好的共识混合应让\emph{多个独立} reward \emph{同时}
+不降;只有单一(尤其"万能")reward 涨,基本是在刷结构(对应病理 2)。
+\item \textbf{OOD baseline 变硬约束}。把 OOD 从软 bonus 改成约束
+$\max_\lambda f_s(\lambda)\ \text{s.t.}\ f_j(\lambda)\ge \rho_j^{(s),\const}\ \forall j\neq s$
+(\texttt{mof\_ood\_guarantee\_analysis.tex} \S8.3 open problem)。此时"好"不再是
+"复合分最高",而是"在不破坏任何单项的前提下取得共识"。
+\end{enumerate}
+
+%% ============================================================
+\section{综合：把 "Best Mixing" 重新定义为分布层面目标}
+\label{sec:synthesis}
+%% ============================================================
+
+\S\ref{sec:or_and} 表明"如何混合"在分布层面有\emph{多个}精确目标,reward 这个标量
+\emph{分辨不出}它们。把"best mixing"重述为\textbf{先选目标分布、再问算子能否表示它}:
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Mixture(OR)} $\sum_k\lambda_k p^{(k)}$:要"覆盖并集 / 保多样性 / 时而像
+A 时而像 B"。正确算子 $=$ responsibility-weighted $\tilde v_\lambda$
+(\emph{当前未实现};需让 router 输出 data-dependent 责任权)。
+\item \textbf{Product / PoE(AND / 共识)} $\prod_k (p^{(k)})^{\lambda_k}$:要"一张图
+\emph{同时}满足所有技能"。正确算子 $=$ affine velocity 混合(\emph{MoF 现在做的};
+建议用 \texttt{affine}/\texttt{none} 而非 \texttt{softmax},以容许共识锐化)。
+\item \textbf{Barycenter(OT)}:要 teacher 的"几何公平平均"(风格变体的居中)。需
+Wasserstein barycenter,既非简单 velocity 平均也非 PoE。
+\end{itemize}
+
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=\textbf{Reward-Free 判据清单(选 $\lambda$ / 选算子时)}]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{先验上限}:Criterion~\ref{crit:interference}(残差干涉)——若技能冲突,
+停止,任何混合都没用。
+\item \textbf{语义对齐}:Criterion~\ref{crit:semantic}——你要 AND 还是 OR?当前算子
+(softmax/affine/none)能表示它吗?
+\item \textbf{有效性}:Criterion~\ref{crit:drift}(off-manifold 漂移)——$\lambda$ 是否
+把轨迹推离所有 teacher 流形?
+\item \textbf{覆盖与质量}:Criterion~\ref{crit:fm}(真实数据 FM 残差/似然)+
+Criterion~\ref{crit:pr}(precision-recall)——分布是否真的变好。
+\item \textbf{(可选)排序}:\S\ref{sec:break_loop} 的独立裁判,而非训练 reward。
+\end{enumerate}
+"Best" $=$ 在 1--4 全部健康的前提下,逼近你\emph{显式选定}的目标分布的那个 $\lambda$。
+\end{tcolorbox}
+
+%% ============================================================
+\section{与现有 docs 的关系 + 纯诊断实验顺序}
+\label{sec:relation}
+%% ============================================================
+
+\subsection{与现有 docs 的关系}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{mof\_notes.tex}:给出混合构造、两阶段、affine 闭包与
+density-weighted 真传输。本文用 Lemma~\ref{lem:affine} 把"affine 平均 $=$ PoE"
+点破,并把其 density\_weighted 公式重认成 OR 语义。
+\item \texttt{mof\_reward\_design.tex}:讨论\emph{优化目标}(reward 怎么设);本文
+讨论\emph{评价准则}(怎么不靠 reward 判好坏),互补。
+\item \texttt{mof\_ood\_guarantee\_analysis.tex}:reward \emph{内部}的可证性;本文
+质疑 reward \emph{本身}作为 ground truth,并给外部信号。\S\ref{sec:break_loop}
+第 3 条直接沿用其 \S8.3 open problem。
+\item \texttt{mof\_per\_set\_analysis.tex}:in-domain Level-1 构造性保证;本文的
+Criterion~\ref{crit:interference} 解释该保证的\emph{质量}前提(残差需互补)。
+\end{itemize}
+
+\subsection{纯诊断实验顺序(无需训练 student)}
+
+全部只需 forward teacher + base + 一小批留出真实数据:
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{可组合性体检}(Criterion~\ref{crit:interference}):算
+$\Delta v^{(k)}$ 两两 cosine 的 per-timestep 谱。\emph{先于一切}——决定混合有没有
+希望。
+\item \textbf{语义定位}(Criterion~\ref{crit:semantic}):对 $\{\delta_s^\const,
+1/K, \lambda^*\}$ 测外推幅度 $\rho$ 与 $d_{\text{OR}}$,确认在逼近 AND 还是 OR。
+\item \textbf{有效性 + 覆盖}(Criterion~\ref{crit:drift},~\ref{crit:fm}):沿轨迹
+累计 $D$;在留出真实数据上比 $\mathrm{FMres}(\delta_s^\const)$ vs
+$\mathrm{FMres}(\lambda^*)$。
+\item \textbf{独立裁判抽检}(\S\ref{sec:break_loop}):对少数 $\lambda$ 快照用
+held-out judge 交叉验证 $\Delta_{\text{train}}$ vs $\Delta_{\text{judge}}$。
+\end{enumerate}
+
+只有当 1--3 通过后,Stage 1 / Stage 2 的 reward 数字才值得相信。
+
+%% ============================================================
+\section*{结语}
+%% ============================================================
+
+\begin{tcolorbox}[colback=yellow!5,colframe=yellow!60!black,title=\textbf{一句话}]
+别再问"哪个 $\lambda$ 的 reward 最高",而问"$v_\lambda$ 诱导的\emph{分布}是不是
+我们要的那个"。这会暴露:(i) 一个与 reward 无关的\textbf{算子错配}——affine
+velocity 混合其实是 Product-of-Experts(AND),softmax 凸组合偏"软选择",而真正的
+mixture(OR)需要当前\emph{尚未实现}的 responsibility-weighted velocity;(ii) 一组
+\textbf{reward-free 度量}(真实数据 FM 残差/似然、marginal 一致性、残差干涉、
+多样性),它们以数据分布为 ground truth,能真正打破"用 reward 造 teacher、又用
+reward 评 teacher"的自循环。
+\end{tcolorbox}
+
+\end{document}
