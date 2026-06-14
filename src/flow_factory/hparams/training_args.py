@@ -1196,6 +1196,22 @@ class MoFNFTTrainingArguments(MoFBaseTrainingArguments):
 
 
 @dataclass
+class MoFDMinTrainingArguments(MoFBaseTrainingArguments):
+    r"""MoF with reward-free D-minimization (teacher-disagreement variance).
+
+    Optimizes the mixing weights to minimize
+    ``D = sum_k w_k ||v_k - v_lambda||^2`` on re-noised rollout points. No
+    reward or advantage is used during training; the three rewards are computed
+    only at evaluation (inherited from MoFTrainerBase) to monitor training.
+
+    Inherits all mixing/teacher/timestep fields from MoFBaseTrainingArguments;
+    reward-specific fields (e.g. ood_bonus_gamma) and nft_beta are unused.
+
+    Register as trainer_type: 'mof-dmin'.
+    """
+
+
+@dataclass
 class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
     r"""MoF with GRPO (PPO-clipped ratio) optimization.
 
@@ -2481,6 +2497,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "nft": NFTTrainingArguments,
     "mof-nft": MoFNFTTrainingArguments,
     "mof-grpo": MoFGRPOTrainingArguments,
+    "mof-dmin": MoFDMinTrainingArguments,
     "mof-distill": MoFDistillTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,

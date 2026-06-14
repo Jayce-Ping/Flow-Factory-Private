@@ -1,0 +1,218 @@
+# MoF D-min (reward-free) with AdaLN Router.
+#
+# Same reward-free off-manifold loss as the LUT variant
+#   D = sum_k w_k ||v_k - v_lambda||^2  (teacher-disagreement variance),
+# but the mixing weights are produced by an AdaLN-style neural router
+# conditioned on (timestep, pooled_prompt_embeds) instead of a per-(t,s) table.
+# AdaLN is the best-generalizing router for this task, so it is the default
+# neural-net module going forward.
+#
+# Router architecture (see MoFAdaLNRouter in trainers/mof/common.py):
+#   pooled_prompt_embeds (2048) -> c_proj -> c (256)
+#   timestep -> sinusoidal -> time_mlp -> t (256)
+#   t -> adaLN_modulation -> (gamma, beta);  h = gamma * c + beta
+#   h -> MLP -> K=3 logits -> softmax -> weights
+#
+# No reward/advantage enters the training loss; the three rewards are computed
+# ONLY at eval (inherited from MoFTrainerBase) to monitor training.
+#
+# Expected behavior (this is the validation):
+#   - D-min has D=0 at every single-teacher vertex, so the router learns a
+#     near one-hot selection per (timestep, prompt) -- a hard route, not a blend.
+#   - The eval rewards reveal that collapse: off-manifold avoidance is a
+#     guardrail, not a standalone objective.
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (3 prompt sets)
+data:
+  dataset_dir: "dataset/ocr"
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/pickscore"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "dmin_sd3-5_mof_geneval_pickscore_ocr_adaln-router"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: false
+
+# Training Configuration
+train:
+  trainer_type: 'mof-dmin'                   # Reward-free D-minimization
+
+  # ---- Teacher configuration ----
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]
+      reward_name: "geneval"                # Used only for eval logging
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]
+      reward_name: "pick_score"             # Used only for eval logging
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]
+      reward_name: "ocr"                    # Used only for eval logging
+
+  teacher_route_by_source: false            # Router handles per-sample routing from text content
+  teacher_param_device: 'cuda'
+
+  # ---- Mixing module: AdaLN Router ----
+  mixing_module_type: "adaln_router"
+  mixing_d_pool: 2048                       # SD3.5 Medium pooled_prompt_embeds dim (CLIP-L[768] + CLIP-G[1280])
+  mixing_hidden_dim: 256                    # Bottleneck: 8x smaller than d_pool (K=3 output needs minimal capacity)
+  temperature: 1.0                          # Softmax temperature for weight normalization
+
+  # ---- MoF core hyperparameters ----
+  off_policy: false                         # D-min is on-policy (no old-policy needed)
+  learning_rate: 1.0e-3                     # Router LR: ~600K params needs smaller LR than LUT's 90 logits
+  weight_normalization: softmax             # softmax | affine | none
+
+  # ---- EMA schedule (unused when off_policy=false; kept for checkpoint compat) ----
+  ema_decay_schedule: "piecewise_linear"
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.0                            # Disabled (D-min is on-policy)
+  ema_update_interval: 1
+  ema_device: "cuda"
+
+  # ---- Reward design (UNUSED by D-min training; rewards only logged at eval) ----
+  eval_teachers_at_start: true              # Evaluate each teacher baseline at epoch 0 (for comparison)
+  ood_bonus_gamma: 0.2                      # Unused by D-min (no advantage); kept for config schema
+
+  # ---- Advantage computation (UNUSED by D-min) ----
+  advantage_aggregation: "gdpo"
+  adv_clip_range: [-5.0, 5.0]
+  global_std: true
+
+  # ---- Timestep control ----
+  time_sampling_strategy: "discrete"
+  timestep_range: 0.9
+  num_inference_steps: 10
+
+  # ---- Optimization ----
+  per_device_batch_size: 8
+  group_size: 16
+  unique_sample_num_per_epoch: 144
+  source_ratio: null
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 1000
+  seed: 42
+
+  # ---- KL penalty (disabled) ----
+  kl_beta: 0.0
+  kl_type: 'v-based'
+
+  # ---- Generation settings ----
+  resolution: 512
+  guidance_scale: 1.0
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  seed: 42
+
+# Evaluation settings — runs the MIXTURE and computes the 3 rewards to monitor training.
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0
+  num_inference_steps: 40                   # Router accepts continuous t, so eval T can differ from train T
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards — required so the rollout reward_buffer is valid, but D-min's
+# overridden prepare_feedback does NOT finalize them (no reward in the loss).
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+
+# Evaluation rewards (used during eval only) — the 3 metrics that monitor training.
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]

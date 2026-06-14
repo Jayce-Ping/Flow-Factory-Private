@@ -1,0 +1,207 @@
+# MoF D-min (reward-free): 3-teacher off-manifold-drift minimization.
+#
+# GenEval + PickScore + OCR teachers, each routed to its own prompt set.
+# Loss = D = sum_k w_k ||v_k - v_lambda||^2 (teacher-disagreement variance).
+# No reward/advantage in the training loss; the three rewards are computed
+# ONLY at eval to monitor training (see _evaluate_test_set in MoFTrainerBase).
+#
+# Learnable params: K=3 x T=10 x S=3 = 90 logits.
+#
+# Expected behavior (this is the validation):
+#   - D-min has D=0 at every single-teacher vertex, so lambda collapses toward
+#     a single teacher per (timestep, prompt_set).
+#   - The eval rewards will show one metric near its in-domain teacher and the
+#     others clearly lower -- demonstrating off-manifold avoidance is a
+#     guardrail, not a standalone objective.
+
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — multi-source (3 prompt sets)
+data:
+  dataset_dir: "dataset/ocr"               # Fallback single-source (used by eval/test if no dataset_dirs)
+  dataset_dirs:                             # Multi-source: each dir becomes a prompt set
+    - "dataset/geneval"                     # Source "geneval" → prompt set 0 (composition/counting prompts)
+    - "dataset/pickscore"                   # Source "pickscore" → prompt set 1 (general aesthetics prompts)
+    - "dataset/ocr"                         # Source "ocr" → prompt set 2 (text rendering prompts)
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 32                             # LoRA rank (must match teacher checkpoints)
+  lora_alpha: 64                            # LoRA alpha scaling
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null                         # Set to checkpoint path to resume training
+  resume_type: null
+
+log:
+  run_name: "dmin_sd3-5_mof_geneval_pickscore_ocr_lut"
+  project: "Flow-Factory-OPD-Experiments"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20                             # Save checkpoint every N epochs
+  save_model_only: false                    # Save full MoF state (logits + EMA + reward stats)
+
+# Training Configuration
+train:
+  trainer_type: 'mof-dmin'                   # Mixture-of-Flow trainer (reward-free D-minimization)
+
+  # Per-source teacher configuration: 3 teachers x 3 prompt sets.
+  teachers:
+    - name: "teacher-geneval"
+      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      sources: [geneval]                    # In-domain for composition/counting tasks
+      reward_name: "geneval"                # In-domain reward (used only for eval logging)
+    - name: "teacher-pickscore"
+      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      sources: [pickscore]                  # In-domain for aesthetic quality
+      reward_name: "pick_score"             # In-domain reward (used only for eval logging)
+    - name: "teacher-ocr"
+      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      sources: [ocr]                        # In-domain for text rendering accuracy
+      reward_name: "ocr"                    # In-domain reward (used only for eval logging)
+
+  teacher_route_by_source: true             # Enable per-set independent lambda (S=3)
+  teacher_param_device: 'cuda'              # GPU storage for fast weight swapping (~1-2ms per teacher)
+
+  # ---- MoF core hyperparameters ----
+  off_policy: false                         # D-min has no old-policy; sample with current weights
+  logits_init: "uniform"                    # Start uniform so collapse direction is data-driven
+  logits_init_bias: 2.0                     # Bias strength: softmax(2,0,0) ≈ (0.78, 0.11, 0.11) for K=3
+  learning_rate: 0.05                       # Learning rate for lambda logits (large: only 90 params)
+  temperature: 1.0                          # Softmax temp: 1.0=standard, <1=sharper, >1=softer mixing
+  weight_normalization: softmax             # softmax | affine | none (logits → weights mapping)
+
+  # ---- EMA schedule (unused when off_policy=false; kept for checkpoint compat) ----
+  ema_decay_schedule: "piecewise_linear"
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.0                            # Disabled (D-min is on-policy)
+  ema_update_interval: 1
+  ema_device: "cuda"
+
+  # ---- Reward design (UNUSED by D-min training; rewards only logged at eval) ----
+  eval_teachers_at_start: true              # Evaluate each teacher baseline at epoch 0 (for comparison)
+  ood_bonus_gamma: 0.2                      # Unused by D-min (no advantage); kept for config schema
+
+  # ---- Advantage computation (UNUSED by D-min) ----
+  advantage_aggregation: "gdpo"
+  adv_clip_range: [-5.0, 5.0]
+  global_std: true
+
+  # ---- Timestep control ----
+  time_sampling_strategy: "discrete"        # Match scheduler's discrete grid (1:1 logits column mapping)
+  timestep_range: 0.9                       # Cover 90% of denoising trajectory
+  num_inference_steps: 10                   # T=10 denoising steps (logits shape: 3 x 10 x 3 = 90)
+
+  # ---- Optimization ----
+  per_device_batch_size: 8                  # Micro-batch per GPU (small due to K teacher forwards per step)
+  group_size: 16                            # Samples per prompt (only used by eval reward grouping)
+  unique_sample_num_per_epoch: 144          # 3 sources * 48 samples per source = 144 total per epoch
+  source_ratio: null                        # null → equal 1:1:1 round-robin
+  num_inner_epochs: 1                       # Single pass over samples per epoch
+  gradient_step_per_epoch: 1                # Gradient steps per epoch
+  gradient_accumulation_steps: auto         # Auto-compute from batch/sample counts
+  max_grad_norm: 1.0                        # Gradient clipping on (K,T,S) logits tensor
+  adam_weight_decay: 1.0e-4                 # NOTE: ignored for the MoF mixing module in all modes
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 1000
+  seed: 42
+
+  # ---- KL penalty (disabled) ----
+  kl_beta: 0.0
+  kl_type: 'v-based'
+
+  # ---- Generation settings ----
+  resolution: 512
+  guidance_scale: 1.0                       # No CFG (guidance_scale=1.0)
+  enable_gradient_checkpointing: false
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"                      # ODE dynamics (no SDE noise)
+  noise_level: 0.0                          # Pure ODE: sigma=0
+  seed: 42
+
+# Evaluation settings — runs the MIXTURE and computes the 3 rewards to monitor training.
+eval:
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0
+  num_inference_steps: 40                   # Eval at higher T than training (10): LUT is linearly resampled along T
+  eval_freq: 10                             # Eval every 10 epochs
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
+    - name: pickscore
+      dataset_dir: dataset/pickscore
+      split: test
+      eval_reward_names: [pick_score]
+    - name: ocr
+      dataset_dir: dataset/ocr
+      split: test
+      eval_reward_names: [ocr, pick_score]
+
+# Training rewards — required so the rollout reward_buffer is valid, but D-min's
+# overridden prepare_feedback does NOT finalize them (no reward in the loss).
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [geneval, pickscore, ocr]
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]
+
+# Evaluation rewards (used during eval only) — the 3 metrics that monitor training.
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: [geneval]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: [ocr]

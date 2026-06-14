@@ -11,12 +11,14 @@ Exports:
 from .common import MoFTrainerBase, MoFMixingModule
 from .nft import MoFNFTTrainer
 from .grpo import MoFGRPOTrainer
+from .dmin import MoFDMinTrainer
 from .distill import MoFDistillTrainer
 
 __all__ = [
     'MoFTrainerBase',
     'MoFNFTTrainer',
     'MoFGRPOTrainer',
+    'MoFDMinTrainer',
     'MoFDistillTrainer',
     'MoFMixingModule',
 ]
