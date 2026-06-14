@@ -53,13 +53,13 @@ train:
   trainer_type: 'ensemble-eval'
 
   checkpoint_paths:
-    - "jieliu/SD3.5M-FlowGRPO-Text"
-    - "jieliu/SD3.5M-FlowGRPO-PickScore"
-    - "jieliu/SD3.5M-FlowGRPO-GenEval"
+    - "Jayce-Ping/OCR-Teacher"           # OCR/Text checkpoint
+    - "Jayce-Ping/Pickscore-Teacher"     # PickScore checkpoint
+    - "Jayce-Ping/GenEval-Teacher"       # GenEval checkpoint
   # Use [] to eval current adapter only (no ensemble); cannot combine with checkpoint_weights
   checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
   checkpoint_param_device: 'cuda'
-  ensemble_blend_mode: weighted  # weighted | pcgrad
+  ensemble_blend_mode: pcgrad  # weighted | pcgrad | pcgrad_residual | pcgrad_channelwise; pcgrad = velocity-space PCGrad on noise_pred
   pcgrad_eps: 1.0e-8
 
   max_epochs: 1
