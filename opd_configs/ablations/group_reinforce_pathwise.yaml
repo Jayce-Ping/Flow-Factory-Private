@@ -53,8 +53,8 @@ train:
   trainer_type: 'opd'
 
   teacher_paths:
-    - "jieliu/SD3.5M-FlowGRPO-Text"
-    - "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - "Jayce-Ping/OCR-Teacher"           # OCR/Text teacher
+    - "Jayce-Ping/Pickscore-Teacher"     # PickScore teacher
   teacher_param_device: 'cuda'
   teacher_aggregation: 'average'
   pathwise_coef: 1.0

@@ -56,11 +56,11 @@ train:
 
   # Per-source teacher configuration
   teachers:
-    - path: "jieliu/SD3.5M-FlowGRPO-Text"
+    - path: "Jayce-Ping/OCR-Teacher"
       sources: [ocr]               # Only distills on samples from dataset/ocr
-    - path: "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - path: "Jayce-Ping/Pickscore-Teacher"
       sources: [pickscore]         # Only distills on samples from dataset/pickscore
-    - path: "jieliu/SD3.5M-FlowGRPO-GenEval"
+    - path: "Jayce-Ping/GenEval-Teacher"
       sources: [geneval]           # Only distills on samples from dataset/geneval
 
   teacher_route_by_source: true    # Enable per-source routing

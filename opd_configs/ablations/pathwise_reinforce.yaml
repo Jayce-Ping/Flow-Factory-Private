@@ -69,8 +69,8 @@ train:
   #     (auto-downloaded; local paths are checked first when both could match).
   # Each entry is one teacher; with >1 entry, OPD distills the entire set.
   teacher_paths:
-    - "jieliu/SD3.5M-FlowGRPO-Text"      # HF Hub repo id (auto-downloaded)
-    - "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - "Jayce-Ping/OCR-Teacher"           # OCR/Text teacher (HF Hub repo id, auto-downloaded)
+    - "Jayce-Ping/Pickscore-Teacher"     # PickScore teacher
     # - "/path/to/local/lora_dir"          # local directory
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.

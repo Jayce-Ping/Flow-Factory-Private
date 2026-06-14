@@ -47,9 +47,9 @@ train:
   trainer_type: 'opd'
 
   teacher_paths:
-    - "jieliu/SD3.5M-FlowGRPO-Text"
-    - "jieliu/SD3.5M-FlowGRPO-PickScore"
-    - "jieliu/SD3.5M-FlowGRPO-GenEval"
+    - "Jayce-Ping/OCR-Teacher"           # OCR/Text teacher
+    - "Jayce-Ping/Pickscore-Teacher"     # PickScore teacher
+    - "Jayce-Ping/GenEval-Teacher"       # GenEval teacher
   teacher_param_device: 'cuda'
   teacher_aggregation: 'round_robin'   # One teacher per batch, cycling across (epoch, inner_epoch, batch_idx)
   pathwise_coef: 1.0
