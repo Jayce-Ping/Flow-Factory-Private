@@ -1,0 +1,378 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\PC}{\mathrm{PCGrad}}
+\newcommand{\vb}{v_{\mathrm{base}}}
+\newcommand{\vfused}{v_{\mathrm{fused}}}
+\newcommand{\inner}[2]{\langle #1,\, #2\rangle}
+\newcommand{\norm}[1]{\lVert #1\rVert}
+\newcommand{\proj}[2]{\mathrm{proj}_{#2}\!\left(#1\right)}
+\DeclareMathOperator{\sign}{sign}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator*{\softmax}{softmax}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\title{\textbf{Ensemble Blend Modes: Definitions and Theory}\\[0.3em]
+\large \texttt{ensemble-eval} 多 teacher 聚合算法（weighted / PCGrad 家族 / TIES）的含义与理论分析}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文系统给出 \texttt{ensemble-eval} trainer 在每个去噪步对 $K$ 个 LoRA checkpoint 的 \texttt{noise\_pred} 进行融合时所用的全部聚合算法（\texttt{ensemble\_blend\_mode}）的严格定义与理论分析，并解释 \texttt{scripts/compare\_ensemble\_methods.py} 默认对比的那一组方法为何如此选择。核心结论：
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{无冲突即退化}（命题~\ref{prop:noconflict}）：任意 PCGrad 投影（global / channelwise / normalized）在没有符号冲突时都退化为加权和 \texttt{weighted}。单 checkpoint 时三者恒等于 \texttt{weighted}。
+\item \textbf{全速度坍缩}（命题~\ref{prop:collapse}）：teacher 的 full velocity $v_i$ 被共享的 base 方向主导（近平行），冲突率趋零，故 \texttt{pcgrad}/\texttt{pcgrad\_channelwise}/\texttt{pcgrad\_normalized} 与 \texttt{weighted} 数值上几乎相同。
+\item \textbf{base 锚定暴露冲突}（命题~\ref{prop:residual}）：在残差 $\tau_i=v_i-\vb$ 上操作移除了共享共模分量，task delta 之间冲突频繁，故 \texttt{pcgrad\_residual} 系列与 \texttt{ties} 才与基线实质不同。
+\item \textbf{TIES 的退化与去毒}（命题~\ref{prop:ties}）：无符号分歧时 TIES 退化为加权平均；有分歧时通过 sign election 丢弃逆向 teacher，等价于一种逐元素的鲁棒聚合。
+\end{enumerate}
+据此，默认对比集合 $=\{$\texttt{weighted}（基线）$\}\cup\{$\texttt{pcgrad\_residual} 系列 $+$ \texttt{ties}$\}\cup\{$KL/$1/$KL 动态加权$\}$，外加 base 与各 teacher 的单独 baseline。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{设定与符号}
+%% ============================================================
+
+\texttt{ensemble-eval} trainer（\texttt{src/flow\_factory/trainers/ensemble\_eval/}）在每个去噪步把 $K$ 个 checkpoint 的 \texttt{noise\_pred} 融合为单个 $\vfused$，再做一次 \texttt{scheduler.step}。所有融合算子的入口是 \texttt{ensemble\_forward\_step}（\texttt{common.py}），其分发逻辑为：
+\[
+\text{vector}\in\{\underbrace{v_i}_{\text{full velocity}},\ \underbrace{\tau_i=v_i-\vb}_{\text{residual delta}}\}
+\ \times\
+\text{projection}\in\{\text{global},\ \text{channelwise},\ \text{normalized}\}
+\ \cup\ \{\texttt{weighted},\ \texttt{ties}\}.
+\]
+
+\paragraph{符号约定。} 所有量均为 \emph{per-sample}（固定 batch 样本 $b$ 与时间步 $k$，省略上下标）：
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{符号} & \textbf{含义} \\
+\midrule
+$K$ & ensemble 中 checkpoint（teacher）数 \\
+$d=C\times H\times W$ & latent 维度 \\
+$\vb$ & base（pretrained，LoRA 关闭）的 velocity（\texttt{use\_ref\_parameters}） \\
+$v_i$ & teacher $i$ 的 velocity（\texttt{noise\_pred}，\texttt{use\_named\_parameters}） \\
+$\tau_i=v_i-\vb$ & teacher $i$ 的 task vector（residual delta） \\
+$\pi_i\ge0,\ \sum_i\pi_i=1$ & 静态 checkpoint 权重（\texttt{checkpoint\_weights}，默认均匀 $1/K$） \\
+$w_i\ge0$ & 实际融合权重（静态或 per-sample 动态，\S\ref{sec:weighting}） \\
+$\varepsilon$ & \texttt{pcgrad\_eps}，数值下限（默认 $10^{-8}$） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent 投影记号：对向量 $a$ 在 $b$ 方向的投影 $\proj{a}{b}=\dfrac{\inner{a}{b}}{\norm{b}^2}\,b$。
+
+%% ============================================================
+\section{Weighted：线性基线}
+%% ============================================================
+
+\begin{definition}[\texttt{weighted}]
+\label{def:weighted}
+线性加权和（\texttt{common.py}, full-velocity 分支）：
+\begin{equation}
+\vfused^{\,\mathrm{wsum}} \;=\; \sum_{i=1}^{K} w_i\, v_i.
+\label{eq:weighted}
+\end{equation}
+\end{definition}
+
+这是最简单的聚合：各 teacher 速度的凸组合（$w_i$ 归一化时）。它不做任何冲突检测，是其余所有方法的参照系；下文反复出现的结论是"某模式在某条件下退化为~\eqref{eq:weighted}"。从 RL/蒸馏视角，\eqref{eq:weighted} 等价于把各 teacher 的转移均值做加权平均（见 \texttt{teacher\_aggregation\_loss\_formulations.tex}），即 \texttt{average}/\texttt{sum} 聚合的推理期对应物。
+
+%% ============================================================
+\section{PCGrad 家族：冲突投影}
+%% ============================================================
+
+PCGrad（Projecting Conflicting Gradients，Yu et al.\ 2020）原用于多任务梯度去冲突。这里把"梯度"换成 teacher 的速度/残差向量。
+
+\subsection{Global PCGrad}
+
+\begin{definition}[\texttt{pcgrad}，global]
+\label{def:pcgrad}
+输入 $\{g_i\}$（full 模式 $g_i=w_iv_i$，残差模式 $g_i=w_i\tau_i$，见 \texttt{\_blend\_velocity\_set}）。初始化 $\mathrm{pc}_i\gets g_i$；对每个 $i$，按固定（含可复现随机）顺序遍历 $j\neq i$：
+\begin{equation}
+\text{若 } \inner{\mathrm{pc}_i}{g_j}<0:\quad
+\mathrm{pc}_i \;\gets\; \mathrm{pc}_i - \frac{\inner{\mathrm{pc}_i}{g_j}}{\norm{g_j}^2}\,g_j
+\;=\; \mathrm{pc}_i - \proj{\mathrm{pc}_i}{g_j},
+\label{eq:pcgrad_step}
+\end{equation}
+投影方向始终用 \emph{原始} $g_j$。输出 $\vfused=\sum_i\mathrm{pc}_i$。冲突判定 $\inner{\cdot}{\cdot}<0$ 在全部 $d$ 维上做一次内积。
+\end{definition}
+
+几何含义：当 teacher $i$ 与 $j$ 方向相悖（夹角 $>90^\circ$）时，把 $i$ 中与 $j$ 相抵的分量减去，只保留非冲突部分，再求和。其作用是\emph{抑制相互抵消}，让融合方向更"协调"。
+
+\subsection{Channelwise PCGrad}
+
+\begin{definition}[\texttt{pcgrad\_channelwise}]
+\label{def:channelwise}
+与~\eqref{eq:pcgrad_step} 相同，但内积与冲突判定在更细粒度上独立进行（\texttt{pcgrad\_blend\_noise\_preds\_channelwise}）：
+\begin{itemize}[leftmargin=1.6em]
+\item 4D $(B,C,H,W)$：\emph{逐 channel}，内积在 $H\times W$ 上，每个 channel 独立决定是否投影；
+\item 3D $(B,\text{seq},\text{feat})$：\emph{逐 token}，内积在 feat 上。
+\end{itemize}
+\end{definition}
+
+直觉：global 用一个标量内积概括整张图的冲突，可能"一票否决"；channelwise 允许部分 channel/token 冲突、部分不冲突，去冲突更局部、更激进（冲突触发面更大）。
+
+\subsection{Normalized PCGrad}
+
+\begin{definition}[\texttt{pcgrad\_normalized}]
+\label{def:normalized}
+把每个向量拆成幅度 $n_i=\norm{v_i}$ 与单位方向 $u_i=v_i/n_i$（\texttt{pcgrad\_blend\_noise\_preds\_normalized}）。PCGrad 在 \emph{单位方向} $\{u_i\}$ 上运行~\eqref{eq:pcgrad_step} 得投影方向 $p_i$，再恢复幅度与权重重组：
+\begin{equation}
+\vfused \;=\; \sum_{i=1}^{K} w_i\, n_i\, p_i.
+\label{eq:normalized}
+\end{equation}
+\end{definition}
+
+动机：global 的投影系数 $\inner{\mathrm{pc}_i}{g_j}/\norm{g_j}^2$ 受 $g_j$ 幅度影响，高范数 teacher 会主导投影。归一化后冲突几何 $\inner{u_i}{u_j}$（即 cosine）幅度无关，避免"大嗓门"teacher 支配方向；幅度只在最后线性重组时加回。
+
+\subsection{Residual（base-anchored）变体}
+
+\begin{definition}[\texttt{pcgrad\_residual} 系列]
+\label{def:residual}
+先做一次 base 前向得 $\vb$（\texttt{use\_ref\_parameters}），各 teacher 残差 $\tau_i=v_i-\vb$；对 $\{\tau_i\}$（而非 $\{v_i\}$）施加上述三种投影之一得 $\{\tau_i^{\PC}\}$，再加回基线（\texttt{\_pcgrad\_residual\_blend}）：
+\begin{equation}
+\vfused \;=\; \vb \;+\; \underbrace{\textstyle\sum_i w_i\,\tau_i^{\PC}}_{\text{combined delta}}.
+\label{eq:residual}
+\end{equation}
+对应 \texttt{pcgrad\_residual}（global）/ \texttt{\_channelwise} / \texttt{\_normalized}。代价：每步多一次 base 前向。
+\end{definition}
+
+%% ============================================================
+\section{TIES：符号选举 $+$ 不相交合并}
+%% ============================================================
+
+\begin{definition}[\texttt{ties}]
+\label{def:ties}
+base-anchored。在 task vectors $\{\tau_i\}$ 上做 TIES-merging（Yadav et al.\ 2023）的两步（\texttt{ties\_blend\_deltas}）：
+\begin{enumerate}[leftmargin=1.6em]
+\item（可选）\textbf{trim}：每个 $\tau_i$ 按幅度保留 top-$\rho$ 比例的元素（\texttt{ties\_density}$=\rho$，默认 $1.0$ 不裁剪），其余置零；
+\item \textbf{sign election}：逐元素选举主导符号
+\begin{equation}
+\gamma \;=\; \sign\Bigl(\textstyle\sum_i w_i\,\tau_i\Bigr)\in\{-1,0,+1\}^d;
+\label{eq:ties_sign}
+\end{equation}
+\item \textbf{disjoint merge}：仅对与 $\gamma$ 同号的 teacher 做加权平均
+\begin{equation}
+\tau_{\mathrm{merged}}
+=\frac{\sum_i w_i\,\tau_i\,\mathbf{1}[\sign(\tau_i)=\gamma]}{\sum_i w_i\,\mathbf{1}[\sign(\tau_i)=\gamma]}
+\quad(\text{分母为 }0\text{ 处取 }0),
+\label{eq:ties_merge}
+\end{equation}
+\end{enumerate}
+返回 $\vfused=\vb+\tau_{\mathrm{merged}}$。
+\end{definition}
+
+直觉：逐元素地"投票"决定该坐标应往哪个方向修正，再只让赞成方贡献，逆向 teacher 被直接剔除（而非像 PCGrad 那样按投影削减）。这是一种比 PCGrad 更"硬"的冲突消解。
+
+%% ============================================================
+\section{核心理论：退化关系与 base 锚定的必要性}
+%% ============================================================
+
+本节给出"为何默认对比只保留 \texttt{weighted} $+$ residual 系列 $+$ \texttt{ties}"的严格依据。
+
+\begin{lemma}[投影对正缩放的齐次性]
+\label{lem:homog}
+固定遍历顺序与冲突判定，~\eqref{eq:pcgrad_step} 对输入正缩放齐次：若 $g_i\mapsto c\,g_i$（$c>0$ 对所有 $i$ 相同），则 $\mathrm{pc}_i\mapsto c\,\mathrm{pc}_i$。
+\end{lemma}
+\begin{proof}
+归纳。内积 $\inner{c\,\mathrm{pc}_i}{c\,g_j}=c^2\inner{\mathrm{pc}_i}{g_j}$ 符号不变，故冲突判定一致；投影 $\proj{c\,\mathrm{pc}_i}{c\,g_j}=c\,\proj{\mathrm{pc}_i}{g_j}$，更新两边同乘 $c$。
+\end{proof}
+
+\begin{proposition}[无冲突即退化为 weighted]
+\label{prop:noconflict}
+若在某样本上 PCGrad 内层循环 \emph{未触发任何投影}（所有判定 $\inner{\cdot}{\cdot}\ge0$），则
+\begin{itemize}[leftmargin=1.6em]
+\item global / channelwise：$\mathrm{pc}_i=g_i=w_i v_i$（或 $w_i\tau_i$），故 $\vfused=\sum_i w_i v_i$，即 \texttt{weighted}（残差模式为 $\vb+\sum_i w_i\tau_i$）；
+\item normalized：$p_i=u_i$，重组 $\sum_i w_i n_i u_i=\sum_i w_i v_i$，\emph{代数上} 亦等于 \texttt{weighted}。
+\end{itemize}
+特别地，$K=1$ 时不存在 $j\neq i$，三种投影 \emph{恒} 退化为 $w_1 v_1$。
+\end{proposition}
+\begin{proof}
+无投影时 $\mathrm{pc}_i$ 保持初值；global/channelwise 初值即 $g_i$。normalized 初值 $p_i=u_i$，代入~\eqref{eq:normalized} 得 $\sum_i w_i n_i u_i=\sum_i w_i v_i$。$K=1$ 见定义中的单元素短路分支。
+\end{proof}
+
+\begin{remark}
+命题~\ref{prop:noconflict} 解释了脚本中"单 teacher baseline"为何直接用 \texttt{blend\_mode=weighted} 配单 checkpoint：由短路分支它就是该 teacher 自身的 $v_1$。
+\end{remark}
+
+\subsection{为何全速度 PCGrad 坍缩到 weighted}
+
+\begin{proposition}[full-velocity 坍缩]
+\label{prop:collapse}
+设各 teacher 由同一 base 微调，故 $v_i=\vb+\tau_i$ 且 $\norm{\tau_i}\ll\norm{\vb}$（残差远小于共享分量）。则任意两 teacher 的 full velocity 夹角余弦
+\begin{equation}
+\cos\angle(v_i,v_j)
+=\frac{\inner{\vb+\tau_i}{\vb+\tau_j}}{\norm{\vb+\tau_i}\,\norm{\vb+\tau_j}}
+= 1 - O\!\Bigl(\tfrac{\norm{\tau}^2}{\norm{\vb}^2}\Bigr)\;\to\;1,
+\label{eq:collapse}
+\end{equation}
+即 $v_i$ 近平行、内积恒正。于是 global PCGrad 几乎不触发投影，由命题~\ref{prop:noconflict} 数值上 $\approx$ \texttt{weighted}；normalized 同理（单位方向近重合）。
+\end{proposition}
+\begin{proof}
+展开 $\inner{\vb+\tau_i}{\vb+\tau_j}=\norm{\vb}^2+\inner{\vb}{\tau_i+\tau_j}+\inner{\tau_i}{\tau_j}$，分母 $\norm{\vb+\tau_i}=\norm{\vb}\sqrt{1+2\inner{\vb}{\tau_i}/\norm{\vb}^2+O(\norm{\tau}^2/\norm{\vb}^2)}$。令 $\delta=\norm{\tau}/\norm{\vb}\to0$，逐阶展开即得 $\cos=1-O(\delta^2)$。正内积 $\Rightarrow$ 冲突判定 $\inner{\cdot}{\cdot}<0$ 几乎不成立。
+\end{proof}
+
+\begin{corollary}
+\label{cor:exclude}
+\texttt{pcgrad}, \texttt{pcgrad\_channelwise}, \texttt{pcgrad\_normalized} 在 fine-tuned ensemble 上与 \texttt{weighted} 数值近乎一致，对比中信息冗余，故默认对比集合将其剔除（仅保留 \texttt{weighted} 作为这一族的代表基线）。channelwise 因逐 channel 判定冲突面更大，可能略有偏离，但共模主导对每个 channel 同样成立，定性不变。
+\end{corollary}
+
+\subsection{为何 base 锚定（残差）才有效}
+
+\begin{proposition}[残差移除共模、暴露冲突]
+\label{prop:residual}
+在残差空间，融合对象是 $\tau_i=v_i-\vb$，共享分量 $\vb$ 被精确减去。task delta 之间无共模约束，夹角可自由分布于 $[0,\pi]$；当 teacher 专精不同目标时，$\inner{\tau_i}{\tau_j}<0$（方向相悖）频繁出现。因此 residual PCGrad/\texttt{ties} 的投影/选举\emph{真正触发}，融合结果与 \texttt{weighted}（残差）$\vb+\sum_i w_i\tau_i$ 实质不同。
+\end{proposition}
+\begin{proof}
+由构造 $\tau_i$ 不含 $\vb$ 方向的强制正分量；命题~\ref{prop:collapse} 的 $\cos\to1$ 论证不再适用。冲突率由 $\{\tau_i\}$ 的真实几何决定，可显著 $>0$（经验上由 \texttt{PCGradStats} 的 conflict 率证实：full 模式 $\approx0$，residual 模式显著为正）。
+\end{proof}
+
+\begin{tcolorbox}[colback=gray!6,colframe=gray!50,title=\textbf{为何默认对比是这一组}]
+\begin{itemize}[leftmargin=1.4em]
+\item \texttt{weighted}：线性基线（也代表整族 full-velocity，命题~\ref{prop:collapse}）。
+\item \texttt{pcgrad\_residual} / \texttt{\_channelwise} / \texttt{\_normalized}：唯一与基线实质不同的 PCGrad（命题~\ref{prop:residual}）。
+\item \texttt{ties}：base-anchored 的硬冲突消解，独立于 PCGrad 的一类。
+\item \texttt{pcgrad\_residual\_kl} / \texttt{\_kl\_inv}：在 residual 上叠加 per-sample 动态加权（\S\ref{sec:weighting}）。
+\item baseline：\texttt{base}（$\vb$）与各 teacher 单独（$v_i$），给出融合的下界参照。
+\end{itemize}
+被剔除：\texttt{pcgrad} / \texttt{pcgrad\_channelwise} / \texttt{pcgrad\_normalized}（坍缩到 \texttt{weighted}）。
+\end{tcolorbox}
+
+\subsection{TIES 的退化与鲁棒性}
+
+\begin{proposition}[TIES 退化为加权平均]
+\label{prop:ties}
+若所有 teacher 在某元素上符号一致（无分歧），则~\eqref{eq:ties_merge} 的指示函数恒为 $1$，
+\[
+\tau_{\mathrm{merged}}=\frac{\sum_i w_i\tau_i}{\sum_i w_i}=\sum_i \tilde w_i\,\tau_i,\qquad \tilde w_i=w_i/\textstyle\sum_j w_j,
+\]
+即归一化加权平均（$\rho=1$ 时）。存在分歧时，逆向（与 $\gamma$ 异号）teacher 在该元素被剔除，等价于逐元素的 sign-trimmed 加权平均——对"少数派强烈反向"具有鲁棒性。
+\end{proposition}
+\begin{proof}
+指示函数恒 $1$ 时分子分母同为 $\sum_i w_i(\cdot)$，直接化简。分歧时异号项被乘零剔除，仅同号项进入加权平均。
+\end{proof}
+
+\begin{remark}[与 PCGrad 的对比]
+PCGrad 对冲突做\emph{连续}的投影削减（保留正交分量）；TIES 做\emph{离散}的符号剔除（整项丢弃）。前者温和、保几何；后者激进、保符号一致性。二者都需 base 锚定才有意义（命题~\ref{prop:residual}）。
+\end{remark}
+
+%% ============================================================
+\section{动态加权：KL / inverse-KL}
+\label{sec:weighting}
+%% ============================================================
+
+权重 $w_i$ 可为静态 $\pi_i$（\texttt{uniform}）或 per-sample 动态。动态族以 teacher--base 的 per-step KL（在 flow matching 下 $=$ velocity-MSE）$D_i=\norm{\tau_i}^2$ 的幂为权：
+\begin{equation}
+w_i(\alpha)=\frac{\pi_i\,D_i^{\alpha}}{\sum_j \pi_j\,D_j^{\alpha}},\qquad
+\begin{cases}
+\alpha=0 & \texttt{uniform}\\
+\alpha=+1 & \texttt{kl}\ (\text{放大偏离最大的 specialist，软路由})\\
+\alpha=-1 & \texttt{kl\_inv}\ (\text{inverse-variance，压制偏离大者}).
+\end{cases}
+\label{eq:kl_weights}
+\end{equation}
+因需要 $\vb$，\texttt{kl}/\texttt{kl\_inv} 仅对 base-anchored 模式（residual 系列与 \texttt{ties}）有效（\texttt{\_resolve\_blend\_weights} / \texttt{\_dynamic\_kl\_weights}，否则显式报错）。
+
+\begin{theorem}[加权与 global/channelwise 投影可交换]
+\label{thm:commute}
+对 global/channelwise PCGrad，引入 per-sample 标量 $w_i>0$ 等价于先用 \emph{未加权} $\{\tau_j\}$ 投影、再加权重组：$\mathrm{pc}_i=w_i\,\tau_i^{\PC}$，从而 $\vfused=\vb+\sum_i w_i\tau_i^{\PC}$。即动态加权只改变最终线性重组，不改变冲突结构。
+\end{theorem}
+\begin{proof}
+即引理~\ref{lem:homog} 的逐 teacher 推广（不同 $w_i$）：内积 $\inner{w_i\mathrm{pc}_i}{w_j\tau_j}=w_iw_j\inner{\mathrm{pc}_i}{\tau_j}$，$w_iw_j>0$ 符号不变；投影中 $w_j$ 于分子分母相消，更新保持 $\mathrm{pc}_i=w_i\tau_i^{(s)}$。详见 \texttt{kl\_weighted\_teacher\_fusion.tex} 定理~1。
+\end{proof}
+
+\noindent normalized 与 \texttt{ties} 不满足可交换（前者把幅度剥离、$w_i\propto\norm{\tau_i}^{2\alpha}$ 改变等效幂；后者 sign election 显式用 $w_i$）。\texttt{ensemble-eval} 的 OCR/PickScore/GenEval 属 specialist 制度，理论预测 $\alpha>0$（\texttt{kl}）$\gg$ \texttt{uniform} $\gg$ $\alpha<0$（\texttt{kl\_inv}）。完整推导见 \texttt{kl\_weighted\_teacher\_fusion.tex}。
+
+%% ============================================================
+\section{速查表}
+%% ============================================================
+
+\begin{center}
+\begin{tabular}{lllc}
+\toprule
+\textbf{mode} & \textbf{融合公式} & \textbf{冲突处理} & \textbf{base 前向} \\
+\midrule
+\texttt{weighted} & $\sum_i w_i v_i$ & 无 & \ding{55} \\
+\texttt{pcgrad} & $\sum_i \mathrm{pc}_i(\{w_jv_j\})$ & global 投影 & \ding{55} \\
+\texttt{pcgrad\_channelwise} & 同上，逐 channel/token & 细粒度投影 & \ding{55} \\
+\texttt{pcgrad\_normalized} & $\sum_i w_i n_i p_i$ & 单位方向投影 & \ding{55} \\
+\texttt{pcgrad\_residual} & $\vb+\sum_i w_i\tau_i^{\PC}$ & global 投影（残差） & \ding{51} \\
+\texttt{pcgrad\_residual\_channelwise} & 同上，逐 channel & 细粒度（残差） & \ding{51} \\
+\texttt{pcgrad\_residual\_normalized} & $\vb+\sum_i w_i n_i^\tau p_i^\tau$ & 单位方向（残差） & \ding{51} \\
+\texttt{ties} & $\vb+\tau_{\mathrm{merged}}$ & 符号选举$+$剔除 & \ding{51} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent 加权选项 \texttt{ensemble\_blend\_weighting}$\in\{$\texttt{uniform}, \texttt{kl}, \texttt{kl\_inv}$\}$ 仅对带 \ding{51}（base-anchored）的行有效。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{模式} & \textbf{与 weighted 关系} & \textbf{默认对比} \\
+\midrule
+\texttt{pcgrad}/\texttt{\_channelwise}/\texttt{\_normalized} & 近似相等（命题~\ref{prop:collapse}） & 剔除 \\
+\texttt{weighted} & --- & 保留（基线） \\
+\texttt{pcgrad\_residual} 系列 & 实质不同（命题~\ref{prop:residual}） & 保留 \\
+\texttt{ties} & 实质不同 & 保留 \\
+\texttt{*\_kl} / \texttt{*\_kl\_inv} & 残差 $+$ 动态重组 & 保留 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{结论}
+%% ============================================================
+
+\begin{enumerate}[leftmargin=1.6em]
+\item 所有 PCGrad 投影在无冲突时退化为 \texttt{weighted}（命题~\ref{prop:noconflict}）；单 checkpoint 时恒等。
+\item full-velocity 被共享 base 方向主导，冲突率趋零，\texttt{pcgrad}/\texttt{\_channelwise}/\texttt{\_normalized} 坍缩到 \texttt{weighted}（命题~\ref{prop:collapse}），故默认对比剔除之。
+\item base 锚定（残差）移除共模、暴露真实冲突，是 PCGrad/\texttt{ties} 产生非平凡效果的前提（命题~\ref{prop:residual}）。
+\item TIES 无分歧时退化为加权平均，有分歧时硬剔除逆向 teacher（命题~\ref{prop:ties}），与 PCGrad 的软投影互补。
+\item 动态 KL 加权与 global/channelwise 投影可交换（定理~\ref{thm:commute}），是低成本、可叠加的正交改进；符号 $\alpha$ 由 ensemble 制度决定。
+\end{enumerate}
+
+\paragraph{一句话总结。} 在"各 teacher 由同一 base 微调"的 \texttt{ensemble-eval} 设定下，唯有在 \emph{残差} $\tau_i=v_i-\vb$ 上做冲突消解（\texttt{pcgrad\_residual} 系列、\texttt{ties}）才与简单加权和不同；全速度版本因共模主导而退化。默认对比因此聚焦于 \texttt{weighted} 基线、residual 冲突消解族、动态加权变体，以及 base/teacher 单独 baseline。
+
+\paragraph{相关文档。}
+\texttt{kl\_weighted\_teacher\_fusion.tex}（KL 动态加权的完整理论）、
+\texttt{pcgrad\_gradient\_vs\_velocity\_analysis.tex}（gradient-space vs velocity-space PCGrad）、
+\texttt{teacher\_aggregation\_loss\_formulations.tex}（训练期 teacher aggregation）。
+
+\end{document}

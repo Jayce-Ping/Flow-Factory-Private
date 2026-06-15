@@ -63,6 +63,7 @@ import html
 import json
 import logging
 import math
+import os
 import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -770,12 +771,21 @@ def rebuild_report(output_dir: Path, gallery_num_fallback: int = 32) -> None:
 def main() -> None:  # noqa: C901 - orchestration script
     args = parse_args()
 
+    # Keep only rank-0 console output: silence INFO/WARNING on worker ranks as early
+    # as possible (before flow_factory imports/trainer load emit anything). ERROR and
+    # above still pass through on every rank. Resolved from the launcher env so it
+    # also covers the noisy model/trainer construction below.
+    worker_rank = int(os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or 0)
+    if worker_rank != 0:
+        logging.disable(logging.WARNING)
+
     if args.report_only:
         # Prefer the persisted meta's gallery size; fall back to the CLI value.
         rebuild_report(Path(args.output_dir), gallery_num_fallback=args.gallery_num_prompts)
         return
 
     from accelerate.utils import gather_object
+    from tqdm.auto import tqdm
 
     from flow_factory.data_utils.dataset import GeneralDataset
     from flow_factory.hparams import Arguments
@@ -877,6 +887,19 @@ def main() -> None:  # noqa: C901 - orchestration script
 
     local_records: List[Dict[str, Any]] = []
 
+    # Single global progress bar over this rank's image share across all
+    # (test_set x method) columns; shown only on rank 0.
+    total_units = sum(len(range(num_prompts_per_set[ts])[rank::world]) for ts in test_sets) * len(
+        methods
+    )
+    progress = tqdm(
+        total=total_units,
+        disable=not is_main,
+        desc="ensemble-eval",
+        unit="img",
+        dynamic_ncols=True,
+    )
+
     for test_set in test_sets:
         merged_eval = trainer._merged_eval_args_for_test_set_name(test_set)
         eval_seed = (
@@ -894,6 +917,7 @@ def main() -> None:  # noqa: C901 - orchestration script
             _configure_trainer_for_spec(
                 trainer, spec, base_checkpoint_names, base_weights, eval_seed
             )
+            progress.set_postfix_str(f"{test_set}/{spec.label}")
 
             img_dir = output_dir / "images" / test_set / spec.label
             buffer = RewardBuffer(
@@ -955,6 +979,7 @@ def main() -> None:  # noqa: C901 - orchestration script
                     ordered = [samples_by_pos[j] for j in range(len(batch_indices))]
                     buffer.add_samples(ordered)
                     ordered_gidx.extend(batch_indices)
+                    progress.update(len(batch_indices))
 
                 rewards = buffer.finalize(store_to_samples=True, split="pointwise")
 
@@ -982,10 +1007,8 @@ def main() -> None:  # noqa: C901 - orchestration script
             # run is still reportable from disk (records + images), not just images.
             _write_record_shard(records_dir, test_set, spec.label, rank, method_records)
             acc.wait_for_everyone()
-            if is_main:
-                logger.info(
-                    f"[{test_set}] method={spec.label}: {len(ordered_gidx)*world}~ prompts done"
-                )
+
+    progress.close()
 
     # ---- Gather records and build the report on rank 0 ----
     gathered: List[Dict[str, Any]] = list(gather_object(local_records))
