@@ -7,15 +7,20 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Fair side-by-side comparison of ensemble-eval blend methods.
+"""Side-by-side comparison of base-anchored ensemble-eval blend methods.
 
-Loads the base model + checkpoints + reward models ONCE, then for every blend
-method (the ablation configs under ``ensemble-eval/lora/sd3_5/ablations/``)
-generates and scores every test-set prompt at a FIXED seed, saves the images,
-and renders a single self-contained ``index.html`` with:
+By default compares the four blends that genuinely differ from the weighted sum:
+``pcgrad_residual``, ``pcgrad_residual_channelwise``,
+``pcgrad_residual_normalized``, and ``ties`` (see ``DEFAULT_METHODS``). The
+full-velocity modes (``weighted`` / ``pcgrad`` / ``pcgrad_channelwise`` /
+``pcgrad_normalized``) are excluded because the per-teacher velocities share a
+dominant base direction, so PCGrad finds almost no sign conflicts and collapses
+to the weighted sum. Override with ``--methods`` to run any other subset.
 
-  * an aggregate metrics table (methods x test_set/reward, best highlighted), and
-  * a per-prompt side-by-side gallery (first ``--gallery-num-prompts`` prompts).
+Loads the base model + checkpoints + reward models ONCE, then for every selected
+method generates and scores every test-set prompt at a FIXED seed, saves the
+images, and renders a self-contained ``index.html`` with an aggregate metrics
+table and a per-prompt gallery (first ``--gallery-num-prompts`` prompts).
 
 Fairness is structural: the initial latent is a pure function of ``prompt +
 seed`` (``create_generator_by_prompt``), so with ODE sampling every method
@@ -77,6 +82,19 @@ class MethodSpec:
     weighting: str
     ties_density: float
     config_path: str
+
+
+# Default methods: the base-anchored blends (PCGrad on task deltas tau_i = v_i - v_base
+# and TIES sign-election). The full-velocity modes ('weighted', 'pcgrad',
+# 'pcgrad_channelwise', 'pcgrad_normalized') degenerate to the weighted sum because
+# v_i is dominated by the shared base direction (near-zero sign conflicts), so only
+# these four produce outputs that genuinely differ from 'pcgrad'/'weighted'.
+DEFAULT_METHODS: Tuple[str, ...] = (
+    "3_geneval-ocr-pickscore_pcgrad_residual",
+    "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
+    "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
+    "3_geneval-ocr-pickscore_ties",
+)
 
 
 def load_method_specs(configs_glob: str) -> List[MethodSpec]:
@@ -386,11 +404,13 @@ def main() -> None:  # noqa: C901 - orchestration script
     config.log_args.logging_backend = "none"  # standalone report; no W&B run
     apply_eval_overrides(config, args)
     methods = load_method_specs(args.configs_glob)
-    if args.methods:
-        wanted = set(args.methods)
-        methods = [m for m in methods if m.label in wanted]
-        if not methods:
-            raise ValueError(f"--methods {args.methods} matched none of the ablation configs.")
+    wanted = set(args.methods) if args.methods else set(DEFAULT_METHODS)
+    methods = [m for m in methods if m.label in wanted]
+    if not methods:
+        raise ValueError(
+            "No method configs to run after filtering. "
+            f"configs_glob={args.configs_glob!r}, methods={sorted(wanted)!r}"
+        )
 
     # ---- Build trainer once (model, 3 checkpoints, rewards, datasets) ----
     trainer = load_trainer(config)
@@ -679,7 +699,10 @@ def parse_args() -> argparse.Namespace:
         "--configs-glob",
         type=str,
         default="ensemble-eval/lora/sd3_5/ablations/*.yaml",
-        help="Glob of ablation YAMLs; each contributes one method (blend params + run_name label).",
+        help=(
+            "Glob of ablation YAMLs; each contributes one method (blend params + run_name label). "
+            "By default only the base-anchored methods (see --methods) are kept."
+        ),
     )
     p.add_argument(
         "--output-dir",
@@ -687,7 +710,16 @@ def parse_args() -> argparse.Namespace:
         default=f"saves/ensemble_compare/{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}",
         help="Output root: images/<test_set>/<method>/<idx>.png, metrics.json/csv, index.html.",
     )
-    p.add_argument("--methods", nargs="*", default=None, help="Subset of method labels to run.")
+    p.add_argument(
+        "--methods",
+        nargs="*",
+        default=None,
+        help=(
+            "Subset of method labels to run. Defaults to the four base-anchored blends: "
+            + ", ".join(DEFAULT_METHODS)
+            + "."
+        ),
+    )
     p.add_argument("--test-sets", nargs="*", default=None, help="Subset of test set names to run.")
     p.add_argument(
         "--gallery-num-prompts",

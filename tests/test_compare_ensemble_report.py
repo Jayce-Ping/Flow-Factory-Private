@@ -187,6 +187,26 @@ class TestLoadMethodSpecs(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             cmp.load_method_specs(str(_REPO_ROOT / "no_such_dir" / "*.yaml"))
 
+    def test_default_methods_are_base_anchored(self) -> None:
+        glob_pat = str(_REPO_ROOT / "ensemble-eval/lora/sd3_5/ablations" / "*.yaml")
+        specs = cmp.load_method_specs(glob_pat)
+        by_label = {s.label: s for s in specs}
+        # The four base-anchored defaults all resolve and exclude kl/kl_inv variants.
+        self.assertEqual(
+            cmp.DEFAULT_METHODS,
+            (
+                "3_geneval-ocr-pickscore_pcgrad_residual",
+                "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
+                "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
+                "3_geneval-ocr-pickscore_ties",
+            ),
+        )
+        for label in cmp.DEFAULT_METHODS:
+            self.assertIn(label, by_label, f"default method {label!r} missing from ablations")
+        self.assertEqual(by_label[cmp.DEFAULT_METHODS[-1]].blend_mode, "ties")
+        for label in cmp.DEFAULT_METHODS[:-1]:
+            self.assertTrue(by_label[label].blend_mode.startswith("pcgrad_residual"))
+
 
 if __name__ == "__main__":
     unittest.main()
