@@ -1,15 +1,7 @@
-# Multi-checkpoint offline ensemble evaluation — SD3.5 LoRA example.
-#
-# Loads multiple LoRA checkpoints as named snapshots (OPD-style) and runs one
-# evaluation pass per entry in eval.test_sets. At each denoising step, fuse
-# per-checkpoint noise_pred, then one scheduler.step:
-#   weighted (default): noise_pred = sum_i w_i * noise_pred_i
-#   pcgrad: PCGrad on w_i * noise_pred_i, then sum projected vectors
-#
-# Prerequisites:
-#   - `finetune_type: lora` with rank/alpha matching every checkpoint.
-#   - Each `checkpoint_paths` entry: local dir from `save_checkpoint()` or HF Hub id.
-#   - Each test set: `{dataset_dir}/{split}.jsonl` (default split: test).
+# Ensemble-eval ablation (SD3.5 LoRA): pcgrad_residual_normalized fusion (residual delta, magnitude-normalized).
+# Magnitude-invariant PCGrad on unit directions of task deltas (noise_pred_i - v_base)
+# over 3 LoRA checkpoints (OCR + PickScore + GenEval); one extra base forward per step.
+# Run: ff-train ensemble-eval/lora/sd3_5/ablations/3_geneval-ocr-pickscore_pcgrad_residual_normalized.yaml
 
 # Environment Configuration
 launcher: "accelerate"
@@ -41,7 +33,7 @@ model:
   resume_type: null
 
 log:
-  run_name: null
+  run_name: "3_geneval-ocr-pickscore_pcgrad_residual_normalized"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -59,7 +51,7 @@ train:
   # Use [] to eval current adapter only (no ensemble); cannot combine with checkpoint_weights
   checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
   checkpoint_param_device: 'cuda'
-  ensemble_blend_mode: pcgrad  # weighted | pcgrad | pcgrad_channelwise | pcgrad_normalized | pcgrad_residual | pcgrad_residual_channelwise | pcgrad_residual_normalized | ties
+  ensemble_blend_mode: pcgrad_residual_normalized  # weighted | pcgrad | pcgrad_channelwise | pcgrad_normalized | pcgrad_residual | pcgrad_residual_channelwise | pcgrad_residual_normalized | ties
   pcgrad_eps: 1.0e-8
   ties_density: 1.0  # ties only: fraction of top-|tau| entries kept per task (1.0 = no trim)
 

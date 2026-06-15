@@ -30,6 +30,8 @@ from flow_factory.trainers.ensemble_eval.common import (
     normalize_checkpoint_weights,
     pcgrad_blend_noise_preds,
     pcgrad_blend_noise_preds_channelwise,
+    pcgrad_blend_noise_preds_normalized,
+    ties_blend_deltas,
 )
 from flow_factory.trainers.registry import get_trainer_class
 
@@ -143,6 +145,91 @@ class TestPcgradBlendNoisePreds(unittest.TestCase):
     def test_rejects_non_positive_eps(self) -> None:
         with self.assertRaises(ValueError):
             pcgrad_blend_noise_preds([torch.tensor([1.0])], eps=0.0)
+
+
+class TestPcgradBlendNoisePredsNormalized(unittest.TestCase):
+    def test_single_returns_weighted_input(self) -> None:
+        out = pcgrad_blend_noise_preds_normalized([torch.tensor([3.0])], [0.5])
+        torch.testing.assert_close(out, torch.tensor([1.5]))
+
+    def test_two_conflict_cancels(self) -> None:
+        out = pcgrad_blend_noise_preds_normalized(
+            [torch.tensor([2.0]), torch.tensor([-2.0])], [0.5, 0.5]
+        )
+        torch.testing.assert_close(out, torch.tensor([0.0]))
+
+    def test_two_non_conflict_equals_weighted(self) -> None:
+        # Aligned directions: result restores magnitude+weight = weighted blend.
+        out = pcgrad_blend_noise_preds_normalized(
+            [torch.tensor([2.0]), torch.tensor([1.0])], [0.5, 0.5]
+        )
+        torch.testing.assert_close(out, torch.tensor([1.5]))
+
+    def test_magnitude_invariant_geometry(self) -> None:
+        # Two 2D vectors, one with much larger magnitude but partially conflicting.
+        # Normalized projection works on unit directions so the large-norm vector
+        # does not dominate the conflict geometry.
+        v0 = torch.tensor([[10.0, 0.0]])
+        v1 = torch.tensor([[-1.0, 1.0]])
+        out = pcgrad_blend_noise_preds_normalized([v0, v1], [0.5, 0.5])
+        # u0=[1,0], u1=[-1,1]/sqrt(2). dot(u0,u1)<0 -> conflict.
+        # pc0 = u0 - (u0·u1)u1 ; pc1 = u1 - (u1·u0)u0. Recombine w*n*pc.
+        cos = -1.0 / (2.0**0.5)
+        u0 = torch.tensor([[1.0, 0.0]])
+        u1 = torch.tensor([[-1.0, 1.0]]) / (2.0**0.5)
+        pc0 = u0 - cos * u1
+        pc1 = u1 - cos * u0
+        expected = 0.5 * 10.0 * pc0 + 0.5 * (2.0**0.5) * pc1
+        torch.testing.assert_close(out, expected)
+
+    def test_rejects_empty_sequence(self) -> None:
+        with self.assertRaises(ValueError):
+            pcgrad_blend_noise_preds_normalized([], [])
+
+    def test_rejects_length_mismatch(self) -> None:
+        with self.assertRaises(ValueError):
+            pcgrad_blend_noise_preds_normalized([torch.tensor([1.0]), torch.tensor([2.0])], [1.0])
+
+    def test_rejects_non_positive_eps(self) -> None:
+        with self.assertRaises(ValueError):
+            pcgrad_blend_noise_preds_normalized([torch.tensor([1.0])], [1.0], eps=0.0)
+
+
+class TestTiesBlendDeltas(unittest.TestCase):
+    def test_single_returns_input_delta(self) -> None:
+        out = ties_blend_deltas([torch.tensor([[2.0, 0.0, -3.0]])], [1.0])
+        torch.testing.assert_close(out, torch.tensor([[2.0, 0.0, -3.0]]))
+
+    def test_sign_vote_drops_disagreeing(self) -> None:
+        tau0 = torch.tensor([[2.0, 1.0, -1.0]])
+        tau1 = torch.tensor([[-1.0, 2.0, 1.0]])
+        out = ties_blend_deltas([tau0, tau1], [0.5, 0.5])
+        # weighted_sum=[0.5,1.5,0.0] -> gamma=[1,1,0].
+        # e0: only tau0 agrees -> 0.5*2/0.5 = 2.0
+        # e1: both agree -> (0.5*1+0.5*2)/1.0 = 1.5
+        # e2: gamma=0 -> no agreement -> 0.0
+        torch.testing.assert_close(out, torch.tensor([[2.0, 1.5, 0.0]]))
+
+    def test_no_disagreement_equals_weighted(self) -> None:
+        tau0 = torch.tensor([[2.0, 4.0]])
+        tau1 = torch.tensor([[1.0, 2.0]])
+        out = ties_blend_deltas([tau0, tau1], [0.5, 0.5])
+        torch.testing.assert_close(out, torch.tensor([[1.5, 3.0]]))
+
+    def test_density_trim_keeps_top_magnitude(self) -> None:
+        # density=0.5 over 4 elements keeps top-2 by |tau| per sample.
+        tau0 = torch.tensor([[4.0, 0.1, 3.0, 0.2]])
+        out = ties_blend_deltas([tau0], [1.0], density=0.5)
+        # Single delta: keeps the two largest-magnitude entries, zeros the rest.
+        torch.testing.assert_close(out, torch.tensor([[4.0, 0.0, 3.0, 0.0]]))
+
+    def test_rejects_empty_sequence(self) -> None:
+        with self.assertRaises(ValueError):
+            ties_blend_deltas([], [])
+
+    def test_rejects_invalid_density(self) -> None:
+        with self.assertRaises(ValueError):
+            ties_blend_deltas([torch.tensor([1.0])], [1.0], density=0.0)
 
 
 class TestLoadCheckpoints(unittest.TestCase):
@@ -516,6 +603,152 @@ class TestEnsembleForwardStepChannelwiseMode(unittest.TestCase):
         torch.testing.assert_close(out.noise_pred, torch.tensor([[[[0.0]], [[4.0]]]]))
 
 
+class TestEnsembleForwardStepResidualNormalizedMode(unittest.TestCase):
+    """Tests for blend_mode='pcgrad_residual_normalized' via ensemble_forward_step."""
+
+    def _run(self, ref_pred, preds, names, weights, latents):
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        return ensemble_forward_step(
+            adapter,
+            names,
+            weights,
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": latents,
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad_residual_normalized",
+        )
+
+    def test_conflicting_deltas(self) -> None:
+        # ref=10, ckpt deltas +2/-2 -> opposite unit directions cancel -> v_b.
+        out = self._run(
+            torch.tensor([10.0]),
+            {"eval_ckpt_0": torch.tensor([12.0]), "eval_ckpt_1": torch.tensor([8.0])},
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            torch.tensor([0.0]),
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([10.0]))
+
+    def test_aligned_deltas_equals_weighted(self) -> None:
+        # ref=0, deltas +2/+4 aligned -> restores magnitude+weight = weighted.
+        out = self._run(
+            torch.tensor([0.0]),
+            {"eval_ckpt_0": torch.tensor([2.0]), "eval_ckpt_1": torch.tensor([4.0])},
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            torch.tensor([0.0]),
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([3.0]))
+
+
+class TestEnsembleForwardStepResidualChannelwiseMode(unittest.TestCase):
+    """Tests for blend_mode='pcgrad_residual_channelwise' via ensemble_forward_step."""
+
+    def test_per_channel_delta_conflict(self) -> None:
+        ref_pred = torch.zeros(1, 2, 1, 1)
+        preds = {
+            "eval_ckpt_0": torch.tensor([[[[2.0]], [[1.0]]]]),
+            "eval_ckpt_1": torch.tensor([[[[-2.0]], [[3.0]]]]),
+        }
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.zeros(1, 2, 1, 1),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad_residual_channelwise",
+        )
+        # ch0: deltas +2/-2 -> conflict -> 0; ch1: deltas +1/+3 aligned -> 0.5+1.5=2.
+        torch.testing.assert_close(out.noise_pred, torch.tensor([[[[0.0]], [[2.0]]]]))
+
+
+class TestEnsembleForwardStepTiesMode(unittest.TestCase):
+    """Tests for blend_mode='ties' via ensemble_forward_step."""
+
+    def test_sign_vote(self) -> None:
+        ref_pred = torch.zeros(1, 3)
+        preds = {
+            "eval_ckpt_0": torch.tensor([[2.0, 1.0, -1.0]]),
+            "eval_ckpt_1": torch.tensor([[-1.0, 2.0, 1.0]]),
+        }
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.zeros(1, 3),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="ties",
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([[2.0, 1.5, 0.0]]))
+
+    def test_no_disagreement_equals_weighted(self) -> None:
+        ref_pred = torch.zeros(1, 2)
+        preds = {
+            "eval_ckpt_0": torch.tensor([[2.0, 4.0]]),
+            "eval_ckpt_1": torch.tensor([[1.0, 2.0]]),
+        }
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.zeros(1, 2),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="ties",
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([[1.5, 3.0]]))
+
+    def test_single_checkpoint_returns_v0(self) -> None:
+        ref_pred = torch.tensor([5.0])
+        preds = {"eval_ckpt_0": torch.tensor([10.0])}
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0"],
+            [1.0],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.tensor([0.0]),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="ties",
+        )
+        torch.testing.assert_close(out.noise_pred, torch.tensor([10.0]))
+
+
 # ---------------------------------------------------------------------------
 # Training Arguments Validation for blend modes
 # ---------------------------------------------------------------------------
@@ -523,7 +756,16 @@ class TestEnsembleForwardStepChannelwiseMode(unittest.TestCase):
 
 class TestBlendModeValidation(unittest.TestCase):
     def test_accepts_all_valid_blend_modes(self) -> None:
-        for mode in ("weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"):
+        for mode in (
+            "weighted",
+            "pcgrad",
+            "pcgrad_residual",
+            "pcgrad_channelwise",
+            "pcgrad_normalized",
+            "pcgrad_residual_normalized",
+            "pcgrad_residual_channelwise",
+            "ties",
+        ):
             args = EnsembleEvalTrainingArguments(
                 checkpoint_paths=["/tmp/a"],
                 ensemble_blend_mode=mode,
@@ -542,6 +784,28 @@ class TestBlendModeValidation(unittest.TestCase):
                 group_size=1,
                 per_device_batch_size=1,
             )
+
+    def test_accepts_valid_ties_density(self) -> None:
+        args = EnsembleEvalTrainingArguments(
+            checkpoint_paths=["/tmp/a"],
+            ensemble_blend_mode="ties",
+            ties_density=0.5,
+            unique_sample_num_per_epoch=1,
+            group_size=1,
+            per_device_batch_size=1,
+        )
+        self.assertEqual(args.ties_density, 0.5)
+
+    def test_rejects_invalid_ties_density(self) -> None:
+        for bad in (0.0, 1.5, -0.1):
+            with self.assertRaises(ValueError):
+                EnsembleEvalTrainingArguments(
+                    checkpoint_paths=["/tmp/a"],
+                    ties_density=bad,
+                    unique_sample_num_per_epoch=1,
+                    group_size=1,
+                    per_device_batch_size=1,
+                )
 
 
 class TestEnsembleEvalRegistry(unittest.TestCase):

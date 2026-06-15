@@ -505,9 +505,13 @@ Logs appear under `eval/{name}/reward_*` (e.g. `eval/ocr/reward_ocr_mean`, `eval
 At each denoising step inside `adapter.inference`, `adapter.forward` is temporarily patched to:
 
 1. Forward each checkpoint under `use_named_parameters(eval_ckpt_i)` and collect `noise_pred_i`.
-2. Blend (see `ensemble_blend_mode`):
+2. Blend (see `ensemble_blend_mode`). The PCGrad family is `vector {full velocity, residual delta} × projection {global, channelwise, normalized}`; every mode reduces to `weighted` when no conflicts/disagreements occur:
    - **`weighted`** (default): `noise_pred = Σ_i w_i · noise_pred_i` (weights normalized to sum to 1).
-   - **`pcgrad`**: Let `v_i = w_i · noise_pred_i`. For each pair `(i, j)` with negative per-batch dot product, project `v_i` off the conflicting component of the **original** `v_j` (PCGrad), then `noise_pred = Σ_i v_i^PC`. When no conflicts occur, this matches the weighted blend.
+   - **`pcgrad`**: Let `v_i = w_i · noise_pred_i`. For each pair `(i, j)` with negative per-batch dot product, project `v_i` off the conflicting component of the **original** `v_j` (PCGrad, one global dot per sample), then `noise_pred = Σ_i v_i^PC`.
+   - **`pcgrad_channelwise`**: same as `pcgrad` but with per-channel (4D) / per-token (3D) dot products for finer conflict detection.
+   - **`pcgrad_normalized`**: magnitude-invariant PCGrad — project on unit directions `u_i = v_i / ‖v_i‖`, then recombine `Σ_i w_i · ‖v_i‖ · u_i^PC` so a high-norm checkpoint cannot dominate the geometry.
+   - **`pcgrad_residual`** / **`pcgrad_residual_channelwise`** / **`pcgrad_residual_normalized`**: the same three projections applied to task-specific deltas `τ_i = noise_pred_i − v_b` (one extra pretrained forward `v_b` per step), then `noise_pred = v_b + Σ_i τ_i^PC`. Recommended for checkpoints trained on different objectives (deltas conflict far more than full predictions).
+   - **`ties`**: TIES-merging base-anchored sign vote — elect a per-element sign `γ = sign(Σ_i w_i τ_i)`, take the disjoint weighted mean over sign-agreeing checkpoints, then `noise_pred = v_b + τ_merged` (one extra pretrained forward per step). `ties_density < 1` first trims each `τ_i` to its top-magnitude entries.
 3. Call `scheduler.step` once with the blended `noise_pred`.
 
 ### Key config fields (`train:`)
@@ -518,8 +522,9 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
 | `checkpoint_paths` | List of LoRA paths (local or HF Hub); `[]` = eval current adapter (no ensemble) |
 | `checkpoint_weights` | Optional blend weights (same length as paths); default uniform |
 | `checkpoint_param_device` | `'cpu'` or `'cuda'` for snapshot storage |
-| `ensemble_blend_mode` | `'weighted'` or `'pcgrad'` |
+| `ensemble_blend_mode` | `'weighted'`, `'pcgrad'`, `'pcgrad_channelwise'`, `'pcgrad_normalized'`, `'pcgrad_residual'`, `'pcgrad_residual_channelwise'`, `'pcgrad_residual_normalized'`, or `'ties'` |
 | `pcgrad_eps` | Minimum squared norm per batch element in PCGrad projection (default `1e-8`) |
+| `ties_density` | `ties` only: fraction of top-magnitude entries kept per task vector before the sign vote (default `1.0` = no trim; must be in `(0, 1]`) |
 
 Requires `model.finetune_type: lora`. Non-empty `checkpoint_paths` need matching `lora_rank` / `lora_alpha` across checkpoints. Empty `checkpoint_paths` uses the loaded student LoRA as-is (`model.resume_path` or initialized weights), not Hub ensemble snapshots. Example: `ensemble-eval/lora/sd3_5/default.yaml`.
 

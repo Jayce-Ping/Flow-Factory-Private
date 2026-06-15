@@ -17,9 +17,10 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Literal, Optional, Sequence, Tuple, get_args
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Literal, Optional, Sequence, Tuple, Union, get_args
 
 import torch
 
@@ -34,8 +35,33 @@ logger = setup_logger(__name__)
 
 SchedulerStepCache = Tuple[FrozenSet[str], bool]
 
-EnsembleBlendMode = Literal["weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"]
+EnsembleBlendMode = Literal[
+    "weighted",
+    "pcgrad",
+    "pcgrad_residual",
+    "pcgrad_channelwise",
+    "pcgrad_normalized",
+    "pcgrad_residual_normalized",
+    "pcgrad_residual_channelwise",
+    "ties",
+]
 ENSEMBLE_BLEND_MODES: Tuple[str, ...] = get_args(EnsembleBlendMode)
+
+# Conflict-projection strategy shared by the full-velocity and residual-delta paths.
+PCGradProjection = Literal["global", "channelwise", "normalized"]
+
+# blend_mode -> projection for the two PCGrad families (the remaining modes
+# 'weighted' and 'ties' are dispatched explicitly in ensemble_forward_step).
+_FULL_PROJECTIONS: Dict[str, "PCGradProjection"] = {
+    "pcgrad": "global",
+    "pcgrad_channelwise": "channelwise",
+    "pcgrad_normalized": "normalized",
+}
+_RESIDUAL_PROJECTIONS: Dict[str, "PCGradProjection"] = {
+    "pcgrad_residual": "global",
+    "pcgrad_residual_channelwise": "channelwise",
+    "pcgrad_residual_normalized": "normalized",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +164,61 @@ class PCGradStats:
                 "Result is identical to weighted_sum."
             )
 
+        logger.info("\n".join(summary_lines))
+
+
+@dataclass
+class TIESStats:
+    """Accumulates TIES-merging sign-disagreement statistics across steps.
+
+    Create one instance per evaluation run, pass it to ``ensemble_forward_step``
+    (via the ``stats`` parameter) when ``ensemble_blend_mode='ties'``, then call
+    :meth:`log_summary` after evaluation completes.
+    """
+
+    num_steps: int = 0
+    total_elements: int = 0  # non-zero (checkpoint, element) task entries
+    disagree_elements: int = 0  # entries dropped because sign != elected sign
+
+    blend_mode: str = "ties"
+    tensor_shape: Tuple[int, ...] = ()
+    num_checkpoints: int = 0
+
+    def record_step(
+        self,
+        *,
+        step_total_elements: int,
+        step_disagree_elements: int,
+    ) -> None:
+        """Record statistics from one denoising step."""
+        self.num_steps += 1
+        self.total_elements += step_total_elements
+        self.disagree_elements += step_disagree_elements
+
+    def log_summary(self) -> None:
+        """Log accumulated statistics as a single summary message."""
+        if self.num_steps == 0:
+            return
+
+        disagree_rate = (
+            self.disagree_elements / self.total_elements
+            if self.total_elements > 0
+            else 0.0
+        )
+        summary_lines = [
+            f"TIES summary ({self.blend_mode}): "
+            f"{self.num_checkpoints} checkpoints, "
+            f"{self.num_steps} denoising steps, "
+            f"tensor_shape={self.tensor_shape}.",
+            f"  Sign-disagreement rate: {disagree_rate:.4f} "
+            f"({self.disagree_elements}/{self.total_elements} non-zero task "
+            f"entries dropped by the sign vote across all steps).",
+        ]
+        if self.disagree_elements == 0:
+            summary_lines.append(
+                "  WARNING: No sign disagreement detected across any step. "
+                "Result is identical to weighted_sum."
+            )
         logger.info("\n".join(summary_lines))
 
 
@@ -545,6 +626,197 @@ def pcgrad_blend_noise_preds_channelwise(
     return result
 
 
+def pcgrad_blend_noise_preds_normalized(
+    vectors: Sequence[torch.Tensor],
+    weights: Sequence[float],
+    *,
+    eps: float = 1e-8,
+    generator: Optional[torch.Generator] = None,
+    stats: Optional[PCGradStats] = None,
+) -> torch.Tensor:
+    """Magnitude-normalized global PCGrad blend.
+
+    Splits each ``vectors[i]`` into a per-sample magnitude ``n_i = ||vectors[i]||``
+    and unit direction ``u_i = vectors[i] / n_i``. The PCGrad pairwise projection
+    runs on the **unit directions** so the conflict geometry is magnitude-invariant
+    (a high-norm checkpoint cannot dominate the projection coefficient
+    ``<u_i, u_j>``). The projected unit directions ``p_i`` are recombined as
+    ``sum_i w_i * n_i * p_i``, restoring each checkpoint's original magnitude and
+    blend weight.
+
+    No conflicts reduce to the weighted blend ``sum_i w_i * vectors[i]``; a single
+    vector returns ``w_0 * vectors[0]``.
+
+    Args:
+        vectors: Per-checkpoint velocity tensors, same shape.
+        weights: Per-checkpoint blend weights (same length as ``vectors``).
+        eps: Minimum value for ``||v||^2`` when normalizing / dividing.
+        generator: Optional RNG for shuffling inner-loop task order.
+        stats: Optional accumulator for deferred summary logging.
+
+    Returns:
+        Combined ``noise_pred`` tensor.
+
+    Raises:
+        ValueError: Empty sequence, shape mismatch, length mismatch, or invalid ``eps``.
+        TypeError: Non-tensor entries in ``vectors``.
+    """
+    if not vectors:
+        raise ValueError(
+            "pcgrad_blend_noise_preds_normalized requires at least one tensor, "
+            "got empty sequence."
+        )
+    if eps <= 0:
+        raise ValueError(f"pcgrad_eps must be > 0, got {eps}.")
+    if len(vectors) != len(weights):
+        raise ValueError(
+            "pcgrad_blend_noise_preds_normalized expected len(vectors) == "
+            f"len(weights), got len(vectors)={len(vectors)}, "
+            f"len(weights)={len(weights)}."
+        )
+
+    ref = vectors[0]
+    if not isinstance(ref, torch.Tensor):
+        raise TypeError(
+            f"pcgrad_blend_noise_preds_normalized expected torch.Tensor, "
+            f"got {type(ref).__name__}."
+        )
+    if ref.ndim < 1:
+        raise ValueError(
+            "pcgrad_blend_noise_preds_normalized expected batch dimension "
+            f"(ndim >= 1), got ndim={ref.ndim}."
+        )
+    ref_shape = ref.shape
+    for idx, vec in enumerate(vectors):
+        if not isinstance(vec, torch.Tensor):
+            raise TypeError(
+                "pcgrad_blend_noise_preds_normalized expected torch.Tensor at "
+                f"index {idx}, got {type(vec).__name__}."
+            )
+        if vec.shape != ref_shape:
+            raise ValueError(
+                "pcgrad_blend_noise_preds_normalized expected all tensors to "
+                f"share shape {tuple(ref_shape)}, got index {idx} shape "
+                f"{tuple(vec.shape)}."
+            )
+
+    if len(vectors) == 1:
+        return weights[0] * vectors[0]
+
+    batch = ref_shape[0]
+    broadcast_shape = _batchwise_broadcast_shape(ref)
+
+    # Per-sample magnitude (B, 1, 1, ...) and unit direction.
+    norm = [
+        vec.reshape(batch, -1).pow(2).sum(dim=1).clamp_min(eps).sqrt().view(broadcast_shape)
+        for vec in vectors
+    ]
+    unit = [vec / n for vec, n in zip(vectors, norm, strict=True)]
+
+    flat_unit = [u.reshape(batch, -1) for u in unit]
+    norm_sq_unit = [
+        (fu * fu).sum(dim=1).clamp_min(eps).view(broadcast_shape) for fu in flat_unit
+    ]
+
+    num_checkpoints = len(vectors)
+    pc = [u.clone() for u in unit]
+
+    total_pairs = 0
+    conflict_pairs = 0
+    conflict_batches = 0
+    total_batches = 0
+
+    for i in range(num_checkpoints):
+        for j in _shuffled_other_indices(num_checkpoints, i, generator):
+            flat_pc_i = pc[i].reshape(batch, -1)
+            dot = (flat_pc_i * flat_unit[j]).sum(dim=1).view(broadcast_shape)
+            coeff = dot / norm_sq_unit[j]
+            proj = coeff * unit[j]
+            conflict_mask = dot < 0
+            pc[i] = torch.where(conflict_mask, pc[i] - proj, pc[i])
+
+            if stats is not None:
+                n_conflicts = int(conflict_mask.sum().item())
+                total_pairs += 1
+                total_batches += batch
+                conflict_batches += n_conflicts
+                if n_conflicts > 0:
+                    conflict_pairs += 1
+
+    if stats is not None and total_pairs > 0:
+        if stats.num_steps == 0:
+            stats.tensor_shape = tuple(ref_shape)
+        cosine_means: List[float] = []
+        cosine_mins: List[float] = []
+        cosine_maxs: List[float] = []
+        for i in range(num_checkpoints):
+            for j in range(num_checkpoints):
+                if i == j:
+                    continue
+                # Unit directions: dot product is already the cosine similarity.
+                cosine_sim = (flat_unit[i] * flat_unit[j]).sum(dim=1)
+                cosine_means.append(cosine_sim.mean().item())
+                cosine_mins.append(cosine_sim.min().item())
+                cosine_maxs.append(cosine_sim.max().item())
+        stats.record_step(
+            step_total_pairs=total_pairs,
+            step_conflict_pairs=conflict_pairs,
+            step_total_elements=total_batches,
+            step_conflict_elements=conflict_batches,
+            cosine_means=cosine_means,
+            cosine_mins=cosine_mins,
+            cosine_maxs=cosine_maxs,
+        )
+
+    result = weights[0] * norm[0] * pc[0]
+    for k in range(1, num_checkpoints):
+        result = result + weights[k] * norm[k] * pc[k]
+    return result
+
+
+def _blend_velocity_set(
+    vectors: Sequence[torch.Tensor],
+    weights: Sequence[float],
+    *,
+    projection: "PCGradProjection",
+    eps: float = 1e-8,
+    generator: Optional[torch.Generator] = None,
+    stats: Optional[PCGradStats] = None,
+) -> torch.Tensor:
+    """Blend velocity tensors with the requested PCGrad projection.
+
+    Shared by the full-velocity and residual-delta paths so each projection
+    works in both spaces:
+
+    - ``global``: PCGrad on ``w_i * vectors[i]`` with one dot product per sample.
+    - ``channelwise``: PCGrad on ``w_i * vectors[i]`` with per-channel (4D) or
+      per-token (3D) dot products.
+    - ``normalized``: magnitude-normalized PCGrad on unit directions, recombined
+      as ``sum_i w_i * n_i * p_i``.
+
+    Raises:
+        ValueError: Unknown ``projection``.
+    """
+    if projection == "normalized":
+        return pcgrad_blend_noise_preds_normalized(
+            vectors, weights, eps=eps, generator=generator, stats=stats
+        )
+
+    scaled_preds = [vec * weight for vec, weight in zip(vectors, weights, strict=True)]
+    if projection == "channelwise":
+        return pcgrad_blend_noise_preds_channelwise(
+            scaled_preds, eps=eps, generator=generator, stats=stats
+        )
+    if projection == "global":
+        return pcgrad_blend_noise_preds(
+            scaled_preds, eps=eps, generator=generator, stats=stats
+        )
+    raise ValueError(
+        "_blend_velocity_set expected projection in "
+        f"('global', 'channelwise', 'normalized'), got projection={projection!r}."
+    )
+
+
 def _pcgrad_residual_blend(
     adapter: "BaseAdapter",
     checkpoint_names: Sequence[str],
@@ -553,18 +825,20 @@ def _pcgrad_residual_blend(
     base_forward: Callable[..., Any],
     pcgrad_eps: float,
     pcgrad_generator: Optional[torch.Generator],
+    projection: "PCGradProjection" = "global",
     stats: Optional[PCGradStats] = None,
 ) -> torch.Tensor:
-    """Compute PCGrad on deltas from pretrained model noise_pred.
+    """Compute PCGrad on deltas from the pretrained model noise_pred.
 
     Steps:
         1. Run ``base_forward`` with all LoRA adapters disabled to get the
-           pretrained (reference) model's ``noise_pred``.
-        2. For each checkpoint, compute ``delta_i = noise_pred_i - ref_noise_pred``.
-        3. Scale deltas: ``scaled_delta_i = weight_i * delta_i``.
-        4. Apply PCGrad (global dot product) on scaled deltas — these task-specific
+           pretrained (reference) model's ``noise_pred`` (``v_b``).
+        2. For each checkpoint, compute ``tau_i = noise_pred_i - v_b``.
+        3. Blend the task-specific deltas with the requested ``projection``
+           (``global`` / ``channelwise`` / ``normalized``) via
+           :func:`_blend_velocity_set` (blend weights applied inside). These
            corrections are much more likely to conflict than the full predictions.
-        5. Return ``ref_noise_pred + sum(pcgrad_deltas)``.
+        4. Return ``v_b + combined_delta``.
 
     Note:
         This adds one extra forward pass per denoising step for the pretrained model.
@@ -580,9 +854,9 @@ def _pcgrad_residual_blend(
         )
     ref_noise_pred = ref_out.noise_pred
 
-    # 2-3. Compute weighted deltas from pretrained baseline
-    scaled_deltas: List[torch.Tensor] = []
-    for name, weight in zip(checkpoint_names, weights, strict=True):
+    # 2. Compute raw task-specific deltas from the pretrained baseline.
+    taus: List[torch.Tensor] = []
+    for name in checkpoint_names:
         with adapter.use_named_parameters(name):
             out = base_forward(**noise_only_kwargs)
         if out.noise_pred is None:
@@ -590,19 +864,184 @@ def _pcgrad_residual_blend(
                 f"Checkpoint '{name}' forward did not return `noise_pred`; "
                 "check that the adapter supports return_kwargs=['noise_pred']."
             )
-        delta = out.noise_pred - ref_noise_pred
-        scaled_deltas.append(delta * weight)
+        taus.append(out.noise_pred - ref_noise_pred)
 
-    # 4. Apply PCGrad on deltas (global dot product — deltas likely conflict)
-    combined_delta = pcgrad_blend_noise_preds(
-        scaled_deltas,
+    # 3. Blend deltas with the requested projection (weights applied inside).
+    combined_delta = _blend_velocity_set(
+        taus,
+        weights,
+        projection=projection,
         eps=pcgrad_eps,
         generator=pcgrad_generator,
         stats=stats,
     )
 
-    # 5. Add back pretrained baseline
+    # 4. Add back pretrained baseline.
     return ref_noise_pred + combined_delta
+
+
+def ties_blend_deltas(
+    taus: Sequence[torch.Tensor],
+    weights: Sequence[float],
+    *,
+    density: float = 1.0,
+    stats: Optional[TIESStats] = None,
+) -> torch.Tensor:
+    """Merge task-specific deltas with TIES-merging sign election.
+
+    Implements the elect-sign + disjoint-merge steps of TIES-merging on
+    per-checkpoint task vectors ``tau_i`` (typically ``noise_pred_i - v_b``):
+
+    1. (Optional) Trim each ``tau_i`` to its top-``density`` fraction of entries
+       by magnitude (per sample), zeroing the rest.
+    2. Elect a per-element sign ``gamma = sign(sum_i w_i * tau_i)``.
+    3. Disjoint weighted mean over sign-agreeing checkpoints:
+       ``tau_merged = sum_i w_i*tau_i*1[sign(tau_i)=gamma]
+                      / sum_i w_i*1[sign(tau_i)=gamma]`` (0 where no agreement).
+
+    No sign disagreement reduces to the weighted blend ``sum_i w_i * tau_i``
+    (weights normalized); a single delta returns ``tau_0``.
+
+    Args:
+        taus: Per-checkpoint task-vector tensors, same shape.
+        weights: Per-checkpoint blend weights (same length as ``taus``).
+        density: Fraction of largest-magnitude entries to keep per task
+            (``1.0`` = no trim). Must be in ``(0, 1]``.
+        stats: Optional accumulator for deferred summary logging.
+
+    Returns:
+        Merged delta tensor.
+
+    Raises:
+        ValueError: Empty sequence, shape mismatch, length mismatch, or invalid ``density``.
+        TypeError: Non-tensor entries in ``taus``.
+    """
+    if not taus:
+        raise ValueError("ties_blend_deltas requires at least one tensor, got empty sequence.")
+    if len(taus) != len(weights):
+        raise ValueError(
+            "ties_blend_deltas expected len(taus) == len(weights), got "
+            f"len(taus)={len(taus)}, len(weights)={len(weights)}."
+        )
+    if not (0.0 < density <= 1.0):
+        raise ValueError(f"ties_density must be in (0, 1], got density={density}.")
+
+    ref = taus[0]
+    if not isinstance(ref, torch.Tensor):
+        raise TypeError(f"ties_blend_deltas expected torch.Tensor, got {type(ref).__name__}.")
+    if ref.ndim < 1:
+        raise ValueError(
+            f"ties_blend_deltas expected batch dimension (ndim >= 1), got ndim={ref.ndim}."
+        )
+    ref_shape = ref.shape
+    for idx, tau in enumerate(taus):
+        if not isinstance(tau, torch.Tensor):
+            raise TypeError(
+                f"ties_blend_deltas expected torch.Tensor at index {idx}, "
+                f"got {type(tau).__name__}."
+            )
+        if tau.shape != ref_shape:
+            raise ValueError(
+                f"ties_blend_deltas expected all tensors to share shape "
+                f"{tuple(ref_shape)}, got index {idx} shape {tuple(tau.shape)}."
+            )
+
+    batch = ref_shape[0]
+    task_list = list(taus)
+
+    # 1. Optional magnitude trim (per sample, per checkpoint).
+    if density < 1.0:
+        trimmed: List[torch.Tensor] = []
+        for tau in task_list:
+            flat = tau.reshape(batch, -1)
+            num_elems = flat.shape[1]
+            keep = max(1, int(math.ceil(density * num_elems)))
+            if keep >= num_elems:
+                trimmed.append(tau)
+                continue
+            kth = torch.topk(flat.abs(), keep, dim=1).values[:, -1:]
+            mask = flat.abs() >= kth
+            trimmed.append((flat * mask).reshape(ref_shape))
+        task_list = trimmed
+
+    # 2. Elect a per-element sign from the weighted sum.
+    weighted_sum = task_list[0] * weights[0]
+    for k in range(1, len(task_list)):
+        weighted_sum = weighted_sum + task_list[k] * weights[k]
+    gamma = torch.sign(weighted_sum)
+
+    # 3. Disjoint weighted mean over sign-agreeing checkpoints.
+    numerator = torch.zeros_like(ref)
+    denom = torch.zeros_like(ref)
+    total_elements = 0
+    disagree_elements = 0
+    for tau, weight in zip(task_list, weights, strict=True):
+        nonzero = tau != 0
+        agree = (torch.sign(tau) == gamma) & nonzero
+        agree_f = agree.to(ref.dtype)
+        numerator = numerator + weight * tau * agree_f
+        denom = denom + weight * agree_f
+        if stats is not None:
+            total_elements += int(nonzero.sum().item())
+            disagree_elements += int((nonzero & ~agree).sum().item())
+
+    tiny = torch.finfo(ref.dtype).tiny
+    tau_merged = torch.where(
+        denom > 0, numerator / denom.clamp_min(tiny), torch.zeros_like(ref)
+    )
+
+    if stats is not None:
+        if stats.num_steps == 0:
+            stats.tensor_shape = tuple(ref_shape)
+        stats.record_step(
+            step_total_elements=total_elements,
+            step_disagree_elements=disagree_elements,
+        )
+
+    return tau_merged
+
+
+def _ties_blend(
+    adapter: "BaseAdapter",
+    checkpoint_names: Sequence[str],
+    weights: Sequence[float],
+    noise_only_kwargs: Dict[str, Any],
+    base_forward: Callable[..., Any],
+    density: float,
+    stats: Optional[TIESStats] = None,
+) -> torch.Tensor:
+    """TIES-merging fusion of checkpoint noise_pred via base-anchored sign vote.
+
+    Runs the pretrained baseline forward (``v_b``) and each checkpoint forward,
+    forms task vectors ``tau_i = noise_pred_i - v_b``, merges them with
+    :func:`ties_blend_deltas` (sign election + disjoint weighted mean), and
+    returns ``v_b + tau_merged``.
+
+    Note:
+        This adds one extra forward pass per denoising step for the pretrained model.
+    """
+    with torch.no_grad(), adapter.use_ref_parameters():
+        ref_out = base_forward(**noise_only_kwargs)
+    if ref_out.noise_pred is None:
+        raise RuntimeError(
+            "Pretrained model forward did not return `noise_pred` in TIES mode; "
+            "check that the adapter supports return_kwargs=['noise_pred']."
+        )
+    ref_noise_pred = ref_out.noise_pred
+
+    taus: List[torch.Tensor] = []
+    for name in checkpoint_names:
+        with adapter.use_named_parameters(name):
+            out = base_forward(**noise_only_kwargs)
+        if out.noise_pred is None:
+            raise RuntimeError(
+                f"Checkpoint '{name}' forward did not return `noise_pred`; "
+                "check that the adapter supports return_kwargs=['noise_pred']."
+            )
+        taus.append(out.noise_pred - ref_noise_pred)
+
+    tau_merged = ties_blend_deltas(taus, weights, density=density, stats=stats)
+    return ref_noise_pred + tau_merged
 
 
 def ensemble_forward_step(
@@ -615,7 +1054,8 @@ def ensemble_forward_step(
     blend_mode: EnsembleBlendMode = "weighted",
     pcgrad_eps: float = 1e-8,
     pcgrad_generator: Optional[torch.Generator] = None,
-    stats: Optional[PCGradStats] = None,
+    ties_density: float = 1.0,
+    stats: Optional[Union[PCGradStats, TIESStats]] = None,
 ) -> Any:
     """Blend per-checkpoint ``noise_pred`` tensors, then run one scheduler step.
 
@@ -632,14 +1072,25 @@ def ensemble_forward_step(
         sched_cache: Cached signature from :func:`cache_scheduler_step_signature`.
         base_forward: Original ``adapter.forward`` before any ensemble patch; must
             not re-enter :func:`ensemble_forward_step`.
-        blend_mode: Fusion strategy:
+        blend_mode: Fusion strategy. The PCGrad family is the cross product of
+            ``vector in {full velocity, residual delta from base}`` and
+            ``projection in {global, channelwise, normalized}``:
             ``'weighted'``: linear blend ``sum_i w_i * noise_pred_i``.
-            ``'pcgrad'``: global PCGrad conflict projection.
-            ``'pcgrad_residual'``: PCGrad on deltas from pretrained model.
-            ``'pcgrad_channelwise'``: per-channel/per-token PCGrad.
+            ``'pcgrad'`` / ``'pcgrad_channelwise'`` / ``'pcgrad_normalized'``:
+            full-velocity PCGrad with global / per-channel / magnitude-normalized
+            projection.
+            ``'pcgrad_residual'`` / ``'pcgrad_residual_channelwise'`` /
+            ``'pcgrad_residual_normalized'``: same three projections on the
+            task-specific deltas from the pretrained model (one extra forward
+            per step).
+            ``'ties'``: TIES-merging base-anchored per-element sign vote (one
+            extra forward per step).
         pcgrad_eps: Epsilon for PCGrad denominator (any pcgrad mode).
         pcgrad_generator: Optional RNG for PCGrad inner-loop shuffle.
-        stats: Optional :class:`PCGradStats` accumulator for deferred logging.
+        ties_density: Fraction of largest-magnitude entries kept per task in
+            ``'ties'`` mode (``1.0`` = no trim).
+        stats: Optional :class:`PCGradStats` (pcgrad modes) or :class:`TIESStats`
+            (``'ties'`` mode) accumulator for deferred logging.
 
     Returns:
         Scheduler step output (same type as ``adapter.forward``).
@@ -664,7 +1115,7 @@ def ensemble_forward_step(
     noise_only_kwargs = dict(forward_kwargs)
     noise_only_kwargs["return_kwargs"] = ["noise_pred"]
 
-    if blend_mode == "pcgrad_residual":
+    if blend_mode in _RESIDUAL_PROJECTIONS:
         combined_noise_pred = _pcgrad_residual_blend(
             adapter=adapter,
             checkpoint_names=checkpoint_names,
@@ -673,12 +1124,23 @@ def ensemble_forward_step(
             base_forward=base_forward,
             pcgrad_eps=pcgrad_eps,
             pcgrad_generator=pcgrad_generator,
+            projection=_RESIDUAL_PROJECTIONS[blend_mode],
+            stats=stats,
+        )
+    elif blend_mode == "ties":
+        combined_noise_pred = _ties_blend(
+            adapter=adapter,
+            checkpoint_names=checkpoint_names,
+            weights=weights,
+            noise_only_kwargs=noise_only_kwargs,
+            base_forward=base_forward,
+            density=ties_density,
             stats=stats,
         )
     else:
-        # Collect weighted noise predictions (weighted, pcgrad, pcgrad_channelwise)
-        scaled_preds: List[torch.Tensor] = []
-        for name, weight in zip(checkpoint_names, weights, strict=True):
+        # Full-velocity blends: weighted, pcgrad, pcgrad_channelwise, pcgrad_normalized.
+        raw_preds: List[torch.Tensor] = []
+        for name in checkpoint_names:
             with adapter.use_named_parameters(name):
                 out = base_forward(**noise_only_kwargs)
             if out.noise_pred is None:
@@ -686,21 +1148,18 @@ def ensemble_forward_step(
                     f"Checkpoint '{name}' forward did not return `noise_pred`; "
                     "check that the adapter supports return_kwargs=['noise_pred']."
                 )
-            scaled_preds.append(out.noise_pred * weight)
+            raw_preds.append(out.noise_pred)
 
         if blend_mode == "weighted":
-            combined_noise_pred = torch.stack(scaled_preds, dim=0).sum(dim=0)
-        elif blend_mode == "pcgrad_channelwise":
-            combined_noise_pred = pcgrad_blend_noise_preds_channelwise(
-                scaled_preds,
-                eps=pcgrad_eps,
-                generator=pcgrad_generator,
-                stats=stats,
-            )
+            combined_noise_pred = torch.stack(
+                [pred * weight for pred, weight in zip(raw_preds, weights, strict=True)],
+                dim=0,
+            ).sum(dim=0)
         else:
-            # blend_mode == "pcgrad" (global)
-            combined_noise_pred = pcgrad_blend_noise_preds(
-                scaled_preds,
+            combined_noise_pred = _blend_velocity_set(
+                raw_preds,
+                weights,
+                projection=_FULL_PROJECTIONS[blend_mode],
                 eps=pcgrad_eps,
                 generator=pcgrad_generator,
                 stats=stats,

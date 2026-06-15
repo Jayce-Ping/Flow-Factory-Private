@@ -2416,22 +2416,37 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         },
     )
     ensemble_blend_mode: Literal[
-        "weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"
+        "weighted",
+        "pcgrad",
+        "pcgrad_residual",
+        "pcgrad_channelwise",
+        "pcgrad_normalized",
+        "pcgrad_residual_normalized",
+        "pcgrad_residual_channelwise",
+        "ties",
     ] = field(
         default="pcgrad_residual",
         metadata={
             "help": (
                 "How to fuse per-checkpoint noise_pred at each denoising step. "
+                "The PCGrad family is vector {full velocity, residual delta from "
+                "pretrained} x projection {global, channelwise, normalized}. "
                 "'weighted': linear blend sum_i w_i * noise_pred_i. "
-                "'pcgrad': PCGrad conflict projection on w_i * noise_pred_i with "
-                "a single global dot product per batch element (original algorithm; "
-                "may never detect conflicts for similar LoRA checkpoints). "
-                "'pcgrad_residual': compute delta from pretrained model, apply "
-                "PCGrad on the task-specific deltas (adds one extra forward pass "
-                "per denoising step; recommended for checkpoints trained on "
-                "different objectives). "
-                "'pcgrad_channelwise': per-channel (4D) or per-token (3D) "
-                "dot products for finer-grained conflict detection."
+                "'pcgrad': global PCGrad on w_i * noise_pred_i (one dot product "
+                "per batch element; may never detect conflicts for similar LoRA "
+                "checkpoints). "
+                "'pcgrad_channelwise': per-channel (4D) or per-token (3D) PCGrad "
+                "for finer-grained conflict detection. "
+                "'pcgrad_normalized': magnitude-normalized PCGrad on unit "
+                "directions so a high-norm checkpoint cannot dominate the "
+                "projection geometry. "
+                "'pcgrad_residual', 'pcgrad_residual_channelwise', "
+                "'pcgrad_residual_normalized': the same three projections applied "
+                "to the task-specific deltas from the pretrained model (adds one "
+                "extra forward pass per denoising step; recommended for "
+                "checkpoints trained on different objectives). "
+                "'ties': TIES-merging base-anchored per-element sign vote (also "
+                "adds one extra forward pass per denoising step)."
             )
         },
     )
@@ -2445,11 +2460,29 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
             )
         },
     )
+    ties_density: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "TIES-merging trim density (only used when "
+                "ensemble_blend_mode='ties'): fraction of largest-magnitude "
+                "entries kept per task vector before the sign vote. 1.0 = no trim. "
+                "Must be in (0, 1]."
+            )
+        },
+    )
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _valid_blend_modes = (
-            "weighted", "pcgrad", "pcgrad_residual", "pcgrad_channelwise"
+            "weighted",
+            "pcgrad",
+            "pcgrad_residual",
+            "pcgrad_channelwise",
+            "pcgrad_normalized",
+            "pcgrad_residual_normalized",
+            "pcgrad_residual_channelwise",
+            "ties",
         )
         if self.ensemble_blend_mode not in _valid_blend_modes:
             raise ValueError(
@@ -2459,6 +2492,10 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         if self.pcgrad_eps <= 0:
             raise ValueError(
                 f"pcgrad_eps must be > 0, got pcgrad_eps={self.pcgrad_eps}."
+            )
+        if not (0.0 < self.ties_density <= 1.0):
+            raise ValueError(
+                f"ties_density must be in (0, 1], got ties_density={self.ties_density}."
             )
         n_ckpt = len(self.checkpoint_paths)
         if n_ckpt == 0:

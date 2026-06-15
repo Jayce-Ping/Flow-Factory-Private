@@ -58,8 +58,9 @@ train:
   # Use [] to eval current adapter only (no ensemble); cannot combine with checkpoint_weights
   checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
   checkpoint_param_device: 'cuda'
-  ensemble_blend_mode: weighted  # weighted | pcgrad
+  ensemble_blend_mode: weighted  # weighted | pcgrad | pcgrad_channelwise | pcgrad_normalized | pcgrad_residual | pcgrad_residual_channelwise | pcgrad_residual_normalized | ties
   pcgrad_eps: 1.0e-8
+  ties_density: 1.0  # ties only: fraction of top-|tau| entries kept per task (1.0 = no trim)
 
   max_epochs: 1
   unique_sample_num_per_epoch: 1
