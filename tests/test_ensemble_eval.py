@@ -996,6 +996,55 @@ class TestBlendWeightingValidation(unittest.TestCase):
                 )
 
 
+class TestEvalInferenceContextDDPBypass(unittest.TestCase):
+    """The ensemble eval context must bypass the DDP/DeepSpeed wrapper so the
+    per-teacher use_named_parameters swap actually takes effect (otherwise all
+    teachers produce identical noise_pred and every blend mode collapses)."""
+
+    def test_bypass_swaps_to_unwrapped_transformer_in_context(self) -> None:
+        from types import SimpleNamespace
+
+        cls = get_trainer_class("ensemble-eval")
+
+        wrapped = torch.nn.Linear(1, 1)
+        unwrapped = torch.nn.Linear(1, 1)
+
+        class _FakeAdapter:
+            def __init__(self) -> None:
+                self._components = {"transformer": wrapped}
+                self.forward = lambda **kw: None  # patched/restored by the context
+
+            def get_component(self, name: str):
+                return self._components[name]
+
+            def get_component_unwrapped(self, name: str):
+                return unwrapped
+
+            def set_component(self, name: str, module) -> None:
+                self._components[name] = module
+
+        trainer = object.__new__(cls)
+        trainer._checkpoint_names = ["eval_ckpt_0", "eval_ckpt_1"]
+        trainer._weights = [0.5, 0.5]
+        trainer._sched_cache = (frozenset(), False)
+        trainer._pcgrad_generator = None
+        trainer.adapter = _FakeAdapter()
+        trainer.training_args = SimpleNamespace(
+            ensemble_blend_mode="pcgrad",
+            ensemble_blend_weighting="uniform",
+            pcgrad_eps=1e-8,
+            ties_density=1.0,
+        )
+
+        self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
+        with trainer._eval_inference_context():
+            # Inside the eval scope the active transformer must be unwrapped so
+            # use_named_parameters / forward see the swapped weights.
+            self.assertIs(trainer.adapter.get_component("transformer"), unwrapped)
+        # Restored on exit.
+        self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
+
+
 class TestEnsembleEvalRegistry(unittest.TestCase):
     def test_trainer_registered(self) -> None:
         cls = get_trainer_class("ensemble-eval")

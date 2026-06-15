@@ -33,6 +33,7 @@ from typing import Any, Iterator, List, Optional, Union
 import torch
 
 from ..abc import BaseTrainer
+from ..mof.utils import bypass_ddp_for_weight_swap
 from ...hparams import EnsembleEvalTrainingArguments
 from ...samples import BaseSample
 from ...utils.logger_utils import setup_logger
@@ -155,14 +156,21 @@ class EnsembleEvalTrainer(BaseTrainer):
         # would otherwise serve stale casted weights across checkpoint swaps.
         prev_cache_enabled = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        try:
-            yield
-        finally:
-            torch.set_autocast_cache_enabled(prev_cache_enabled)
-            self.adapter.forward = original_forward
-            # Log blend-mode summary after all denoising steps complete
-            if blend_stats is not None:
-                blend_stats.log_summary()
+        # Bypass the DDP/DeepSpeed wrapper for the whole inference scope. The
+        # per-checkpoint use_named_parameters swap (.data.copy_) and base_forward
+        # must read the SAME unwrapped transformer; otherwise the wrapper's stale
+        # bucket params under no_grad make every checkpoint produce identical
+        # noise_pred (all blend modes collapse to weighted). See CLAUDE.md and
+        # mof/utils.py:bypass_ddp_for_weight_swap.
+        with bypass_ddp_for_weight_swap(self.adapter):
+            try:
+                yield
+            finally:
+                torch.set_autocast_cache_enabled(prev_cache_enabled)
+                self.adapter.forward = original_forward
+                # Log blend-mode summary after all denoising steps complete
+                if blend_stats is not None:
+                    blend_stats.log_summary()
 
     def sample(self) -> List[BaseSample]:
         """No-op: ensemble-eval does not sample for training."""
