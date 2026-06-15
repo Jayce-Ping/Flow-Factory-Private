@@ -1006,6 +1006,8 @@ class TestEvalInferenceContextDDPBypass(unittest.TestCase):
 
         cls = get_trainer_class("ensemble-eval")
 
+        # `unwrapped` stands in for the accelerator-unwrapped PeftModel; `wrapped`
+        # for the DDP/DeepSpeed-prepared module stored in _components.
         wrapped = torch.nn.Linear(1, 1)
         unwrapped = torch.nn.Linear(1, 1)
 
@@ -1017,9 +1019,6 @@ class TestEvalInferenceContextDDPBypass(unittest.TestCase):
             def get_component(self, name: str):
                 return self._components[name]
 
-            def get_component_unwrapped(self, name: str):
-                return unwrapped
-
             def set_component(self, name: str, module) -> None:
                 self._components[name] = module
 
@@ -1029,6 +1028,9 @@ class TestEvalInferenceContextDDPBypass(unittest.TestCase):
         trainer._sched_cache = (frozenset(), False)
         trainer._pcgrad_generator = None
         trainer.adapter = _FakeAdapter()
+        trainer.accelerator = SimpleNamespace(
+            unwrap_model=lambda m: unwrapped if m is wrapped else m
+        )
         trainer.training_args = SimpleNamespace(
             ensemble_blend_mode="pcgrad",
             ensemble_blend_weighting="uniform",
@@ -1038,8 +1040,9 @@ class TestEvalInferenceContextDDPBypass(unittest.TestCase):
 
         self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
         with trainer._eval_inference_context():
-            # Inside the eval scope the active transformer must be unwrapped so
-            # use_named_parameters / forward see the swapped weights.
+            # Inside the eval scope the active transformer must be the
+            # accelerator-unwrapped module (a PeftModel in practice) so both
+            # use_named_parameters swaps AND use_ref_parameters.disable_adapter work.
             self.assertIs(trainer.adapter.get_component("transformer"), unwrapped)
         # Restored on exit.
         self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
