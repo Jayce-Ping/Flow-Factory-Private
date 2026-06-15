@@ -263,6 +263,102 @@ class TestLoadMethodSpecs(unittest.TestCase):
         with self.assertRaises(ValueError):
             cmp.build_baseline_specs(["eval_ckpt_0"], ["a", "b"])
 
+
+class TestReportOnly(unittest.TestCase):
+    def _records(self):
+        return [
+            {
+                "test_set": "ocr",
+                "method": m,
+                "gidx": 0,
+                "scores": {"ocr": s},
+                "tag": None,
+                "prompt": "a cat",
+                "include": None,
+            }
+            for m, s in (("baseline_base", 0.1), ("weighted", 0.5), ("pcgrad_residual", 0.7))
+        ]
+
+    def _meta(self):
+        return {
+            "methods": ["baseline_base", "weighted", "pcgrad_residual"],
+            "baseline_methods": ["baseline_base"],
+            "test_sets": ["ocr"],
+            "seed": 42,
+            "num_inference_steps": 40,
+            "guidance_scale": 4.5,
+            "resolution": 512,
+            "num_prompts_per_set": {"ocr": 1},
+            "gallery_num_prompts": 8,
+        }
+
+    def test_rebuild_report_writes_outputs(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "report_data.json").write_text(
+                json.dumps({"meta": self._meta(), "records": self._records()}),
+                encoding="utf-8",
+            )
+            cmp.rebuild_report(out)
+            html_text = (out / "index.html").read_text(encoding="utf-8")
+            self.assertIn("<!doctype html>", html_text)
+            self.assertIn("pcgrad_residual", html_text)
+            self.assertIn(">ref<", html_text)  # baseline styling preserved
+            self.assertTrue((out / "metrics.json").exists())
+            self.assertTrue((out / "metrics.csv").exists())
+            # prompt text from records reaches the gallery
+            self.assertIn("a cat", html_text)
+
+    def test_rebuild_report_missing_data_raises(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError):
+                cmp.rebuild_report(Path(tmp))
+
+
+class TestBuildGalleryFromRecords(unittest.TestCase):
+    def test_gallery_from_records(self) -> None:
+        import tempfile
+
+        records = [
+            {
+                "test_set": "ocr",
+                "method": "A",
+                "gidx": 0,
+                "scores": {"ocr": 0.8},
+                "tag": "color",
+                "prompt": "p0",
+                "include": "x",
+            },
+            {
+                "test_set": "ocr",
+                "method": "B",
+                "gidx": 0,
+                "scores": {"ocr": 0.2},
+                "tag": "color",
+                "prompt": "p0",
+                "include": "x",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            img = out / "images" / "ocr" / "A" / "00000.png"
+            img.parent.mkdir(parents=True, exist_ok=True)
+            img.write_bytes(b"x")  # existence-only check
+            gallery = cmp._build_gallery_from_records(
+                records, ["A", "B"], ["ocr"], {"ocr": 1}, 8, out
+            )
+            entry = gallery["ocr"][0]
+            self.assertEqual(entry["prompt"], "p0")
+            self.assertEqual(entry["tag"], "color")
+            self.assertEqual(entry["include"], "x")
+            self.assertEqual(entry["methods"]["A"]["img"], "images/ocr/A/00000.png")
+            self.assertIsNone(entry["methods"]["B"]["img"])
+            self.assertEqual(entry["methods"]["B"]["scores"], {"ocr": 0.2})
+
     def test_default_methods_resolve(self) -> None:
         glob_pat = str(_REPO_ROOT / "ensemble-eval/lora/sd3_5/ablations" / "*.yaml")
         specs = cmp.load_method_specs(glob_pat)

@@ -45,6 +45,12 @@ Single-GPU debug:
     python scripts/compare_ensemble_methods.py \\
         --base-config ensemble-eval/lora/sd3_5/default.yaml \\
         --max-prompts 4 --gallery-num-prompts 4
+
+Offline report rebuild (no GPU/model; re-renders index.html from a prior run's
+``report_data.json``, e.g. after editing the HTML/CSS):
+
+    python scripts/compare_ensemble_methods.py \\
+        --report-only --output-dir saves/ensemble_compare/run1
 """
 
 from __future__ import annotations
@@ -611,8 +617,46 @@ def _load_intact_image(path: Path) -> Optional[Any]:
         return None
 
 
+def rebuild_report(output_dir: Path, gallery_num_prompts: Optional[int] = None) -> None:
+    """Re-render ``index.html`` (+ metrics) from a prior run's ``report_data.json``.
+
+    Pure CPU / stdlib: reads persisted per-prompt records and re-checks which
+    images exist on disk, then rebuilds the aggregate tables and gallery. No
+    model, dataset, or GPU is loaded. Requires a completed scoring pass to have
+    written ``report_data.json``.
+    """
+    data_path = output_dir / "report_data.json"
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"--report-only needs {data_path} from a prior run that finished scoring; "
+            "found none. Run the full pass once (it reuses any existing images)."
+        )
+    data = json.loads(data_path.read_text(encoding="utf-8"))
+    meta = data["meta"]
+    records = data["records"]
+    if gallery_num_prompts is None:
+        gallery_num_prompts = int(meta.get("gallery_num_prompts", 32))
+
+    summary = aggregate_metrics(records)
+    gallery = _build_gallery_from_records(
+        records,
+        meta["methods"],
+        meta["test_sets"],
+        meta.get("num_prompts_per_set", {}),
+        gallery_num_prompts,
+        output_dir,
+    )
+    _write_outputs(output_dir, summary, gallery, meta, records)
+    logger.info(f"Report rebuilt: {output_dir / 'index.html'}")
+
+
 def main() -> None:  # noqa: C901 - orchestration script
     args = parse_args()
+
+    if args.report_only:
+        # Faithfully reproduce the run's gallery size from persisted meta.
+        rebuild_report(Path(args.output_dir), gallery_num_prompts=None)
+        return
 
     from accelerate.utils import gather_object
 
@@ -775,6 +819,9 @@ def main() -> None:  # noqa: C901 - orchestration script
             for gidx, sample in zip(ordered_gidx, buffer.all_samples):
                 scores = sample.extra_kwargs.get("rewards", {})
                 tag = sample.extra_kwargs.get("tag")
+                include = sample.extra_kwargs.get("include")
+                # Persist prompt/tag/include so the gallery can be rebuilt offline
+                # (report-only mode) without reopening the dataset.
                 local_records.append(
                     {
                         "test_set": test_set,
@@ -782,6 +829,8 @@ def main() -> None:  # noqa: C901 - orchestration script
                         "gidx": int(gidx),
                         "scores": {r: float(scores[r]) for r in reward_names if r in scores},
                         "tag": str(tag) if tag is not None else None,
+                        "prompt": str(sample.prompt) if sample.prompt is not None else "",
+                        "include": str(include) if include is not None else None,
                     }
                 )
             acc.wait_for_everyone()
@@ -805,12 +854,12 @@ def main() -> None:  # noqa: C901 - orchestration script
             "guidance_scale": config.eval_args.guidance_scale,
             "resolution": getattr(config.eval_args, "resolution", None),
             "num_prompts_per_set": num_prompts_per_set,
+            "gallery_num_prompts": args.gallery_num_prompts,
         }
-        gallery = _build_gallery(
+        gallery = _build_gallery_from_records(
             gathered,
-            methods,
+            [m.label for m in methods],
             test_sets,
-            trainer,
             num_prompts_per_set,
             args.gallery_num_prompts,
             output_dir,
@@ -826,43 +875,55 @@ def main() -> None:  # noqa: C901 - orchestration script
             logger.warning(f"cleanup raised: {exc}")
 
 
-def _build_gallery(
+def _build_gallery_from_records(
     records: List[Dict[str, Any]],
-    methods: List[MethodSpec],
-    test_sets: List[str],
-    trainer: Any,
+    method_labels: Sequence[str],
+    test_sets: Sequence[str],
     num_prompts_per_set: Dict[str, int],
     gallery_num: int,
     output_dir: Path,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Assemble first-N per-prompt gallery rows from gathered scores + datasets."""
-    # (test_set, method, gidx) -> scores
+    """Assemble first-N per-prompt gallery rows purely from records + images on disk.
+
+    Records carry ``prompt`` / ``tag`` / ``include`` (per ``(test_set, gidx)``) and
+    per-method ``scores``, so the gallery can be built both during a live run and
+    offline in report-only mode (no dataset / trainer needed).
+    """
+    # (test_set, method, gidx) -> scores; (test_set, gidx) -> prompt/tag/include.
     score_index: Dict[Tuple[str, str, int], Dict[str, float]] = {}
+    prompt_index: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for r in records:
-        score_index[(r["test_set"], r["method"], r["gidx"])] = r.get("scores", {})
+        ts, gidx = r["test_set"], int(r["gidx"])
+        score_index[(ts, r["method"], gidx)] = r.get("scores", {})
+        prompt_index.setdefault(
+            (ts, gidx),
+            {
+                "prompt": r.get("prompt", ""),
+                "tag": r.get("tag"),
+                "include": r.get("include"),
+            },
+        )
 
     gallery: Dict[str, List[Dict[str, Any]]] = {}
     for test_set in test_sets:
         n = min(gallery_num, num_prompts_per_set.get(test_set, 0))
-        dataset = trainer.test_dataloaders[test_set].dataset
         entries: List[Dict[str, Any]] = []
         for gidx in range(n):
-            item = dataset[gidx]
-            meta_dict = item.get("metadata") or {}
+            info = prompt_index.get((test_set, gidx), {})
             per_method: Dict[str, Dict[str, Any]] = {}
-            for spec in methods:
-                rel = f"images/{test_set}/{spec.label}/{gidx:05d}.png"
+            for label in method_labels:
+                rel = f"images/{test_set}/{label}/{gidx:05d}.png"
                 img = rel if (output_dir / rel).exists() else None
-                per_method[spec.label] = {
+                per_method[label] = {
                     "img": img,
-                    "scores": score_index.get((test_set, spec.label, gidx), {}),
+                    "scores": score_index.get((test_set, label, gidx), {}),
                 }
             entries.append(
                 {
                     "gidx": gidx,
-                    "prompt": item.get("prompt", ""),
-                    "tag": meta_dict.get("tag") if isinstance(meta_dict, dict) else None,
-                    "include": meta_dict.get("include") if isinstance(meta_dict, dict) else None,
+                    "prompt": info.get("prompt", ""),
+                    "tag": info.get("tag"),
+                    "include": info.get("include"),
                     "methods": per_method,
                 }
             )
@@ -879,6 +940,11 @@ def _write_outputs(
 ) -> None:
     (output_dir / "metrics.json").write_text(
         json.dumps({"meta": meta, "summary": summary}, indent=2), encoding="utf-8"
+    )
+    # Per-prompt records + meta: the source for offline report rebuilds
+    # (`--report-only`), which re-render index.html without any GPU/model.
+    (output_dir / "report_data.json").write_text(
+        json.dumps({"meta": meta, "records": records}), encoding="utf-8"
     )
     # Flat CSV: test_set, method, reward, mean, std, n
     with open(output_dir / "metrics.csv", "w", newline="", encoding="utf-8") as fh:
@@ -954,6 +1020,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Prepend reference columns: the pretrained base model (LoRA disabled) and "
             "each teacher checkpoint alone. Use --no-baselines for blends only."
+        ),
+    )
+    p.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "Skip all generation/scoring and only re-render index.html (+ metrics) from "
+            "<output-dir>/report_data.json written by a prior run. No model/GPU is loaded."
         ),
     )
     p.add_argument("--test-sets", nargs="*", default=None, help="Subset of test set names to run.")
