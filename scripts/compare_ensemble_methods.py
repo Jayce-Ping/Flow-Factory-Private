@@ -7,7 +7,14 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Side-by-side comparison of ensemble-eval blend methods.
+"""Generate + score ensemble-eval blend methods, then write a comparison report.
+
+This is the GPU half of the comparison tool. It loads the base model +
+checkpoints + reward models ONCE, then for every selected method generates and
+scores every test-set prompt at a FIXED seed and saves the images. Rendering
+(metric tables, per-prompt gallery, ``index.html``) is delegated to the GPU-free
+sibling module ``ensemble_report`` so the heavy path and the report path stay
+separated; ``--report-only`` here just calls ``ensemble_report.rebuild_report``.
 
 By default compares the ``weighted`` linear baseline against the base-anchored
 blends that genuinely differ from it (``pcgrad_residual`` and its channelwise /
@@ -21,16 +28,15 @@ Reference columns (``--baselines``, on by default) prepend the pretrained base
 model (all LoRA adapters disabled) and each teacher checkpoint evaluated alone,
 bounding the ensemble from below (untuned base / best single specialist).
 
-Loads the base model + checkpoints + reward models ONCE, then for every selected
-method generates and scores every test-set prompt at a FIXED seed, saves the
-images, and renders a self-contained ``index.html`` with an aggregate metrics
-table and a per-prompt gallery (first ``--gallery-num-prompts`` prompts).
-
 Fairness is structural: the initial latent is a pure function of ``prompt +
 seed`` (``create_generator_by_prompt``), so with ODE sampling every method
 denoises from the SAME starting noise per prompt; only the per-step blend
 differs. Dataset + metric coverage are inherited verbatim from the config's
 ``eval.test_sets`` / ``eval_reward_names``.
+
+Outputs (under ``--output-dir``; consumed by ``ensemble_report``):
+    images/<test_set>/<method>/<NNNNN>.png, records/*.jsonl, report_meta.json,
+    report_data.json, metrics.json, metrics.csv, index.html
 
 Multi-GPU (recommended for full test sets):
 
@@ -47,24 +53,26 @@ Single-GPU debug:
         --max-prompts 4 --gallery-num-prompts 4
 
 Offline report rebuild (no GPU/model; re-renders index.html from a prior run's
-``report_data.json``, e.g. after editing the HTML/CSS):
+images/records, e.g. after editing the HTML/CSS or adding new methods). Either
+delegate through this script:
 
     python scripts/compare_ensemble_methods.py \\
         --report-only --output-dir saves/ensemble_compare/run1
+
+or call the standalone report CLI directly (same effect, zero torch import):
+
+    python scripts/ensemble_report.py --output-dir saves/ensemble_compare/run1
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as _dt
 import glob
-import html
 import json
 import logging
-import math
 import os
-import statistics
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +80,22 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import yaml
+
+# This script lives in scripts/ next to ensemble_report.py. Make that directory
+# importable whether we are run as a script (python scripts/compare_ensemble_methods.py,
+# which already puts scripts/ on sys.path) or imported by file path (e.g. unit tests
+# load this module via importlib without adding scripts/ to sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from ensemble_report import (  # noqa: E402  (import after sys.path bootstrap above)
+    _build_gallery_from_records,
+    _mean_std,  # noqa: F401  re-exported for tests / external callers
+    _write_outputs,
+    _write_record_shard,
+    aggregate_metrics,
+    rebuild_report,
+    render_html,  # noqa: F401  re-exported for tests / external callers
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -263,277 +287,6 @@ def _spec_eval_context(trainer: Any, spec: MethodSpec):
 
 
 # =============================================================================
-# Metric aggregation (pure, GPU-free, unit-tested)
-# =============================================================================
-
-
-def _mean_std(values: Sequence[float]) -> Dict[str, float]:
-    vals = [float(v) for v in values if v is not None and not math.isnan(float(v))]
-    if not vals:
-        return {"mean": float("nan"), "std": float("nan"), "n": 0}
-    mean = statistics.fmean(vals)
-    std = statistics.pstdev(vals) if len(vals) > 1 else 0.0
-    return {"mean": mean, "std": std, "n": len(vals)}
-
-
-def aggregate_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate flat per-prompt records into mean/std tables.
-
-    Each record: ``{"test_set", "method", "gidx", "scores": {reward: float},
-    "tag": Optional[str]}``.
-
-    Returns ``{"aggregate": {test_set: {reward: {method: {mean,std,n}}}},
-    "per_tag": {test_set: {reward: {tag: {method: {mean,n}}}}}}``.
-    """
-    bucket: Dict[Tuple[str, str, str], List[float]] = {}
-    tag_bucket: Dict[Tuple[str, str, str, str], List[float]] = {}
-    for r in records:
-        ts = r["test_set"]
-        method = r["method"]
-        tag = r.get("tag")
-        for reward, value in (r.get("scores") or {}).items():
-            bucket.setdefault((ts, method, reward), []).append(value)
-            if tag:
-                tag_bucket.setdefault((ts, method, reward, str(tag)), []).append(value)
-
-    aggregate: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
-    for (ts, method, reward), values in bucket.items():
-        aggregate.setdefault(ts, {}).setdefault(reward, {})[method] = _mean_std(values)
-
-    per_tag: Dict[str, Dict[str, Dict[str, Dict[str, Dict[str, float]]]]] = {}
-    for (ts, method, reward, tag), values in tag_bucket.items():
-        per_tag.setdefault(ts, {}).setdefault(reward, {}).setdefault(tag, {})[method] = _mean_std(
-            values
-        )
-
-    return {"aggregate": aggregate, "per_tag": per_tag}
-
-
-# =============================================================================
-# HTML report (pure, GPU-free, unit-tested)
-# =============================================================================
-
-_HTML_CSS = """
-:root { color-scheme: light dark; }
-body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-       margin: 0; padding: 24px; line-height: 1.4; }
-h1 { margin: 0 0 4px; } h2 { margin: 28px 0 8px; border-bottom: 2px solid #8884; padding-bottom: 4px; }
-h3 { margin: 18px 0 6px; }
-.meta { color: #888; font-size: 13px; margin-bottom: 16px; }
-table.metrics { border-collapse: collapse; margin: 8px 0 16px; font-size: 13px; }
-table.metrics th, table.metrics td { border: 1px solid #8884; padding: 4px 10px; text-align: right; }
-table.metrics th.method, table.metrics td.method { text-align: left; font-weight: 600; white-space: nowrap; }
-table.metrics td.best { font-weight: 700; background: #2e7d3233; }
-table.metrics td.basebest { font-weight: 700; background: #6d4c4133; }
-table.metrics tr.baseline td, table.metrics tr.baseline th.method { color: #999; font-style: italic; }
-table.metrics tr.sep-below td, table.metrics tr.sep-below th { border-bottom: 2px solid #8886; }
-.badge { display: inline-block; font-size: 10px; font-weight: 700; line-height: 1.4; padding: 0 5px;
-         margin-left: 6px; border-radius: 8px; background: #8883; color: #777; font-style: normal;
-         vertical-align: middle; }
-.std { color: #999; font-size: 11px; }
-.legend { color: #888; font-size: 12px; margin: 4px 0 14px; }
-.legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin: 0 4px 0 12px;
-              vertical-align: middle; }
-.prompt-block { border: 1px solid #8883; border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
-.prompt-text { font-size: 14px; margin-bottom: 2px; }
-.prompt-meta { color: #888; font-size: 12px; margin-bottom: 8px; word-break: break-word; }
-.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
-.cell { width: 200px; }
-.cell.baseline .label { color: #999; font-style: italic; }
-.cell img { width: 200px; height: 200px; object-fit: cover; border-radius: 6px; background: #8882; display: block; }
-.cell.baseline img, .cell.baseline .missing { outline: 2px solid #6d4c4155; outline-offset: -2px; }
-.cell .label { font-size: 12px; font-weight: 600; margin-top: 3px; word-break: break-word; }
-.cell .scores { font-size: 11px; color: #888; }
-.sep { width: 2px; align-self: stretch; background: #8885; margin: 0 4px; border-radius: 1px; }
-.missing { width: 200px; height: 200px; display: flex; align-items: center; justify-content: center;
-           border: 1px dashed #8886; border-radius: 6px; color: #888; font-size: 12px; }
-"""
-
-
-def _fmt(v: float) -> str:
-    return "-" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:.4f}"
-
-
-def _best_per_reward(
-    methods: Sequence[str], rewards: Sequence[str], agg_ts: Dict[str, Any]
-) -> Dict[str, float]:
-    """Max mean per reward over ``methods`` (NaN if none finite)."""
-    best: Dict[str, float] = {}
-    for reward in rewards:
-        means = [agg_ts.get(reward, {}).get(m, {}).get("mean", float("nan")) for m in methods]
-        finite = [x for x in means if not (isinstance(x, float) and math.isnan(x))]
-        best[reward] = max(finite) if finite else float("nan")
-    return best
-
-
-def _aggregate_table_html(
-    test_set: str,
-    methods: List[str],
-    rewards: List[str],
-    agg_ts: Dict[str, Any],
-    baseline_methods: Sequence[str] = (),
-) -> str:
-    baseline_set = set(baseline_methods)
-    blend_methods = [m for m in methods if m not in baseline_set]
-    base_methods = [m for m in methods if m in baseline_set]
-    # Green highlights the best fusion method; brown marks the best baseline (the
-    # bar to beat). Computed within each group so a single teacher does not steal
-    # the "best method" marker.
-    best_blend = _best_per_reward(blend_methods, rewards, agg_ts)
-    best_base = _best_per_reward(base_methods, rewards, agg_ts)
-
-    head = "".join(f"<th>{html.escape(r)}</th>" for r in rewards)
-    last_baseline = base_methods[-1] if base_methods else None
-    rows = []
-    for m in methods:
-        is_baseline = m in baseline_set
-        target = best_base if is_baseline else best_blend
-        hit_cls = "basebest" if is_baseline else "best"
-        row_cls = []
-        if is_baseline:
-            row_cls.append("baseline")
-        if m == last_baseline:
-            row_cls.append("sep-below")
-        badge = "<span class='badge'>ref</span>" if is_baseline else ""
-        cells = [f'<td class="method">{html.escape(m)}{badge}</td>']
-        for reward in rewards:
-            entry = agg_ts.get(reward, {}).get(m)
-            if not entry:
-                cells.append("<td>-</td>")
-                continue
-            mean, std = entry.get("mean", float("nan")), entry.get("std", float("nan"))
-            cls = hit_cls if (not math.isnan(mean) and mean >= target[reward] - 1e-12) else ""
-            cells.append(
-                f'<td class="{cls}">{_fmt(mean)}<span class="std"> &plusmn;{_fmt(std)}</span></td>'
-            )
-        row_attr = f' class="{" ".join(row_cls)}"' if row_cls else ""
-        rows.append(f"<tr{row_attr}>{''.join(cells)}</tr>")
-    return (
-        f'<table class="metrics"><thead><tr><th class="method">method \\ reward</th>'
-        f"{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
-    )
-
-
-def render_html(
-    summary: Dict[str, Any],
-    gallery: Dict[str, List[Dict[str, Any]]],
-    meta: Dict[str, Any],
-) -> str:
-    """Build the self-contained comparison page. Pure function (no I/O)."""
-    methods: List[str] = meta["methods"]
-    baseline_methods: List[str] = list(meta.get("baseline_methods", []))
-    baseline_set = set(baseline_methods)
-    last_baseline = baseline_methods[-1] if baseline_methods else None
-    aggregate = summary["aggregate"]
-    per_tag = summary.get("per_tag", {})
-
-    parts: List[str] = []
-    parts.append("<!doctype html><html><head><meta charset='utf-8'>")
-    parts.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
-    parts.append("<title>Ensemble methods comparison</title>")
-    parts.append(f"<style>{_HTML_CSS}</style></head><body>")
-    parts.append("<h1>Ensemble methods comparison</h1>")
-    meta_bits = (
-        f"seed={meta.get('seed')}, steps={meta.get('num_inference_steps')}, "
-        f"guidance={meta.get('guidance_scale')}, resolution={meta.get('resolution')}, "
-        f"methods={len(methods)}, baselines={len(baseline_methods)}, "
-        f"generated={_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    )
-    parts.append(f"<div class='meta'>{html.escape(meta_bits)}</div>")
-    if baseline_methods:
-        parts.append(
-            "<div class='legend'>"
-            "<span class='sw' style='background:#2e7d3233'></span>best fusion method"
-            "<span class='sw' style='background:#6d4c4133'></span>best baseline (bar to beat)"
-            "<span class='badge'>ref</span>reference column (base model / single teacher)"
-            "</div>"
-        )
-
-    for test_set in meta["test_sets"]:
-        agg_ts = aggregate.get(test_set, {})
-        rewards = sorted(agg_ts.keys())
-        n_prompts = meta.get("num_prompts_per_set", {}).get(test_set, 0)
-        parts.append(
-            f"<h2>{html.escape(test_set)} <span class='meta'>({n_prompts} prompts)</span></h2>"
-        )
-        if rewards:
-            parts.append(
-                _aggregate_table_html(test_set, methods, rewards, agg_ts, baseline_methods)
-            )
-
-        # per-tag tables (geneval)
-        tag_ts = per_tag.get(test_set, {})
-        for reward in sorted(tag_ts.keys()):
-            tags = sorted(tag_ts[reward].keys())
-            if not tags:
-                continue
-            parts.append(f"<h3>{html.escape(reward)} by tag</h3>")
-            head = "".join(f"<th>{html.escape(t)}</th>" for t in tags)
-            rows = []
-            for m in methods:
-                is_baseline = m in baseline_set
-                row_cls = []
-                if is_baseline:
-                    row_cls.append("baseline")
-                if m == last_baseline:
-                    row_cls.append("sep-below")
-                badge = "<span class='badge'>ref</span>" if is_baseline else ""
-                cells = [f'<td class="method">{html.escape(m)}{badge}</td>']
-                for t in tags:
-                    e = tag_ts[reward][t].get(m)
-                    cells.append(f"<td>{_fmt(e['mean']) if e else '-'}</td>")
-                row_attr = f' class="{" ".join(row_cls)}"' if row_cls else ""
-                rows.append(f"<tr{row_attr}>{''.join(cells)}</tr>")
-            parts.append(
-                f'<table class="metrics"><thead><tr><th class="method">method \\ tag</th>'
-                f"{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
-            )
-
-        # gallery
-        entries = gallery.get(test_set, [])
-        if entries:
-            parts.append(f"<h3>Gallery (first {len(entries)} prompts)</h3>")
-        for entry in entries:
-            parts.append("<div class='prompt-block'>")
-            parts.append(
-                f"<div class='prompt-text'><b>#{entry['gidx']}</b> "
-                f"{html.escape(str(entry.get('prompt', '')))}</div>"
-            )
-            extra = []
-            if entry.get("tag"):
-                extra.append(f"tag: {html.escape(str(entry['tag']))}")
-            if entry.get("include"):
-                extra.append(f"include: {html.escape(str(entry['include']))}")
-            if extra:
-                parts.append(f"<div class='prompt-meta'>{' | '.join(extra)}</div>")
-            parts.append("<div class='row'>")
-            for m in methods:
-                is_baseline = m in baseline_set
-                cell = entry["methods"].get(m, {})
-                img = cell.get("img")
-                scores = cell.get("scores", {})
-                score_str = ", ".join(f"{k}={_fmt(v)}" for k, v in sorted(scores.items()))
-                cell_cls = "cell baseline" if is_baseline else "cell"
-                badge = "<span class='badge'>ref</span>" if is_baseline else ""
-                if img:
-                    inner = f"<img loading='lazy' src='{html.escape(img)}' alt='{html.escape(m)}'>"
-                else:
-                    inner = "<div class='missing'>no image</div>"
-                parts.append(
-                    f"<div class='{cell_cls}'>{inner}"
-                    f"<div class='label'>{html.escape(m)}{badge}</div>"
-                    f"<div class='scores'>{html.escape(score_str)}</div></div>"
-                )
-                # Visual divider between the reference columns and the fusion methods.
-                if m == last_baseline:
-                    parts.append("<div class='sep'></div>")
-            parts.append("</div></div>")
-
-    parts.append("</body></html>")
-    return "".join(parts)
-
-
-# =============================================================================
 # Generation + scoring (needs GPU / the trainer)
 # =============================================================================
 
@@ -618,156 +371,6 @@ def _load_intact_image(path: Path) -> Optional[Any]:
         return None
 
 
-def _safe_name(name: str) -> str:
-    """Filesystem-safe token for record shard filenames."""
-    return "".join(c if (c.isalnum() or c in "-._") else "_" for c in str(name))
-
-
-def _write_record_shard(
-    records_dir: Path, test_set: str, method: str, rank: int, records: List[Dict[str, Any]]
-) -> None:
-    """Persist one (test_set, method, rank) shard as JSONL (overwrite on re-score)."""
-    records_dir.mkdir(parents=True, exist_ok=True)
-    shard = records_dir / f"{_safe_name(test_set)}__{_safe_name(method)}__r{rank}.jsonl"
-    with open(shard, "w", encoding="utf-8") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec) + "\n")
-
-
-def _load_cached_records(output_dir: Path) -> List[Dict[str, Any]]:
-    """Merge all per-(test_set, method, rank) record shards under ``records/``."""
-    records_dir = output_dir / "records"
-    if not records_dir.is_dir():
-        return []
-    records: List[Dict[str, Any]] = []
-    for shard in sorted(records_dir.glob("*.jsonl")):
-        for line in shard.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
-
-
-def _ordered_methods(labels: Sequence[str]) -> List[str]:
-    """Stable order with baseline columns first (matches the live-run layout)."""
-    seen: set = set()
-    uniq: List[str] = []
-    for label in labels:
-        if label not in seen:
-            seen.add(label)
-            uniq.append(label)
-    baselines = [m for m in uniq if m.startswith("baseline_")]
-    others = [m for m in uniq if not m.startswith("baseline_")]
-    return baselines + others
-
-
-def _infer_meta_from_records(
-    records: List[Dict[str, Any]], gallery_num_prompts: int
-) -> Dict[str, Any]:
-    """Reconstruct a minimal meta from cached records (no report_meta.json present)."""
-    methods = _ordered_methods([r["method"] for r in records])
-    test_sets = sorted({r["test_set"] for r in records})
-    num_prompts_per_set: Dict[str, int] = {}
-    for r in records:
-        ts = r["test_set"]
-        num_prompts_per_set[ts] = max(num_prompts_per_set.get(ts, 0), int(r["gidx"]) + 1)
-    return {
-        "methods": methods,
-        "baseline_methods": [m for m in methods if m.startswith("baseline_")],
-        "test_sets": test_sets,
-        "seed": None,
-        "num_inference_steps": None,
-        "guidance_scale": None,
-        "resolution": None,
-        "num_prompts_per_set": num_prompts_per_set,
-        "gallery_num_prompts": gallery_num_prompts,
-    }
-
-
-def _scan_images_for_meta(output_dir: Path, gallery_num_prompts: int) -> Dict[str, Any]:
-    """Reconstruct meta purely from the ``images/<test_set>/<method>/<idx>.png`` tree.
-
-    Used as the last-resort image-only rebuild: no records/metrics, so the report
-    shows just the image gallery (prompts replaced by the file index).
-    """
-    images_root = output_dir / "images"
-    methods: List[str] = []
-    test_sets: List[str] = []
-    num_prompts_per_set: Dict[str, int] = {}
-    if images_root.is_dir():
-        for ts_dir in sorted(p for p in images_root.iterdir() if p.is_dir()):
-            test_sets.append(ts_dir.name)
-            max_idx = -1
-            for method_dir in sorted(p for p in ts_dir.iterdir() if p.is_dir()):
-                if method_dir.name not in methods:
-                    methods.append(method_dir.name)
-                for png in method_dir.glob("*.png"):
-                    if png.stem.isdigit():
-                        max_idx = max(max_idx, int(png.stem))
-            num_prompts_per_set[ts_dir.name] = max_idx + 1
-    methods = _ordered_methods(methods)
-    return {
-        "methods": methods,
-        "baseline_methods": [m for m in methods if m.startswith("baseline_")],
-        "test_sets": test_sets,
-        "seed": None,
-        "num_inference_steps": None,
-        "guidance_scale": None,
-        "resolution": None,
-        "num_prompts_per_set": num_prompts_per_set,
-        "gallery_num_prompts": gallery_num_prompts,
-    }
-
-
-def rebuild_report(output_dir: Path, gallery_num_fallback: int = 32) -> None:
-    """Re-render ``index.html`` (+ metrics) from a prior run, with graceful fallback.
-
-    Pure CPU / stdlib (no model / dataset / GPU). Source precedence:
-
-    1. ``report_data.json`` (consolidated meta + records) — full report.
-    2. cached record shards under ``records/`` (+ ``report_meta.json`` if present)
-       — full report from a partial/interrupted run.
-    3. images on disk only — gallery-only report; metrics tables are omitted and
-       each prompt is labelled by its file index.
-    """
-    data_path = output_dir / "report_data.json"
-    meta_path = output_dir / "report_meta.json"
-
-    if data_path.exists():
-        data = json.loads(data_path.read_text(encoding="utf-8"))
-        meta, records = data["meta"], data["records"]
-    else:
-        records = _load_cached_records(output_dir)
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        elif records:
-            meta = _infer_meta_from_records(records, gallery_num_fallback)
-        else:
-            meta = _scan_images_for_meta(output_dir, gallery_num_fallback)
-            if not meta["methods"]:
-                raise FileNotFoundError(
-                    f"--report-only found nothing usable under {output_dir}: no "
-                    "report_data.json, no records/, and no images/. Run a pass first."
-                )
-            logger.warning(
-                "No records/metrics found; rendering image-only gallery "
-                "(prompts shown as file index, no metric tables)."
-            )
-
-    gallery_num = int(meta.get("gallery_num_prompts") or gallery_num_fallback)
-    summary = aggregate_metrics(records)
-    gallery = _build_gallery_from_records(
-        records,
-        meta["methods"],
-        meta["test_sets"],
-        meta.get("num_prompts_per_set", {}),
-        gallery_num,
-        output_dir,
-    )
-    _write_outputs(output_dir, summary, gallery, meta, records)
-    logger.info(f"Report rebuilt: {output_dir / 'index.html'}")
-
-
 def main() -> None:  # noqa: C901 - orchestration script
     args = parse_args()
 
@@ -780,7 +383,8 @@ def main() -> None:  # noqa: C901 - orchestration script
         logging.disable(logging.WARNING)
 
     if args.report_only:
-        # Prefer the persisted meta's gallery size; fall back to the CLI value.
+        # Pure CPU rebuild lives in ensemble_report; prefer the persisted meta's
+        # gallery size, fall back to the CLI value.
         rebuild_report(Path(args.output_dir), gallery_num_fallback=args.gallery_num_prompts)
         return
 
@@ -1021,7 +625,7 @@ def main() -> None:  # noqa: C901 - orchestration script
             [m.label for m in methods],
             test_sets,
             num_prompts_per_set,
-            args.gallery_num_prompts,
+            None,  # include every prompt; the HTML paginates them (page size = gallery_num_prompts)
             output_dir,
         )
         _write_outputs(output_dir, summary, gallery, meta, gathered)
@@ -1033,90 +637,6 @@ def main() -> None:  # noqa: C901 - orchestration script
     except Exception as exc:  # noqa: BLE001 - best-effort teardown
         if is_main:
             logger.warning(f"cleanup raised: {exc}")
-
-
-def _build_gallery_from_records(
-    records: List[Dict[str, Any]],
-    method_labels: Sequence[str],
-    test_sets: Sequence[str],
-    num_prompts_per_set: Dict[str, int],
-    gallery_num: int,
-    output_dir: Path,
-) -> Dict[str, List[Dict[str, Any]]]:
-    """Assemble first-N per-prompt gallery rows purely from records + images on disk.
-
-    Records carry ``prompt`` / ``tag`` / ``include`` (per ``(test_set, gidx)``) and
-    per-method ``scores``, so the gallery can be built both during a live run and
-    offline in report-only mode (no dataset / trainer needed).
-    """
-    # (test_set, method, gidx) -> scores; (test_set, gidx) -> prompt/tag/include.
-    score_index: Dict[Tuple[str, str, int], Dict[str, float]] = {}
-    prompt_index: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    for r in records:
-        ts, gidx = r["test_set"], int(r["gidx"])
-        score_index[(ts, r["method"], gidx)] = r.get("scores", {})
-        prompt_index.setdefault(
-            (ts, gidx),
-            {
-                "prompt": r.get("prompt", ""),
-                "tag": r.get("tag"),
-                "include": r.get("include"),
-            },
-        )
-
-    gallery: Dict[str, List[Dict[str, Any]]] = {}
-    for test_set in test_sets:
-        n = min(gallery_num, num_prompts_per_set.get(test_set, 0))
-        entries: List[Dict[str, Any]] = []
-        for gidx in range(n):
-            info = prompt_index.get((test_set, gidx), {})
-            per_method: Dict[str, Dict[str, Any]] = {}
-            for label in method_labels:
-                rel = f"images/{test_set}/{label}/{gidx:05d}.png"
-                img = rel if (output_dir / rel).exists() else None
-                per_method[label] = {
-                    "img": img,
-                    "scores": score_index.get((test_set, label, gidx), {}),
-                }
-            entries.append(
-                {
-                    "gidx": gidx,
-                    # Fall back to the file index when no prompt text is on record
-                    # (image-only rebuilds have no records to read the prompt from).
-                    "prompt": info.get("prompt") or f"#{gidx:05d}",
-                    "tag": info.get("tag"),
-                    "include": info.get("include"),
-                    "methods": per_method,
-                }
-            )
-        gallery[test_set] = entries
-    return gallery
-
-
-def _write_outputs(
-    output_dir: Path,
-    summary: Dict[str, Any],
-    gallery: Dict[str, List[Dict[str, Any]]],
-    meta: Dict[str, Any],
-    records: List[Dict[str, Any]],
-) -> None:
-    (output_dir / "metrics.json").write_text(
-        json.dumps({"meta": meta, "summary": summary}, indent=2), encoding="utf-8"
-    )
-    # Per-prompt records + meta: the source for offline report rebuilds
-    # (`--report-only`), which re-render index.html without any GPU/model.
-    (output_dir / "report_data.json").write_text(
-        json.dumps({"meta": meta, "records": records}), encoding="utf-8"
-    )
-    # Flat CSV: test_set, method, reward, mean, std, n
-    with open(output_dir / "metrics.csv", "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["test_set", "method", "reward", "mean", "std", "n"])
-        for ts, by_reward in summary["aggregate"].items():
-            for reward, by_method in by_reward.items():
-                for method, stats in by_method.items():
-                    writer.writerow([ts, method, reward, stats["mean"], stats["std"], stats["n"]])
-    (output_dir / "index.html").write_text(render_html(summary, gallery, meta), encoding="utf-8")
 
 
 # =============================================================================
@@ -1189,7 +709,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Skip all generation/scoring and only re-render index.html (+ metrics) from "
-            "<output-dir>/report_data.json written by a prior run. No model/GPU is loaded."
+            "<output-dir> written by a prior run (delegates to ensemble_report.rebuild_report). "
+            "No model/GPU is loaded; scripts/ensemble_report.py is the standalone equivalent."
         ),
     )
     p.add_argument("--test-sets", nargs="*", default=None, help="Subset of test set names to run.")
@@ -1197,7 +718,10 @@ def parse_args() -> argparse.Namespace:
         "--gallery-num-prompts",
         type=int,
         default=32,
-        help="How many prompts per test set to render in the HTML gallery (metrics use all).",
+        help=(
+            "Prompts shown per PAGE in the HTML gallery; the gallery paginates over ALL "
+            "prompts (metrics always use all)."
+        ),
     )
     p.add_argument(
         "--max-prompts",
@@ -1209,7 +733,10 @@ def parse_args() -> argparse.Namespace:
         "--save-images",
         choices=["all", "gallery", "none"],
         default="all",
-        help="all: keep every image; gallery: only the first --gallery-num-prompts; none: metrics only.",
+        help=(
+            "all: keep every image; gallery: only the first --gallery-num-prompts (the first "
+            "gallery page; later pages show placeholders); none: metrics only."
+        ),
     )
     p.add_argument(
         "--guidance-scale", type=float, default=None, help="Override eval.guidance_scale."

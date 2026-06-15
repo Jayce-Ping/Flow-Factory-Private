@@ -16,6 +16,7 @@ the model/trainer, so they run on CPU in CI.
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import sys
 import unittest
