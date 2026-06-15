@@ -75,7 +75,7 @@
 \text{vector}\in\{\underbrace{v_i}_{\text{full velocity}},\ \underbrace{\tau_i=v_i-\vb}_{\text{residual delta}}\}
 \ \times\
 \text{projection}\in\{\text{global},\ \text{channelwise},\ \text{normalized}\}
-\ \cup\ \{\texttt{weighted},\ \texttt{ties}\}.
+\ \cup\ \{\texttt{weighted},\ \texttt{ties},\ \texttt{ties\_channelwise}\}.
 \]
 此外 \texttt{weight\_merge}（\S\ref{sec:weight_merge}）在 \emph{参数空间} 一次性融合（不经 per-step 路径），作为 model-soup baseline。
 
@@ -200,6 +200,22 @@ base-anchored。在 task vectors $\{\tau_i\}$ 上做 TIES-merging（Yadav et al.
 \end{definition}
 
 直觉：逐元素地"投票"决定该坐标应往哪个方向修正，再只让赞成方贡献，逆向 teacher 被直接剔除（而非像 PCGrad 那样按投影削减）。这是一种比 PCGrad 更"硬"的冲突消解。
+
+\begin{definition}[\texttt{ties\_channelwise}]
+\label{def:ties_channelwise}
+TIES 的 channel 粒度变体（group $=$ \texttt{dim 1}，与 channelwise PCGrad 同一分组；要求 ndim $\ge 3$）。先按 feature 维求每个 teacher 的 \emph{每通道净质量} $m_{i,c}=\sum_{\text{feat}}\tau_i[c,\cdot]$，据此 \emph{每通道} 选举一个符号
+\begin{equation}
+\gamma_c \;=\; \sign\Bigl(\textstyle\sum_i w_i\,m_{i,c}\Bigr);
+\label{eq:ties_cw_sign}
+\end{equation}
+再做 \emph{整通道} 的 disjoint 加权平均——仅当 teacher 的该通道净符号 $\sign(m_{i,c})=\gamma_c$ 时，其 \emph{整条通道} 才参与
+\begin{equation}
+\tau_{\mathrm{merged}}[c,\cdot]
+=\frac{\sum_i w_i\,\tau_i[c,\cdot]\,\mathbf{1}[\sign(m_{i,c})=\gamma_c]}{\sum_i w_i\,\mathbf{1}[\sign(m_{i,c})=\gamma_c]}.
+\label{eq:ties_cw_merge}
+\end{equation}
+返回 $\vfused=\vb+\tau_{\mathrm{merged}}$。与逐元素 \texttt{ties} 相比，决策与动作都在通道粒度（更粗、更"成块"），对应 PCGrad 的 global$\to$channelwise 类比。
+\end{definition}
 
 %% ============================================================
 \section{Weight Merge：权重空间融合（model soup）}
@@ -367,7 +383,8 @@ w_i(\alpha)=\frac{\pi_i\,D_i^{\alpha}}{\sum_j \pi_j\,D_j^{\alpha}},\qquad
 \texttt{pcgrad\_residual} & $\vb+\sum_i w_i\tau_i^{\PC}$ & global 投影（残差） & \ding{51} \\
 \texttt{pcgrad\_residual\_channelwise} & 同上，逐 channel & 细粒度（残差） & \ding{51} \\
 \texttt{pcgrad\_residual\_normalized} & $\vb+\sum_i w_i n_i^\tau p_i^\tau$ & 单位方向（残差） & \ding{51} \\
-\texttt{ties} & $\vb+\tau_{\mathrm{merged}}$ & 符号选举$+$剔除 & \ding{51} \\
+\texttt{ties} & $\vb+\tau_{\mathrm{merged}}$ & 逐元素符号选举$+$剔除 & \ding{51} \\
+\texttt{ties\_channelwise} & $\vb+\tau_{\mathrm{merged}}$ & 逐通道符号选举$+$整通道剔除 & \ding{51} \\
 \texttt{weight\_merge} & 单模型 $f(\theta_{\mathrm{merged}})$，$\theta_{\mathrm{merged}}{=}\sum_i w_i\theta_i$ & 无（参数空间） & \ding{55} \\
 \bottomrule
 \end{tabular}
@@ -383,7 +400,7 @@ w_i(\alpha)=\frac{\pi_i\,D_i^{\alpha}}{\sum_j \pi_j\,D_j^{\alpha}},\qquad
 \texttt{pcgrad}/\texttt{\_channelwise}/\texttt{\_normalized} & 近似相等（命题~\ref{prop:collapse}） & 剔除 \\
 \texttt{weighted} & --- & 保留（基线） \\
 \texttt{pcgrad\_residual} 系列 & 实质不同（命题~\ref{prop:residual}） & 保留 \\
-\texttt{ties} & 实质不同 & 保留 \\
+\texttt{ties} / \texttt{ties\_channelwise} & 实质不同（逐元素 / 逐通道） & 保留 \\
 \texttt{*\_kl} / \texttt{*\_kl\_inv} & 残差 $+$ 动态重组 & 保留 \\
 \texttt{weight\_merge} & 参数空间（非输出空间） & 保留（baseline） \\
 \bottomrule

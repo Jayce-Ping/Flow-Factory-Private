@@ -414,8 +414,10 @@ class TestBuildGalleryFromRecords(unittest.TestCase):
                 "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
                 "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
                 "3_geneval-ocr-pickscore_pcgrad_residual_kl",
+                "3_geneval-ocr-pickscore_pcgrad_residual_kl_channelwise",
                 "3_geneval-ocr-pickscore_pcgrad_residual_kl_inv",
                 "3_geneval-ocr-pickscore_ties",
+                "3_geneval-ocr-pickscore_ties_channelwise",
             ),
         )
         for label in cmp.DEFAULT_METHODS:
@@ -425,11 +427,21 @@ class TestBuildGalleryFromRecords(unittest.TestCase):
         for label in cmp.DEFAULT_METHODS[1:]:
             mode = by_label[label].blend_mode
             self.assertTrue(
-                mode.startswith("pcgrad_residual") or mode == "ties",
+                mode.startswith("pcgrad_residual") or mode.startswith("ties"),
                 f"default method {label!r} has non-base-anchored mode {mode!r}",
             )
         # The kl / kl_inv variants carry the dynamic weighting flags.
         self.assertEqual(by_label["3_geneval-ocr-pickscore_pcgrad_residual_kl"].weighting, "kl")
+        self.assertEqual(
+            by_label["3_geneval-ocr-pickscore_pcgrad_residual_kl_channelwise"].weighting, "kl"
+        )
+        self.assertEqual(
+            by_label["3_geneval-ocr-pickscore_pcgrad_residual_kl_channelwise"].blend_mode,
+            "pcgrad_residual_channelwise",
+        )
+        self.assertEqual(
+            by_label["3_geneval-ocr-pickscore_ties_channelwise"].blend_mode, "ties_channelwise"
+        )
         self.assertEqual(
             by_label["3_geneval-ocr-pickscore_pcgrad_residual_kl_inv"].weighting, "kl_inv"
         )

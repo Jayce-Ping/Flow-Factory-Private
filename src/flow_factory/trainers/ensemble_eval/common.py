@@ -44,8 +44,17 @@ EnsembleBlendMode = Literal[
     "pcgrad_residual_normalized",
     "pcgrad_residual_channelwise",
     "ties",
+    "ties_channelwise",
 ]
 ENSEMBLE_BLEND_MODES: Tuple[str, ...] = get_args(EnsembleBlendMode)
+
+# TIES granularity per blend_mode: 'element' (per-coordinate sign vote, the
+# standard TIES) or 'channelwise' (per-channel/per-token sign vote, mirroring the
+# channelwise PCGrad grouping). Both are base-anchored and dispatched explicitly.
+_TIES_GRANULARITY: Dict[str, str] = {
+    "ties": "element",
+    "ties_channelwise": "channelwise",
+}
 
 # Conflict-projection strategy shared by the full-velocity and residual-delta paths.
 PCGradProjection = Literal["global", "channelwise", "normalized"]
@@ -72,8 +81,10 @@ EnsembleBlendWeighting = Literal["uniform", "kl", "kl_inv"]
 _WEIGHTING_ALPHA: Dict[str, float] = {"kl": 1.0, "kl_inv": -1.0}
 
 # KL weighting needs the base anchor v_base, so it is only valid for blend modes
-# that already run a base forward (the residual family and 'ties').
-_KL_WEIGHTABLE_MODES: FrozenSet[str] = frozenset(_RESIDUAL_PROJECTIONS) | frozenset({"ties"})
+# that already run a base forward (the residual family and the TIES family).
+_KL_WEIGHTABLE_MODES: FrozenSet[str] = frozenset(_RESIDUAL_PROJECTIONS) | frozenset(
+    _TIES_GRANULARITY
+)
 
 
 def _weight_batch_means(weights: Sequence[Any]) -> List[float]:
@@ -1119,6 +1130,7 @@ def ties_blend_deltas(
     weights: Sequence[BlendWeight],
     *,
     density: float = 1.0,
+    granularity: str = "element",
     stats: Optional[TIESStats] = None,
 ) -> torch.Tensor:
     """Merge task-specific deltas with TIES-merging sign election.
@@ -1128,10 +1140,18 @@ def ties_blend_deltas(
 
     1. (Optional) Trim each ``tau_i`` to its top-``density`` fraction of entries
        by magnitude (per sample), zeroing the rest.
-    2. Elect a per-element sign ``gamma = sign(sum_i w_i * tau_i)``.
-    3. Disjoint weighted mean over sign-agreeing checkpoints:
-       ``tau_merged = sum_i w_i*tau_i*1[sign(tau_i)=gamma]
-                      / sum_i w_i*1[sign(tau_i)=gamma]`` (0 where no agreement).
+    2. Elect a sign and take a disjoint weighted mean over sign-agreeing
+       checkpoints, at one of two granularities (``granularity``):
+
+       - ``'element'`` (default, standard TIES): per-coordinate sign
+         ``gamma = sign(sum_i w_i * tau_i)``; merge per coordinate:
+         ``tau_merged = sum_i w_i*tau_i*1[sign(tau_i)=gamma]
+                        / sum_i w_i*1[sign(tau_i)=gamma]`` (0 where no agreement).
+       - ``'channelwise'``: one sign per channel/token group (group = ``dim=1``,
+         features = remaining dims, same grouping as channelwise PCGrad).
+         The per-channel net mass ``m_i = sum_features tau_i`` elects
+         ``gamma_c = sign(sum_i w_i * m_i)``; a teacher's whole channel
+         contributes iff ``sign(m_i) == gamma_c``. Requires ``ndim >= 3``.
 
     No sign disagreement reduces to the weighted blend ``sum_i w_i * tau_i``
     (weights normalized); a single delta returns ``tau_0``.
@@ -1142,13 +1162,15 @@ def ties_blend_deltas(
             tensors), same length as ``taus``.
         density: Fraction of largest-magnitude entries to keep per task
             (``1.0`` = no trim). Must be in ``(0, 1]``.
+        granularity: ``'element'`` or ``'channelwise'`` sign election (see above).
         stats: Optional accumulator for deferred summary logging.
 
     Returns:
         Merged delta tensor.
 
     Raises:
-        ValueError: Empty sequence, shape mismatch, length mismatch, or invalid ``density``.
+        ValueError: Empty sequence, shape mismatch, length mismatch, invalid
+            ``density``, invalid ``granularity``, or ``channelwise`` with ``ndim < 3``.
         TypeError: Non-tensor entries in ``taus``.
     """
     if not taus:
@@ -1160,6 +1182,11 @@ def ties_blend_deltas(
         )
     if not (0.0 < density <= 1.0):
         raise ValueError(f"ties_density must be in (0, 1], got density={density}.")
+    if granularity not in ("element", "channelwise"):
+        raise ValueError(
+            "ties_blend_deltas expected granularity in ('element', 'channelwise'), "
+            f"got granularity={granularity!r}."
+        )
 
     ref = taus[0]
     if not isinstance(ref, torch.Tensor):
@@ -1199,6 +1226,60 @@ def ties_blend_deltas(
             trimmed.append((flat * mask).reshape(ref_shape))
         task_list = trimmed
 
+    tiny = torch.finfo(ref.dtype).tiny
+
+    if granularity == "channelwise":
+        if ref.ndim < 3:
+            raise ValueError(
+                "ties_blend_deltas granularity='channelwise' requires ndim >= 3 for "
+                f"channel grouping, got ndim={ref.ndim}. Use granularity='element' "
+                "(standard TIES) for 1D/2D tensors."
+            )
+        channels = ref_shape[1]
+        # Per-channel net mass m_i = sum over feature dims -> (B, C); elect one
+        # sign per channel, then a whole-channel disjoint weighted mean.
+        weighted_net = (task_list[0] * _broadcast_weight(weights[0], task_list[0])).reshape(
+            batch, channels, -1
+        ).sum(dim=2)
+        for k in range(1, len(task_list)):
+            weighted_net = weighted_net + (
+                task_list[k] * _broadcast_weight(weights[k], task_list[k])
+            ).reshape(batch, channels, -1).sum(dim=2)
+        gamma = torch.sign(weighted_net)  # (B, C)
+
+        numerator = torch.zeros_like(ref).reshape(batch, channels, -1)
+        denom = torch.zeros(
+            (batch, channels, 1), dtype=ref.dtype, device=ref.device
+        )
+        total_groups = 0
+        disagree_groups = 0
+        for tau, weight in zip(task_list, weights, strict=True):
+            tau_flat = tau.reshape(batch, channels, -1)
+            net = tau_flat.sum(dim=2)  # (B, C)
+            nonzero = net != 0
+            agree = (torch.sign(net) == gamma) & nonzero  # (B, C)
+            agree_f = agree.to(ref.dtype).unsqueeze(-1)  # (B, C, 1)
+            weight_b = _broadcast_weight(weight, tau_flat)
+            numerator = numerator + weight_b * tau_flat * agree_f
+            denom = denom + weight_b * agree_f
+            if stats is not None:
+                total_groups += int(nonzero.sum().item())
+                disagree_groups += int((nonzero & ~agree).sum().item())
+
+        tau_merged = torch.where(
+            denom > 0, numerator / denom.clamp_min(tiny), torch.zeros_like(numerator)
+        ).reshape(ref_shape)
+
+        if stats is not None:
+            if stats.num_steps == 0:
+                stats.tensor_shape = tuple(ref_shape)
+            stats.record_step(
+                step_total_elements=total_groups,
+                step_disagree_elements=disagree_groups,
+            )
+        return tau_merged
+
+    # granularity == "element": standard per-coordinate TIES.
     # 2. Elect a per-element sign from the weighted sum.
     weighted_sum = task_list[0] * _broadcast_weight(weights[0], task_list[0])
     for k in range(1, len(task_list)):
@@ -1221,7 +1302,6 @@ def ties_blend_deltas(
             total_elements += int(nonzero.sum().item())
             disagree_elements += int((nonzero & ~agree).sum().item())
 
-    tiny = torch.finfo(ref.dtype).tiny
     tau_merged = torch.where(
         denom > 0, numerator / denom.clamp_min(tiny), torch.zeros_like(ref)
     )
@@ -1246,6 +1326,7 @@ def _ties_blend(
     density: float,
     pcgrad_eps: float = 1e-8,
     weighting: EnsembleBlendWeighting = "uniform",
+    granularity: str = "element",
     stats: Optional[TIESStats] = None,
 ) -> torch.Tensor:
     """TIES-merging fusion of checkpoint noise_pred via base-anchored sign vote.
@@ -1253,8 +1334,8 @@ def _ties_blend(
     Runs the pretrained baseline forward (``v_b``) and each checkpoint forward,
     forms task vectors ``tau_i = noise_pred_i - v_b``, resolves effective weights
     (static or per-sample KL via ``weighting``), merges with
-    :func:`ties_blend_deltas` (sign election + disjoint weighted mean), and
-    returns ``v_b + tau_merged``.
+    :func:`ties_blend_deltas` (sign election + disjoint weighted mean at the
+    requested ``granularity``), and returns ``v_b + tau_merged``.
 
     Note:
         This adds one extra forward pass per denoising step for the pretrained model.
@@ -1280,7 +1361,9 @@ def _ties_blend(
         taus.append(out.noise_pred - ref_noise_pred)
 
     eff_weights = _resolve_blend_weights(taus, weights, weighting, pcgrad_eps, stats)
-    tau_merged = ties_blend_deltas(taus, eff_weights, density=density, stats=stats)
+    tau_merged = ties_blend_deltas(
+        taus, eff_weights, density=density, granularity=granularity, stats=stats
+    )
     return ref_noise_pred + tau_merged
 
 
@@ -1324,8 +1407,9 @@ def ensemble_forward_step(
             ``'pcgrad_residual_normalized'``: same three projections on the
             task-specific deltas from the pretrained model (one extra forward
             per step).
-            ``'ties'``: TIES-merging base-anchored per-element sign vote (one
-            extra forward per step).
+            ``'ties'`` / ``'ties_channelwise'``: TIES-merging base-anchored sign
+            vote, per-element or per-channel respectively (one extra forward per
+            step).
         pcgrad_eps: Epsilon for PCGrad denominator (any pcgrad mode).
         pcgrad_generator: Optional RNG for PCGrad inner-loop shuffle.
         ties_density: Fraction of largest-magnitude entries kept per task in
@@ -1380,7 +1464,7 @@ def ensemble_forward_step(
             weighting=weighting,
             stats=stats,
         )
-    elif blend_mode == "ties":
+    elif blend_mode in _TIES_GRANULARITY:
         combined_noise_pred = _ties_blend(
             adapter=adapter,
             checkpoint_names=checkpoint_names,
@@ -1390,6 +1474,7 @@ def ensemble_forward_step(
             density=ties_density,
             pcgrad_eps=pcgrad_eps,
             weighting=weighting,
+            granularity=_TIES_GRANULARITY[blend_mode],
             stats=stats,
         )
     else:

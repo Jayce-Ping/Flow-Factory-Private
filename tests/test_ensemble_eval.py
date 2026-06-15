@@ -326,6 +326,38 @@ class TestTiesBlendDeltas(unittest.TestCase):
         with self.assertRaises(ValueError):
             ties_blend_deltas([torch.tensor([1.0])], [1.0], density=0.0)
 
+    def test_rejects_invalid_granularity(self) -> None:
+        with self.assertRaises(ValueError):
+            ties_blend_deltas([torch.tensor([[1.0]])], [1.0], granularity="bogus")
+
+    def test_channelwise_requires_ndim_ge_3(self) -> None:
+        # 2D (B, D) has no feature dim to aggregate per channel.
+        with self.assertRaises(ValueError):
+            ties_blend_deltas(
+                [torch.tensor([[1.0, 2.0]])], [1.0], granularity="channelwise"
+            )
+
+    def test_channelwise_per_channel_sign_vote(self) -> None:
+        # Shape (B=1, C=2, F=2). Channel nets decide one sign per channel.
+        # tau0 channel nets = [1+1, -1-1] = [2, -2]; tau1 = [-1-2, 1+2] = [-3, 3].
+        # weighted (0.5,0.5) channel net = [-0.5, 0.5] -> gamma_c = [-1, +1].
+        # Channel 0: tau0 net +2 disagrees (dropped); tau1 net -3 agrees -> [-1,-2].
+        # Channel 1: tau0 net -2 disagrees (dropped); tau1 net +3 agrees -> [1, 2].
+        tau0 = torch.tensor([[[1.0, 1.0], [-1.0, -1.0]]])
+        tau1 = torch.tensor([[[-1.0, -2.0], [1.0, 2.0]]])
+        out = ties_blend_deltas([tau0, tau1], [0.5, 0.5], granularity="channelwise")
+        torch.testing.assert_close(out, torch.tensor([[[-1.0, -2.0], [1.0, 2.0]]]))
+
+    def test_channelwise_no_disagreement_equals_weighted(self) -> None:
+        # Both teachers' channel nets share sign -> whole-channel weighted mean.
+        tau0 = torch.tensor([[[2.0, 2.0], [-4.0, -2.0]]])
+        tau1 = torch.tensor([[[1.0, 3.0], [-2.0, -4.0]]])
+        out = ties_blend_deltas([tau0, tau1], [0.5, 0.5], granularity="channelwise")
+        # channel 0 nets +4/+4 agree; channel 1 nets -6/-6 agree -> plain 0.5/0.5 mean.
+        torch.testing.assert_close(
+            out, torch.tensor([[[1.5, 2.5], [-3.0, -3.0]]])
+        )
+
 
 class TestLoadCheckpoints(unittest.TestCase):
     def test_empty_paths_raises(self) -> None:

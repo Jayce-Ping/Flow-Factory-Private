@@ -192,7 +192,7 @@ class EnsembleEvalTrainer(BaseTrainer):
                 blend_mode=blend_mode,
                 num_checkpoints=len(self._checkpoint_names),
             )
-        elif blend_mode == "ties":
+        elif blend_mode.startswith("ties"):
             blend_stats = TIESStats(
                 blend_mode=blend_mode,
                 num_checkpoints=len(self._checkpoint_names),

@@ -148,8 +148,10 @@ DEFAULT_METHODS: Tuple[str, ...] = (
     "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
     "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
     "3_geneval-ocr-pickscore_pcgrad_residual_kl",
+    "3_geneval-ocr-pickscore_pcgrad_residual_kl_channelwise",
     "3_geneval-ocr-pickscore_pcgrad_residual_kl_inv",
     "3_geneval-ocr-pickscore_ties",
+    "3_geneval-ocr-pickscore_ties_channelwise",
 )
 
 

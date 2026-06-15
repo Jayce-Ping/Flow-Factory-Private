@@ -2424,6 +2424,7 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         "pcgrad_residual_normalized",
         "pcgrad_residual_channelwise",
         "ties",
+        "ties_channelwise",
         "weight_merge",
     ] = field(
         default="pcgrad_residual",
@@ -2448,6 +2449,9 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
                 "checkpoints trained on different objectives). "
                 "'ties': TIES-merging base-anchored per-element sign vote (also "
                 "adds one extra forward pass per denoising step). "
+                "'ties_channelwise': TIES with a per-channel/per-token sign vote "
+                "(group = dim 1, same grouping as channelwise PCGrad); the whole "
+                "channel of a sign-agreeing teacher contributes. "
                 "'weight_merge': weight-space LoRA soup -- average the teacher "
                 "LoRA parameters once (sum_i w_i * theta_i) and run single-model "
                 "inference (one forward per step, no per-step blend). Uses static "
@@ -2506,6 +2510,7 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
             "pcgrad_residual_normalized",
             "pcgrad_residual_channelwise",
             "ties",
+            "ties_channelwise",
             "weight_merge",
         )
         if self.ensemble_blend_mode not in _valid_blend_modes:
@@ -2542,6 +2547,7 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
             "pcgrad_residual_channelwise",
             "pcgrad_residual_normalized",
             "ties",
+            "ties_channelwise",
         )
         if (
             self.ensemble_blend_weighting != "uniform"
