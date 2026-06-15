@@ -25,6 +25,7 @@
 \newcommand{\N}{\mathcal{N}}
 \newcommand{\PC}{\mathrm{PCGrad}}
 \newcommand{\vb}{v_{\mathrm{base}}}
+\newcommand{\vfused}{v_{\mathrm{fused}}}
 \newcommand{\inner}[2]{\langle #1,\, #2\rangle}
 \newcommand{\norm}[1]{\lVert #1\rVert}
 \DeclareMathOperator{\sign}{sign}
@@ -201,12 +202,35 @@ v_{\mathrm{fused}} = (\vb \text{ if residual else } 0) + \sum_i w_i\,\tau_i^{\PC
 因此"KL 加权对 PCGrad 是否有益"与"KL 加权对（投影后的）线性重组是否有益"是 \emph{同一个问题}；是否开启 PCGrad 不改变这一判断的本质。下文据此聚焦于加权重组 $\bar\tau(\alpha)=\sum_i w_i(\alpha)\,\tau_i^{\PC}$。
 \end{corollary}
 
+\begin{remark}[\texttt{weighted} / \texttt{pcgrad} / \texttt{pcgrad\_residual} 的系数性质]
+\label{rem:coeff_pcgrad}
+把融合结果按 \emph{原始} teacher 向量展开，判定其是否为 teacher 的凸组合（系数 $\ge0$ 且和 $1$，即落在凸包内）。注意区分"融合权重 $w_i$"（由~\eqref{eq:weights} 恒满足 $\sum_i w_i=1,\ w_i\ge0$）与"velocity 的有效系数"（PCGrad 后一般不归一）。
+\begin{itemize}[leftmargin=1.6em]
+\item \texttt{weighted}：$\vfused=\sum_i w_i v_i$，直接是 teacher 的 \textbf{凸组合}（base 系数 $0$）。
+\item \texttt{pcgrad} / \texttt{pcgrad\_channelwise}（及其 residual 版）：冲突投影~\eqref{eq:pcgrad_step} 在 $\inner{\mathrm{pc}_i}{g_j}<0$ 时给 $\mathrm{pc}_i$ \emph{加上} 正的 $g_j=w_j\tau_j$ 倍数，故 $\mathrm{pc}_i=w_i\tau_i+\sum_{j\neq i}\beta_{ij}\tau_j$（$\beta_{ij}\ge0$），有效系数
+\[
+e_j=w_j+\sum_{i\neq j}\beta_{ij}\ \ge\ w_j\ge0,\qquad \sum_j e_j=1+S,\quad S=\textstyle\sum_{i\neq j}\beta_{ij}\ge0
+\]
+（$\mathrm{pc}_i$ 中 $\tau_i$ 的系数恒为 $w_i$，因 $g_j$ 不含 $\tau_i$ 分量；增量 $-\inner{\mathrm{pc}_i}{g_j}w_j/\norm{g_j}^2>0$）。代入 $\tau_j=v_j-\vb$，residual 模式
+\begin{equation}
+\vfused=\vb+\sum_j e_j\tau_j=\underbrace{(1-\textstyle\sum_j e_j)}_{=-S\ \le\ 0}\vb+\sum_j e_j v_j,
+\label{eq:affine}
+\end{equation}
+全体系数和 $=1$（\emph{仿射}），但 base 系数 $-S\le0$、teacher 系数和 $1+S\ge1$：有冲突（$S>0$）时 \textbf{非凸}，沿 consensus delta 外推出 teacher 凸包（远离 base、放大净修正）；无冲突（$S=0$）退化为 \texttt{weighted} 的凸组合。full 模式同理（无 $\vb$ 项，teacher 系数 $e_j$ 之和 $1+S$，亦非归一）。KL 加权只改变 $w_i$（从而 $e_j$），不改变此结构（定理~\ref{thm:commute}）。
+\end{itemize}
+\end{remark}
+
+\begin{example}[2-teacher 对消]
+\label{ex:cancel}
+$\vb=10$，$v_0=12,v_1=8$（$\tau_0=2,\tau_1=-2$），$w=(\tfrac12,\tfrac12)$。global PCGrad 得 $\mathrm{pc}_0=\tfrac12\tau_0+\tfrac12\tau_1$、$\mathrm{pc}_1=\tfrac12\tau_1+\tfrac12\tau_0$，故 $e_0=e_1=1$、$S=1$。代入~\eqref{eq:affine}：$\vfused=-1\cdot10+1\cdot12+1\cdot8=10$，base 系数 $-1<0$。此对称例数值恰在 $[8,12]$ 内，但表示是仿射（base 负权）而非凸；非对称 / 高维时可越出凸包。
+\end{example}
+
 \begin{remark}[两个例外：normalized 与 ties]
 \label{rem:exceptions}
 定理~\ref{thm:commute} 依赖"投影对象按 $w_i$ 线性缩放"。两个模式不满足该前提：
 \begin{itemize}[leftmargin=1.6em]
-\item \texttt{normalized}：先把 $\tau_i$ 除以 $\norm{\tau_i}$ 再投影，重组为 $\sum_i w_i\norm{\tau_i}\,p_i$。叠加 KL 权重 $w_i\propto\norm{\tau_i}^{2\alpha}$ 后，等效幅度变为 $\norm{\tau_i}^{2\alpha+1}$。即 normalized 把"幅度"剥离后，KL 加权又以 $2\alpha+1$ 次幂把它\emph{部分}加回——$\alpha=-\tfrac12$ 恰好回到纯方向（完全剥离幅度），$\alpha=0$ 回到原 normalized 行为。
-\item \texttt{ties}：sign 选举 $\gamma=\sign(\sum_i w_i\tau_i)$ 与 disjoint 加权平均都显式用到 $w_i$，故 KL 权重会改变选举与平均，\emph{不可交换}。
+\item \texttt{normalized}：先把 $\tau_i$ 除以 $\norm{\tau_i}$ 再投影，重组为 $\sum_i w_i\norm{\tau_i}\,p_i$。叠加 KL 权重 $w_i\propto\norm{\tau_i}^{2\alpha}$ 后，等效幅度变为 $\norm{\tau_i}^{2\alpha+1}$。即 normalized 把"幅度"剥离后，KL 加权又以 $2\alpha+1$ 次幂把它\emph{部分}加回——$\alpha=-\tfrac12$ 恰好回到纯方向（完全剥离幅度），$\alpha=0$ 回到原 normalized 行为。\emph{系数性质}：以单位方向 $p_i$ 重组、幅度被剥离再加权，质量不守恒，一般 \textbf{非凸}（无冲突时 $p_i=u_i$ 退化为 $\sum_i w_i v_i$）。
+\item \texttt{ties}：sign 选举 $\gamma=\sign(\sum_i w_i\tau_i)$ 与 disjoint 加权平均都显式用到 $w_i$，故 KL 权重会改变选举与平均，\emph{不可交换}。\emph{系数性质}：disjoint mean $\tau_{\mathrm{merged}}=\frac{\sum_i w_i\tau_i\mathbf{1}[\sign(\tau_i)=\gamma]}{\sum_i w_i\mathbf{1}[\sign(\tau_i)=\gamma]}$ 逐元素归一，是同号 teacher 的凸组合；故 $\vfused=\vb+\tau_{\mathrm{merged}}$ \emph{逐坐标} 是 $\{\vb,v_i\}$ 的 \textbf{凸组合}（同号方处 base 系数 $0$，无同号方处取 $\vb$），恒在凸包内、无质量膨胀。
 \end{itemize}
 \end{remark}
 
