@@ -282,6 +282,11 @@ class TIESStats:
         logger.info("\n".join(summary_lines))
 
 
+# Snapshot name for the weight-space merged LoRA ("model soup"), built by
+# build_merged_lora_snapshot and consumed via use_named_parameters like any teacher.
+MERGED_SNAPSHOT_NAME = "eval_merged"
+
+
 def load_checkpoints(
     adapter: "BaseAdapter",
     checkpoint_paths: List[str],
@@ -362,6 +367,69 @@ def normalize_checkpoint_weights(
     if total <= 0:
         raise ValueError(f"checkpoint_weights must sum to a positive value, got {weight_list!r}.")
     return [w / total for w in weight_list]
+
+
+def build_merged_lora_snapshot(
+    adapter: "BaseAdapter",
+    checkpoint_names: Sequence[str],
+    weights: Sequence[float],
+    *,
+    name: str = MERGED_SNAPSHOT_NAME,
+    device: Union[torch.device, str] = "cpu",
+) -> str:
+    """Build a weight-space weighted-average LoRA snapshot ("model soup").
+
+    Each teacher is stored as an element-wise aligned tensor list (same arch,
+    same ``_get_component_parameters`` order), so the merge is a per-slot
+    weighted sum ``merged[k] = sum_i weights[i] * teacher_i[k]``. The result is
+    stored as a new named-parameter snapshot ``name`` that can be swapped in via
+    :meth:`BaseAdapter.use_named_parameters` for single-model inference.
+
+    Note:
+        LoRA ``A`` and ``B`` factors are averaged independently, so this is the
+        cheap bilinear-approximate soup: ``merged`` reproduces
+        ``(sum_i w_i B_i)(sum_i w_i A_i)``, NOT the exact effective-delta merge
+        ``sum_i w_i (B_i A_i)``. This is the intended simple baseline.
+
+    Args:
+        adapter: Active LoRA adapter holding the teacher snapshots.
+        checkpoint_names: Teacher snapshot names (from :func:`load_checkpoints`).
+        weights: Per-teacher merge weights (length must match ``checkpoint_names``).
+        name: Snapshot name to (over)write with the merged parameters.
+        device: Storage device for the merged snapshot.
+
+    Returns:
+        The snapshot ``name``.
+
+    Raises:
+        ValueError: Empty ``checkpoint_names`` or length mismatch with ``weights``.
+    """
+    if not checkpoint_names:
+        raise ValueError(
+            "build_merged_lora_snapshot requires at least one checkpoint, got empty sequence."
+        )
+    if len(checkpoint_names) != len(weights):
+        raise ValueError(
+            "build_merged_lora_snapshot expected len(checkpoint_names) == len(weights), "
+            f"got len(checkpoint_names)={len(checkpoint_names)}, len(weights)={len(weights)}."
+        )
+
+    teacher_params = [list(adapter.get_named_parameters(n)) for n in checkpoint_names]
+    # Accumulate per slot in fp32 to avoid precision loss, then cast back.
+    merged: List[torch.Tensor] = []
+    for slot in zip(*teacher_params, strict=True):
+        acc = torch.zeros_like(slot[0], dtype=torch.float32)
+        for weight, tensor in zip(weights, slot, strict=True):
+            acc = acc + float(weight) * tensor.detach().to(torch.float32)
+        merged.append(acc.to(slot[0].dtype))
+
+    adapter.add_named_parameters(name, device=device, overwrite=True)
+    adapter.update_named_parameters(name, new_parameters=merged)
+    logger.info(
+        f"Built weight-merged LoRA snapshot {name!r} from {len(checkpoint_names)} "
+        f"checkpoint(s) with weights={list(weights)} (device={str(device)!r})."
+    )
+    return name
 
 
 def cache_scheduler_step_signature(

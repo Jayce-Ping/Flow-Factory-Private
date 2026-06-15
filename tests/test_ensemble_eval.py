@@ -25,7 +25,9 @@ import torch
 
 from flow_factory.hparams.training_args import EnsembleEvalTrainingArguments
 from flow_factory.trainers.ensemble_eval.common import (
+    MERGED_SNAPSHOT_NAME,
     _dynamic_kl_weights,
+    build_merged_lora_snapshot,
     ensemble_forward_step,
     load_checkpoints,
     normalize_checkpoint_weights,
@@ -111,6 +113,98 @@ class TestEnsembleEvalTrainingArgumentsPostInit(unittest.TestCase):
                 group_size=1,
                 per_device_batch_size=1,
             )
+
+    def test_allows_weight_merge_with_uniform(self) -> None:
+        args = EnsembleEvalTrainingArguments(
+            checkpoint_paths=["/tmp/a", "/tmp/b"],
+            ensemble_blend_mode="weight_merge",
+            ensemble_blend_weighting="uniform",
+            unique_sample_num_per_epoch=1,
+            group_size=1,
+            per_device_batch_size=1,
+        )
+        self.assertEqual(args.ensemble_blend_mode, "weight_merge")
+
+    def test_rejects_weight_merge_with_kl_weighting(self) -> None:
+        with self.assertRaises(ValueError):
+            EnsembleEvalTrainingArguments(
+                checkpoint_paths=["/tmp/a", "/tmp/b"],
+                ensemble_blend_mode="weight_merge",
+                ensemble_blend_weighting="kl",
+                unique_sample_num_per_epoch=1,
+                group_size=1,
+                per_device_batch_size=1,
+            )
+
+
+class TestBuildMergedLoraSnapshot(unittest.TestCase):
+    class _MergeAdapter:
+        """Minimal adapter stub exercising the named-parameter snapshot API."""
+
+        def __init__(self, snapshots: Dict[str, List[torch.Tensor]]) -> None:
+            self._snap: Dict[str, Any] = dict(snapshots)
+
+        def get_named_parameters(self, name: str) -> List[torch.Tensor]:
+            return self._snap[name]
+
+        def list_named_parameters(self) -> List[str]:
+            return list(self._snap)
+
+        def add_named_parameters(
+            self, name: str, device: Any = None, overwrite: bool = True
+        ) -> None:
+            self._snap[name] = None
+
+        def update_named_parameters(self, name: str, new_parameters: Any = None) -> None:
+            self._snap[name] = list(new_parameters)
+
+    def test_uniform_average(self) -> None:
+        adapter = self._MergeAdapter(
+            {
+                "eval_ckpt_0": [torch.tensor([2.0, 0.0]), torch.tensor([[4.0]])],
+                "eval_ckpt_1": [torch.tensor([0.0, 4.0]), torch.tensor([[0.0]])],
+            }
+        )
+        name = build_merged_lora_snapshot(
+            adapter, ["eval_ckpt_0", "eval_ckpt_1"], [0.5, 0.5]
+        )
+        self.assertEqual(name, MERGED_SNAPSHOT_NAME)
+        merged = adapter.get_named_parameters(MERGED_SNAPSHOT_NAME)
+        torch.testing.assert_close(merged[0], torch.tensor([1.0, 2.0]))
+        torch.testing.assert_close(merged[1], torch.tensor([[2.0]]))
+
+    def test_weighted_average(self) -> None:
+        adapter = self._MergeAdapter(
+            {
+                "eval_ckpt_0": [torch.tensor([10.0])],
+                "eval_ckpt_1": [torch.tensor([0.0])],
+            }
+        )
+        build_merged_lora_snapshot(adapter, ["eval_ckpt_0", "eval_ckpt_1"], [0.25, 0.75])
+        merged = adapter.get_named_parameters(MERGED_SNAPSHOT_NAME)
+        torch.testing.assert_close(merged[0], torch.tensor([2.5]))
+
+    def test_preserves_dtype(self) -> None:
+        adapter = self._MergeAdapter(
+            {
+                "eval_ckpt_0": [torch.tensor([2.0, 4.0], dtype=torch.bfloat16)],
+                "eval_ckpt_1": [torch.tensor([4.0, 8.0], dtype=torch.bfloat16)],
+            }
+        )
+        build_merged_lora_snapshot(adapter, ["eval_ckpt_0", "eval_ckpt_1"], [0.5, 0.5])
+        merged = adapter.get_named_parameters(MERGED_SNAPSHOT_NAME)
+        self.assertEqual(merged[0].dtype, torch.bfloat16)
+        torch.testing.assert_close(merged[0], torch.tensor([3.0, 6.0], dtype=torch.bfloat16))
+
+    def test_rejects_length_mismatch(self) -> None:
+        adapter = self._MergeAdapter({"eval_ckpt_0": [torch.tensor([1.0])]})
+        with self.assertRaises(ValueError):
+            build_merged_lora_snapshot(adapter, ["eval_ckpt_0"], [0.5, 0.5])
+
+    def test_rejects_empty(self) -> None:
+        adapter = self._MergeAdapter({})
+        with self.assertRaises(ValueError):
+            build_merged_lora_snapshot(adapter, [], [])
 
 
 class TestPcgradBlendNoisePreds(unittest.TestCase):

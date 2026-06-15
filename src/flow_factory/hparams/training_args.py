@@ -2424,6 +2424,7 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         "pcgrad_residual_normalized",
         "pcgrad_residual_channelwise",
         "ties",
+        "weight_merge",
     ] = field(
         default="pcgrad_residual",
         metadata={
@@ -2446,7 +2447,12 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
                 "extra forward pass per denoising step; recommended for "
                 "checkpoints trained on different objectives). "
                 "'ties': TIES-merging base-anchored per-element sign vote (also "
-                "adds one extra forward pass per denoising step)."
+                "adds one extra forward pass per denoising step). "
+                "'weight_merge': weight-space LoRA soup -- average the teacher "
+                "LoRA parameters once (sum_i w_i * theta_i) and run single-model "
+                "inference (one forward per step, no per-step blend). Uses static "
+                "checkpoint_weights only (ensemble_blend_weighting must be "
+                "'uniform')."
             )
         },
     )
@@ -2500,6 +2506,7 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
             "pcgrad_residual_normalized",
             "pcgrad_residual_channelwise",
             "ties",
+            "weight_merge",
         )
         if self.ensemble_blend_mode not in _valid_blend_modes:
             raise ValueError(
@@ -2518,6 +2525,16 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         if self.ensemble_blend_weighting not in _valid_weightings:
             raise ValueError(
                 f"ensemble_blend_weighting must be one of {_valid_weightings}, "
+                f"got ensemble_blend_weighting={self.ensemble_blend_weighting!r}."
+            )
+        if (
+            self.ensemble_blend_mode == "weight_merge"
+            and self.ensemble_blend_weighting != "uniform"
+        ):
+            raise ValueError(
+                "ensemble_blend_mode='weight_merge' merges teacher weights once "
+                "using static checkpoint_weights, so ensemble_blend_weighting must "
+                "be 'uniform' (per-sample KL weighting needs a per-step v_base); "
                 f"got ensemble_blend_weighting={self.ensemble_blend_weighting!r}."
             )
         _kl_weightable_modes = (

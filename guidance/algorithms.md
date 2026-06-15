@@ -515,6 +515,8 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
 3. Optionally re-weight teachers per-sample (`ensemble_blend_weighting`, see below) before blending.
 4. Call `scheduler.step` once with the blended `noise_pred`.
 
+**Weight-space merge (`weight_merge`).** Unlike the per-step output-space modes above, `weight_merge` is a one-time **parameter** merge: it averages the teacher LoRA weights once (`θ_merged = Σ_i w_i · θ_i`, using static `checkpoint_weights`) into a single merged adapter, then runs ordinary single-model inference (one forward per step, no per-step blend, no `v_b`). A cheap parameter-merge ("model soup") baseline. Note LoRA `A`/`B` are averaged independently, so it approximates rather than equals the exact effective-delta merge `Σ_i w_i (B_i A_i)`; `ensemble_blend_weighting` must be `uniform` (no per-step `v_b` to derive KL weights).
+
 **Dynamic teacher weighting (`ensemble_blend_weighting`).** Instead of static `checkpoint_weights`, weight each teacher per-sample by its teacher–base KL `D_i = ‖v_i − v_b‖²` (= velocity-MSE): `w_i ∝ π_i · D_i^α`, normalized per sample. `kl` (`α=+1`) up-weights the most-deviating specialist (per-sample soft routing — recovers the relevant expert's correction on specialist ensembles); `kl_inv` (`α=−1`) is inverse-variance and down-weights it; `uniform` (default) keeps static weights. Because the weight needs `v_b`, `kl`/`kl_inv` are only valid for the base-anchored modes (`pcgrad_residual*` and `ties`). See `docs/opd/kl_weighted_teacher_fusion.tex` for the derivation (weighting commutes with PCGrad projection, so it only re-weights the recombination).
 
 ### Key config fields (`train:`)
@@ -525,7 +527,7 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
 | `checkpoint_paths` | List of LoRA paths (local or HF Hub); `[]` = eval current adapter (no ensemble) |
 | `checkpoint_weights` | Optional blend weights (same length as paths); default uniform |
 | `checkpoint_param_device` | `'cpu'` or `'cuda'` for snapshot storage |
-| `ensemble_blend_mode` | `'weighted'`, `'pcgrad'`, `'pcgrad_channelwise'`, `'pcgrad_normalized'`, `'pcgrad_residual'`, `'pcgrad_residual_channelwise'`, `'pcgrad_residual_normalized'`, or `'ties'` |
+| `ensemble_blend_mode` | `'weighted'`, `'pcgrad'`, `'pcgrad_channelwise'`, `'pcgrad_normalized'`, `'pcgrad_residual'`, `'pcgrad_residual_channelwise'`, `'pcgrad_residual_normalized'`, `'ties'`, or `'weight_merge'` (weight-space LoRA soup; single-model inference) |
 | `pcgrad_eps` | Minimum squared norm per batch element in PCGrad projection (default `1e-8`) |
 | `ties_density` | `ties` only: fraction of top-magnitude entries kept per task vector before the sign vote (default `1.0` = no trim; must be in `(0, 1]`) |
 | `ensemble_blend_weighting` | `'uniform'` (default), `'kl'`, or `'kl_inv'`: per-sample teacher weighting by `‖v_i − v_b‖²`. `kl`/`kl_inv` require a base-anchored mode (`pcgrad_residual*` or `ties`) |

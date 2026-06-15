@@ -249,13 +249,21 @@ class TestLoadMethodSpecs(unittest.TestCase):
         specs = cmp.build_baseline_specs(names, paths)
         self.assertEqual(
             [s.label for s in specs],
-            ["baseline_base", "baseline_OCR-Teacher", "baseline_GenEval-Teacher"],
+            [
+                "baseline_base",
+                "baseline_OCR-Teacher",
+                "baseline_GenEval-Teacher",
+                "baseline_weight_merge",
+            ],
         )
         self.assertEqual(specs[0].kind, "base")
         self.assertIsNone(specs[0].checkpoint_name)
         self.assertEqual(specs[1].kind, "single")
         self.assertEqual(specs[1].checkpoint_name, "eval_ckpt_0")
         self.assertEqual(specs[2].checkpoint_name, "eval_ckpt_1")
+        # Weight-space soup baseline: no specific checkpoint, weight_merge kind.
+        self.assertEqual(specs[3].kind, "weight_merge")
+        self.assertIsNone(specs[3].checkpoint_name)
         # Every baseline runs as a plain weighted forward (no PCGrad/TIES).
         for spec in specs:
             self.assertEqual(spec.blend_mode, "weighted")

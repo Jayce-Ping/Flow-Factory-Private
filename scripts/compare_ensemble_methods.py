@@ -121,6 +121,9 @@ class MethodSpec:
       ``blend_mode='weighted'``, weight ``1.0``).
     - ``'base'``: the pretrained base model with all LoRA adapters disabled
       (no checkpoint, no ensemble patch).
+    - ``'weight_merge'``: weight-space LoRA soup baseline -- average the teacher
+      LoRA parameters once into a merged snapshot, then run single-model
+      inference (one forward per step).
     """
 
     label: str
@@ -193,9 +196,10 @@ def build_baseline_specs(
     """Reference columns: the pretrained base model plus each teacher alone.
 
     These are not blends; they bound the ensemble from below so the report shows
-    how much each fusion method gains over (a) the untuned base and (b) the best
-    single specialist. ``checkpoint_names`` and ``checkpoint_paths`` are aligned
-    (``load_checkpoints`` returns ``eval_ckpt_i`` in ``checkpoint_paths`` order).
+    how much each fusion method gains over (a) the untuned base, (b) the best
+    single specialist, and (c) a naive weight-space LoRA soup. ``checkpoint_names``
+    and ``checkpoint_paths`` are aligned (``load_checkpoints`` returns
+    ``eval_ckpt_i`` in ``checkpoint_paths`` order).
     """
     if len(checkpoint_names) != len(checkpoint_paths):
         raise ValueError(
@@ -225,6 +229,16 @@ def build_baseline_specs(
                 checkpoint_name=str(name),
             )
         )
+    specs.append(
+        MethodSpec(
+            label="baseline_weight_merge",
+            blend_mode="weighted",
+            weighting="uniform",
+            ties_density=1.0,
+            config_path="",
+            kind="weight_merge",
+        )
+    )
     return specs
 
 
@@ -252,20 +266,41 @@ def _configure_trainer_for_spec(
             )
         trainer._checkpoint_names = [spec.checkpoint_name]
         trainer._weights = [1.0]
+    elif spec.kind == "weight_merge":
+        # Weight-space LoRA soup: merge the teachers once into a single snapshot,
+        # then run it as a single merged checkpoint via the 'weighted' path.
+        from flow_factory.trainers.ensemble_eval.common import (
+            MERGED_SNAPSHOT_NAME,
+            build_merged_lora_snapshot,
+        )
+
+        if MERGED_SNAPSHOT_NAME not in trainer.adapter.list_named_parameters():
+            build_merged_lora_snapshot(
+                trainer.adapter,
+                base_checkpoint_names,
+                base_weights,
+                device=training_args.checkpoint_param_device,
+            )
+        trainer._checkpoint_names = [MERGED_SNAPSHOT_NAME]
+        trainer._weights = [1.0]
     elif spec.kind == "blend":
         trainer._checkpoint_names = list(base_checkpoint_names)
         trainer._weights = list(base_weights)
     else:
         raise ValueError(
-            f"MethodSpec.kind must be 'blend', 'single', or 'base', got {spec.kind!r}."
+            "MethodSpec.kind must be 'blend', 'single', 'base', or 'weight_merge', "
+            f"got {spec.kind!r}."
         )
 
-    training_args.ensemble_blend_mode = spec.blend_mode
+    # weight_merge runs single-model inference, so drive it as plain 'weighted'.
+    effective_blend_mode = "weighted" if spec.kind == "weight_merge" else spec.blend_mode
+    training_args.ensemble_blend_mode = effective_blend_mode
     training_args.ensemble_blend_weighting = spec.weighting
     training_args.ties_density = spec.ties_density
+    trainer._effective_blend_mode = effective_blend_mode
     trainer._pcgrad_generator = (
         torch.Generator().manual_seed(int(eval_seed))
-        if (spec.blend_mode.startswith("pcgrad") and trainer._checkpoint_names)
+        if (effective_blend_mode.startswith("pcgrad") and trainer._checkpoint_names)
         else None
     )
 
@@ -275,8 +310,9 @@ def _spec_eval_context(trainer: Any, spec: MethodSpec):
     """Inference context for one column.
 
     ``base`` runs the standard (unpatched) forward with adapters disabled via
-    ``use_ref_parameters``; ``blend`` / ``single`` run the ensemble forward patch
-    (``single`` reduces to that one teacher's ``noise_pred``).
+    ``use_ref_parameters``; ``blend`` / ``single`` / ``weight_merge`` run the
+    ensemble forward patch (``single`` reduces to that one teacher's
+    ``noise_pred``; ``weight_merge`` reduces to the single merged snapshot).
     """
     if spec.kind == "base":
         with trainer._eval_inference_context(), trainer.adapter.use_ref_parameters():

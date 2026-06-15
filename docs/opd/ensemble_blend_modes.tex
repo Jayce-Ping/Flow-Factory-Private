@@ -70,13 +70,14 @@
 \section{设定与符号}
 %% ============================================================
 
-\texttt{ensemble-eval} trainer（\texttt{src/flow\_factory/trainers/ensemble\_eval/}）在每个去噪步把 $K$ 个 checkpoint 的 \texttt{noise\_pred} 融合为单个 $\vfused$，再做一次 \texttt{scheduler.step}。所有融合算子的入口是 \texttt{ensemble\_forward\_step}（\texttt{common.py}），其分发逻辑为：
+\texttt{ensemble-eval} trainer（\texttt{src/flow\_factory/trainers/ensemble\_eval/}）在每个去噪步把 $K$ 个 checkpoint 的 \texttt{noise\_pred} 融合为单个 $\vfused$，再做一次 \texttt{scheduler.step}。\emph{输出空间} 融合算子的入口是 \texttt{ensemble\_forward\_step}（\texttt{common.py}），其分发逻辑为：
 \[
 \text{vector}\in\{\underbrace{v_i}_{\text{full velocity}},\ \underbrace{\tau_i=v_i-\vb}_{\text{residual delta}}\}
 \ \times\
 \text{projection}\in\{\text{global},\ \text{channelwise},\ \text{normalized}\}
 \ \cup\ \{\texttt{weighted},\ \texttt{ties}\}.
 \]
+此外 \texttt{weight\_merge}（\S\ref{sec:weight_merge}）在 \emph{参数空间} 一次性融合（不经 per-step 路径），作为 model-soup baseline。
 
 \paragraph{符号约定。} 所有量均为 \emph{per-sample}（固定 batch 样本 $b$ 与时间步 $k$，省略上下标）：
 \begin{center}
@@ -199,6 +200,37 @@ base-anchored。在 task vectors $\{\tau_i\}$ 上做 TIES-merging（Yadav et al.
 \end{definition}
 
 直觉：逐元素地"投票"决定该坐标应往哪个方向修正，再只让赞成方贡献，逆向 teacher 被直接剔除（而非像 PCGrad 那样按投影削减）。这是一种比 PCGrad 更"硬"的冲突消解。
+
+%% ============================================================
+\section{Weight Merge：权重空间融合（model soup）}
+\label{sec:weight_merge}
+%% ============================================================
+
+上述所有模式都在 \emph{输出空间}（per-step velocity）上融合，每步需 $K$ 次（residual/ties 为 $K{+}1$ 次）前向。\texttt{weight\_merge} 则在 \emph{参数空间} 上融合，且只融合一次。
+
+\begin{definition}[\texttt{weight\_merge}]
+\label{def:weight_merge}
+设 teacher $i$ 的 LoRA 参数为 $\theta_i$（与 base 架构对齐的张量列表）。一次性做权重空间加权平均，得到单个合并 LoRA：
+\begin{equation}
+\theta_{\mathrm{merged}} \;=\; \sum_{i=1}^{K} w_i\,\theta_i,\qquad w_i=\pi_i\ (\text{静态 \texttt{checkpoint\_weights}，默认 }1/K),
+\label{eq:weight_merge}
+\end{equation}
+随后用 $\theta_{\mathrm{merged}}$ 做 \emph{普通单模型} 推理（每步仅 1 次前向，无 per-step blend、无 $\vb$）。实现见 \texttt{build\_merged\_lora\_snapshot}：对齐的 teacher 快照逐槽 fp32 加权求和，写入合并快照后经 \texttt{use\_named\_parameters} 单模型推理。
+\end{definition}
+
+\begin{remark}[LoRA 双线性：近似而非精确 delta merge]
+\label{rem:bilinear}
+LoRA 的有效增量为 $\Delta W_i=B_iA_i$（双线性）。\eqref{eq:weight_merge} 对 $A_i,B_i$ \emph{分别} 平均，故
+\[
+\Bigl(\textstyle\sum_i w_iB_i\Bigr)\Bigl(\sum_i w_iA_i\Bigr)\ \neq\ \sum_i w_i\,B_iA_i
+\]
+即 \texttt{weight\_merge} 复现的是左式（廉价的 LoRA soup），\emph{不等于} 右式的精确 task-arithmetic delta merge。这是有意为之的简单基线。又因无 per-step $\vb$，KL 动态加权不适用，\texttt{ensemble\_blend\_weighting} 必须为 \texttt{uniform}。
+\end{remark}
+
+\begin{remark}[系数性质与成本]
+\label{rem:wm_props}
+权重 $\theta_{\mathrm{merged}}$ 是 teacher 参数的凸组合（$w_i\ge0,\sum w_i=1$），但由于扩散映射对参数高度非线性，\emph{输出} $\vfused$ 一般不是各 teacher 输出 $v_i$ 的凸组合（与 \texttt{weighted} 的输出空间凸组合不同）。成本上最省：合并一次后每步单前向，远低于 PCGrad/TIES 的 $K$/$K{+}1$ 次。
+\end{remark}
 
 %% ============================================================
 \section{核心理论：退化关系与 base 锚定的必要性}
@@ -336,11 +368,12 @@ w_i(\alpha)=\frac{\pi_i\,D_i^{\alpha}}{\sum_j \pi_j\,D_j^{\alpha}},\qquad
 \texttt{pcgrad\_residual\_channelwise} & 同上，逐 channel & 细粒度（残差） & \ding{51} \\
 \texttt{pcgrad\_residual\_normalized} & $\vb+\sum_i w_i n_i^\tau p_i^\tau$ & 单位方向（残差） & \ding{51} \\
 \texttt{ties} & $\vb+\tau_{\mathrm{merged}}$ & 符号选举$+$剔除 & \ding{51} \\
+\texttt{weight\_merge} & 单模型 $f(\theta_{\mathrm{merged}})$，$\theta_{\mathrm{merged}}{=}\sum_i w_i\theta_i$ & 无（参数空间） & \ding{55} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\noindent 加权选项 \texttt{ensemble\_blend\_weighting}$\in\{$\texttt{uniform}, \texttt{kl}, \texttt{kl\_inv}$\}$ 仅对带 \ding{51}（base-anchored）的行有效。
+\noindent 加权选项 \texttt{ensemble\_blend\_weighting}$\in\{$\texttt{uniform}, \texttt{kl}, \texttt{kl\_inv}$\}$ 仅对带 \ding{51}（base-anchored）的行有效；\texttt{weight\_merge} 仅支持 \texttt{uniform}（无 per-step $\vb$）。注意 \texttt{weight\_merge} 在 \emph{参数空间} 融合、每步仅 1 次前向，其余模式在 \emph{输出空间} 融合。
 
 \begin{center}
 \begin{tabular}{lll}
@@ -352,6 +385,7 @@ w_i(\alpha)=\frac{\pi_i\,D_i^{\alpha}}{\sum_j \pi_j\,D_j^{\alpha}},\qquad
 \texttt{pcgrad\_residual} 系列 & 实质不同（命题~\ref{prop:residual}） & 保留 \\
 \texttt{ties} & 实质不同 & 保留 \\
 \texttt{*\_kl} / \texttt{*\_kl\_inv} & 残差 $+$ 动态重组 & 保留 \\
+\texttt{weight\_merge} & 参数空间（非输出空间） & 保留（baseline） \\
 \bottomrule
 \end{tabular}
 \end{center}

@@ -37,8 +37,10 @@ from ...hparams import EnsembleEvalTrainingArguments
 from ...samples import BaseSample
 from ...utils.logger_utils import setup_logger
 from .common import (
+    MERGED_SNAPSHOT_NAME,
     PCGradStats,
     TIESStats,
+    build_merged_lora_snapshot,
     cache_scheduler_step_signature,
     ensemble_forward_step,
     load_checkpoints,
@@ -57,6 +59,10 @@ class EnsembleEvalTrainer(BaseTrainer):
 
         self._checkpoint_names: List[str] = []
         self._weights: List[float] = []
+        # Effective per-step blend mode. Equals ensemble_blend_mode except for
+        # 'weight_merge', which is a one-time weight-space merge run as a single
+        # merged checkpoint via the ordinary 'weighted' path (one forward/step).
+        self._effective_blend_mode: str = self.training_args.ensemble_blend_mode
         if self.training_args.checkpoint_paths:
             self._checkpoint_names = load_checkpoints(
                 self.adapter,
@@ -68,7 +74,23 @@ class EnsembleEvalTrainer(BaseTrainer):
                 len(self._checkpoint_names),
             )
             blend_mode = self.training_args.ensemble_blend_mode
-            if blend_mode != "weighted" and len(self._checkpoint_names) == 1:
+            if blend_mode == "weight_merge":
+                # Collapse the teachers into one merged LoRA snapshot now; eval then
+                # runs single-model inference (single merged checkpoint, weighted w=1).
+                build_merged_lora_snapshot(
+                    self.adapter,
+                    self._checkpoint_names,
+                    self._weights,
+                    device=self.training_args.checkpoint_param_device,
+                )
+                self._checkpoint_names = [MERGED_SNAPSHOT_NAME]
+                self._weights = [1.0]
+                self._effective_blend_mode = "weighted"
+                logger.info(
+                    "Ensemble eval: weight_merge -> single merged LoRA snapshot "
+                    f"{MERGED_SNAPSHOT_NAME!r} (single-model inference)."
+                )
+            elif blend_mode != "weighted" and len(self._checkpoint_names) == 1:
                 logger.info(
                     f"Ensemble eval: {blend_mode!r} blend with one checkpoint is "
                     "equivalent to weighted blend (no conflict pairs)."
@@ -85,10 +107,7 @@ class EnsembleEvalTrainer(BaseTrainer):
 
         self._sched_cache = cache_scheduler_step_signature(self.adapter.scheduler.step)
         self._pcgrad_generator: Optional[torch.Generator] = None
-        if (
-            self._checkpoint_names
-            and self.training_args.ensemble_blend_mode.startswith("pcgrad")
-        ):
+        if self._checkpoint_names and self._effective_blend_mode.startswith("pcgrad"):
             self._pcgrad_generator = torch.Generator().manual_seed(
                 int(self.training_args.seed)
             )
@@ -164,7 +183,9 @@ class EnsembleEvalTrainer(BaseTrainer):
         original_forward = self.adapter.forward
 
         # Create stats accumulator for conflict-resolution modes (deferred logging).
-        blend_mode = self.training_args.ensemble_blend_mode
+        # Use the effective mode so 'weight_merge' runs as 'weighted' (single merged
+        # checkpoint) rather than re-entering a per-step blend path.
+        blend_mode = self._effective_blend_mode
         blend_stats: Optional[Union[PCGradStats, TIESStats]] = None
         if blend_mode.startswith("pcgrad"):
             blend_stats = PCGradStats(

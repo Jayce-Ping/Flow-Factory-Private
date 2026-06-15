@@ -1,15 +1,8 @@
-# Multi-checkpoint offline ensemble evaluation — SD3.5 LoRA example.
-#
-# Loads multiple LoRA checkpoints as named snapshots (OPD-style) and runs one
-# evaluation pass per entry in eval.test_sets. At each denoising step, fuse
-# per-checkpoint noise_pred, then one scheduler.step:
-#   weighted (default): noise_pred = sum_i w_i * noise_pred_i
-#   pcgrad: PCGrad on w_i * noise_pred_i, then sum projected vectors
-#
-# Prerequisites:
-#   - `finetune_type: lora` with rank/alpha matching every checkpoint.
-#   - Each `checkpoint_paths` entry: local dir from `save_checkpoint()` or HF Hub id.
-#   - Each test set: `{dataset_dir}/{split}.jsonl` (default split: test).
+# Ensemble-eval ablation (SD3.5 LoRA): weight_merge fusion (weight-space LoRA soup).
+# Average the 3 teacher LoRA parameters once (sum_i w_i * theta_i over
+# OCR + PickScore + GenEval) into a single merged LoRA, then run single-model
+# inference (one forward per denoising step, no per-step blend).
+# Run: ff-train ensemble-eval/lora/sd3_5/ablations/3_geneval-ocr-pickscore_weight_merge.yaml
 
 # Environment Configuration
 launcher: "accelerate"
@@ -22,8 +15,8 @@ mixed_precision: "bf16"
 # train split only (eval-only trainer does not sample); eval data comes from eval.test_sets
 data:
   dataset_dir: "dataset/ocr"
-  preprocessing_batch_size: 8
-  dataloader_num_workers: 16
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 64
   force_reprocess: false
   cache_dir: "~/.cache/flow_factory/datasets"
   max_dataset_size: null
@@ -41,8 +34,8 @@ model:
   resume_type: null
 
 log:
-  run_name: null
-  project: "Flow-Factory"
+  run_name: "3_geneval-ocr-pickscore_weight_merge"
+  project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
   save_freq: 0
@@ -53,15 +46,16 @@ train:
   trainer_type: 'ensemble-eval'
 
   checkpoint_paths:
-    - "jieliu/SD3.5M-FlowGRPO-Text"
-    - "jieliu/SD3.5M-FlowGRPO-PickScore"
+    - "Jayce-Ping/OCR-Teacher"           # OCR/Text checkpoint
+    - "Jayce-Ping/Pickscore-Teacher"     # PickScore checkpoint
+    - "Jayce-Ping/GenEval-Teacher"       # GenEval checkpoint
   # Use [] to eval current adapter only (no ensemble); cannot combine with checkpoint_weights
   checkpoint_weights: null  # uniform; or e.g. [0.6, 0.4]
   checkpoint_param_device: 'cuda'
-  ensemble_blend_mode: weighted  # weighted | pcgrad | pcgrad_channelwise | pcgrad_normalized | pcgrad_residual | pcgrad_residual_channelwise | pcgrad_residual_normalized | ties | weight_merge
+  ensemble_blend_mode: weight_merge  # weighted | pcgrad | pcgrad_channelwise | pcgrad_normalized | pcgrad_residual | pcgrad_residual_channelwise | pcgrad_residual_normalized | ties | weight_merge
   pcgrad_eps: 1.0e-8
   ties_density: 1.0  # ties only: fraction of top-|tau| entries kept per task (1.0 = no trim)
-  ensemble_blend_weighting: uniform  # uniform | kl | kl_inv (kl/kl_inv require a residual or ties blend mode; weight teachers by ||v_i - v_base||^2)
+  ensemble_blend_weighting: uniform  # weight_merge requires uniform (static checkpoint_weights only)
 
   max_epochs: 1
   unique_sample_num_per_epoch: 1
@@ -102,6 +96,10 @@ eval:
       dataset_dir: dataset/pickscore
       split: test
       eval_reward_names: [pick_score]
+    - name: geneval
+      dataset_dir: dataset/geneval
+      split: test
+      eval_reward_names: [geneval, pick_score]
 
 rewards: []
 
@@ -117,4 +115,12 @@ eval_rewards:
     batch_size: 64
     device: "cuda"
     dtype: bfloat16
+    async_reward: false
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    # NOTE: GenEval reward 内部强制 fp32 计算（autocast disabled + model.float()），
+    # 此处 dtype 仅作配置占位，实际不被消费；显式写 float32 避免"yaml 控制 GenEval 精度"的误会。
+    dtype: float32
     async_reward: false
