@@ -110,36 +110,48 @@ class EnsembleEvalTrainer(BaseTrainer):
 
     @contextmanager
     def _bypass_wrapped_transformer(self) -> Iterator[None]:
-        """Run the eval scope against the accelerator-unwrapped transformer.
+        """Run the eval scope against the unwrapped ``pipeline.transformer`` --
+        **only under plain DDP**, where it is both necessary and safe.
 
-        Two effects, both required for correct multi-checkpoint eval under DDP:
+        Plain DDP: the prepared (DDP-wrapped) transformer's forward reads stale
+        replica params in ``no_grad``, so per-checkpoint ``use_named_parameters``
+        ``.data.copy_()`` swaps are not observed and every teacher collapses to
+        identical ``noise_pred`` (all blend modes degenerate to ``weighted``). We
+        therefore run forwards against the unwrapped module for the eval scope,
+        using ``adapter.get_component_unwrapped`` (== ``pipeline.transformer``, the
+        in-place LoRA-injected base). This mirrors
+        ``mof.utils.bypass_ddp_for_weight_swap``.
 
-        1. Wrapper bypass: under DDP the wrapped forward reads stale bucket params
-           in ``no_grad``, so per-checkpoint ``use_named_parameters`` swaps are not
-           observed and every teacher collapses to identical ``noise_pred`` (all
-           blend modes degenerate to ``weighted``).
-        2. PeftModel preservation: we swap to ``accelerator.unwrap_model(component)``
-           (the ``PeftModel``), NOT ``adapter.get_component_unwrapped`` /
-           ``mof.utils.bypass_ddp_for_weight_swap`` (which target the raw
-           ``pipeline.transformer`` -- an in-place LoRA-injected base that is NOT a
-           ``PeftModel``). ``use_ref_parameters`` (the residual / ties base
-           velocity ``v_base``) requires a ``PeftModel`` to call
-           ``disable_adapter()``; otherwise it logs "No LoRA adapters found to
-           disable" and computes ``v_base`` without disabling the active adapter.
+        We DO NOT bypass for:
+          * DeepSpeed (ZeRO-1/2): the swap is reflected through the wrapped forward
+            natively -- this is why ff-train's default ``deepspeed_zero2`` ensemble
+            eval keeps teachers distinct with no bypass. Bypassing would just run a
+            non-canonical path for no benefit.
+          * Sharded backends (DeepSpeed ZeRO-3 / FSDP): the module holds only param
+            *shards* gathered on-demand via hooks on the wrapper. Forwarding through
+            the unwrapped module would read empty/partial weights -> garbage/crash.
 
-        Both the swapped weights and the forward target the same unwrapped module,
-        so it is correct for plain DDP and DeepSpeed ZeRO-2 (full, unsharded
-        params) and a no-op when nothing is wrapped (single process).
+        Note: when the bypass IS active, ``pipeline.transformer`` is not a
+        ``peft.PeftModel`` but its submodules are PEFT tuner layers, so
+        ``use_ref_parameters`` (residual / ties ``v_base``) disables those tuner
+        layers directly -- ``v_base`` is the exact base model and no warning is
+        emitted. On the DeepSpeed path the active component stays the wrapped
+        ``PeftModel``, so ``use_ref_parameters`` takes its normal branch.
         """
         wrapped = self.adapter.get_component("transformer")
-        unwrapped = self.accelerator.unwrap_model(wrapped)
-        swapped = unwrapped is not wrapped
-        if swapped:
+        unwrapped = self.adapter.get_component_unwrapped("transformer")
+        needs_bypass = (
+            unwrapped is not wrapped
+            and not self.adapter._is_deepspeed()
+            and not self.adapter._is_fsdp()
+            and not self.adapter._is_param_sharded()
+        )
+        if needs_bypass:
             self.adapter.set_component("transformer", unwrapped)
         try:
             yield
         finally:
-            if swapped:
+            if needs_bypass:
                 self.adapter.set_component("transformer", wrapped)
 
     @contextmanager
@@ -189,12 +201,12 @@ class EnsembleEvalTrainer(BaseTrainer):
         # would otherwise serve stale casted weights across checkpoint swaps.
         prev_cache_enabled = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
-        # Bypass the DDP/DeepSpeed wrapper for the whole inference scope so the
+        # Under plain DDP, bypass the wrapper for the inference scope so the
         # per-checkpoint use_named_parameters swap (.data.copy_) and base_forward
-        # read the SAME unwrapped transformer; otherwise stale wrapper params under
+        # read the unwrapped transformer; otherwise stale DDP replica params under
         # no_grad make every checkpoint produce identical noise_pred (all blend
-        # modes collapse to weighted). Unwraps to the PeftModel so use_ref_parameters
-        # (residual / ties v_base) can still disable adapters. See CLAUDE.md.
+        # modes collapse to weighted). No-op under DeepSpeed (native) and sharded
+        # backends (unsafe). See _bypass_wrapped_transformer + CLAUDE.md.
         with self._bypass_wrapped_transformer():
             try:
                 yield

@@ -997,17 +997,20 @@ class TestBlendWeightingValidation(unittest.TestCase):
 
 
 class TestEvalInferenceContextDDPBypass(unittest.TestCase):
-    """The ensemble eval context must bypass the DDP/DeepSpeed wrapper so the
-    per-teacher use_named_parameters swap actually takes effect (otherwise all
-    teachers produce identical noise_pred and every blend mode collapses)."""
+    """The ensemble eval context bypasses the wrapper ONLY under plain DDP, so the
+    per-teacher use_named_parameters swap takes effect (otherwise teachers produce
+    identical noise_pred and every blend mode collapses). It must NOT bypass under
+    DeepSpeed (swaps reflected natively) or sharded backends (ZeRO-3 / FSDP hold
+    only param shards -> bypassing would read empty/garbage weights)."""
 
-    def test_bypass_swaps_to_unwrapped_transformer_in_context(self) -> None:
+    @staticmethod
+    def _make_trainer(*, is_deepspeed: bool, is_fsdp: bool = False, is_sharded: bool = False):
         from types import SimpleNamespace
 
         cls = get_trainer_class("ensemble-eval")
 
-        # `unwrapped` stands in for the accelerator-unwrapped PeftModel; `wrapped`
-        # for the DDP/DeepSpeed-prepared module stored in _components.
+        # `unwrapped` stands in for pipeline.transformer (get_component_unwrapped);
+        # `wrapped` for the prepared module stored in _components.
         wrapped = torch.nn.Linear(1, 1)
         unwrapped = torch.nn.Linear(1, 1)
 
@@ -1019,8 +1022,20 @@ class TestEvalInferenceContextDDPBypass(unittest.TestCase):
             def get_component(self, name: str):
                 return self._components[name]
 
+            def get_component_unwrapped(self, name: str):
+                return unwrapped
+
             def set_component(self, name: str, module) -> None:
                 self._components[name] = module
+
+            def _is_deepspeed(self) -> bool:
+                return is_deepspeed
+
+            def _is_fsdp(self) -> bool:
+                return is_fsdp
+
+            def _is_param_sharded(self) -> bool:
+                return is_sharded
 
         trainer = object.__new__(cls)
         trainer._checkpoint_names = ["eval_ckpt_0", "eval_ckpt_1"]
@@ -1028,24 +1043,104 @@ class TestEvalInferenceContextDDPBypass(unittest.TestCase):
         trainer._sched_cache = (frozenset(), False)
         trainer._pcgrad_generator = None
         trainer.adapter = _FakeAdapter()
-        trainer.accelerator = SimpleNamespace(
-            unwrap_model=lambda m: unwrapped if m is wrapped else m
-        )
         trainer.training_args = SimpleNamespace(
             ensemble_blend_mode="pcgrad",
             ensemble_blend_weighting="uniform",
             pcgrad_eps=1e-8,
             ties_density=1.0,
         )
+        return trainer, wrapped, unwrapped
 
+    def test_ddp_bypasses_to_unwrapped_transformer(self) -> None:
+        trainer, wrapped, unwrapped = self._make_trainer(is_deepspeed=False)
         self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
         with trainer._eval_inference_context():
-            # Inside the eval scope the active transformer must be the
-            # accelerator-unwrapped module (a PeftModel in practice) so both
-            # use_named_parameters swaps AND use_ref_parameters.disable_adapter work.
+            # Plain DDP: the active transformer must be the unwrapped
+            # pipeline.transformer so per-checkpoint swaps are observed.
             self.assertIs(trainer.adapter.get_component("transformer"), unwrapped)
         # Restored on exit.
         self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
+
+    def test_deepspeed_does_not_bypass(self) -> None:
+        trainer, wrapped, _ = self._make_trainer(is_deepspeed=True)
+        with trainer._eval_inference_context():
+            # DeepSpeed reflects .data.copy_() swaps natively -> keep the canonical
+            # wrapped path (matches ff-train's default deepspeed_zero2 behavior).
+            self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
+        self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
+
+    def test_sharded_backend_does_not_bypass(self) -> None:
+        trainer, wrapped, _ = self._make_trainer(is_deepspeed=False, is_sharded=True)
+        with trainer._eval_inference_context():
+            # ZeRO-3 / FSDP hold only param shards -> bypassing would read garbage.
+            self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
+        self.assertIs(trainer.adapter.get_component("transformer"), wrapped)
+
+
+class TestUseRefParametersInPlaceLoRA(unittest.TestCase):
+    """Under the DDP bypass the active transformer is the unwrapped
+    pipeline.transformer -- an in-place get_peft_model-injected module, *not* a
+    PeftModel wrapper. use_ref_parameters must still disable its LoRA (so the
+    residual/TIES v_base is the true base) and restore it on exit, instead of
+    warning and leaving the adapter active."""
+
+    def test_disables_and_restores_inplace_injected_lora(self) -> None:
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+        from peft import LoraConfig, get_peft_model
+
+        from flow_factory.models.abc import BaseAdapter
+
+        class _Tiny(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Linear(4, 4, bias=False)
+
+            def forward(self, x):
+                return self.proj(x)
+
+        # Concrete stub so the ABC can be instantiated; __init__ is bypassed and
+        # the abstract methods are never called by use_ref_parameters.
+        class _StubAdapter(BaseAdapter):
+            def decode_latents(self, *a, **k):  # pragma: no cover - stub
+                raise NotImplementedError
+
+            def forward(self, *a, **k):  # pragma: no cover - stub
+                raise NotImplementedError
+
+            def inference(self, *a, **k):  # pragma: no cover - stub
+                raise NotImplementedError
+
+            def load_pipeline(self, *a, **k):  # pragma: no cover - stub
+                raise NotImplementedError
+
+        base = _Tiny()
+        # Injects LoRA into base.proj in-place; the wrapper is discarded so the
+        # active component is the bare module (mirrors the DDP-bypass path).
+        peft_model = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, target_modules=["proj"]))
+        for name, param in peft_model.named_parameters():
+            if "lora_B" in name:
+                with torch.no_grad():
+                    param.add_(torch.randn_like(param))
+
+        adapter = object.__new__(_StubAdapter)
+        adapter.model_args = SimpleNamespace(finetune_type="lora")
+        adapter.target_module_map = {"transformer": None}
+        adapter.get_component = lambda name: base
+        adapter._unwrap = lambda module: module
+
+        x = torch.randn(3, 4)
+        out_lora = base(x).clone()
+        with adapter.use_ref_parameters():
+            out_ref = base(x).clone()
+        out_after = base(x).clone()
+
+        # LoRA disabled inside the context (output reverts to pure base) ...
+        self.assertFalse(torch.allclose(out_lora, out_ref))
+        self.assertTrue(torch.allclose(out_ref, base.proj.base_layer(x)))
+        # ... and restored on exit.
+        self.assertTrue(torch.allclose(out_lora, out_after))
 
 
 class TestEnsembleEvalRegistry(unittest.TestCase):

@@ -492,6 +492,13 @@ def main() -> None:  # noqa: C901 - orchestration script
                         stitch_batch_metadata(sub, gen_samples)
                         for pos, sample in zip(gen_positions, gen_samples):
                             gidx = batch_indices[pos]
+                            # Offload to CPU so freshly-generated samples match the
+                            # disk-loaded ones (also CPU after PIL canonicalization).
+                            # Otherwise the reward buffer mixes CUDA + CPU image
+                            # tensors and the 'pil' reward path's torch.stack raises
+                            # a cross-device error. Also frees GPU memory while the
+                            # whole test set accumulates before finalize().
+                            sample.to("cpu")
                             if args.save_images == "all" or (
                                 args.save_images == "gallery" and gidx < args.gallery_num_prompts
                             ):

@@ -36,6 +36,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from peft import get_peft_model, LoraConfig, PeftModel
+from peft.tuners.tuners_utils import BaseTunerLayer
 
 from huggingface_hub import split_torch_state_dict_into_shards
 from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
@@ -577,6 +578,25 @@ class BaseAdapter(ABC):
                             # Enter disable_adapter context for each component
                             stack.enter_context(unwrapped.disable_adapter())
                             enabled_any = True
+                        else:
+                            # In-place LoRA injection: the module is not a PeftModel
+                            # wrapper but its submodules are PEFT tuner layers. This
+                            # is what ensemble-eval's DDP bypass exposes (the active
+                            # component is the unwrapped ``pipeline.transformer``).
+                            # Toggle the tuner layers directly -- same effect as
+                            # ``PeftModel.disable_adapter()`` -- and restore on exit.
+                            tuner_layers = [
+                                m for m in unwrapped.modules() if isinstance(m, BaseTunerLayer)
+                            ]
+                            if tuner_layers:
+                                for layer in tuner_layers:
+                                    layer.enable_adapters(False)
+                                stack.callback(
+                                    lambda layers=tuner_layers: [
+                                        layer.enable_adapters(True) for layer in layers
+                                    ]
+                                )
+                                enabled_any = True
                 if not enabled_any:
                     logger.warning("No LoRA adapters found to disable in use_ref_parameters")
 
