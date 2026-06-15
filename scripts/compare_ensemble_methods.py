@@ -7,15 +7,19 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Side-by-side comparison of base-anchored ensemble-eval blend methods.
+"""Side-by-side comparison of ensemble-eval blend methods.
 
-By default compares the four blends that genuinely differ from the weighted sum:
-``pcgrad_residual``, ``pcgrad_residual_channelwise``,
-``pcgrad_residual_normalized``, and ``ties`` (see ``DEFAULT_METHODS``). The
-full-velocity modes (``weighted`` / ``pcgrad`` / ``pcgrad_channelwise`` /
+By default compares the ``weighted`` linear baseline against the base-anchored
+blends that genuinely differ from it (``pcgrad_residual`` and its channelwise /
+normalized / KL / inverse-KL variants, plus ``ties``; see ``DEFAULT_METHODS``).
+The remaining full-velocity modes (``pcgrad`` / ``pcgrad_channelwise`` /
 ``pcgrad_normalized``) are excluded because the per-teacher velocities share a
 dominant base direction, so PCGrad finds almost no sign conflicts and collapses
 to the weighted sum. Override with ``--methods`` to run any other subset.
+
+Reference columns (``--baselines``, on by default) prepend the pretrained base
+model (all LoRA adapters disabled) and each teacher checkpoint evaluated alone,
+bounding the ensemble from below (untuned base / best single specialist).
 
 Loads the base model + checkpoints + reward models ONCE, then for every selected
 method generates and scores every test-set prompt at a FIXED seed, saves the
@@ -54,6 +58,7 @@ import json
 import logging
 import math
 import statistics
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -75,22 +80,36 @@ logger = logging.getLogger("flow_factory.compare_ensemble_methods")
 
 @dataclass(frozen=True)
 class MethodSpec:
-    """One blend method: a label plus the three blend knobs to set on the trainer."""
+    """One evaluation column.
+
+    ``kind`` selects how the trainer is driven for this column:
+
+    - ``'blend'`` (default): ensemble the full checkpoint set with the YAML's
+      ``blend_mode`` / ``weighting`` / ``ties_density``.
+    - ``'single'``: a single-teacher baseline (only ``checkpoint_name`` active,
+      ``blend_mode='weighted'``, weight ``1.0``).
+    - ``'base'``: the pretrained base model with all LoRA adapters disabled
+      (no checkpoint, no ensemble patch).
+    """
 
     label: str
     blend_mode: str
     weighting: str
     ties_density: float
     config_path: str
+    kind: str = "blend"
+    checkpoint_name: Optional[str] = None
 
 
-# Default methods: the base-anchored blends (PCGrad on task deltas tau_i = v_i - v_base
-# and TIES sign-election), plus the KL / inverse-KL dynamic-weighting variants of
-# pcgrad_residual. The full-velocity modes ('weighted', 'pcgrad', 'pcgrad_channelwise',
-# 'pcgrad_normalized') degenerate to the weighted sum because v_i is dominated by the
-# shared base direction (near-zero sign conflicts), so only these produce outputs that
-# genuinely differ from 'pcgrad'/'weighted'.
+# Default methods: 'weighted' as the linear-blend baseline, plus the base-anchored
+# blends (PCGrad on task deltas tau_i = v_i - v_base and TIES sign-election) and the
+# KL / inverse-KL dynamic-weighting variants of pcgrad_residual. The remaining
+# full-velocity modes ('pcgrad', 'pcgrad_channelwise', 'pcgrad_normalized') are
+# omitted: v_i is dominated by the shared base direction (near-zero sign conflicts),
+# so they collapse onto 'weighted'. The base-anchored blends operate on deltas where
+# conflicts are real, so they genuinely differ from the baseline.
 DEFAULT_METHODS: Tuple[str, ...] = (
+    "3_geneval-ocr-pickscore_weighted",
     "3_geneval-ocr-pickscore_pcgrad_residual",
     "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
     "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
@@ -129,6 +148,111 @@ def load_method_specs(configs_glob: str) -> List[MethodSpec]:
         seen.add(s.label)
         unique.append(s)
     return unique
+
+
+def _checkpoint_short_label(path: str) -> str:
+    """Readable teacher label from a checkpoint path (``Org/OCR-Teacher`` -> ``OCR-Teacher``)."""
+    name = Path(str(path)).name
+    return name or str(path)
+
+
+def build_baseline_specs(
+    checkpoint_names: Sequence[str], checkpoint_paths: Sequence[str]
+) -> List[MethodSpec]:
+    """Reference columns: the pretrained base model plus each teacher alone.
+
+    These are not blends; they bound the ensemble from below so the report shows
+    how much each fusion method gains over (a) the untuned base and (b) the best
+    single specialist. ``checkpoint_names`` and ``checkpoint_paths`` are aligned
+    (``load_checkpoints`` returns ``eval_ckpt_i`` in ``checkpoint_paths`` order).
+    """
+    if len(checkpoint_names) != len(checkpoint_paths):
+        raise ValueError(
+            "build_baseline_specs expected aligned checkpoint_names and "
+            f"checkpoint_paths, got len(names)={len(checkpoint_names)}, "
+            f"len(paths)={len(checkpoint_paths)}."
+        )
+    specs: List[MethodSpec] = [
+        MethodSpec(
+            label="baseline_base",
+            blend_mode="weighted",
+            weighting="uniform",
+            ties_density=1.0,
+            config_path="",
+            kind="base",
+        )
+    ]
+    for name, path in zip(checkpoint_names, checkpoint_paths, strict=True):
+        specs.append(
+            MethodSpec(
+                label=f"baseline_{_checkpoint_short_label(path)}",
+                blend_mode="weighted",
+                weighting="uniform",
+                ties_density=1.0,
+                config_path="",
+                kind="single",
+                checkpoint_name=str(name),
+            )
+        )
+    return specs
+
+
+def _configure_trainer_for_spec(
+    trainer: Any,
+    spec: MethodSpec,
+    base_checkpoint_names: Sequence[str],
+    base_weights: Sequence[float],
+    eval_seed: int,
+) -> None:
+    """Fully (re)configure the trainer's ensemble state for one column.
+
+    Each column sets the trainer state from scratch (no reliance on the previous
+    iteration), so blend / single-teacher / base columns can be interleaved.
+    """
+    training_args = trainer.training_args
+    if spec.kind == "base":
+        trainer._checkpoint_names = []
+        trainer._weights = []
+    elif spec.kind == "single":
+        if spec.checkpoint_name not in base_checkpoint_names:
+            raise ValueError(
+                f"single-teacher spec {spec.label!r} references unknown checkpoint "
+                f"{spec.checkpoint_name!r}; available: {list(base_checkpoint_names)}."
+            )
+        trainer._checkpoint_names = [spec.checkpoint_name]
+        trainer._weights = [1.0]
+    elif spec.kind == "blend":
+        trainer._checkpoint_names = list(base_checkpoint_names)
+        trainer._weights = list(base_weights)
+    else:
+        raise ValueError(
+            f"MethodSpec.kind must be 'blend', 'single', or 'base', got {spec.kind!r}."
+        )
+
+    training_args.ensemble_blend_mode = spec.blend_mode
+    training_args.ensemble_blend_weighting = spec.weighting
+    training_args.ties_density = spec.ties_density
+    trainer._pcgrad_generator = (
+        torch.Generator().manual_seed(int(eval_seed))
+        if (spec.blend_mode.startswith("pcgrad") and trainer._checkpoint_names)
+        else None
+    )
+
+
+@contextmanager
+def _spec_eval_context(trainer: Any, spec: MethodSpec):
+    """Inference context for one column.
+
+    ``base`` runs the standard (unpatched) forward with adapters disabled via
+    ``use_ref_parameters``; ``blend`` / ``single`` run the ensemble forward patch
+    (``single`` reduces to that one teacher's ``noise_pred``).
+    """
+    if spec.kind == "base":
+        with trainer._eval_inference_context(), trainer.adapter.use_ref_parameters():
+            yield
+    else:
+        with trainer._eval_inference_context():
+            yield
 
 
 # =============================================================================
@@ -193,15 +317,27 @@ table.metrics { border-collapse: collapse; margin: 8px 0 16px; font-size: 13px; 
 table.metrics th, table.metrics td { border: 1px solid #8884; padding: 4px 10px; text-align: right; }
 table.metrics th.method, table.metrics td.method { text-align: left; font-weight: 600; white-space: nowrap; }
 table.metrics td.best { font-weight: 700; background: #2e7d3233; }
+table.metrics td.basebest { font-weight: 700; background: #6d4c4133; }
+table.metrics tr.baseline td, table.metrics tr.baseline th.method { color: #999; font-style: italic; }
+table.metrics tr.sep-below td, table.metrics tr.sep-below th { border-bottom: 2px solid #8886; }
+.badge { display: inline-block; font-size: 10px; font-weight: 700; line-height: 1.4; padding: 0 5px;
+         margin-left: 6px; border-radius: 8px; background: #8883; color: #777; font-style: normal;
+         vertical-align: middle; }
 .std { color: #999; font-size: 11px; }
+.legend { color: #888; font-size: 12px; margin: 4px 0 14px; }
+.legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin: 0 4px 0 12px;
+              vertical-align: middle; }
 .prompt-block { border: 1px solid #8883; border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
 .prompt-text { font-size: 14px; margin-bottom: 2px; }
 .prompt-meta { color: #888; font-size: 12px; margin-bottom: 8px; word-break: break-word; }
-.row { display: flex; flex-wrap: wrap; gap: 10px; }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
 .cell { width: 200px; }
+.cell.baseline .label { color: #999; font-style: italic; }
 .cell img { width: 200px; height: 200px; object-fit: cover; border-radius: 6px; background: #8882; display: block; }
+.cell.baseline img, .cell.baseline .missing { outline: 2px solid #6d4c4155; outline-offset: -2px; }
 .cell .label { font-size: 12px; font-weight: 600; margin-top: 3px; word-break: break-word; }
 .cell .scores { font-size: 11px; color: #888; }
+.sep { width: 2px; align-self: stretch; background: #8885; margin: 0 4px; border-radius: 1px; }
 .missing { width: 200px; height: 200px; display: flex; align-items: center; justify-content: center;
            border: 1px dashed #8886; border-radius: 6px; color: #888; font-size: 12px; }
 """
@@ -211,31 +347,60 @@ def _fmt(v: float) -> str:
     return "-" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:.4f}"
 
 
-def _aggregate_table_html(
-    test_set: str, methods: List[str], rewards: List[str], agg_ts: Dict[str, Any]
-) -> str:
-    # best (max mean) per reward column
+def _best_per_reward(
+    methods: Sequence[str], rewards: Sequence[str], agg_ts: Dict[str, Any]
+) -> Dict[str, float]:
+    """Max mean per reward over ``methods`` (NaN if none finite)."""
     best: Dict[str, float] = {}
     for reward in rewards:
         means = [agg_ts.get(reward, {}).get(m, {}).get("mean", float("nan")) for m in methods]
         finite = [x for x in means if not (isinstance(x, float) and math.isnan(x))]
         best[reward] = max(finite) if finite else float("nan")
+    return best
+
+
+def _aggregate_table_html(
+    test_set: str,
+    methods: List[str],
+    rewards: List[str],
+    agg_ts: Dict[str, Any],
+    baseline_methods: Sequence[str] = (),
+) -> str:
+    baseline_set = set(baseline_methods)
+    blend_methods = [m for m in methods if m not in baseline_set]
+    base_methods = [m for m in methods if m in baseline_set]
+    # Green highlights the best fusion method; brown marks the best baseline (the
+    # bar to beat). Computed within each group so a single teacher does not steal
+    # the "best method" marker.
+    best_blend = _best_per_reward(blend_methods, rewards, agg_ts)
+    best_base = _best_per_reward(base_methods, rewards, agg_ts)
 
     head = "".join(f"<th>{html.escape(r)}</th>" for r in rewards)
+    last_baseline = base_methods[-1] if base_methods else None
     rows = []
     for m in methods:
-        cells = [f'<td class="method">{html.escape(m)}</td>']
+        is_baseline = m in baseline_set
+        target = best_base if is_baseline else best_blend
+        hit_cls = "basebest" if is_baseline else "best"
+        row_cls = []
+        if is_baseline:
+            row_cls.append("baseline")
+        if m == last_baseline:
+            row_cls.append("sep-below")
+        badge = "<span class='badge'>ref</span>" if is_baseline else ""
+        cells = [f'<td class="method">{html.escape(m)}{badge}</td>']
         for reward in rewards:
             entry = agg_ts.get(reward, {}).get(m)
             if not entry:
                 cells.append("<td>-</td>")
                 continue
             mean, std = entry.get("mean", float("nan")), entry.get("std", float("nan"))
-            cls = "best" if (not math.isnan(mean) and mean >= best[reward] - 1e-12) else ""
+            cls = hit_cls if (not math.isnan(mean) and mean >= target[reward] - 1e-12) else ""
             cells.append(
                 f'<td class="{cls}">{_fmt(mean)}<span class="std"> &plusmn;{_fmt(std)}</span></td>'
             )
-        rows.append(f"<tr>{''.join(cells)}</tr>")
+        row_attr = f' class="{" ".join(row_cls)}"' if row_cls else ""
+        rows.append(f"<tr{row_attr}>{''.join(cells)}</tr>")
     return (
         f'<table class="metrics"><thead><tr><th class="method">method \\ reward</th>'
         f"{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
@@ -249,6 +414,9 @@ def render_html(
 ) -> str:
     """Build the self-contained comparison page. Pure function (no I/O)."""
     methods: List[str] = meta["methods"]
+    baseline_methods: List[str] = list(meta.get("baseline_methods", []))
+    baseline_set = set(baseline_methods)
+    last_baseline = baseline_methods[-1] if baseline_methods else None
     aggregate = summary["aggregate"]
     per_tag = summary.get("per_tag", {})
 
@@ -261,9 +429,18 @@ def render_html(
     meta_bits = (
         f"seed={meta.get('seed')}, steps={meta.get('num_inference_steps')}, "
         f"guidance={meta.get('guidance_scale')}, resolution={meta.get('resolution')}, "
-        f"methods={len(methods)}, generated={_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        f"methods={len(methods)}, baselines={len(baseline_methods)}, "
+        f"generated={_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
     parts.append(f"<div class='meta'>{html.escape(meta_bits)}</div>")
+    if baseline_methods:
+        parts.append(
+            "<div class='legend'>"
+            "<span class='sw' style='background:#2e7d3233'></span>best fusion method"
+            "<span class='sw' style='background:#6d4c4133'></span>best baseline (bar to beat)"
+            "<span class='badge'>ref</span>reference column (base model / single teacher)"
+            "</div>"
+        )
 
     for test_set in meta["test_sets"]:
         agg_ts = aggregate.get(test_set, {})
@@ -273,7 +450,9 @@ def render_html(
             f"<h2>{html.escape(test_set)} <span class='meta'>({n_prompts} prompts)</span></h2>"
         )
         if rewards:
-            parts.append(_aggregate_table_html(test_set, methods, rewards, agg_ts))
+            parts.append(
+                _aggregate_table_html(test_set, methods, rewards, agg_ts, baseline_methods)
+            )
 
         # per-tag tables (geneval)
         tag_ts = per_tag.get(test_set, {})
@@ -285,11 +464,19 @@ def render_html(
             head = "".join(f"<th>{html.escape(t)}</th>" for t in tags)
             rows = []
             for m in methods:
-                cells = [f'<td class="method">{html.escape(m)}</td>']
+                is_baseline = m in baseline_set
+                row_cls = []
+                if is_baseline:
+                    row_cls.append("baseline")
+                if m == last_baseline:
+                    row_cls.append("sep-below")
+                badge = "<span class='badge'>ref</span>" if is_baseline else ""
+                cells = [f'<td class="method">{html.escape(m)}{badge}</td>']
                 for t in tags:
                     e = tag_ts[reward][t].get(m)
                     cells.append(f"<td>{_fmt(e['mean']) if e else '-'}</td>")
-                rows.append(f"<tr>{''.join(cells)}</tr>")
+                row_attr = f' class="{" ".join(row_cls)}"' if row_cls else ""
+                rows.append(f"<tr{row_attr}>{''.join(cells)}</tr>")
             parts.append(
                 f'<table class="metrics"><thead><tr><th class="method">method \\ tag</th>'
                 f"{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
@@ -314,23 +501,25 @@ def render_html(
                 parts.append(f"<div class='prompt-meta'>{' | '.join(extra)}</div>")
             parts.append("<div class='row'>")
             for m in methods:
+                is_baseline = m in baseline_set
                 cell = entry["methods"].get(m, {})
                 img = cell.get("img")
                 scores = cell.get("scores", {})
                 score_str = ", ".join(f"{k}={_fmt(v)}" for k, v in sorted(scores.items()))
+                cell_cls = "cell baseline" if is_baseline else "cell"
+                badge = "<span class='badge'>ref</span>" if is_baseline else ""
                 if img:
-                    parts.append(
-                        f"<div class='cell'><img loading='lazy' src='{html.escape(img)}' "
-                        f"alt='{html.escape(m)}'>"
-                        f"<div class='label'>{html.escape(m)}</div>"
-                        f"<div class='scores'>{html.escape(score_str)}</div></div>"
-                    )
+                    inner = f"<img loading='lazy' src='{html.escape(img)}' alt='{html.escape(m)}'>"
                 else:
-                    parts.append(
-                        f"<div class='cell'><div class='missing'>no image</div>"
-                        f"<div class='label'>{html.escape(m)}</div>"
-                        f"<div class='scores'>{html.escape(score_str)}</div></div>"
-                    )
+                    inner = "<div class='missing'>no image</div>"
+                parts.append(
+                    f"<div class='{cell_cls}'>{inner}"
+                    f"<div class='label'>{html.escape(m)}{badge}</div>"
+                    f"<div class='scores'>{html.escape(score_str)}</div></div>"
+                )
+                # Visual divider between the reference columns and the fusion methods.
+                if m == last_baseline:
+                    parts.append("<div class='sep'></div>")
             parts.append("</div></div>")
 
     parts.append("</body></html>")
@@ -378,12 +567,48 @@ def _subset_batch(batch: Dict[str, Any], positions: List[int]) -> Dict[str, Any]
 
 
 def _save_pil_from_tensor(image: Any, path: Path) -> None:
+    """Atomically write the sample image to ``path`` as PNG.
+
+    Writes to a temp sibling then ``os.replace`` so an interrupted run never
+    leaves a half-written PNG on disk (the resume path treats only intact files
+    as done; see :func:`_load_intact_image`).
+    """
+    import os
+
     from flow_factory.utils.image import standardize_image_batch
 
     pil = standardize_image_batch(image, "pil")
     pil = pil[0] if isinstance(pil, list) else pil
     path.parent.mkdir(parents=True, exist_ok=True)
-    pil.save(path, format="PNG")
+    tmp_path = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    pil.save(tmp_path, format="PNG")
+    os.replace(tmp_path, path)
+
+
+def _load_intact_image(path: Path) -> Optional[Any]:
+    """Return a fully-decoded RGB PIL image, or ``None`` if missing/corrupt.
+
+    Used by the resume path: a previously saved PNG is reused only when it
+    decodes completely. A truncated/corrupt file (e.g. from a hard-killed run)
+    is reported and treated as missing so it gets regenerated rather than
+    crashing the scoring pass or poisoning metrics.
+
+    The narrow ``except`` is intentional and documented: PIL raises ``OSError``
+    on truncated image data and ``UnidentifiedImageError`` on non-image bytes;
+    both mean "regenerate this prompt", which is exactly the requested behavior.
+    """
+    if not path.exists():
+        return None
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(path) as handle:
+            rgb = handle.convert("RGB")
+            rgb.load()  # force full decode to detect truncation
+        return rgb
+    except (OSError, UnidentifiedImageError) as exc:
+        logger.warning(f"Ignoring corrupt/incomplete image (will regenerate): {path} ({exc})")
+        return None
 
 
 def main() -> None:  # noqa: C901 - orchestration script
@@ -429,6 +654,15 @@ def main() -> None:  # noqa: C901 - orchestration script
             "teacher checkpoints loaded (use ensemble-eval/lora/sd3_5/default.yaml)."
         )
 
+    # Snapshot the full checkpoint set; per-spec configuration mutates these in place.
+    base_checkpoint_names: List[str] = list(trainer._checkpoint_names)
+    base_weights: List[float] = list(trainer._weights)
+    if args.baselines:
+        baseline_specs = build_baseline_specs(
+            base_checkpoint_names, list(trainer.training_args.checkpoint_paths)
+        )
+        methods = baseline_specs + methods
+
     output_dir = Path(args.output_dir)
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -469,14 +703,9 @@ def main() -> None:  # noqa: C901 - orchestration script
         bs = max(1, int(merged_eval.per_device_batch_size))
 
         for spec in methods:
-            # Switch blend knobs (read by _eval_inference_context at enter time).
-            trainer.training_args.ensemble_blend_mode = spec.blend_mode
-            trainer.training_args.ensemble_blend_weighting = spec.weighting
-            trainer.training_args.ties_density = spec.ties_density
-            trainer._pcgrad_generator = (
-                torch.Generator().manual_seed(int(eval_seed))
-                if spec.blend_mode.startswith("pcgrad")
-                else None
+            # Reconfigure trainer state for this column (blend / single-teacher / base).
+            _configure_trainer_for_spec(
+                trainer, spec, base_checkpoint_names, base_weights, eval_seed
             )
 
             img_dir = output_dir / "images" / test_set / spec.label
@@ -486,19 +715,27 @@ def main() -> None:  # noqa: C901 - orchestration script
             )
             ordered_gidx: List[int] = []
 
-            with torch.no_grad(), trainer.autocast(), trainer._eval_inference_context():
+            with torch.no_grad(), trainer.autocast(), _spec_eval_context(trainer, spec):
                 for batch_indices in _chunks(my_indices, bs):
                     items = [dataset[i] for i in batch_indices]
                     batch = GeneralDataset.collate_fn(items)
 
-                    # Resumable: only (re)generate prompts whose PNG is missing;
-                    # existing images are loaded from disk and only (cheaply) re-scored.
-                    gen_positions = [
-                        j
-                        for j, gidx in enumerate(batch_indices)
-                        if not (img_dir / f"{gidx:05d}.png").exists()
-                    ]
+                    # Resumable: reuse only intact PNGs already on disk (re-scored
+                    # cheaply); missing OR corrupt/incomplete files are regenerated.
                     samples_by_pos: Dict[int, Any] = {}
+                    for j, gidx in enumerate(batch_indices):
+                        pil = _load_intact_image(img_dir / f"{gidx:05d}.png")
+                        if pil is None:
+                            continue
+                        sample = BaseSample(prompt=items[j].get("prompt"), image=pil)
+                        meta_dict = items[j].get("metadata") or {}
+                        if isinstance(meta_dict, dict):
+                            sample.extra_kwargs.update(meta_dict)
+                        samples_by_pos[j] = sample
+
+                    gen_positions = [
+                        j for j in range(len(batch_indices)) if j not in samples_by_pos
+                    ]
 
                     if gen_positions:
                         sub = _to_device(_subset_batch(batch, gen_positions), device)
@@ -527,19 +764,6 @@ def main() -> None:  # noqa: C901 - orchestration script
                             ):
                                 _save_pil_from_tensor(sample.image, img_dir / f"{gidx:05d}.png")
                             samples_by_pos[pos] = sample
-
-                    # Disk-loaded samples for the already-generated prompts.
-                    for j, gidx in enumerate(batch_indices):
-                        if j in samples_by_pos:
-                            continue
-                        from PIL import Image
-
-                        pil = Image.open(img_dir / f"{gidx:05d}.png").convert("RGB")
-                        sample = BaseSample(prompt=items[j].get("prompt"), image=pil)
-                        meta_dict = items[j].get("metadata") or {}
-                        if isinstance(meta_dict, dict):
-                            sample.extra_kwargs.update(meta_dict)
-                        samples_by_pos[j] = sample
 
                     ordered = [samples_by_pos[j] for j in range(len(batch_indices))]
                     buffer.add_samples(ordered)
@@ -574,6 +798,7 @@ def main() -> None:  # noqa: C901 - orchestration script
         summary = aggregate_metrics(gathered)
         meta = {
             "methods": [m.label for m in methods],
+            "baseline_methods": [m.label for m in methods if m.kind != "blend"],
             "test_sets": test_sets,
             "seed": (args.seed if args.seed is not None else trainer.training_args.seed),
             "num_inference_steps": config.eval_args.num_inference_steps,
@@ -718,9 +943,17 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help=(
-            "Subset of method labels to run. Defaults to the four base-anchored blends: "
-            + ", ".join(DEFAULT_METHODS)
-            + "."
+            "Subset of blend method labels to run (baselines are added separately via "
+            "--baselines). Defaults to: " + ", ".join(DEFAULT_METHODS) + "."
+        ),
+    )
+    p.add_argument(
+        "--baselines",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Prepend reference columns: the pretrained base model (LoRA disabled) and "
+            "each teacher checkpoint alone. Use --no-baselines for blends only."
         ),
     )
     p.add_argument("--test-sets", nargs="*", default=None, help="Subset of test set names to run.")

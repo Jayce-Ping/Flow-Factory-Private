@@ -164,6 +164,61 @@ class TestRenderHtml(unittest.TestCase):
         self.assertIn("&lt;b&gt;", out)
         self.assertNotIn('saying "Hi" <b>', out)
 
+    def _summary_with_baseline(self):
+        return cmp.aggregate_metrics(
+            [
+                # base baseline (weak), blend A (best fusion), blend B
+                {
+                    "test_set": "ocr",
+                    "method": "base",
+                    "gidx": 0,
+                    "scores": {"ocr": 0.1},
+                    "tag": None,
+                },
+                {"test_set": "ocr", "method": "A", "gidx": 0, "scores": {"ocr": 0.8}, "tag": None},
+                {"test_set": "ocr", "method": "B", "gidx": 0, "scores": {"ocr": 0.2}, "tag": None},
+            ]
+        )
+
+    def _meta_with_baseline(self):
+        meta = self._meta()
+        meta["methods"] = ["base", "A", "B"]
+        meta["baseline_methods"] = ["base"]
+        return meta
+
+    def _gallery_with_baseline(self):
+        return {
+            "ocr": [
+                {
+                    "gidx": 0,
+                    "prompt": "p",
+                    "tag": None,
+                    "include": None,
+                    "methods": {
+                        "base": {"img": "images/ocr/base/00000.png", "scores": {"ocr": 0.1}},
+                        "A": {"img": "images/ocr/A/00000.png", "scores": {"ocr": 0.8}},
+                        "B": {"img": None, "scores": {"ocr": 0.2}},
+                    },
+                }
+            ]
+        }
+
+    def test_html_baseline_styling(self) -> None:
+        out = cmp.render_html(
+            self._summary_with_baseline(),
+            self._gallery_with_baseline(),
+            self._meta_with_baseline(),
+        )
+        # baseline row + ref badge + legend present
+        self.assertIn("baseline", out)
+        self.assertIn(">ref<", out)
+        self.assertIn("class='legend'", out)
+        # best fusion method (A) highlighted green; best baseline (base) brown
+        self.assertIn('class="best"', out)
+        self.assertIn('class="basebest"', out)
+        # gallery separator between reference and fusion columns
+        self.assertIn("class='sep'", out)
+
 
 class TestLoadMethodSpecs(unittest.TestCase):
     def test_loads_ablation_configs(self) -> None:
@@ -187,13 +242,35 @@ class TestLoadMethodSpecs(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             cmp.load_method_specs(str(_REPO_ROOT / "no_such_dir" / "*.yaml"))
 
-    def test_default_methods_are_base_anchored(self) -> None:
+    def test_build_baseline_specs(self) -> None:
+        names = ["eval_ckpt_0", "eval_ckpt_1"]
+        paths = ["Org/OCR-Teacher", "Org/GenEval-Teacher"]
+        specs = cmp.build_baseline_specs(names, paths)
+        self.assertEqual(
+            [s.label for s in specs],
+            ["baseline_base", "baseline_OCR-Teacher", "baseline_GenEval-Teacher"],
+        )
+        self.assertEqual(specs[0].kind, "base")
+        self.assertIsNone(specs[0].checkpoint_name)
+        self.assertEqual(specs[1].kind, "single")
+        self.assertEqual(specs[1].checkpoint_name, "eval_ckpt_0")
+        self.assertEqual(specs[2].checkpoint_name, "eval_ckpt_1")
+        # Every baseline runs as a plain weighted forward (no PCGrad/TIES).
+        for spec in specs:
+            self.assertEqual(spec.blend_mode, "weighted")
+
+    def test_build_baseline_specs_length_mismatch_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            cmp.build_baseline_specs(["eval_ckpt_0"], ["a", "b"])
+
+    def test_default_methods_resolve(self) -> None:
         glob_pat = str(_REPO_ROOT / "ensemble-eval/lora/sd3_5/ablations" / "*.yaml")
         specs = cmp.load_method_specs(glob_pat)
         by_label = {s.label: s for s in specs}
         self.assertEqual(
             cmp.DEFAULT_METHODS,
             (
+                "3_geneval-ocr-pickscore_weighted",
                 "3_geneval-ocr-pickscore_pcgrad_residual",
                 "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
                 "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
@@ -202,9 +279,11 @@ class TestLoadMethodSpecs(unittest.TestCase):
                 "3_geneval-ocr-pickscore_ties",
             ),
         )
-        # Every default resolves and is base-anchored (residual family or ties).
         for label in cmp.DEFAULT_METHODS:
             self.assertIn(label, by_label, f"default method {label!r} missing from ablations")
+        # 'weighted' is the linear-blend baseline; the rest are base-anchored.
+        self.assertEqual(by_label["3_geneval-ocr-pickscore_weighted"].blend_mode, "weighted")
+        for label in cmp.DEFAULT_METHODS[1:]:
             mode = by_label[label].blend_mode
             self.assertTrue(
                 mode.startswith("pcgrad_residual") or mode == "ties",
