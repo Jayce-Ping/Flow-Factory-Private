@@ -85,14 +85,17 @@ class MethodSpec:
 
 
 # Default methods: the base-anchored blends (PCGrad on task deltas tau_i = v_i - v_base
-# and TIES sign-election). The full-velocity modes ('weighted', 'pcgrad',
-# 'pcgrad_channelwise', 'pcgrad_normalized') degenerate to the weighted sum because
-# v_i is dominated by the shared base direction (near-zero sign conflicts), so only
-# these four produce outputs that genuinely differ from 'pcgrad'/'weighted'.
+# and TIES sign-election), plus the KL / inverse-KL dynamic-weighting variants of
+# pcgrad_residual. The full-velocity modes ('weighted', 'pcgrad', 'pcgrad_channelwise',
+# 'pcgrad_normalized') degenerate to the weighted sum because v_i is dominated by the
+# shared base direction (near-zero sign conflicts), so only these produce outputs that
+# genuinely differ from 'pcgrad'/'weighted'.
 DEFAULT_METHODS: Tuple[str, ...] = (
     "3_geneval-ocr-pickscore_pcgrad_residual",
     "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
     "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
+    "3_geneval-ocr-pickscore_pcgrad_residual_kl",
+    "3_geneval-ocr-pickscore_pcgrad_residual_kl_inv",
     "3_geneval-ocr-pickscore_ties",
 )
 

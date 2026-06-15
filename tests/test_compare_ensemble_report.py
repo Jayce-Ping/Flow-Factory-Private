@@ -191,21 +191,30 @@ class TestLoadMethodSpecs(unittest.TestCase):
         glob_pat = str(_REPO_ROOT / "ensemble-eval/lora/sd3_5/ablations" / "*.yaml")
         specs = cmp.load_method_specs(glob_pat)
         by_label = {s.label: s for s in specs}
-        # The four base-anchored defaults all resolve and exclude kl/kl_inv variants.
         self.assertEqual(
             cmp.DEFAULT_METHODS,
             (
                 "3_geneval-ocr-pickscore_pcgrad_residual",
                 "3_geneval-ocr-pickscore_pcgrad_residual_channelwise",
                 "3_geneval-ocr-pickscore_pcgrad_residual_normalized",
+                "3_geneval-ocr-pickscore_pcgrad_residual_kl",
+                "3_geneval-ocr-pickscore_pcgrad_residual_kl_inv",
                 "3_geneval-ocr-pickscore_ties",
             ),
         )
+        # Every default resolves and is base-anchored (residual family or ties).
         for label in cmp.DEFAULT_METHODS:
             self.assertIn(label, by_label, f"default method {label!r} missing from ablations")
-        self.assertEqual(by_label[cmp.DEFAULT_METHODS[-1]].blend_mode, "ties")
-        for label in cmp.DEFAULT_METHODS[:-1]:
-            self.assertTrue(by_label[label].blend_mode.startswith("pcgrad_residual"))
+            mode = by_label[label].blend_mode
+            self.assertTrue(
+                mode.startswith("pcgrad_residual") or mode == "ties",
+                f"default method {label!r} has non-base-anchored mode {mode!r}",
+            )
+        # The kl / kl_inv variants carry the dynamic weighting flags.
+        self.assertEqual(by_label["3_geneval-ocr-pickscore_pcgrad_residual_kl"].weighting, "kl")
+        self.assertEqual(
+            by_label["3_geneval-ocr-pickscore_pcgrad_residual_kl_inv"].weighting, "kl_inv"
+        )
 
 
 if __name__ == "__main__":
