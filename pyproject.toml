@@ -73,8 +73,15 @@ nvidia = [
     "nvidia-ml-py",
 ]
 
+# Visualization / analysis (plots for the eval/comparison scripts, e.g.
+# scripts/sweep_teacher_weights.py and scripts/inspect_mof_checkpoint.py).
+# Only imported lazily in viz code paths, never in the core train/inference path.
+viz = [
+    "matplotlib>=3.7.0",
+]
+
 all = [
-    "flow-factory[deepspeed,quantization]",
+    "flow-factory[deepspeed,quantization,viz]",
 ]
 
 [project.scripts]
