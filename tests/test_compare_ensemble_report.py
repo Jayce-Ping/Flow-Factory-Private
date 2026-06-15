@@ -361,6 +361,115 @@ class TestReportOnly(unittest.TestCase):
             self.assertIn("#00000", html_text)
             self.assertIn("images/ocr/pcgrad_residual/00000.png", html_text)
 
+    def test_rebuild_unions_shards_over_partial_report_data(self) -> None:
+        """A stale report_data.json (only method A) must not hide a newly-scored B.
+
+        Simulates incrementally adding a baseline: the per-method shards have both
+        A and B, but report_data.json was last overwritten by a partial run that
+        only scored A. The shards are authoritative, so both must appear.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            a_rec = {
+                "test_set": "ocr",
+                "method": "weighted",
+                "gidx": 0,
+                "scores": {"ocr": 0.5},
+                "tag": None,
+                "prompt": "a cat",
+                "include": None,
+            }
+            b_rec = {
+                "test_set": "ocr",
+                "method": "baseline_weight_merge",
+                "gidx": 0,
+                "scores": {"ocr": 0.3},
+                "tag": None,
+                "prompt": "a cat",
+                "include": None,
+            }
+            # Stale/partial consolidated snapshot: only method A.
+            partial_meta = {
+                "methods": ["weighted"],
+                "baseline_methods": [],
+                "test_sets": ["ocr"],
+                "seed": 42,
+                "num_inference_steps": 40,
+                "guidance_scale": 4.5,
+                "resolution": 512,
+                "num_prompts_per_set": {"ocr": 1},
+                "gallery_num_prompts": 8,
+            }
+            (out / "report_data.json").write_text(
+                json.dumps({"meta": partial_meta, "records": [a_rec]}), encoding="utf-8"
+            )
+            # Per-method shards have BOTH A and B; images exist for both.
+            cmp._write_record_shard(out / "records", "ocr", "weighted", 0, [a_rec])
+            cmp._write_record_shard(out / "records", "ocr", "baseline_weight_merge", 0, [b_rec])
+            for method in ("weighted", "baseline_weight_merge"):
+                d = out / "images" / "ocr" / method
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "00000.png").write_bytes(b"x")
+
+            cmp.rebuild_report(out)
+
+            metrics = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
+            by_method = metrics["summary"]["aggregate"]["ocr"]["ocr"]
+            self.assertIn("weighted", by_method)
+            self.assertIn("baseline_weight_merge", by_method)  # not dropped by stale snapshot
+            self.assertAlmostEqual(by_method["baseline_weight_merge"]["mean"], 0.3)
+            self.assertAlmostEqual(by_method["weighted"]["mean"], 0.5)
+            # The rewritten snapshot is now complete (union of all shards).
+            rewritten = json.loads((out / "report_data.json").read_text(encoding="utf-8"))
+            methods_in_data = {r["method"] for r in rewritten["records"]}
+            self.assertEqual(methods_in_data, {"weighted", "baseline_weight_merge"})
+
+    def test_rebuild_dedups_stale_rank_shards_newest_wins(self) -> None:
+        """Same (test_set, method, gidx) across rank shards: newest-mtime shard wins.
+
+        Mimics a re-run with a different world size leaving a stale higher-rank
+        shard: the record is deduped (n == 1) and the newest score is kept.
+        """
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            old = {
+                "test_set": "ocr",
+                "method": "M",
+                "gidx": 0,
+                "scores": {"ocr": 0.1},
+                "tag": None,
+                "prompt": "p",
+                "include": None,
+            }
+            new = dict(old, scores={"ocr": 0.9})
+            cmp._write_record_shard(out / "records", "ocr", "M", 0, [old])
+            cmp._write_record_shard(out / "records", "ocr", "M", 1, [new])
+            os.utime(out / "records" / "ocr__M__r0.jsonl", (1000, 1000))
+            os.utime(out / "records" / "ocr__M__r1.jsonl", (2000, 2000))  # newer wins
+            (out / "report_meta.json").write_text(
+                json.dumps(
+                    {
+                        "methods": ["M"],
+                        "baseline_methods": [],
+                        "test_sets": ["ocr"],
+                        "num_prompts_per_set": {"ocr": 1},
+                        "gallery_num_prompts": 8,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cmp.rebuild_report(out)
+            entry = json.loads((out / "metrics.json").read_text(encoding="utf-8"))[
+                "summary"
+            ]["aggregate"]["ocr"]["ocr"]["M"]
+            self.assertEqual(entry["n"], 1)  # deduped, not double-counted
+            self.assertAlmostEqual(entry["mean"], 0.9)  # newest shard wins
+
 
 class TestBuildGalleryFromRecords(unittest.TestCase):
     def test_gallery_from_records(self) -> None:

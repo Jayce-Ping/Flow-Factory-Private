@@ -28,12 +28,17 @@ here. The two halves communicate only through files under ``--output-dir``:
       metrics.json / metrics.csv                 # aggregated tables
       index.html                                 # self-contained report page
 
-``rebuild_report`` source precedence (graceful fallback):
-  1. report_data.json (consolidated meta + records) -> full report
-  2. records/ shards (+ report_meta.json if present) -> full report
-  3. images/ only -> gallery without metric tables (prompts shown as file index)
-In every case the ``images/`` tree is re-scanned and merged so newly generated
-methods / test sets / prompts are picked up incrementally.
+``rebuild_report`` record source: the per-method ``records/`` shards are the
+authoritative, incrementally-unioned source (one file per ``(test_set, method,
+rank)``, never cross-overwritten), so a method scored in any prior run shows up
+even if ``report_data.json`` was later overwritten by a partial run.
+``report_data.json``'s records are used only as a fallback for legacy runs that
+have no ``records/`` dir. Meta (seed/steps/...) precedence: ``report_meta.json``
+-> ``report_data.json`` meta -> inferred from records -> scanned from images.
+With neither records nor report_data.json, an images-only gallery is rendered
+(no metric tables; prompts shown as file index). In every case the ``images/``
+tree is re-scanned and merged so newly generated methods / test sets / prompts
+are picked up incrementally.
 
 The gallery renders EVERY prompt that has records/images and paginates them
 client-side; ``--gallery-num-prompts`` is the page size (prompts per page), not a
@@ -472,17 +477,24 @@ def _write_record_shard(
 
 
 def _load_cached_records(output_dir: Path) -> List[Dict[str, Any]]:
-    """Merge all per-(test_set, method, rank) record shards under ``records/``."""
+    """Union all per-(test_set, method, rank) record shards under ``records/``.
+
+    Dedups by ``(test_set, method, gidx)``, processing shards oldest -> newest by
+    mtime so a re-score (or a later run) wins over stale entries -- e.g. leftover
+    higher-rank shards from a previous run with a larger world size. This is the
+    authoritative, incrementally-merged record source for :func:`rebuild_report`.
+    """
     records_dir = output_dir / "records"
     if not records_dir.is_dir():
         return []
-    records: List[Dict[str, Any]] = []
-    for shard in sorted(records_dir.glob("*.jsonl")):
+    by_key: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    for shard in sorted(records_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime):
         for line in shard.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line:
-                records.append(json.loads(line))
-    return records
+                rec = json.loads(line)
+                by_key[(rec["test_set"], rec["method"], int(rec["gidx"]))] = rec
+    return list(by_key.values())
 
 
 def _ordered_methods(labels: Sequence[str]) -> List[str]:
@@ -682,17 +694,21 @@ def rebuild_report(
 ) -> None:
     """Re-render ``index.html`` (+ metrics) from a prior run, with graceful fallback.
 
-    Pure CPU / stdlib (no model / dataset / GPU). Source precedence:
-
-    1. ``report_data.json`` (consolidated meta + records) — full report.
-    2. cached record shards under ``records/`` (+ ``report_meta.json`` if present)
-       — full report from a partial/interrupted run.
-    3. images on disk only — gallery-only report; metrics tables are omitted and
-       each prompt is labelled by its file index.
+    Pure CPU / stdlib (no model / dataset / GPU). Records are read from the
+    per-method ``records/`` shards as the authoritative, incrementally-unioned
+    source (so a method scored in any prior run is included even if a later
+    partial run overwrote ``report_data.json``); ``report_data.json``'s records
+    are used only as a fallback when there is no ``records/`` dir (legacy runs).
+    Meta precedence: ``report_meta.json`` -> ``report_data.json`` meta ->
+    inferred from records -> scanned from images. With neither records nor
+    ``report_data.json``, an images-only gallery is rendered (no metric tables;
+    each prompt labelled by its file index).
 
     The ``images/`` tree is always re-scanned and merged into ``meta`` so newly
     generated methods / test sets / prompts are picked up incrementally, even when
-    a stale ``report_data.json`` predates them.
+    a stale ``report_data.json`` predates them. ``_write_outputs`` then rewrites
+    ``report_data.json`` from the unioned records, so it becomes a complete
+    snapshot again.
 
     ``page_size`` overrides the gallery prompts-per-page; when ``None`` the run's
     stored ``gallery_num_prompts`` is kept (falling back to ``gallery_num_fallback``).
@@ -700,29 +716,37 @@ def rebuild_report(
     data_path = output_dir / "report_data.json"
     meta_path = output_dir / "report_meta.json"
 
+    # Records: the per-method records/ shards are the authoritative, incrementally
+    # unioned source (one file per (test_set, method, rank), never cross-overwritten).
+    # report_data.json's records are only a fallback for legacy runs with no records/ dir.
+    records = _load_cached_records(output_dir)
+    data_meta: Optional[Dict[str, Any]] = None
     if data_path.exists():
         data = json.loads(data_path.read_text(encoding="utf-8"))
-        meta, records = data["meta"], data["records"]
-    else:
-        records = _load_cached_records(output_dir)
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        elif records:
-            meta = _infer_meta_from_records(records, gallery_num_fallback)
-        else:
-            meta = _scan_images_for_meta(output_dir, gallery_num_fallback)
-            if not meta["methods"]:
-                raise FileNotFoundError(
-                    f"--report-only found nothing usable under {output_dir}: no "
-                    "report_data.json, no records/, and no images/. Run a pass first."
-                )
-            logger.warning(
-                "No records/metrics found; rendering image-only gallery "
-                "(prompts shown as file index, no metric tables)."
-            )
+        data_meta = data.get("meta")
+        if not records:
+            records = data.get("records", [])
 
-    if not records:
-        records = _load_cached_records(output_dir)
+    # Meta priority: report_meta.json (run metadata) -> report_data.json meta ->
+    # infer-from-records -> image-scan. Methods/test_sets/prompt counts are then
+    # always refreshed from the images/ tree below.
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    elif data_meta is not None:
+        meta = data_meta
+    elif records:
+        meta = _infer_meta_from_records(records, gallery_num_fallback)
+    else:
+        meta = _scan_images_for_meta(output_dir, gallery_num_fallback)
+        if not meta["methods"]:
+            raise FileNotFoundError(
+                f"--report-only found nothing usable under {output_dir}: no "
+                "report_data.json, no records/, and no images/. Run a pass first."
+            )
+        logger.warning(
+            "No records/metrics found; rendering image-only gallery "
+            "(prompts shown as file index, no metric tables)."
+        )
 
     scanned = _scan_images_for_meta(output_dir, gallery_num_fallback)
     if scanned["methods"]:
