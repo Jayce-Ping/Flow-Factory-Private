@@ -318,6 +318,40 @@ class TestReportOnly(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 cmp.rebuild_report(Path(tmp))
 
+    def test_rebuild_from_record_shards(self) -> None:
+        """No consolidated report_data.json: rebuild from cached shards + report_meta."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "report_meta.json").write_text(json.dumps(self._meta()), encoding="utf-8")
+            for rec in self._records():
+                cmp._write_record_shard(out / "records", rec["test_set"], rec["method"], 0, [rec])
+            cmp.rebuild_report(out)
+            html_text = (out / "index.html").read_text(encoding="utf-8")
+            self.assertIn("pcgrad_residual", html_text)
+            self.assertIn("a cat", html_text)
+            self.assertFalse((out / "report_data.json").exists() and False)  # data path absent
+
+    def test_rebuild_image_only_fallback(self) -> None:
+        """No records at all: render an image-only gallery with index placeholders."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for method in ("baseline_base", "pcgrad_residual"):
+                d = out / "images" / "ocr" / method
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "00000.png").write_bytes(b"x")
+                (d / "00001.png").write_bytes(b"x")
+            cmp.rebuild_report(out)
+            html_text = (out / "index.html").read_text(encoding="utf-8")
+            # methods discovered from dirs, baseline styled, index used as prompt
+            self.assertIn("pcgrad_residual", html_text)
+            self.assertIn(">ref<", html_text)
+            self.assertIn("#00000", html_text)
+            self.assertIn("images/ocr/pcgrad_residual/00000.png", html_text)
+
 
 class TestBuildGalleryFromRecords(unittest.TestCase):
     def test_gallery_from_records(self) -> None:

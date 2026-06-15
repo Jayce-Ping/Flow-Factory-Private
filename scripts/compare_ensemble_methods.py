@@ -617,33 +617,150 @@ def _load_intact_image(path: Path) -> Optional[Any]:
         return None
 
 
-def rebuild_report(output_dir: Path, gallery_num_prompts: Optional[int] = None) -> None:
-    """Re-render ``index.html`` (+ metrics) from a prior run's ``report_data.json``.
+def _safe_name(name: str) -> str:
+    """Filesystem-safe token for record shard filenames."""
+    return "".join(c if (c.isalnum() or c in "-._") else "_" for c in str(name))
 
-    Pure CPU / stdlib: reads persisted per-prompt records and re-checks which
-    images exist on disk, then rebuilds the aggregate tables and gallery. No
-    model, dataset, or GPU is loaded. Requires a completed scoring pass to have
-    written ``report_data.json``.
+
+def _write_record_shard(
+    records_dir: Path, test_set: str, method: str, rank: int, records: List[Dict[str, Any]]
+) -> None:
+    """Persist one (test_set, method, rank) shard as JSONL (overwrite on re-score)."""
+    records_dir.mkdir(parents=True, exist_ok=True)
+    shard = records_dir / f"{_safe_name(test_set)}__{_safe_name(method)}__r{rank}.jsonl"
+    with open(shard, "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+
+
+def _load_cached_records(output_dir: Path) -> List[Dict[str, Any]]:
+    """Merge all per-(test_set, method, rank) record shards under ``records/``."""
+    records_dir = output_dir / "records"
+    if not records_dir.is_dir():
+        return []
+    records: List[Dict[str, Any]] = []
+    for shard in sorted(records_dir.glob("*.jsonl")):
+        for line in shard.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def _ordered_methods(labels: Sequence[str]) -> List[str]:
+    """Stable order with baseline columns first (matches the live-run layout)."""
+    seen: set = set()
+    uniq: List[str] = []
+    for label in labels:
+        if label not in seen:
+            seen.add(label)
+            uniq.append(label)
+    baselines = [m for m in uniq if m.startswith("baseline_")]
+    others = [m for m in uniq if not m.startswith("baseline_")]
+    return baselines + others
+
+
+def _infer_meta_from_records(
+    records: List[Dict[str, Any]], gallery_num_prompts: int
+) -> Dict[str, Any]:
+    """Reconstruct a minimal meta from cached records (no report_meta.json present)."""
+    methods = _ordered_methods([r["method"] for r in records])
+    test_sets = sorted({r["test_set"] for r in records})
+    num_prompts_per_set: Dict[str, int] = {}
+    for r in records:
+        ts = r["test_set"]
+        num_prompts_per_set[ts] = max(num_prompts_per_set.get(ts, 0), int(r["gidx"]) + 1)
+    return {
+        "methods": methods,
+        "baseline_methods": [m for m in methods if m.startswith("baseline_")],
+        "test_sets": test_sets,
+        "seed": None,
+        "num_inference_steps": None,
+        "guidance_scale": None,
+        "resolution": None,
+        "num_prompts_per_set": num_prompts_per_set,
+        "gallery_num_prompts": gallery_num_prompts,
+    }
+
+
+def _scan_images_for_meta(output_dir: Path, gallery_num_prompts: int) -> Dict[str, Any]:
+    """Reconstruct meta purely from the ``images/<test_set>/<method>/<idx>.png`` tree.
+
+    Used as the last-resort image-only rebuild: no records/metrics, so the report
+    shows just the image gallery (prompts replaced by the file index).
+    """
+    images_root = output_dir / "images"
+    methods: List[str] = []
+    test_sets: List[str] = []
+    num_prompts_per_set: Dict[str, int] = {}
+    if images_root.is_dir():
+        for ts_dir in sorted(p for p in images_root.iterdir() if p.is_dir()):
+            test_sets.append(ts_dir.name)
+            max_idx = -1
+            for method_dir in sorted(p for p in ts_dir.iterdir() if p.is_dir()):
+                if method_dir.name not in methods:
+                    methods.append(method_dir.name)
+                for png in method_dir.glob("*.png"):
+                    if png.stem.isdigit():
+                        max_idx = max(max_idx, int(png.stem))
+            num_prompts_per_set[ts_dir.name] = max_idx + 1
+    methods = _ordered_methods(methods)
+    return {
+        "methods": methods,
+        "baseline_methods": [m for m in methods if m.startswith("baseline_")],
+        "test_sets": test_sets,
+        "seed": None,
+        "num_inference_steps": None,
+        "guidance_scale": None,
+        "resolution": None,
+        "num_prompts_per_set": num_prompts_per_set,
+        "gallery_num_prompts": gallery_num_prompts,
+    }
+
+
+def rebuild_report(output_dir: Path, gallery_num_fallback: int = 32) -> None:
+    """Re-render ``index.html`` (+ metrics) from a prior run, with graceful fallback.
+
+    Pure CPU / stdlib (no model / dataset / GPU). Source precedence:
+
+    1. ``report_data.json`` (consolidated meta + records) — full report.
+    2. cached record shards under ``records/`` (+ ``report_meta.json`` if present)
+       — full report from a partial/interrupted run.
+    3. images on disk only — gallery-only report; metrics tables are omitted and
+       each prompt is labelled by its file index.
     """
     data_path = output_dir / "report_data.json"
-    if not data_path.exists():
-        raise FileNotFoundError(
-            f"--report-only needs {data_path} from a prior run that finished scoring; "
-            "found none. Run the full pass once (it reuses any existing images)."
-        )
-    data = json.loads(data_path.read_text(encoding="utf-8"))
-    meta = data["meta"]
-    records = data["records"]
-    if gallery_num_prompts is None:
-        gallery_num_prompts = int(meta.get("gallery_num_prompts", 32))
+    meta_path = output_dir / "report_meta.json"
 
+    if data_path.exists():
+        data = json.loads(data_path.read_text(encoding="utf-8"))
+        meta, records = data["meta"], data["records"]
+    else:
+        records = _load_cached_records(output_dir)
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        elif records:
+            meta = _infer_meta_from_records(records, gallery_num_fallback)
+        else:
+            meta = _scan_images_for_meta(output_dir, gallery_num_fallback)
+            if not meta["methods"]:
+                raise FileNotFoundError(
+                    f"--report-only found nothing usable under {output_dir}: no "
+                    "report_data.json, no records/, and no images/. Run a pass first."
+                )
+            logger.warning(
+                "No records/metrics found; rendering image-only gallery "
+                "(prompts shown as file index, no metric tables)."
+            )
+
+    gallery_num = int(meta.get("gallery_num_prompts") or gallery_num_fallback)
     summary = aggregate_metrics(records)
     gallery = _build_gallery_from_records(
         records,
         meta["methods"],
         meta["test_sets"],
         meta.get("num_prompts_per_set", {}),
-        gallery_num_prompts,
+        gallery_num,
         output_dir,
     )
     _write_outputs(output_dir, summary, gallery, meta, records)
@@ -654,8 +771,8 @@ def main() -> None:  # noqa: C901 - orchestration script
     args = parse_args()
 
     if args.report_only:
-        # Faithfully reproduce the run's gallery size from persisted meta.
-        rebuild_report(Path(args.output_dir), gallery_num_prompts=None)
+        # Prefer the persisted meta's gallery size; fall back to the CLI value.
+        rebuild_report(Path(args.output_dir), gallery_num_fallback=args.gallery_num_prompts)
         return
 
     from accelerate.utils import gather_object
@@ -728,8 +845,37 @@ def main() -> None:  # noqa: C901 - orchestration script
 
     trainer.adapter.eval()
 
-    local_records: List[Dict[str, Any]] = []
+    # Precompute prompt counts and persist meta up front so a partial / interrupted
+    # run can still be turned into a report (--report-only) from cached records.
     num_prompts_per_set: Dict[str, int] = {}
+    for test_set in test_sets:
+        dataset = trainer.test_dataloaders[test_set].dataset
+        n_total = len(dataset)
+        if args.max_prompts and args.max_prompts > 0:
+            n_total = min(n_total, args.max_prompts)
+        num_prompts_per_set[test_set] = n_total
+
+    meta = {
+        "methods": [m.label for m in methods],
+        "baseline_methods": [m.label for m in methods if m.kind != "blend"],
+        "test_sets": test_sets,
+        "seed": (args.seed if args.seed is not None else trainer.training_args.seed),
+        "num_inference_steps": config.eval_args.num_inference_steps,
+        "guidance_scale": config.eval_args.guidance_scale,
+        "resolution": getattr(config.eval_args, "resolution", None),
+        "num_prompts_per_set": num_prompts_per_set,
+        "gallery_num_prompts": args.gallery_num_prompts,
+    }
+    if is_main:
+        (output_dir / "report_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    acc.wait_for_everyone()
+
+    records_dir = output_dir / "records"
+    if is_main:
+        records_dir.mkdir(parents=True, exist_ok=True)
+    acc.wait_for_everyone()
+
+    local_records: List[Dict[str, Any]] = []
 
     for test_set in test_sets:
         merged_eval = trainer._merged_eval_args_for_test_set_name(test_set)
@@ -739,10 +885,7 @@ def main() -> None:  # noqa: C901 - orchestration script
             else (merged_eval.seed if merged_eval.seed is not None else trainer.training_args.seed)
         )
         dataset = trainer.test_dataloaders[test_set].dataset
-        n_total = len(dataset)
-        if args.max_prompts and args.max_prompts > 0:
-            n_total = min(n_total, args.max_prompts)
-        num_prompts_per_set[test_set] = n_total
+        n_total = num_prompts_per_set[test_set]
         my_indices = list(range(n_total))[rank::world]
         bs = max(1, int(merged_eval.per_device_batch_size))
 
@@ -816,13 +959,14 @@ def main() -> None:  # noqa: C901 - orchestration script
                 rewards = buffer.finalize(store_to_samples=True, split="pointwise")
 
             reward_names = sorted(rewards.keys())
+            method_records: List[Dict[str, Any]] = []
             for gidx, sample in zip(ordered_gidx, buffer.all_samples):
                 scores = sample.extra_kwargs.get("rewards", {})
                 tag = sample.extra_kwargs.get("tag")
                 include = sample.extra_kwargs.get("include")
                 # Persist prompt/tag/include so the gallery can be rebuilt offline
                 # (report-only mode) without reopening the dataset.
-                local_records.append(
+                method_records.append(
                     {
                         "test_set": test_set,
                         "method": spec.label,
@@ -833,6 +977,10 @@ def main() -> None:  # noqa: C901 - orchestration script
                         "include": str(include) if include is not None else None,
                     }
                 )
+            local_records.extend(method_records)
+            # Cache this (test_set, method, rank) shard immediately so an interrupted
+            # run is still reportable from disk (records + images), not just images.
+            _write_record_shard(records_dir, test_set, spec.label, rank, method_records)
             acc.wait_for_everyone()
             if is_main:
                 logger.info(
@@ -845,17 +993,6 @@ def main() -> None:  # noqa: C901 - orchestration script
 
     if is_main:
         summary = aggregate_metrics(gathered)
-        meta = {
-            "methods": [m.label for m in methods],
-            "baseline_methods": [m.label for m in methods if m.kind != "blend"],
-            "test_sets": test_sets,
-            "seed": (args.seed if args.seed is not None else trainer.training_args.seed),
-            "num_inference_steps": config.eval_args.num_inference_steps,
-            "guidance_scale": config.eval_args.guidance_scale,
-            "resolution": getattr(config.eval_args, "resolution", None),
-            "num_prompts_per_set": num_prompts_per_set,
-            "gallery_num_prompts": args.gallery_num_prompts,
-        }
         gallery = _build_gallery_from_records(
             gathered,
             [m.label for m in methods],
@@ -921,7 +1058,9 @@ def _build_gallery_from_records(
             entries.append(
                 {
                     "gidx": gidx,
-                    "prompt": info.get("prompt", ""),
+                    # Fall back to the file index when no prompt text is on record
+                    # (image-only rebuilds have no records to read the prompt from).
+                    "prompt": info.get("prompt") or f"#{gidx:05d}",
                     "tag": info.get("tag"),
                     "include": info.get("include"),
                     "methods": per_method,
