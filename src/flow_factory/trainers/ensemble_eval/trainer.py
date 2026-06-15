@@ -143,6 +143,7 @@ class EnsembleEvalTrainer(BaseTrainer):
                 pcgrad_eps=self.training_args.pcgrad_eps,
                 pcgrad_generator=self._pcgrad_generator,
                 ties_density=self.training_args.ties_density,
+                weighting=self.training_args.ensemble_blend_weighting,
                 stats=blend_stats,
             )
 

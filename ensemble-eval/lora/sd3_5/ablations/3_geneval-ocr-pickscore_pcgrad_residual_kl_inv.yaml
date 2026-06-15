@@ -1,7 +1,9 @@
-# Ensemble-eval ablation (SD3.5 LoRA): pcgrad_residual fusion (residual delta, global).
-# Global PCGrad on task deltas w_i * (noise_pred_i - v_base) over 3 LoRA checkpoints
-# (OCR + PickScore + GenEval); one extra base forward per step, then one scheduler.step.
-# Run: ff-train ensemble-eval/lora/sd3_5/ablations/3_geneval-ocr-pickscore_pcgrad_residual.yaml
+# Ensemble-eval ablation (SD3.5 LoRA): pcgrad_residual + inverse-KL weighting.
+# Same as pcgrad_residual (global PCGrad on task deltas v_i - v_base), but each
+# teacher is weighted per-sample by the inverse of its teacher-base KL
+# (w_i ~ pi_i / ||v_i - v_base||^2): inverse-variance, down-weights the
+# most-deviating teacher. Baseline-comparison against the kl variant.
+# Run: ff-train ensemble-eval/lora/sd3_5/ablations/3_geneval-ocr-pickscore_pcgrad_residual_kl_inv.yaml
 
 # Environment Configuration
 launcher: "accelerate"
@@ -33,7 +35,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "3_geneval-ocr-pickscore_pcgrad_residual"
+  run_name: "3_geneval-ocr-pickscore_pcgrad_residual_kl_inv"
   project: "Flow-Factory-OPD-Experiments"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -54,7 +56,7 @@ train:
   ensemble_blend_mode: pcgrad_residual  # weighted | pcgrad | pcgrad_channelwise | pcgrad_normalized | pcgrad_residual | pcgrad_residual_channelwise | pcgrad_residual_normalized | ties
   pcgrad_eps: 1.0e-8
   ties_density: 1.0  # ties only: fraction of top-|tau| entries kept per task (1.0 = no trim)
-  ensemble_blend_weighting: uniform  # uniform | kl | kl_inv (kl/kl_inv require a residual or ties blend mode; weight teachers by ||v_i - v_base||^2)
+  ensemble_blend_weighting: kl_inv  # uniform | kl | kl_inv (kl/kl_inv require a residual or ties blend mode; weight teachers by ||v_i - v_base||^2)
 
   max_epochs: 1
   unique_sample_num_per_epoch: 1

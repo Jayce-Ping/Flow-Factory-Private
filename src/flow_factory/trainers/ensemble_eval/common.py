@@ -63,6 +63,25 @@ _RESIDUAL_PROJECTIONS: Dict[str, "PCGradProjection"] = {
     "pcgrad_residual_normalized": "normalized",
 }
 
+# Per-sample dynamic teacher weighting by teacher-base KL (== velocity-MSE).
+# w_i ~ pi_i * D_i^alpha with D_i = ||v_i - v_base||^2:
+#   'uniform' -> static checkpoint weights only (current behavior),
+#   'kl'      -> alpha=+1 (up-weight high-deviation specialists; soft routing),
+#   'kl_inv'  -> alpha=-1 (inverse-variance; down-weight high-deviation teachers).
+EnsembleBlendWeighting = Literal["uniform", "kl", "kl_inv"]
+_WEIGHTING_ALPHA: Dict[str, float] = {"kl": 1.0, "kl_inv": -1.0}
+
+# KL weighting needs the base anchor v_base, so it is only valid for blend modes
+# that already run a base forward (the residual family and 'ties').
+_KL_WEIGHTABLE_MODES: FrozenSet[str] = frozenset(_RESIDUAL_PROJECTIONS) | frozenset({"ties"})
+
+
+def _weight_batch_means(weights: Sequence[Any]) -> List[float]:
+    """Per-teacher batch-mean weight (tensor -> mean over batch; float -> itself)."""
+    return [
+        float(w.mean().item()) if isinstance(w, torch.Tensor) else float(w) for w in weights
+    ]
+
 
 # ---------------------------------------------------------------------------
 # PCGrad Statistics Accumulator
@@ -95,6 +114,10 @@ class PCGradStats:
     tensor_shape: Tuple[int, ...] = ()
     num_checkpoints: int = 0
 
+    # Dynamic-weighting diagnostics (only populated when weighting != 'uniform').
+    _weight_sums: List[float] = field(default_factory=list)
+    _weight_steps: int = 0
+
     def record_step(
         self,
         *,
@@ -118,6 +141,15 @@ class PCGradStats:
             self._cosine_mins.extend(cosine_mins)
         if cosine_maxs:
             self._cosine_maxs.extend(cosine_maxs)
+
+    def record_weights(self, weights: Sequence["BlendWeight"]) -> None:
+        """Accumulate per-teacher batch-mean dynamic weight for the summary."""
+        means = _weight_batch_means(weights)
+        if not self._weight_sums:
+            self._weight_sums = [0.0] * len(means)
+        for i, m in enumerate(means):
+            self._weight_sums[i] += m
+        self._weight_steps += 1
 
     def log_summary(self) -> None:
         """Log accumulated statistics as a single summary message."""
@@ -158,6 +190,14 @@ class PCGradStats:
                 f"global_max={max_cos:.4f}."
             )
 
+        if self._weight_steps > 0:
+            avg_weights = [s / self._weight_steps for s in self._weight_sums]
+            summary_lines.append(
+                "  Avg teacher weights (dynamic): ["
+                + ", ".join(f"{w:.4f}" for w in avg_weights)
+                + "]."
+            )
+
         if self.conflict_elements == 0:
             summary_lines.append(
                 "  WARNING: No conflicts detected across any step. "
@@ -184,6 +224,10 @@ class TIESStats:
     tensor_shape: Tuple[int, ...] = ()
     num_checkpoints: int = 0
 
+    # Dynamic-weighting diagnostics (only populated when weighting != 'uniform').
+    _weight_sums: List[float] = field(default_factory=list)
+    _weight_steps: int = 0
+
     def record_step(
         self,
         *,
@@ -194,6 +238,15 @@ class TIESStats:
         self.num_steps += 1
         self.total_elements += step_total_elements
         self.disagree_elements += step_disagree_elements
+
+    def record_weights(self, weights: Sequence["BlendWeight"]) -> None:
+        """Accumulate per-teacher batch-mean dynamic weight for the summary."""
+        means = _weight_batch_means(weights)
+        if not self._weight_sums:
+            self._weight_sums = [0.0] * len(means)
+        for i, m in enumerate(means):
+            self._weight_sums[i] += m
+        self._weight_steps += 1
 
     def log_summary(self) -> None:
         """Log accumulated statistics as a single summary message."""
@@ -214,6 +267,13 @@ class TIESStats:
             f"({self.disagree_elements}/{self.total_elements} non-zero task "
             f"entries dropped by the sign vote across all steps).",
         ]
+        if self._weight_steps > 0:
+            avg_weights = [s / self._weight_steps for s in self._weight_sums]
+            summary_lines.append(
+                "  Avg teacher weights (dynamic): ["
+                + ", ".join(f"{w:.4f}" for w in avg_weights)
+                + "]."
+            )
         if self.disagree_elements == 0:
             summary_lines.append(
                 "  WARNING: No sign disagreement detected across any step. "
@@ -366,6 +426,101 @@ def _shuffled_other_indices(
         return [indices[p] for p in perm]
     random.shuffle(indices)
     return indices
+
+
+# A per-checkpoint blend weight is either a Python scalar (uniform across the
+# batch, the static path) or a per-sample tensor of shape ``(B,)`` (the dynamic
+# KL-weighting path).
+BlendWeight = Union[float, torch.Tensor]
+
+
+def _broadcast_weight(weight: BlendWeight, ref: torch.Tensor) -> BlendWeight:
+    """Reshape a per-sample weight ``(B,)`` to ``(B, 1, 1, ...)`` for broadcasting.
+
+    Scalars (Python floats or 0-dim tensors) are returned unchanged so the
+    static-weight path keeps its original behavior.
+    """
+    if isinstance(weight, torch.Tensor) and weight.ndim >= 1:
+        return weight.reshape((weight.shape[0],) + (1,) * (ref.ndim - 1))
+    return weight
+
+
+def _dynamic_kl_weights(
+    taus: Sequence[torch.Tensor],
+    static_weights: Sequence[float],
+    alpha: float,
+    eps: float,
+) -> List[torch.Tensor]:
+    """Per-sample teacher weights from teacher-base KL (== velocity-MSE).
+
+    Computes ``D_i = ||tau_i||^2`` per sample, then the normalized weight
+    ``w_i = pi_i * D_i^alpha / sum_j (pi_j * D_j^alpha)`` where ``pi_i`` are the
+    static ``checkpoint_weights``. ``alpha=+1`` (``kl``) up-weights high-deviation
+    specialists (soft routing); ``alpha=-1`` (``kl_inv``) down-weights them
+    (inverse-variance). The shared per-step KL constant cancels in the ratio, so
+    only ``||tau_i||^2`` is needed.
+
+    Args:
+        taus: Per-checkpoint residual tensors ``tau_i = v_i - v_base``, same shape.
+        static_weights: Static per-checkpoint weights ``pi_i`` (same length).
+        alpha: Weighting exponent on ``D_i``.
+        eps: Floor for ``D_i`` and the normalizer (avoids div-by-zero, esp. for
+            ``alpha < 0``).
+
+    Returns:
+        List of ``K`` per-sample weight tensors, each shape ``(B,)``, summing to
+        1 across checkpoints per sample.
+
+    Raises:
+        ValueError: Empty sequence, length mismatch, or invalid ``eps``.
+    """
+    if not taus:
+        raise ValueError("_dynamic_kl_weights requires at least one tensor, got empty sequence.")
+    if len(taus) != len(static_weights):
+        raise ValueError(
+            "_dynamic_kl_weights expected len(taus) == len(static_weights), got "
+            f"len(taus)={len(taus)}, len(static_weights)={len(static_weights)}."
+        )
+    if eps <= 0:
+        raise ValueError(f"_dynamic_kl_weights eps must be > 0, got {eps}.")
+
+    batch = taus[0].shape[0]
+    kl = [t.reshape(batch, -1).pow(2).sum(dim=1).clamp_min(eps) for t in taus]  # (B,) each
+    raw = [
+        float(static) * d.pow(alpha) for static, d in zip(static_weights, kl, strict=True)
+    ]  # (B,) each
+    total = torch.stack(raw, dim=0).sum(dim=0).clamp_min(eps)  # (B,)
+    return [r / total for r in raw]
+
+
+def _resolve_blend_weights(
+    taus: Sequence[torch.Tensor],
+    static_weights: Sequence[float],
+    weighting: "EnsembleBlendWeighting",
+    eps: float,
+    stats: Optional[Any] = None,
+) -> List[BlendWeight]:
+    """Return the effective per-checkpoint blend weights for a residual/ties blend.
+
+    ``'uniform'`` returns the static ``checkpoint_weights`` unchanged; ``'kl'`` /
+    ``'kl_inv'`` return per-sample dynamic weights from teacher-base KL via
+    :func:`_dynamic_kl_weights`. When dynamic and ``stats`` exposes
+    ``record_weights``, the per-teacher mean weights are logged for diagnostics.
+
+    Raises:
+        ValueError: Unknown ``weighting``.
+    """
+    if weighting == "uniform":
+        return list(static_weights)
+    if weighting not in _WEIGHTING_ALPHA:
+        raise ValueError(
+            "_resolve_blend_weights expected weighting in "
+            f"{('uniform',) + tuple(_WEIGHTING_ALPHA)}, got weighting={weighting!r}."
+        )
+    eff = _dynamic_kl_weights(taus, static_weights, _WEIGHTING_ALPHA[weighting], eps)
+    if stats is not None and hasattr(stats, "record_weights"):
+        stats.record_weights(eff)
+    return eff
 
 
 def pcgrad_blend_noise_preds(
@@ -628,7 +783,7 @@ def pcgrad_blend_noise_preds_channelwise(
 
 def pcgrad_blend_noise_preds_normalized(
     vectors: Sequence[torch.Tensor],
-    weights: Sequence[float],
+    weights: Sequence[BlendWeight],
     *,
     eps: float = 1e-8,
     generator: Optional[torch.Generator] = None,
@@ -649,7 +804,8 @@ def pcgrad_blend_noise_preds_normalized(
 
     Args:
         vectors: Per-checkpoint velocity tensors, same shape.
-        weights: Per-checkpoint blend weights (same length as ``vectors``).
+        weights: Per-checkpoint blend weights (float scalars or per-sample ``(B,)``
+            tensors), same length as ``vectors``.
         eps: Minimum value for ``||v||^2`` when normalizing / dividing.
         generator: Optional RNG for shuffling inner-loop task order.
         stats: Optional accumulator for deferred summary logging.
@@ -701,7 +857,7 @@ def pcgrad_blend_noise_preds_normalized(
             )
 
     if len(vectors) == 1:
-        return weights[0] * vectors[0]
+        return _broadcast_weight(weights[0], vectors[0]) * vectors[0]
 
     batch = ref_shape[0]
     broadcast_shape = _batchwise_broadcast_shape(ref)
@@ -768,15 +924,15 @@ def pcgrad_blend_noise_preds_normalized(
             cosine_maxs=cosine_maxs,
         )
 
-    result = weights[0] * norm[0] * pc[0]
+    result = _broadcast_weight(weights[0], pc[0]) * norm[0] * pc[0]
     for k in range(1, num_checkpoints):
-        result = result + weights[k] * norm[k] * pc[k]
+        result = result + _broadcast_weight(weights[k], pc[k]) * norm[k] * pc[k]
     return result
 
 
 def _blend_velocity_set(
     vectors: Sequence[torch.Tensor],
-    weights: Sequence[float],
+    weights: Sequence[BlendWeight],
     *,
     projection: "PCGradProjection",
     eps: float = 1e-8,
@@ -794,6 +950,8 @@ def _blend_velocity_set(
     - ``normalized``: magnitude-normalized PCGrad on unit directions, recombined
       as ``sum_i w_i * n_i * p_i``.
 
+    ``weights`` entries may be float scalars or per-sample ``(B,)`` tensors.
+
     Raises:
         ValueError: Unknown ``projection``.
     """
@@ -802,7 +960,9 @@ def _blend_velocity_set(
             vectors, weights, eps=eps, generator=generator, stats=stats
         )
 
-    scaled_preds = [vec * weight for vec, weight in zip(vectors, weights, strict=True)]
+    scaled_preds = [
+        vec * _broadcast_weight(weight, vec) for vec, weight in zip(vectors, weights, strict=True)
+    ]
     if projection == "channelwise":
         return pcgrad_blend_noise_preds_channelwise(
             scaled_preds, eps=eps, generator=generator, stats=stats
@@ -826,6 +986,7 @@ def _pcgrad_residual_blend(
     pcgrad_eps: float,
     pcgrad_generator: Optional[torch.Generator],
     projection: "PCGradProjection" = "global",
+    weighting: EnsembleBlendWeighting = "uniform",
     stats: Optional[PCGradStats] = None,
 ) -> torch.Tensor:
     """Compute PCGrad on deltas from the pretrained model noise_pred.
@@ -834,11 +995,13 @@ def _pcgrad_residual_blend(
         1. Run ``base_forward`` with all LoRA adapters disabled to get the
            pretrained (reference) model's ``noise_pred`` (``v_b``).
         2. For each checkpoint, compute ``tau_i = noise_pred_i - v_b``.
-        3. Blend the task-specific deltas with the requested ``projection``
+        3. Resolve effective weights: static ``checkpoint_weights`` for
+           ``weighting='uniform'``, else per-sample KL weights
+           (``w_i ~ pi_i * ||tau_i||^{2*alpha}``) via :func:`_dynamic_kl_weights`.
+        4. Blend the task-specific deltas with the requested ``projection``
            (``global`` / ``channelwise`` / ``normalized``) via
-           :func:`_blend_velocity_set` (blend weights applied inside). These
-           corrections are much more likely to conflict than the full predictions.
-        4. Return ``v_b + combined_delta``.
+           :func:`_blend_velocity_set` (blend weights applied inside).
+        5. Return ``v_b + combined_delta``.
 
     Note:
         This adds one extra forward pass per denoising step for the pretrained model.
@@ -866,23 +1029,26 @@ def _pcgrad_residual_blend(
             )
         taus.append(out.noise_pred - ref_noise_pred)
 
-    # 3. Blend deltas with the requested projection (weights applied inside).
+    # 3. Resolve effective per-sample weights (KL / inverse-KL or static).
+    eff_weights = _resolve_blend_weights(taus, weights, weighting, pcgrad_eps, stats)
+
+    # 4. Blend deltas with the requested projection (weights applied inside).
     combined_delta = _blend_velocity_set(
         taus,
-        weights,
+        eff_weights,
         projection=projection,
         eps=pcgrad_eps,
         generator=pcgrad_generator,
         stats=stats,
     )
 
-    # 4. Add back pretrained baseline.
+    # 5. Add back pretrained baseline.
     return ref_noise_pred + combined_delta
 
 
 def ties_blend_deltas(
     taus: Sequence[torch.Tensor],
-    weights: Sequence[float],
+    weights: Sequence[BlendWeight],
     *,
     density: float = 1.0,
     stats: Optional[TIESStats] = None,
@@ -904,7 +1070,8 @@ def ties_blend_deltas(
 
     Args:
         taus: Per-checkpoint task-vector tensors, same shape.
-        weights: Per-checkpoint blend weights (same length as ``taus``).
+        weights: Per-checkpoint blend weights (float scalars or per-sample ``(B,)``
+            tensors), same length as ``taus``.
         density: Fraction of largest-magnitude entries to keep per task
             (``1.0`` = no trim). Must be in ``(0, 1]``.
         stats: Optional accumulator for deferred summary logging.
@@ -965,9 +1132,9 @@ def ties_blend_deltas(
         task_list = trimmed
 
     # 2. Elect a per-element sign from the weighted sum.
-    weighted_sum = task_list[0] * weights[0]
+    weighted_sum = task_list[0] * _broadcast_weight(weights[0], task_list[0])
     for k in range(1, len(task_list)):
-        weighted_sum = weighted_sum + task_list[k] * weights[k]
+        weighted_sum = weighted_sum + task_list[k] * _broadcast_weight(weights[k], task_list[k])
     gamma = torch.sign(weighted_sum)
 
     # 3. Disjoint weighted mean over sign-agreeing checkpoints.
@@ -979,8 +1146,9 @@ def ties_blend_deltas(
         nonzero = tau != 0
         agree = (torch.sign(tau) == gamma) & nonzero
         agree_f = agree.to(ref.dtype)
-        numerator = numerator + weight * tau * agree_f
-        denom = denom + weight * agree_f
+        weight_b = _broadcast_weight(weight, tau)
+        numerator = numerator + weight_b * tau * agree_f
+        denom = denom + weight_b * agree_f
         if stats is not None:
             total_elements += int(nonzero.sum().item())
             disagree_elements += int((nonzero & ~agree).sum().item())
@@ -1008,12 +1176,15 @@ def _ties_blend(
     noise_only_kwargs: Dict[str, Any],
     base_forward: Callable[..., Any],
     density: float,
+    pcgrad_eps: float = 1e-8,
+    weighting: EnsembleBlendWeighting = "uniform",
     stats: Optional[TIESStats] = None,
 ) -> torch.Tensor:
     """TIES-merging fusion of checkpoint noise_pred via base-anchored sign vote.
 
     Runs the pretrained baseline forward (``v_b``) and each checkpoint forward,
-    forms task vectors ``tau_i = noise_pred_i - v_b``, merges them with
+    forms task vectors ``tau_i = noise_pred_i - v_b``, resolves effective weights
+    (static or per-sample KL via ``weighting``), merges with
     :func:`ties_blend_deltas` (sign election + disjoint weighted mean), and
     returns ``v_b + tau_merged``.
 
@@ -1040,7 +1211,8 @@ def _ties_blend(
             )
         taus.append(out.noise_pred - ref_noise_pred)
 
-    tau_merged = ties_blend_deltas(taus, weights, density=density, stats=stats)
+    eff_weights = _resolve_blend_weights(taus, weights, weighting, pcgrad_eps, stats)
+    tau_merged = ties_blend_deltas(taus, eff_weights, density=density, stats=stats)
     return ref_noise_pred + tau_merged
 
 
@@ -1055,6 +1227,7 @@ def ensemble_forward_step(
     pcgrad_eps: float = 1e-8,
     pcgrad_generator: Optional[torch.Generator] = None,
     ties_density: float = 1.0,
+    weighting: EnsembleBlendWeighting = "uniform",
     stats: Optional[Union[PCGradStats, TIESStats]] = None,
 ) -> Any:
     """Blend per-checkpoint ``noise_pred`` tensors, then run one scheduler step.
@@ -1089,6 +1262,10 @@ def ensemble_forward_step(
         pcgrad_generator: Optional RNG for PCGrad inner-loop shuffle.
         ties_density: Fraction of largest-magnitude entries kept per task in
             ``'ties'`` mode (``1.0`` = no trim).
+        weighting: Per-sample dynamic teacher weighting by teacher-base KL.
+            ``'uniform'`` uses static ``weights``; ``'kl'`` / ``'kl_inv'`` weight
+            by ``||v_i - v_base||^{+/-2}``. Only valid for modes that compute the
+            base velocity (residual family and ``'ties'``).
         stats: Optional :class:`PCGradStats` (pcgrad modes) or :class:`TIESStats`
             (``'ties'`` mode) accumulator for deferred logging.
 
@@ -1096,7 +1273,8 @@ def ensemble_forward_step(
         Scheduler step output (same type as ``adapter.forward``).
 
     Raises:
-        ValueError: Mismatched lengths, invalid ``blend_mode``, or empty checkpoints.
+        ValueError: Mismatched lengths, invalid ``blend_mode``, empty checkpoints,
+            or ``weighting != 'uniform'`` on a mode without a base anchor.
         RuntimeError: A checkpoint forward did not return ``noise_pred``.
     """
     if blend_mode not in ENSEMBLE_BLEND_MODES:
@@ -1111,6 +1289,12 @@ def ensemble_forward_step(
         )
     if not checkpoint_names:
         raise ValueError("ensemble_forward_step requires at least one checkpoint.")
+    if weighting != "uniform" and blend_mode not in _KL_WEIGHTABLE_MODES:
+        raise ValueError(
+            f"ensemble_blend_weighting={weighting!r} requires a base-anchored blend "
+            f"mode (one of {tuple(sorted(_KL_WEIGHTABLE_MODES))}); got "
+            f"blend_mode={blend_mode!r}. KL weighting needs the base velocity v_base."
+        )
 
     noise_only_kwargs = dict(forward_kwargs)
     noise_only_kwargs["return_kwargs"] = ["noise_pred"]
@@ -1125,6 +1309,7 @@ def ensemble_forward_step(
             pcgrad_eps=pcgrad_eps,
             pcgrad_generator=pcgrad_generator,
             projection=_RESIDUAL_PROJECTIONS[blend_mode],
+            weighting=weighting,
             stats=stats,
         )
     elif blend_mode == "ties":
@@ -1135,6 +1320,8 @@ def ensemble_forward_step(
             noise_only_kwargs=noise_only_kwargs,
             base_forward=base_forward,
             density=ties_density,
+            pcgrad_eps=pcgrad_eps,
+            weighting=weighting,
             stats=stats,
         )
     else:

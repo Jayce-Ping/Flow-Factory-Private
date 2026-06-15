@@ -512,7 +512,10 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
    - **`pcgrad_normalized`**: magnitude-invariant PCGrad — project on unit directions `u_i = v_i / ‖v_i‖`, then recombine `Σ_i w_i · ‖v_i‖ · u_i^PC` so a high-norm checkpoint cannot dominate the geometry.
    - **`pcgrad_residual`** / **`pcgrad_residual_channelwise`** / **`pcgrad_residual_normalized`**: the same three projections applied to task-specific deltas `τ_i = noise_pred_i − v_b` (one extra pretrained forward `v_b` per step), then `noise_pred = v_b + Σ_i τ_i^PC`. Recommended for checkpoints trained on different objectives (deltas conflict far more than full predictions).
    - **`ties`**: TIES-merging base-anchored sign vote — elect a per-element sign `γ = sign(Σ_i w_i τ_i)`, take the disjoint weighted mean over sign-agreeing checkpoints, then `noise_pred = v_b + τ_merged` (one extra pretrained forward per step). `ties_density < 1` first trims each `τ_i` to its top-magnitude entries.
-3. Call `scheduler.step` once with the blended `noise_pred`.
+3. Optionally re-weight teachers per-sample (`ensemble_blend_weighting`, see below) before blending.
+4. Call `scheduler.step` once with the blended `noise_pred`.
+
+**Dynamic teacher weighting (`ensemble_blend_weighting`).** Instead of static `checkpoint_weights`, weight each teacher per-sample by its teacher–base KL `D_i = ‖v_i − v_b‖²` (= velocity-MSE): `w_i ∝ π_i · D_i^α`, normalized per sample. `kl` (`α=+1`) up-weights the most-deviating specialist (per-sample soft routing — recovers the relevant expert's correction on specialist ensembles); `kl_inv` (`α=−1`) is inverse-variance and down-weights it; `uniform` (default) keeps static weights. Because the weight needs `v_b`, `kl`/`kl_inv` are only valid for the base-anchored modes (`pcgrad_residual*` and `ties`). See `docs/opd/kl_weighted_teacher_fusion.tex` for the derivation (weighting commutes with PCGrad projection, so it only re-weights the recombination).
 
 ### Key config fields (`train:`)
 
@@ -525,6 +528,7 @@ At each denoising step inside `adapter.inference`, `adapter.forward` is temporar
 | `ensemble_blend_mode` | `'weighted'`, `'pcgrad'`, `'pcgrad_channelwise'`, `'pcgrad_normalized'`, `'pcgrad_residual'`, `'pcgrad_residual_channelwise'`, `'pcgrad_residual_normalized'`, or `'ties'` |
 | `pcgrad_eps` | Minimum squared norm per batch element in PCGrad projection (default `1e-8`) |
 | `ties_density` | `ties` only: fraction of top-magnitude entries kept per task vector before the sign vote (default `1.0` = no trim; must be in `(0, 1]`) |
+| `ensemble_blend_weighting` | `'uniform'` (default), `'kl'`, or `'kl_inv'`: per-sample teacher weighting by `‖v_i − v_b‖²`. `kl`/`kl_inv` require a base-anchored mode (`pcgrad_residual*` or `ties`) |
 
 Requires `model.finetune_type: lora`. Non-empty `checkpoint_paths` need matching `lora_rank` / `lora_alpha` across checkpoints. Empty `checkpoint_paths` uses the loaded student LoRA as-is (`model.resume_path` or initialized weights), not Hub ensemble snapshots. Example: `ensemble-eval/lora/sd3_5/default.yaml`.
 

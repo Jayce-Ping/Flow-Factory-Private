@@ -2471,6 +2471,23 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
             )
         },
     )
+    ensemble_blend_weighting: Literal["uniform", "kl", "kl_inv"] = field(
+        default="uniform",
+        metadata={
+            "help": (
+                "Per-sample dynamic teacher weighting by teacher-base KL "
+                "(== velocity-MSE D_i = ||v_i - v_base||^2). "
+                "'uniform': static checkpoint_weights only (default). "
+                "'kl': w_i ~ pi_i * D_i (up-weight high-deviation specialists; "
+                "per-sample soft routing). "
+                "'kl_inv': w_i ~ pi_i / D_i (inverse-variance; down-weight "
+                "high-deviation teachers). "
+                "'kl'/'kl_inv' require a base-anchored blend mode "
+                "(pcgrad_residual, pcgrad_residual_channelwise, "
+                "pcgrad_residual_normalized, or ties)."
+            )
+        },
+    )
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -2496,6 +2513,27 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
         if not (0.0 < self.ties_density <= 1.0):
             raise ValueError(
                 f"ties_density must be in (0, 1], got ties_density={self.ties_density}."
+            )
+        _valid_weightings = ("uniform", "kl", "kl_inv")
+        if self.ensemble_blend_weighting not in _valid_weightings:
+            raise ValueError(
+                f"ensemble_blend_weighting must be one of {_valid_weightings}, "
+                f"got ensemble_blend_weighting={self.ensemble_blend_weighting!r}."
+            )
+        _kl_weightable_modes = (
+            "pcgrad_residual",
+            "pcgrad_residual_channelwise",
+            "pcgrad_residual_normalized",
+            "ties",
+        )
+        if (
+            self.ensemble_blend_weighting != "uniform"
+            and self.ensemble_blend_mode not in _kl_weightable_modes
+        ):
+            raise ValueError(
+                f"ensemble_blend_weighting={self.ensemble_blend_weighting!r} requires "
+                f"ensemble_blend_mode in {_kl_weightable_modes} (KL weighting needs the "
+                f"base anchor v_base); got ensemble_blend_mode={self.ensemble_blend_mode!r}."
             )
         n_ckpt = len(self.checkpoint_paths)
         if n_ckpt == 0:

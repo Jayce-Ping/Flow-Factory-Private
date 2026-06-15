@@ -25,6 +25,7 @@ import torch
 
 from flow_factory.hparams.training_args import EnsembleEvalTrainingArguments
 from flow_factory.trainers.ensemble_eval.common import (
+    _dynamic_kl_weights,
     ensemble_forward_step,
     load_checkpoints,
     normalize_checkpoint_weights,
@@ -802,6 +803,193 @@ class TestBlendModeValidation(unittest.TestCase):
                 EnsembleEvalTrainingArguments(
                     checkpoint_paths=["/tmp/a"],
                     ties_density=bad,
+                    unique_sample_num_per_epoch=1,
+                    group_size=1,
+                    per_device_batch_size=1,
+                )
+
+
+# ---------------------------------------------------------------------------
+# Dynamic KL / inverse-KL teacher weighting
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicKlWeights(unittest.TestCase):
+    def test_kl_upweights_larger_norm(self) -> None:
+        taus = [torch.tensor([[3.0, 0.0]]), torch.tensor([[0.0, 1.0]])]  # D = 9, 1
+        w = _dynamic_kl_weights(taus, [0.5, 0.5], alpha=1.0, eps=1e-8)
+        torch.testing.assert_close(w[0], torch.tensor([0.9]))
+        torch.testing.assert_close(w[1], torch.tensor([0.1]))
+
+    def test_kl_inv_downweights_larger_norm(self) -> None:
+        taus = [torch.tensor([[3.0, 0.0]]), torch.tensor([[0.0, 1.0]])]  # D = 9, 1
+        w = _dynamic_kl_weights(taus, [0.5, 0.5], alpha=-1.0, eps=1e-8)
+        # raw = 0.5/9, 0.5 -> normalized 0.1, 0.9
+        torch.testing.assert_close(w[0], torch.tensor([0.1]))
+        torch.testing.assert_close(w[1], torch.tensor([0.9]))
+
+    def test_sums_to_one_per_sample(self) -> None:
+        taus = [torch.randn(4, 3, 2, 2), torch.randn(4, 3, 2, 2), torch.randn(4, 3, 2, 2)]
+        w = _dynamic_kl_weights(taus, [1 / 3, 1 / 3, 1 / 3], alpha=1.0, eps=1e-8)
+        total = w[0] + w[1] + w[2]
+        torch.testing.assert_close(total, torch.ones(4))
+
+    def test_per_sample_routing(self) -> None:
+        # sample 0 -> teacher 0 deviates; sample 1 -> teacher 1 deviates.
+        tau0 = torch.tensor([[3.0, 0.0], [0.0, 0.0]])
+        tau1 = torch.tensor([[0.0, 0.0], [0.0, 3.0]])
+        w = _dynamic_kl_weights([tau0, tau1], [0.5, 0.5], alpha=1.0, eps=1e-8)
+        self.assertGreater(w[0][0].item(), 0.99)
+        self.assertLess(w[0][1].item(), 0.01)
+        self.assertLess(w[1][0].item(), 0.01)
+        self.assertGreater(w[1][1].item(), 0.99)
+
+    def test_static_weights_compose(self) -> None:
+        taus = [torch.tensor([[2.0, 0.0]]), torch.tensor([[0.0, 2.0]])]  # equal D = 4
+        w = _dynamic_kl_weights(taus, [0.25, 0.75], alpha=1.0, eps=1e-8)
+        torch.testing.assert_close(w[0], torch.tensor([0.25]))
+        torch.testing.assert_close(w[1], torch.tensor([0.75]))
+
+    def test_rejects_length_mismatch(self) -> None:
+        with self.assertRaises(ValueError):
+            _dynamic_kl_weights([torch.tensor([[1.0]])], [0.5, 0.5], alpha=1.0, eps=1e-8)
+
+
+class TestEnsembleForwardStepKlWeighting(unittest.TestCase):
+    """KL / inverse-KL weighting via ensemble_forward_step (pcgrad_residual)."""
+
+    def _run(self, weighting: str):
+        ref_pred = torch.zeros(1, 2)
+        preds = {
+            "eval_ckpt_0": torch.tensor([[3.0, 0.0]]),  # tau0 = [3, 0] -> D = 9
+            "eval_ckpt_1": torch.tensor([[0.0, 1.0]]),  # tau1 = [0, 1] -> D = 1
+        }
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        return ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.zeros(1, 2),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="pcgrad_residual",
+            weighting=weighting,
+        )
+
+    def test_kl(self) -> None:
+        # No conflict (dot=0); kl weights 0.9/0.1 -> 0.9*[3,0]+0.1*[0,1].
+        out = self._run("kl")
+        torch.testing.assert_close(out.noise_pred, torch.tensor([[2.7, 0.1]]))
+
+    def test_kl_inv(self) -> None:
+        # kl_inv weights 0.1/0.9 -> 0.1*[3,0]+0.9*[0,1].
+        out = self._run("kl_inv")
+        torch.testing.assert_close(out.noise_pred, torch.tensor([[0.3, 0.9]]))
+
+    def test_ties_kl_weighted_sign_vote(self) -> None:
+        ref_pred = torch.zeros(1, 2)
+        preds = {
+            "eval_ckpt_0": torch.tensor([[2.0, 0.0]]),  # D = 4
+            "eval_ckpt_1": torch.tensor([[0.0, 1.0]]),  # D = 1
+        }
+        adapter = _MockAdapterWithRef(preds, ref_pred)
+        out = ensemble_forward_step(
+            adapter,
+            ["eval_ckpt_0", "eval_ckpt_1"],
+            [0.5, 0.5],
+            {
+                "t": torch.tensor(500),
+                "t_next": torch.tensor(400),
+                "latents": torch.zeros(1, 2),
+                "compute_log_prob": False,
+                "return_kwargs": ["next_latents", "noise_pred"],
+            },
+            adapter._sched_cache,
+            base_forward=adapter.forward,
+            blend_mode="ties",
+            weighting="kl",
+        )
+        # kl weights 0.8/0.2; disjoint mean per element -> [2.0, 1.0].
+        torch.testing.assert_close(out.noise_pred, torch.tensor([[2.0, 1.0]]))
+
+    def test_rejects_kl_on_full_velocity_mode(self) -> None:
+        preds = {
+            "eval_ckpt_0": torch.tensor([1.0]),
+            "eval_ckpt_1": torch.tensor([2.0]),
+        }
+        adapter = _MockAdapter(preds)
+        with self.assertRaises(ValueError):
+            ensemble_forward_step(
+                adapter,
+                ["eval_ckpt_0", "eval_ckpt_1"],
+                [0.5, 0.5],
+                {
+                    "t": torch.tensor(500),
+                    "t_next": torch.tensor(400),
+                    "latents": torch.tensor([0.0]),
+                    "compute_log_prob": False,
+                    "return_kwargs": ["next_latents", "noise_pred"],
+                },
+                adapter._sched_cache,
+                base_forward=adapter.forward,
+                blend_mode="pcgrad",
+                weighting="kl",
+            )
+
+
+class TestBlendWeightingValidation(unittest.TestCase):
+    def test_accepts_uniform_with_any_mode(self) -> None:
+        args = EnsembleEvalTrainingArguments(
+            checkpoint_paths=["/tmp/a"],
+            ensemble_blend_mode="weighted",
+            ensemble_blend_weighting="uniform",
+            unique_sample_num_per_epoch=1,
+            group_size=1,
+            per_device_batch_size=1,
+        )
+        self.assertEqual(args.ensemble_blend_weighting, "uniform")
+
+    def test_accepts_kl_with_residual_and_ties(self) -> None:
+        for mode in (
+            "pcgrad_residual",
+            "pcgrad_residual_channelwise",
+            "pcgrad_residual_normalized",
+            "ties",
+        ):
+            for weighting in ("kl", "kl_inv"):
+                args = EnsembleEvalTrainingArguments(
+                    checkpoint_paths=["/tmp/a"],
+                    ensemble_blend_mode=mode,
+                    ensemble_blend_weighting=weighting,
+                    unique_sample_num_per_epoch=1,
+                    group_size=1,
+                    per_device_batch_size=1,
+                )
+                self.assertEqual(args.ensemble_blend_weighting, weighting)
+
+    def test_rejects_invalid_weighting(self) -> None:
+        with self.assertRaises(ValueError):
+            EnsembleEvalTrainingArguments(
+                checkpoint_paths=["/tmp/a"],
+                ensemble_blend_weighting="bogus",  # type: ignore[arg-type]
+                unique_sample_num_per_epoch=1,
+                group_size=1,
+                per_device_batch_size=1,
+            )
+
+    def test_rejects_kl_with_non_residual_mode(self) -> None:
+        for mode in ("weighted", "pcgrad", "pcgrad_channelwise", "pcgrad_normalized"):
+            with self.assertRaises(ValueError):
+                EnsembleEvalTrainingArguments(
+                    checkpoint_paths=["/tmp/a"],
+                    ensemble_blend_mode=mode,
+                    ensemble_blend_weighting="kl",
                     unique_sample_num_per_epoch=1,
                     group_size=1,
                     per_device_batch_size=1,

@@ -1,0 +1,362 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\PC}{\mathrm{PCGrad}}
+\newcommand{\vb}{v_{\mathrm{base}}}
+\newcommand{\inner}[2]{\langle #1,\, #2\rangle}
+\newcommand{\norm}[1]{\lVert #1\rVert}
+\DeclareMathOperator{\sign}{sign}
+\DeclareMathOperator*{\softmax}{softmax}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{example}{Example}
+
+\title{\textbf{KL-Weighted Teacher Fusion for Ensemble Evaluation}\\[0.3em]
+\large 基于 teacher--base KL（velocity-MSE）的动态加权 PCGrad 理论分析}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文分析在 multi-checkpoint ensemble 融合（\texttt{ensemble-eval} trainer）中，用每个 teacher 相对 base model 的 per-step KL（在 flow matching 下等价于 velocity-MSE）$D_i=\norm{v_i-\vb}^2$ 的幂 $D_i^\alpha$ 作为 \emph{per-sample 动态权重} 的理论效果。主要结论：
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{加权--投影可交换}（定理~\ref{thm:commute}）：对 PCGrad 的每个 task 施加正的 per-sample 标量权重 $w_i$，等价于先用 \emph{未加权} 残差做投影、再对投影结果做 \emph{加权求和}。权重不改变冲突检测与投影方向，只改变最终线性重组。
+\item 因此"KL 加权是否有效"归结为"加权重组 $\sum_i w_i\,\tau_i^{\PC}$ 是否优于均匀重组"，与是否使用 PCGrad 无关。
+\item 在 \emph{specialist ensemble}（各 teacher 专精不同目标）下，正幂 $\alpha>0$（KL 加权）实现 per-sample 软路由（命题~\ref{prop:routing}）：可恢复相关 teacher 的修正；uniform 会按 $1/K$ 稀释；反幂 $\alpha<0$（$1/$KL 加权）会主动压制相关 teacher。
+\item 反幂 $\alpha<0$ 仅在"共享目标 $+$ 异方差噪声"假设下（inverse-variance / BLUE）才最优（命题~\ref{prop:ivw}）。$\alpha$ 的符号本质上编码了"偏离 base 的幅度"与"可靠性"之间的先验关系。
+\end{enumerate}
+对 OCR/PickScore/GenEval 三专家 ensemble，理论预测 $\alpha>0 \gg \text{uniform} \gg \alpha<0$，推荐以温度可调的正幂（或 softmax-over-KL）作为默认，并给出失败模式与实现接口。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{背景与问题设定}
+%% ============================================================
+
+\texttt{ensemble-eval} trainer 在每个去噪步把 $K$ 个 LoRA checkpoint 的 \texttt{noise\_pred} 融合后再做一次 \texttt{scheduler.step}。当前已实现的 PCGrad 家族为
+\[
+\text{vector}\in\{\text{full velocity},\ \text{residual delta}\}\ \times\ \text{projection}\in\{\text{global, channelwise, normalized}\},
+\]
+外加 \texttt{weighted} 与 \texttt{ties}（见 \texttt{src/flow\_factory/trainers/ensemble\_eval/common.py}）。在所有 PCGrad 模式里，per-checkpoint 权重 $w_i$ 默认 \textbf{均匀}（或由静态的 \texttt{checkpoint\_weights} 给定），且作用在 velocity 本身上。
+
+\paragraph{想法。} 既然每个 teacher 都是从同一 base model 微调而来，"teacher $i$ 相对 base 偏离多少"本身就携带信息：它度量了该 teacher 在当前 $(x_t,t,\text{prompt})$ 上"想说多少话"。一个自然的提议是用 teacher--base 的 per-step KL
+\[
+D_i \;=\; \KL\bigl(p_{\phi_i}(\cdot|x_t)\,\Vert\,p_{\mathrm{base}}(\cdot|x_t)\bigr)
+\]
+（下一节将证明 $D_i\propto\norm{v_i-\vb}^2$，即 velocity-MSE）作为动态权重：用 $D_i$ 或其倒数 $1/D_i$ 去加权融合。本文回答：这是否合理、在什么假设下有效、以及它如何与 PCGrad 相互作用。
+
+\paragraph{符号约定。} 沿用 \texttt{teacher\_aggregation\_loss\_formulations.tex} 与 \texttt{pcgrad\_gradient\_vs\_velocity\_analysis.tex} 的记号。所有量均为 \emph{per-sample}（固定某个 batch 样本 $b$ 与时间步 $k$，省略上标）：
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{符号} & \textbf{含义} \\
+\midrule
+$K$ & ensemble 中 checkpoint（teacher）数 \\
+$d=C\times H\times W$ & latent 维度 \\
+$\vb$ & base（pretrained，LoRA 关闭）的 velocity \\
+$v_i$ & teacher $i$ 的 velocity（\texttt{noise\_pred}） \\
+$\tau_i = v_i-\vb$ & teacher $i$ 的 task vector（residual delta） \\
+$D_i=\norm{\tau_i}^2$ & teacher--base 的 velocity-MSE（$\propto$ per-step KL） \\
+$w_i\ge 0$ & per-sample 融合权重 \\
+$\tau_i^{\PC}$ & 对 \emph{未加权} $\{\tau_j\}$ 做 PCGrad 后的投影向量 \\
+$\alpha$ & 加权指数：$w_i\propto D_i^{\alpha}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{Per-Step KL 等价于 Velocity-MSE}
+%% ============================================================
+
+在 Flow-SDE / ODE 离散化下，转移核是共享方差的条件高斯，转移均值关于 velocity \emph{仿射}（见 \texttt{teacher\_aggregation\_loss\_formulations.tex} 式 (mu) 与代码 \texttt{flow\_match\_euler\_discrete.py}）：
+\begin{equation}
+\mu(v) = \beta_k\, x_{t_k} + \alpha_k\, v\,\Delta t_k,\qquad
+\bar\sigma_k^2 = \sigma_{t_k}^2(-\Delta t_k),
+\label{eq:mu_affine}
+\end{equation}
+其中 $\beta_k,\alpha_k,\bar\sigma_k^2$ 仅依赖 noise schedule 与时间步，\emph{与具体模型无关}。因此 teacher $i$ 与 base 的均值差只保留 velocity 项：
+\begin{equation}
+\mu(v_i)-\mu(\vb) = \alpha_k\,\Delta t_k\,(v_i-\vb) = \alpha_k\,\Delta t_k\,\tau_i.
+\label{eq:mu_diff}
+\end{equation}
+
+\begin{proposition}[KL $=$ velocity-MSE，且 per-step 常数在归一化后抵消]
+\label{prop:kl_mse}
+共享方差高斯的闭式 KL 给出
+\begin{equation}
+D_i \;=\; \KL\bigl(\N(\mu(v_i),\bar\sigma_k^2 I)\,\Vert\,\N(\mu(\vb),\bar\sigma_k^2 I)\bigr)
+\;=\; \frac{\norm{\mu(v_i)-\mu(\vb)}^2}{2\bar\sigma_k^2}
+\;=\; c_k\,\norm{\tau_i}^2,
+\label{eq:kl_eq_mse}
+\end{equation}
+其中 $c_k = \dfrac{\alpha_k^2\,\Delta t_k^2}{2\bar\sigma_k^2}>0$ 对所有 teacher \emph{相同}。在 ODE eval（$\bar\sigma_k\to0$，使用 v-based 约定）下退化为纯 velocity-MSE $D_i=\norm{\tau_i}^2$。无论哪种情形，归一化权重
+\begin{equation}
+w_i(\alpha)=\frac{D_i^{\alpha}}{\sum_{j} D_j^{\alpha}}
+=\frac{\norm{\tau_i}^{2\alpha}}{\sum_{j}\norm{\tau_j}^{2\alpha}}
+\label{eq:weights}
+\end{equation}
+中的 $c_k^{\alpha}$ \emph{完全抵消}，故"按 KL 加权"与"按 velocity-MSE 加权"严格等价。
+\end{proposition}
+
+\begin{proof}
+\eqref{eq:kl_eq_mse} 是同方差高斯 KL 的标准结果，代入~\eqref{eq:mu_diff} 即得 $D_i=c_k\norm{\tau_i}^2$。代入~\eqref{eq:weights}，分子分母同含因子 $c_k^\alpha$ 相消。
+\end{proof}
+
+\begin{remark}
+这正是代码中 \texttt{trainers/opd/sde.py:\_compute\_per\_step\_kl} 的量（带 $1/(2\bar\sigma^2)$ 归一化或纯 MSE）。在 residual PCGrad 模式里 $\tau_i$ 已被计算（\texttt{\_pcgrad\_residual\_blend} 内的 \texttt{out.noise\_pred - ref\_noise\_pred}），故 $D_i=\norm{\tau_i}^2$ \emph{几乎零额外成本}。
+\end{remark}
+
+%% ============================================================
+\section{KL 加权族与温度}
+%% ============================================================
+
+\eqref{eq:weights} 定义了一族以 $\alpha$ 为参数的权重：
+\begin{itemize}[leftmargin=1.6em]
+\item $\alpha=0$：$w_i=1/K$，即当前的 \textbf{uniform} 加权。
+\item $\alpha=+1$：$w_i\propto D_i$，即"按 KL 加权"（user 的提议之一）。
+\item $\alpha=-1$：$w_i\propto 1/D_i$，即"按 $1/$KL 加权"（user 的另一提议）。
+\end{itemize}
+等价地，$w_i=\softmax_i\bigl(\alpha\log D_i\bigr)$，即 $\alpha$ 是作用在 \emph{log-KL} 上的温度。一个更"锐"的变体是直接对 KL 做 softmax：$w_i\propto\exp(\beta D_i)$（在 KL 量纲上路由），$\beta\to\infty$ 时退化为 hard routing（只选 KL 最大的 teacher）。下文以幂族~\eqref{eq:weights} 为主（贴合 user 提议），必要处对照指数族。
+
+%% ============================================================
+\section{核心结果：KL 加权与 PCGrad 投影可交换}
+%% ============================================================
+
+实现里 PCGrad（\texttt{pcgrad\_blend\_noise\_preds} 及其 channelwise 版本）按如下方式操作输入 $\{g_i\}$：对每个 $i$，按固定（可含随机但 \emph{两次运行一致} 的）顺序遍历 $j\neq i$，当 $\inner{\text{pc}_i}{g_j}<0$ 时
+\begin{equation}
+\text{pc}_i \leftarrow \text{pc}_i - \frac{\inner{\text{pc}_i}{g_j}}{\norm{g_j}^2}\,g_j
+\qquad(\text{投影始终使用\emph{原始} }g_j),
+\label{eq:pcgrad_step}
+\end{equation}
+最后输出 $\sum_i\text{pc}_i$。把 per-sample 标量权重 $w_i>0$ 引入即令 $g_i=w_i\tau_i$。
+
+\begin{theorem}[加权--投影可交换]
+\label{thm:commute}
+设 $w_i>0$ 为 per-sample 标量，$g_i=w_i\tau_i$。在~\eqref{eq:pcgrad_step} 的（global 或 channelwise）PCGrad 下，对每个 $i$ 有
+\begin{equation}
+\boxed{\;\text{pc}_i \;=\; w_i\,\tau_i^{\PC}\;}
+\label{eq:commute_pc}
+\end{equation}
+其中 $\tau_i^{\PC}$ 是对 \emph{未加权} 输入 $\{\tau_j\}$、以 \emph{相同顺序与相同冲突判定} 运行~\eqref{eq:pcgrad_step} 得到的投影向量。从而融合结果
+\begin{equation}
+\boxed{\;\sum_i \text{pc}_i \;=\; \sum_i w_i\,\tau_i^{\PC}\;}
+\label{eq:commute_sum}
+\end{equation}
+即：\textbf{KL 加权只作用在最终线性重组上，不改变冲突检测、不改变投影方向。}
+\end{theorem}
+
+\begin{proof}
+对 $i$ 的投影序列做归纳。初始 $\text{pc}_i=g_i=w_i\tau_i=w_i\tau_i^{(0)}$，其中 $\tau_i^{(0)}=\tau_i$ 为未加权初值。假设在某一步前 $\text{pc}_i=w_i\tau_i^{(s)}$（$\tau_i^{(s)}$ 为未加权运行的对应中间量）。对下一个 $j$：
+\[
+\inner{\text{pc}_i}{g_j}=\inner{w_i\tau_i^{(s)}}{w_j\tau_j}=w_iw_j\inner{\tau_i^{(s)}}{\tau_j}.
+\]
+由 $w_i,w_j>0$，$\sign\inner{\text{pc}_i}{g_j}=\sign\inner{\tau_i^{(s)}}{\tau_j}$，故 \emph{冲突判定与未加权运行完全一致}。若判定冲突，则
+\[
+\text{pc}_i \leftarrow w_i\tau_i^{(s)} - \frac{w_iw_j\inner{\tau_i^{(s)}}{\tau_j}}{w_j^2\norm{\tau_j}^2}\,w_j\tau_j
+= w_i\Bigl(\tau_i^{(s)} - \frac{\inner{\tau_i^{(s)}}{\tau_j}}{\norm{\tau_j}^2}\tau_j\Bigr)=w_i\,\tau_i^{(s+1)},
+\]
+其中 $w_j$ 在分子分母相消，得到的正是未加权更新 $\tau_i^{(s+1)}$ 乘 $w_i$。不冲突时两边同乘 $w_i$ 也保持。归纳完成，末态 $\text{pc}_i=w_i\tau_i^{\PC}$。channelwise 情形对每个 channel 独立重复同一论证（$w_i$ 是 per-sample 标量，对所有 channel 相同），结论不变。
+\end{proof}
+
+\begin{corollary}[问题降维]
+\label{cor:reduce}
+对 \texttt{pcgrad},\texttt{pcgrad\_channelwise},\texttt{pcgrad\_residual},\texttt{pcgrad\_residual\_channelwise}，引入 KL 权重后的融合等于
+\begin{equation}
+v_{\mathrm{fused}} = (\vb \text{ if residual else } 0) + \sum_i w_i\,\tau_i^{\PC}\quad(\text{full 模式中 } \tau_i^{\PC}\to v_i^{\PC}).
+\end{equation}
+因此"KL 加权对 PCGrad 是否有益"与"KL 加权对（投影后的）线性重组是否有益"是 \emph{同一个问题}；是否开启 PCGrad 不改变这一判断的本质。下文据此聚焦于加权重组 $\bar\tau(\alpha)=\sum_i w_i(\alpha)\,\tau_i^{\PC}$。
+\end{corollary}
+
+\begin{remark}[两个例外：normalized 与 ties]
+\label{rem:exceptions}
+定理~\ref{thm:commute} 依赖"投影对象按 $w_i$ 线性缩放"。两个模式不满足该前提：
+\begin{itemize}[leftmargin=1.6em]
+\item \texttt{normalized}：先把 $\tau_i$ 除以 $\norm{\tau_i}$ 再投影，重组为 $\sum_i w_i\norm{\tau_i}\,p_i$。叠加 KL 权重 $w_i\propto\norm{\tau_i}^{2\alpha}$ 后，等效幅度变为 $\norm{\tau_i}^{2\alpha+1}$。即 normalized 把"幅度"剥离后，KL 加权又以 $2\alpha+1$ 次幂把它\emph{部分}加回——$\alpha=-\tfrac12$ 恰好回到纯方向（完全剥离幅度），$\alpha=0$ 回到原 normalized 行为。
+\item \texttt{ties}：sign 选举 $\gamma=\sign(\sum_i w_i\tau_i)$ 与 disjoint 加权平均都显式用到 $w_i$，故 KL 权重会改变选举与平均，\emph{不可交换}。
+\end{itemize}
+\end{remark}
+
+%% ============================================================
+\section{加权重组的几何：$\alpha>0$ 放大"活跃"teacher}
+%% ============================================================
+
+由推论~\ref{cor:reduce}，关键对象是 $\bar\tau(\alpha)=\sum_i w_i(\alpha)\tau_i^{\PC}$。先看无冲突的干净情形（$\tau_i^{\PC}=\tau_i$），则
+\begin{equation}
+\bar\tau(\alpha)=\frac{\sum_i \norm{\tau_i}^{2\alpha}\,\tau_i}{\sum_j\norm{\tau_j}^{2\alpha}},\qquad
+\norm{w_i(\alpha)\tau_i}=\frac{\norm{\tau_i}^{2\alpha+1}}{\sum_j\norm{\tau_j}^{2\alpha}}.
+\label{eq:weighted_combo}
+\end{equation}
+单个 teacher 的贡献幅度 $\propto\norm{\tau_i}^{2\alpha+1}$：
+\begin{itemize}[leftmargin=1.6em]
+\item $\alpha=0$（uniform）：贡献 $\propto\norm{\tau_i}$，简单平均。
+\item $\alpha=1$（KL）：贡献 $\propto\norm{\tau_i}^{3}$，\textbf{立方放大} 偏离最大的 teacher。
+\item $\alpha=-1$（$1/$KL）：贡献 $\propto\norm{\tau_i}^{-1}$，\textbf{抑制} 偏离大的 teacher、放大近 base 的 teacher。
+\end{itemize}
+直观上，$\alpha>0$ 把融合推向"在当前样本上最活跃/最有主张"的 teacher，$\alpha<0$ 则相反。这是否可取，取决于"偏离大"意味着"相关"还是"噪声"——下两节用两个生成模型给出严格判别。
+
+%% ============================================================
+\section{何时 $\alpha>0$ 最优：Specialist Routing}
+%% ============================================================
+
+\begin{definition}[Disjoint-specialist 模型]
+\label{def:specialist}
+在 $(x_t,t,\text{prompt})$ 上存在唯一"相关 teacher" $s$：其 task vector 为真实修正 $\tau_s=r\,u$（$\norm{u}=1,\ r>0$）；其余 off-domain teacher 近似沉默，$\norm{\tau_i}=\epsilon_i\ll r\ (i\neq s)$，方向任意。
+\end{definition}
+
+\begin{proposition}[KL 加权实现软路由]
+\label{prop:routing}
+在定义~\ref{def:specialist} 下，对无冲突情形（或由定理~\ref{thm:commute}，off-domain 很小不改变定性结论）的加权融合~\eqref{eq:weighted_combo}：
+\begin{align}
+\alpha\to+\infty:&\quad \bar\tau\to \tau_s=r\,u \quad(\text{精确恢复相关修正});\\
+\alpha=1:&\quad \bar\tau=\frac{r^3u+\sum_{i\neq s}\epsilon_i^2\tau_i}{r^2+\sum_{i\neq s}\epsilon_i^2}
+= r\,u\,\Bigl(1+O(\epsilon^2/r^2)\Bigr);\\
+\alpha=0:&\quad \bar\tau=\frac1K\Bigl(r\,u+\textstyle\sum_{i\neq s}\tau_i\Bigr)\approx \frac{r}{K}\,u \quad(\text{方向被稀释、幅度欠修正 }1/K);\\
+\alpha=-1:&\quad \bar\tau=\frac{r^{-1}u+\sum_{i\neq s}\epsilon_i^{-2}\tau_i}{r^{-2}+\sum_{i\neq s}\epsilon_i^{-2}}
+\ \xrightarrow{\ \epsilon_i\ll r\ }\ \text{由 off-domain 噪声主导}.
+\end{align}
+即 $\alpha>0$ 恢复相关 teacher 的修正；uniform 把信号按 $1/K$ 稀释且方向被 off-domain 污染；$\alpha<0$ \emph{主动压制} 相关 teacher、放大最不自信者。
+\end{proposition}
+
+\begin{proof}
+直接代入~\eqref{eq:weighted_combo}。$\alpha\to+\infty$ 时 $w_s\to1$（$r$ 严格最大）。$\alpha=1$：分子 $r^2\cdot ru=r^3u$ 主导，余项 $O(\epsilon^2)\cdot O(\epsilon)=O(\epsilon^3)$，分母 $r^2+O(\epsilon^2)$，相除得 $ru(1+O(\epsilon^2/r^2))$。$\alpha=0$：$K$ 项平均，$r u$ 被 $K-1$ 个近零向量稀释为 $\approx ru/K$。$\alpha=-1$：权重 $\propto\epsilon_i^{-2}\gg r^{-2}$，分母 $\approx\sum\epsilon_i^{-2}$，分子相关项 $r^{-1}u$ 相对 $\sum\epsilon_i^{-2}\tau_i$（量级 $\sum\epsilon_i^{-1}$）可忽略。
+\end{proof}
+
+\begin{remark}[与 PCGrad 的协同]
+当 off-domain teacher 不仅沉默而且与 $s$ \emph{冲突} 时，PCGrad 会把 $\tau_s$ 沿冲突方向的分量投掉（$\tau_s^{\PC}$），而 KL 权重保证最终重组仍以 $s$ 为主——二者作用 \emph{正交且互补}：PCGrad 处理方向冲突，KL 权重处理"由谁主导"。这正是定理~\ref{thm:commute} 的实际意义。
+\end{remark}
+
+\begin{remark}[$\texttt{ensemble-eval}$ 即 specialist 制度]
+OCR / PickScore / GenEval 三个 teacher 在不同目标上专精。对一条 OCR prompt，OCR teacher 已学到文字渲染，$\norm{\tau_{\mathrm{OCR}}}$ 大；PickScore/GenEval teacher 多半接近 base（$\epsilon$ 小）。故本设定贴合定义~\ref{def:specialist}，理论预测 $\alpha>0$ 显著优于 uniform，$\alpha<0$ 最差。
+\end{remark}
+
+%% ============================================================
+\section{何时 $\alpha<0$ 最优：共享目标 $+$ 异方差噪声}
+%% ============================================================
+
+反幂并非永远错——它在 \emph{相反} 的生成假设下才是最优估计。
+
+\begin{definition}[Shared-target heteroscedastic 模型]
+\label{def:shared}
+所有 teacher 估计 \emph{同一} 真实修正 $\tau^\star$，带独立零均值噪声：$\tau_i=\tau^\star+\eta_i,\ \eta_i\sim\N(0,\sigma_i^2 I_d)$，且偏离幅度随噪声单调，$\E\norm{\tau_i}^2=\norm{\tau^\star}^2+d\,\sigma_i^2$（"偏离大 $=$ 更不可靠"）。
+\end{definition}
+
+\begin{proposition}[inverse-variance 最优]
+\label{prop:ivw}
+在定义~\ref{def:shared} 下，线性无偏估计 $\sum_i a_i\tau_i$（$\sum a_i=1$）中方差最小者（BLUE）取 $a_i\propto1/\sigma_i^2$。若以 $D_i=\norm{\tau_i}^2$ 近似 $d\sigma_i^2$（高维下 $\norm{\eta_i}^2\approx d\sigma_i^2$ 集中），则 $w_i\propto1/D_i$，即 $\alpha=-1$，且此时 $\bar\tau$ 是 $\tau^\star$ 的最小方差无偏估计。
+\end{proposition}
+
+\begin{proof}
+独立高斯下 $\mathrm{Var}(\sum a_i\tau_i)=\sum a_i^2\sigma_i^2$，在 $\sum a_i=1$ 约束下用 Lagrange 乘子得 $a_i\propto1/\sigma_i^2$（标准 inverse-variance weighting）。高维集中 $\norm{\eta_i}^2/d\to\sigma_i^2$ 给出 $D_i\approx\norm{\tau^\star}^2+d\sigma_i^2$，当 $\sigma_i^2 d\gg\norm{\tau^\star}^2$ 时 $D_i\approx d\sigma_i^2$，故 $1/D_i\propto1/\sigma_i^2$。
+\end{proof}
+
+\begin{tcolorbox}[colback=gray!6,colframe=gray!50,title=\textbf{判别准则：$\alpha$ 的符号编码先验}]
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{生成假设} & \textbf{"偏离大"含义} & \textbf{最优 $\alpha$} \\
+\midrule
+Disjoint specialists（各 teacher 专精） & 相关 / 信号 & $\alpha>0$（KL 加权） \\
+Shared target $+$ 异方差噪声 & 噪声 / 不可靠 & $\alpha<0$（$1/$KL 加权） \\
+同质、等可靠 & 无信息 & $\alpha=0$（uniform） \\
+\bottomrule
+\end{tabular}
+\end{center}
+\texttt{ensemble-eval}（OCR/PickScore/GenEval）属第一行 $\Rightarrow$ 预测 $\alpha>0$。
+\end{tcolorbox}
+
+%% ============================================================
+\section{失败模式与偏差--方差权衡}
+%% ============================================================
+
+\paragraph{$\alpha>0$ 的风险：自信但错误的 teacher。} 若某 off-domain teacher 在 out-of-domain 样本上 \emph{自信地错}（$\norm{\tau_W}$ 大但方向错），则 $\alpha=1$ 会按 $\norm{\tau_W}^3$ 放大它。PCGrad 只能投掉与他人冲突的 \emph{方向} 分量（定理~\ref{thm:commute} 表明权重不改变这一投影），无法阻止其在重组中以大权重主导。因此 $\alpha$ 越大，偏差越低但对"自信错误"越敏感（方差/鲁棒性变差）——这是一个标准的偏差--方差/路由锐度权衡。
+
+\paragraph{缓解。}
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{温度退火}：取 $\alpha\in(0,1]$ 而非直接 $+\infty$；或用 softmax-over-KL 加温度，限制单 teacher 权重上限。
+\item \textbf{与 normalized 组合}：normalized 把投影对象的幅度剥离（注记~\ref{rem:exceptions}），可削弱"自信错误"在 \emph{投影} 阶段的几何主导；KL 权重仍控制重组占比，二者可分别调。
+\item \textbf{Clip / 截断}：对 $w_i$ 设上限或对 $D_i$ 做分位裁剪，避免极端样本的退化。
+\item \textbf{诊断}：训练/评测时记录 per-teacher per-domain 的 $\E\norm{\tau_i}$，验证定义~\ref{def:specialist} 的"on-domain 偏离最大"假设是否成立（可复用现有 PCGrad 统计的日志通路）。
+\end{enumerate}
+
+%% ============================================================
+\section{算法与实现接口}
+%% ============================================================
+
+由定理~\ref{thm:commute}，KL 加权 \emph{无需} 改动 PCGrad 内核：只需把现有 \texttt{\_blend\_velocity\_set} 的 \texttt{weights} 由静态标量改为 \emph{per-sample 动态} 权重 $w_i(\alpha)$（形状 $(B,)$），其余复用残差路径已计算的 $\tau_i$。
+
+\paragraph{已实现接口。} 本方案已落地为配置开关 \texttt{ensemble\_blend\_weighting}$\in\{$\texttt{uniform}, \texttt{kl}, \texttt{kl\_inv}$\}$（\texttt{kl} 即 $\alpha{=}{+}1$，\texttt{kl\_inv} 即 $\alpha{=}{-}1$，\texttt{uniform} 即静态权重）。per-sample 权重由 \texttt{\_dynamic\_kl\_weights} 计算并经 \texttt{\_resolve\_blend\_weights} 注入 \texttt{\_pcgrad\_residual\_blend} / \texttt{\_ties\_blend}；因需要 $\vb$，该开关仅对 base-anchored 模式（\texttt{pcgrad\_residual} 系列与 \texttt{ties}）有效，其余模式会显式报错。per-teacher 平均权重会记入 \texttt{PCGradStats} / \texttt{TIESStats} 的 summary 以便核验路由。
+
+\begin{algorithm}[h]
+\caption{KL-Weighted Residual Fusion（per denoising step, per sample）}
+\begin{algorithmic}[1]
+\State $\vb \gets \text{base forward}(x_t,t)$ \Comment{LoRA 关闭，残差模式已做}
+\For{$i=1,\dots,K$} \Comment{各 teacher 前向}
+  \State $\tau_i \gets v_i - \vb$
+  \State $D_i \gets \norm{\tau_i}^2$ \Comment{per-sample KL（$\propto$），免费复用}
+\EndFor
+\State $w_i \gets D_i^{\alpha}\,/\,\sum_j D_j^{\alpha}$ \Comment{$\alpha>0$ 路由；$\alpha<0$ inverse-variance；含 eps 防 0}
+\State $\{\tau_i^{\PC}\} \gets \PC(\{\tau_i\})$ \Comment{在\emph{未加权}残差上投影（可选 global/channelwise）}
+\State \Return $\vb + \sum_i w_i\,\tau_i^{\PC}$ \Comment{KL 加权重组}
+\end{algorithmic}
+\end{algorithm}
+
+\noindent 数值与一致性要点：
+\begin{itemize}[leftmargin=1.6em]
+\item $D_i$ 加 \texttt{eps} 下限后再取幂，避免 $\alpha<0$ 时除零；权重做归一化使 $\sum_i w_i=1$（保持 no-conflict $\Rightarrow$ weighted 的可比性）。
+\item per-step 常数 $c_k$ 已由归一化抵消（命题~\ref{prop:kl_mse}），无需显式处理 $\bar\sigma_k,\Delta t_k$。
+\item 该加权与 global/channelwise 投影 \emph{严格可交换}（定理~\ref{thm:commute}）；与 normalized/ties 组合时行为见注记~\ref{rem:exceptions}，需单独验证。
+\item 静态 \texttt{checkpoint\_weights} $\pi_i$ 可与动态权重相乘：$w_i\propto\pi_i\,D_i^{\alpha}$（先验 $\times$ per-sample 证据）。
+\end{itemize}
+
+%% ============================================================
+\section{结论与预测}
+%% ============================================================
+
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{KL $=$ velocity-MSE}：teacher--base 的 per-step KL 严格正比于 $\norm{v_i-\vb}^2$，且 per-step 常数在归一化后抵消（命题~\ref{prop:kl_mse}）。
+\item \textbf{加权与 PCGrad 可交换}（定理~\ref{thm:commute}）：对 global/channelwise，KL 加权只改变最终线性重组，不改变冲突结构。故"KL 加权 $+$ PCGrad"$=$"PCGrad（未加权）后做 KL 加权求和"。
+\item \textbf{符号由制度决定}：specialist ensemble $\Rightarrow\alpha>0$（软路由，命题~\ref{prop:routing}）；shared-target heteroscedastic $\Rightarrow\alpha<0$（inverse-variance，命题~\ref{prop:ivw}）。
+\item \textbf{对 \texttt{ensemble-eval} 的预测}：OCR/PickScore/GenEval 属 specialist 制度，预期
+\[
+\alpha>0\ (\text{KL 加权})\ \gg\ \alpha=0\ (\text{uniform})\ \gg\ \alpha<0\ (1/\text{KL 加权}).
+\]
+建议先验证 $\alpha=1$ 于 \texttt{pcgrad\_residual} / \texttt{weighted}（残差）之上，再以温度（$\alpha\in[0.5,2]$ 或 softmax-over-KL）扫描锐度，并监控"自信错误"失败模式。
+\end{enumerate}
+
+\paragraph{一句话回答。} user 的提议在本 ensemble 设定下\emph{方向正确}：按 KL（velocity-MSE）\emph{正向} 加权（而非取倒数）等价于按"每个 teacher 偏离 base 的程度"做 per-sample 软路由，理论上可恢复相关专家的修正、优于均匀融合；取倒数只有在"teacher 共享同一目标、偏离即噪声"时才合理，与本设定相悖。且由于 KL 加权与 PCGrad 投影可交换，它是一个低成本、可与现有任意 projection 叠加的正交改进。
+
+\end{document}

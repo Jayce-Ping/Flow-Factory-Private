@@ -62,6 +62,7 @@ train:
   ensemble_blend_mode: pcgrad  # weighted | pcgrad | pcgrad_channelwise | pcgrad_normalized | pcgrad_residual | pcgrad_residual_channelwise | pcgrad_residual_normalized | ties
   pcgrad_eps: 1.0e-8
   ties_density: 1.0  # ties only: fraction of top-|tau| entries kept per task (1.0 = no trim)
+  ensemble_blend_weighting: uniform  # uniform | kl | kl_inv (kl/kl_inv require a residual or ties blend mode; weight teachers by ||v_i - v_base||^2)
 
   max_epochs: 1
   unique_sample_num_per_epoch: 1
