@@ -159,5 +159,48 @@ class TestFindPeaks(unittest.TestCase):
         self.assertEqual(xs, [0.0, 0.5, 1.0])
 
 
+class TestLoadCachedRecordsSweep(unittest.TestCase):
+    """The shared loader must accept the sweep record schema via a custom identity."""
+
+    _SWEEP_KEY = staticmethod(lambda r: (r["pair"], r["test_set"], r["x"], int(r["gidx"])))
+
+    def test_loads_sweep_records_without_method_field(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            recs = [
+                {"pair": "A__B", "test_set": "ocr", "x": 0.0, "gidx": 0, "scores": {"ocr": 0.2}},
+                {"pair": "A__B", "test_set": "ocr", "x": 0.5, "gidx": 0, "scores": {"ocr": 0.9}},
+            ]
+            sw._write_record_shard(out / "records", "ocr", "A__B_x0.000", 0, recs)
+            loaded = sw._load_cached_records(out, identity=self._SWEEP_KEY)
+            # no KeyError on the missing "method" field; both records returned
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual({r["x"] for r in loaded}, {0.0, 0.5})
+
+    def test_newer_shard_wins_per_identity(self) -> None:
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            rdir = out / "records"
+            sw._write_record_shard(
+                rdir, "ocr", "A__B_x0.000__r0", 0,
+                [{"pair": "A__B", "test_set": "ocr", "x": 0.0, "gidx": 0, "scores": {"ocr": 0.1}}],
+            )
+            # a later (newer mtime) shard re-scores the same (pair, test_set, x, gidx)
+            new_shard = rdir / "ocr__A__B_x0.000__r1.jsonl"
+            new_shard.write_text(
+                '{"pair": "A__B", "test_set": "ocr", "x": 0.0, "gidx": 0, "scores": {"ocr": 0.9}}\n',
+                encoding="utf-8",
+            )
+            os.utime(new_shard, (10**10, 10**10))  # force newest mtime
+            loaded = sw._load_cached_records(out, identity=self._SWEEP_KEY)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["scores"]["ocr"], 0.9)
+
+
 if __name__ == "__main__":
     unittest.main()

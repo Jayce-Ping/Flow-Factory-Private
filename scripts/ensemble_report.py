@@ -71,7 +71,7 @@ import logging
 import math
 import statistics
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -555,24 +555,35 @@ def _write_record_shard(
             fh.write(json.dumps(rec) + "\n")
 
 
-def _load_cached_records(output_dir: Path) -> List[Dict[str, Any]]:
-    """Union all per-(test_set, method, rank) record shards under ``records/``.
+def _default_record_identity(rec: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Dedup identity for ensemble-comparison records: ``(test_set, method, gidx)``."""
+    return (rec["test_set"], rec["method"], int(rec["gidx"]))
 
-    Dedups by ``(test_set, method, gidx)``, processing shards oldest -> newest by
-    mtime so a re-score (or a later run) wins over stale entries -- e.g. leftover
-    higher-rank shards from a previous run with a larger world size. This is the
-    authoritative, incrementally-merged record source for :func:`rebuild_report`.
+
+def _load_cached_records(
+    output_dir: Path,
+    identity: Optional[Callable[[Dict[str, Any]], Tuple[Any, ...]]] = None,
+) -> List[Dict[str, Any]]:
+    """Union all per-shard record files under ``records/``.
+
+    Dedups by ``identity(rec)`` (default ``(test_set, method, gidx)``), processing
+    shards oldest -> newest by mtime so a re-score (or a later run) wins over stale
+    entries -- e.g. leftover higher-rank shards from a previous run with a larger
+    world size. This is the authoritative, incrementally-merged record source for
+    :func:`rebuild_report`. Callers with a different record schema (e.g. the weight
+    sweep, keyed by ``(pair, test_set, x, gidx)``) pass their own ``identity``.
     """
+    identity = identity or _default_record_identity
     records_dir = output_dir / "records"
     if not records_dir.is_dir():
         return []
-    by_key: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+    by_key: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     for shard in sorted(records_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime):
         for line in shard.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line:
                 rec = json.loads(line)
-                by_key[(rec["test_set"], rec["method"], int(rec["gidx"]))] = rec
+                by_key[identity(rec)] = rec
     return list(by_key.values())
 
 

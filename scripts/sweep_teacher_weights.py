@@ -463,7 +463,10 @@ def rebuild_plots(output_dir: Path, gallery_num_fallback: int = 16) -> None:
         data = json.loads(data_path.read_text(encoding="utf-8"))
         meta, records = data["meta"], data["records"]
     else:
-        records = _load_cached_records(output_dir)
+        records = _load_cached_records(
+            output_dir,
+            identity=lambda r: (r["pair"], r["test_set"], r["x"], int(r["gidx"])),
+        )
         if not records:
             raise FileNotFoundError(
                 f"--plot-only found neither {data_path} nor record shards under "
