@@ -78,6 +78,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ensemble_report import (  # noqa: E402  (import after sys.path bootstrap)
     _load_cached_records,
     _mean_std,
+    _safe_name,
     _write_record_shard,
 )
 
@@ -351,6 +352,97 @@ table.peaks th.l, table.peaks td.l { text-align: left; }
 .cell .cap { font-size: 11px; color: #888; word-break: break-word; }
 .xlabel { font-size: 12px; font-weight: 600; margin: 6px 0 2px; }
 .peakx { color: #2e7d32; }
+.viewer { border: 1px solid #8883; border-radius: 8px; padding: 12px; margin: 8px 0 16px; }
+.vctrls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; margin: 8px 0 6px; }
+.vctrls button { cursor: pointer; padding: 3px 11px; border-radius: 6px; border: 1px solid #8886;
+                 background: #8881; color: inherit; }
+.vctrls button:hover { background: #8883; }
+.vctrls .v-pstatus { color: #888; min-width: 150px; text-align: center; }
+.vctrls .v-pjump { width: 64px; padding: 3px 6px; border-radius: 6px; border: 1px solid #8886;
+                   background: transparent; color: inherit; }
+.vweight { margin-bottom: 4px; }
+.vweight .v-slider { width: 100%; max-width: 512px; display: block; }
+.v-xlabel { font-size: 13px; font-weight: 600; margin-top: 4px; }
+.v-ends { display: flex; justify-content: space-between; max-width: 512px; font-size: 11px; color: #888; }
+.vgrid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.gcell { width: 150px; }
+.gthumb { width: 150px; height: 150px; border-radius: 5px; background: #8882; overflow: hidden; }
+.gthumb img { width: 150px; height: 150px; object-fit: cover; display: block; }
+.gcell.empty .gthumb { border: 1px dashed #8886; background: transparent; }
+.gcell.empty .gthumb img { display: none; }
+.gcap { font-size: 11px; color: #888; word-break: break-word; }
+"""
+
+# Interactive per-(pair,test_set) viewer: a weight-ratio slider (x) over a grid of
+# `page` prompt thumbnails, with prev/next arrows paging through ALL prompts. Each
+# viewer reads its sibling <script type="application/json"> payload; the grid cells
+# are built once and their <img>/caption are swapped on slider/page changes.
+_VIEWER_JS = """
+(function () {
+  function init(root) {
+    var dataEl = document.getElementById(root.id + '-data');
+    if (!dataEl) return;
+    var data = JSON.parse(dataEl.textContent);
+    var xs = data.xs, prompts = data.prompts, pageSize = data.page || 32;
+    if (!xs.length || !prompts.length) return;
+    var grid = root.querySelector('.vgrid');
+    var slider = root.querySelector('.v-slider');
+    var xlabel = root.querySelector('.v-xlabel');
+    var pstatus = root.querySelector('.v-pstatus');
+    var pjump = root.querySelector('.v-pjump');
+    var prev = root.querySelector('.v-prev');
+    var next = root.querySelector('.v-next');
+    var nPages = Math.ceil(prompts.length / pageSize);
+    var pageIdx = 0, xi = 0;
+    function pad5(n) { n = String(n); while (n.length < 5) n = '0' + n; return n; }
+    var cells = [];
+    for (var k = 0; k < pageSize; k++) {
+      var c = document.createElement('div'); c.className = 'gcell';
+      var th = document.createElement('div'); th.className = 'gthumb';
+      var im = document.createElement('img'); im.loading = 'lazy'; th.appendChild(im);
+      var cap = document.createElement('div'); cap.className = 'gcap';
+      c.appendChild(th); c.appendChild(cap); grid.appendChild(c);
+      cells.push({ c: c, im: im, cap: cap });
+    }
+    function render() {
+      xlabel.textContent = 'x = ' + xs[xi];
+      var start = pageIdx * pageSize;
+      var shown = Math.min(pageSize, prompts.length - start);
+      pstatus.textContent = 'prompts ' + (start + 1) + '-' + (start + shown) +
+        ' / ' + prompts.length + '  (page ' + (pageIdx + 1) + '/' + nPages + ')';
+      if (pjump) pjump.value = pageIdx + 1;
+      for (var i = 0; i < pageSize; i++) {
+        var cell = cells[i];
+        var pr = prompts[start + i];
+        if (!pr) { cell.c.style.display = 'none'; continue; }
+        cell.c.style.display = '';
+        if (pr.img[xi]) {
+          cell.im.src = data.base + '/x' + xs[xi] + '/' + pad5(pr.g) + '.png';
+          cell.c.classList.remove('empty');
+        } else {
+          cell.im.removeAttribute('src');
+          cell.c.classList.add('empty');
+        }
+        var sc = pr.sc[xi];
+        var scstr = sc
+          ? Object.keys(sc).map(function (key) { return key + '=' + (+sc[key]).toFixed(3); }).join(' ')
+          : '';
+        cell.cap.textContent = '#' + pr.g + (scstr ? ('  ' + scstr) : '');
+        cell.c.title = pr.p || ('#' + pr.g);
+      }
+    }
+    function setPage(i) { pageIdx = Math.max(0, Math.min(nPages - 1, i)); render(); }
+    function setX(i) { xi = Math.max(0, Math.min(xs.length - 1, i)); render(); }
+    if (prev) prev.addEventListener('click', function () { setPage(pageIdx - 1); });
+    if (next) next.addEventListener('click', function () { setPage(pageIdx + 1); });
+    if (pjump) pjump.addEventListener('change', function () {
+      var v = parseInt(pjump.value, 10); if (!isNaN(v)) setPage(v - 1);
+    });
+    slider.addEventListener('input', function () { setX(parseInt(slider.value, 10) || 0); });
+    render();
+  }
+  document.querySelectorAll('.viewer').forEach(init);
+})();
 """
 
 
@@ -373,27 +465,119 @@ def _peak_table_html(by_reward_peaks: Dict[str, Any]) -> str:
     )
 
 
-def _gallery_html(
-    output_dir: Path, pair: str, test_set: str, xs: Sequence[float], gallery_num: int
-) -> str:
-    parts: List[str] = ["<div class='gallery'>"]
-    for x in xs:
-        xdir = output_dir / "images" / pair / test_set / x_dirname(x)
-        cells: List[str] = []
-        for gidx in range(gallery_num):
-            rel = f"images/{pair}/{test_set}/{x_dirname(x)}/{gidx:05d}.png"
-            if (xdir / f"{gidx:05d}.png").exists():
-                cells.append(
-                    f"<div class='cell'><img loading='lazy' src='{html.escape(rel)}'>"
-                    f"<div class='cap'>#{gidx}</div></div>"
-                )
-        if not cells:
+def _viewer_x_dirs(output_dir: Path, pair: str, test_set: str) -> List[Tuple[float, str]]:
+    """Sorted ``(x_float, x_label)`` for the ``x*`` image dirs present on disk."""
+    root = output_dir / "images" / pair / test_set
+    found: List[Tuple[float, str]] = []
+    if root.is_dir():
+        for d in root.iterdir():
+            if d.is_dir() and d.name.startswith("x"):
+                try:
+                    xf = float(d.name[1:])
+                except ValueError:
+                    continue
+                found.append((xf, d.name[1:]))  # label without the leading 'x'
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+def _build_viewer_data(
+    output_dir: Path,
+    pair: str,
+    test_set: str,
+    records: List[Dict[str, Any]],
+    page_size: int,
+) -> Dict[str, Any]:
+    """Compact payload for the grid viewer: x labels + EVERY prompt + page size.
+
+    The viewer shows ``page_size`` thumbnails at once and pages through all prompts
+    via the prev/next arrows; the slider scrubs the weight x. Image presence comes
+    from one scandir per x-dir (network-FS friendly); prompt text / tag / per-x
+    scores come from the records.
+    """
+    xdirs = _viewer_x_dirs(output_dir, pair, test_set)
+    xs_labels = [label for _, label in xdirs]
+    present: Dict[str, set] = {}
+    for _, label in xdirs:
+        idx_set: set = set()
+        for png in (output_dir / "images" / pair / test_set / f"x{label}").iterdir():
+            if png.suffix == ".png" and png.stem.isdigit():
+                idx_set.add(int(png.stem))
+        present[label] = idx_set
+
+    prompt_text: Dict[int, str] = {}
+    prompt_tag: Dict[int, Any] = {}
+    score_at: Dict[Tuple[int, str], Dict[str, float]] = {}
+    for r in records:
+        if r["pair"] != pair or r["test_set"] != test_set:
             continue
-        parts.append(
-            f"<div class='xlabel'>x = {x:.3f}</div><div class='grow'>{''.join(cells)}</div>"
+        g = int(r["gidx"])
+        label = f"{round(float(r['x']), 3):.3f}"
+        prompt_text.setdefault(g, r.get("prompt", ""))
+        prompt_tag.setdefault(g, r.get("tag"))
+        score_at[(g, label)] = r.get("scores", {})
+
+    # Every prompt that has at least one image across the swept weights.
+    all_gidx = sorted(set().union(*present.values())) if present else []
+    prompts: List[Dict[str, Any]] = []
+    for g in all_gidx:
+        imgs = [g in present[label] for label in xs_labels]
+        prompts.append(
+            {
+                "g": g,
+                "p": prompt_text.get(g, ""),
+                "t": prompt_tag.get(g),
+                "img": imgs,
+                "sc": [score_at.get((g, label)) for label in xs_labels],
+            }
         )
-    parts.append("</div>")
-    return "".join(parts)
+    return {
+        "base": f"images/{pair}/{test_set}",
+        "xs": xs_labels,
+        "page": max(1, int(page_size)),
+        "prompts": prompts,
+    }
+
+
+def _viewer_html(
+    output_dir: Path,
+    pair: str,
+    test_set: str,
+    records: List[Dict[str, Any]],
+    page_size: int,
+    teacher_a: str,
+    teacher_b: str,
+) -> str:
+    """Interactive viewer: weight slider over a grid of `page_size` prompt thumbnails.
+
+    The prev/next arrows page the grid through ALL prompts; the slider scrubs the
+    weight ratio x for the whole grid at once.
+    """
+    data = _build_viewer_data(output_dir, pair, test_set, records, page_size)
+    if not data["xs"] or not data["prompts"]:
+        return "<div class='meta'>(no images for this pair / test set yet)</div>"
+    vid = f"viewer-{_safe_name(pair)}-{_safe_name(test_set)}"
+    n_pages = max(1, math.ceil(len(data["prompts"]) / data["page"]))
+    payload = json.dumps(data).replace("</", "<\\/")  # safe inside <script>
+    return (
+        f"<div class='viewer' id='{html.escape(vid)}'>"
+        "<div class='vweight'>"
+        "<input class='v-slider' type='range' min='0' "
+        f"max='{len(data['xs']) - 1}' value='0' step='1' aria-label='weight ratio x'>"
+        "<div class='v-xlabel'>x = ?</div>"
+        f"<div class='v-ends'><span>x=0 &rarr; {html.escape(teacher_b)}</span>"
+        f"<span>{html.escape(teacher_a)} &larr; x=1</span></div>"
+        "</div>"
+        "<div class='vctrls'>"
+        "<button type='button' class='v-prev'>&larr; prev</button>"
+        "<span class='v-pstatus'>prompts</span>"
+        "<button type='button' class='v-next'>next &rarr;</button>"
+        f"<input class='v-pjump' type='number' min='1' max='{n_pages}' value='1' aria-label='page'>"
+        "</div>"
+        "<div class='vgrid'></div>"
+        "</div>"
+        f"<script type='application/json' id='{html.escape(vid)}-data'>{payload}</script>"
+    )
 
 
 def render_outputs(
@@ -436,11 +620,11 @@ def render_outputs(
                 f"<div class='fig'><img loading='lazy' src='{html.escape(rel_fig)}'></div>"
             )
             parts.append(_peak_table_html(peaks_for))
-            x_min = min(min(by_x.keys()) for by_x in by_reward.values())
-            x_max = max(max(by_x.keys()) for by_x in by_reward.values())
-            gallery_xs = _gallery_x_values(peaks_for, x_min, x_max)
-            parts.append(_gallery_html(output_dir, pair, test_set, gallery_xs, gallery_num))
+            parts.append(
+                _viewer_html(output_dir, pair, test_set, records, gallery_num, teacher_a, teacher_b)
+            )
 
+    parts.append(f"<script>{_VIEWER_JS}</script>")
     parts.append("</body></html>")
     (output_dir / "index.html").write_text("".join(parts), encoding="utf-8")
     logger.info(f"Sweep report written: {output_dir / 'index.html'}")
@@ -451,11 +635,12 @@ def _split_pair(pair: str) -> Tuple[str, str]:
     return teacher_a, teacher_b
 
 
-def rebuild_plots(output_dir: Path, gallery_num_fallback: int = 16) -> None:
+def rebuild_plots(output_dir: Path, gallery_num: int = 32) -> None:
     """Re-render plots + index.html from a prior run (no torch/model/GPU).
 
     Source precedence: ``sweep_data.json`` (meta + records), else ``records/``
-    shards (+ ``sweep_meta.json`` if present).
+    shards (+ ``sweep_meta.json`` if present). ``gallery_num`` is the number of
+    prompts the interactive viewer can page through (the slider covers all x).
     """
     data_path = output_dir / "sweep_data.json"
     meta_path = output_dir / "sweep_meta.json"
@@ -475,7 +660,6 @@ def rebuild_plots(output_dir: Path, gallery_num_fallback: int = 16) -> None:
         meta = (
             json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
         )
-    gallery_num = int(meta.get("gallery_num_prompts") or gallery_num_fallback)
     render_outputs(output_dir, meta, records, gallery_num)
 
 
@@ -494,7 +678,7 @@ def main() -> None:  # noqa: C901 - orchestration script
         logging.disable(logging.WARNING)
 
     if args.plot_only:
-        rebuild_plots(Path(args.output_dir), gallery_num_fallback=args.gallery_num_prompts)
+        rebuild_plots(Path(args.output_dir), gallery_num=args.gallery_num_prompts)
         return
 
     from accelerate.utils import gather_object
@@ -773,8 +957,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--gallery-num-prompts",
         type=int,
-        default=16,
-        help="How many prompts per (pair, test_set, x) to show in the HTML galleries.",
+        default=32,
+        help=(
+            "Prompts shown at once per page in the interactive viewer grid; the prev/next "
+            "arrows page through ALL prompts and the slider scrubs the weight x. "
+            "For --plot-only this overrides the stored value."
+        ),
     )
     p.add_argument(
         "--max-prompts",
