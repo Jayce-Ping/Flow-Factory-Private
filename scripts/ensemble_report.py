@@ -165,6 +165,10 @@ table.metrics tr.sep-below td, table.metrics tr.sep-below th { border-bottom: 2p
 .sep { width: 2px; align-self: stretch; background: #8885; margin: 0 4px; border-radius: 1px; }
 .missing { width: 200px; height: 200px; display: flex; align-items: center; justify-content: center;
            border: 1px dashed #8886; border-radius: 6px; color: #888; font-size: 12px; }
+.row-label { font-size: 11px; font-weight: 700; color: #888; letter-spacing: .04em;
+             text-transform: uppercase; margin: 8px 0 2px; }
+.row.baselines-row { padding: 8px; border: 1px solid #6d4c4133; border-radius: 8px;
+                     background: #6d4c4111; }
 .gallery-page[hidden] { display: none; }
 .pager { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 18px; font-size: 13px; }
 .pager button { cursor: pointer; padding: 3px 11px; border-radius: 6px; border: 1px solid #8886;
@@ -289,13 +293,53 @@ def _aggregate_table_html(
     )
 
 
+def _effective_baseline_methods(
+    methods: Sequence[str], declared_baselines: Sequence[str]
+) -> List[str]:
+    """Labels treated as references in the report layout.
+
+    Declared baselines (base model + single teachers + weight_merge) PLUS the
+    weighted-sum linear blend and any weight-merge column: per the report layout,
+    ``weighted`` and ``weight_merge`` count as baselines too. Returned in the input
+    ``methods`` order for stable display.
+    """
+    declared = set(declared_baselines)
+
+    def is_base(m: str) -> bool:
+        return m in declared or m.endswith("_weighted") or "weight_merge" in m
+
+    return [m for m in methods if is_base(m)]
+
+
+def _gallery_cell_html(entry: Dict[str, Any], m: str, is_baseline: bool) -> str:
+    """One method's image + label + scores cell within a prompt block."""
+    cell = entry["methods"].get(m, {})
+    img = cell.get("img")
+    scores = cell.get("scores", {})
+    score_str = ", ".join(f"{k}={_fmt(v)}" for k, v in sorted(scores.items()))
+    cell_cls = "cell baseline" if is_baseline else "cell"
+    badge = "<span class='badge'>ref</span>" if is_baseline else ""
+    if img:
+        inner = f"<img loading='lazy' src='{html.escape(img)}' alt='{html.escape(m)}'>"
+    else:
+        inner = "<div class='missing'>no image</div>"
+    return (
+        f"<div class='{cell_cls}'>{inner}"
+        f"<div class='label'>{html.escape(m)}{badge}</div>"
+        f"<div class='scores'>{html.escape(score_str)}</div></div>"
+    )
+
+
 def _gallery_entry_html(
     entry: Dict[str, Any],
-    methods: Sequence[str],
-    baseline_set: set,
-    last_baseline: Optional[str],
+    row_groups: Sequence[Tuple[str, Sequence[str], bool]],
 ) -> str:
-    """One prompt block: the prompt text/meta + a per-method image row."""
+    """One prompt block: prompt text/meta, then one image row per non-empty group.
+
+    ``row_groups`` is an ordered list of ``(label, methods, is_baseline)``: the
+    baseline group is boxed (``baselines-row``); fusion methods are split into a
+    plain row and a channelwise row by the caller. Empty groups are skipped.
+    """
     parts: List[str] = ["<div class='prompt-block'>"]
     parts.append(
         f"<div class='prompt-text'><b>#{entry['gidx']}</b> "
@@ -308,28 +352,16 @@ def _gallery_entry_html(
         extra.append(f"include: {html.escape(str(entry['include']))}")
     if extra:
         parts.append(f"<div class='prompt-meta'>{' | '.join(extra)}</div>")
-    parts.append("<div class='row'>")
-    for m in methods:
-        is_baseline = m in baseline_set
-        cell = entry["methods"].get(m, {})
-        img = cell.get("img")
-        scores = cell.get("scores", {})
-        score_str = ", ".join(f"{k}={_fmt(v)}" for k, v in sorted(scores.items()))
-        cell_cls = "cell baseline" if is_baseline else "cell"
-        badge = "<span class='badge'>ref</span>" if is_baseline else ""
-        if img:
-            inner = f"<img loading='lazy' src='{html.escape(img)}' alt='{html.escape(m)}'>"
-        else:
-            inner = "<div class='missing'>no image</div>"
-        parts.append(
-            f"<div class='{cell_cls}'>{inner}"
-            f"<div class='label'>{html.escape(m)}{badge}</div>"
-            f"<div class='scores'>{html.escape(score_str)}</div></div>"
-        )
-        # Visual divider between the reference columns and the fusion methods.
-        if m == last_baseline:
-            parts.append("<div class='sep'></div>")
-    parts.append("</div></div>")
+    for label, group_methods, is_baseline in row_groups:
+        if not group_methods:
+            continue
+        row_cls = "row baselines-row" if is_baseline else "row"
+        parts.append(f"<div class='row-label'>{html.escape(label)}</div>")
+        parts.append(f"<div class='{row_cls}'>")
+        for m in group_methods:
+            parts.append(_gallery_cell_html(entry, m, is_baseline))
+        parts.append("</div>")
+    parts.append("</div>")
     return "".join(parts)
 
 
@@ -350,6 +382,40 @@ def _pager_html(ts_id: str, n_pages: int) -> str:
     )
 
 
+def _channelwise_base_key(label: str) -> str:
+    """Pairing key for a method: its label with the ``channelwise`` token removed.
+
+    e.g. ``..._pcgrad_residual_kl_channelwise`` -> ``..._pcgrad_residual_kl`` so the
+    channelwise variant and its plain sibling map to the same key.
+    """
+    return "_".join(p for p in label.split("_") if p != "channelwise")
+
+
+def _split_fusion_by_channelwise(fusion: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Order fusion methods so with/without-channelwise pairs line up column-wise.
+
+    A method that has both a plain and a ``*_channelwise`` form is "paired"; paired
+    methods come first in BOTH rows, in the same order, so column i compares the same
+    method with vs without channelwise. Methods lacking a counterpart go at the end
+    of their own row. Returns ``(plain_row, channelwise_row)``.
+    """
+    plain = [m for m in fusion if "channelwise" not in m]
+    chan = [m for m in fusion if "channelwise" in m]
+    chan_by_base = {_channelwise_base_key(m): m for m in chan}
+    plain_by_base = {_channelwise_base_key(m): m for m in plain}
+
+    paired_keys = [
+        _channelwise_base_key(m) for m in plain if _channelwise_base_key(m) in chan_by_base
+    ]
+    ordered_plain = [plain_by_base[k] for k in paired_keys] + [
+        m for m in plain if _channelwise_base_key(m) not in chan_by_base
+    ]
+    ordered_chan = [chan_by_base[k] for k in paired_keys] + [
+        m for m in chan if _channelwise_base_key(m) not in plain_by_base
+    ]
+    return ordered_plain, ordered_chan
+
+
 def render_html(
     summary: Dict[str, Any],
     gallery: Dict[str, List[Dict[str, Any]]],
@@ -360,10 +426,22 @@ def render_html(
     The gallery shows every prompt in ``gallery[test_set]`` and paginates them
     client-side at ``meta['gallery_num_prompts']`` prompts per page.
     """
-    methods: List[str] = meta["methods"]
-    baseline_methods: List[str] = list(meta.get("baseline_methods", []))
-    baseline_set = set(baseline_methods)
-    last_baseline = baseline_methods[-1] if baseline_methods else None
+    all_methods: List[str] = meta["methods"]
+    # Effective references = declared baselines + weighted-sum + weight_merge; show
+    # them first (and, in the gallery, on their own first row).
+    baseline_list = _effective_baseline_methods(all_methods, meta.get("baseline_methods", []))
+    baseline_set = set(baseline_list)
+    fusion_list = [m for m in all_methods if m not in baseline_set]
+    methods = baseline_list + fusion_list  # display order: references first
+    last_baseline = baseline_list[-1] if baseline_list else None
+    # Gallery rows: baselines, then fusion split into plain vs channelwise with
+    # paired methods aligned column-wise (unpaired methods pushed to the row end).
+    fusion_plain, fusion_channelwise = _split_fusion_by_channelwise(fusion_list)
+    gallery_row_groups = [
+        ("baselines", baseline_list, True),
+        ("fusion", fusion_plain, False),
+        ("fusion (channelwise)", fusion_channelwise, False),
+    ]
     aggregate = summary["aggregate"]
     per_tag = summary.get("per_tag", {})
 
@@ -376,16 +454,17 @@ def render_html(
     meta_bits = (
         f"seed={meta.get('seed')}, steps={meta.get('num_inference_steps')}, "
         f"guidance={meta.get('guidance_scale')}, resolution={meta.get('resolution')}, "
-        f"methods={len(methods)}, baselines={len(baseline_methods)}, "
+        f"methods={len(methods)}, baselines={len(baseline_list)}, "
         f"generated={_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
     parts.append(f"<div class='meta'>{html.escape(meta_bits)}</div>")
-    if baseline_methods:
+    if baseline_list:
         parts.append(
             "<div class='legend'>"
             "<span class='sw' style='background:#2e7d3233'></span>best fusion method"
             "<span class='sw' style='background:#6d4c4133'></span>best baseline (bar to beat)"
-            "<span class='badge'>ref</span>reference column (base model / single teacher)"
+            "<span class='badge'>ref</span>reference column "
+            "(base / teacher / weighted-sum / weight-merge)"
             "</div>"
         )
 
@@ -398,7 +477,7 @@ def render_html(
         )
         if rewards:
             parts.append(
-                _aggregate_table_html(test_set, methods, rewards, agg_ts, baseline_methods)
+                _aggregate_table_html(test_set, methods, rewards, agg_ts, baseline_list)
             )
 
         # per-tag tables (geneval)
@@ -445,7 +524,7 @@ def render_html(
                 hidden = "" if page_idx == 0 else " hidden"
                 parts.append(f"<div class='gallery-page' data-page='{page_idx}'{hidden}>")
                 for entry in entries[page_idx * page_size : (page_idx + 1) * page_size]:
-                    parts.append(_gallery_entry_html(entry, methods, baseline_set, last_baseline))
+                    parts.append(_gallery_entry_html(entry, gallery_row_groups))
                 parts.append("</div>")
             parts.append("</div>")
             parts.append(_pager_html(ts_id, n_pages))

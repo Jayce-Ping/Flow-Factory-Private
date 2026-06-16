@@ -217,8 +217,8 @@ class TestRenderHtml(unittest.TestCase):
         # best fusion method (A) highlighted green; best baseline (base) brown
         self.assertIn('class="best"', out)
         self.assertIn('class="basebest"', out)
-        # gallery separator between reference and fusion columns
-        self.assertIn("class='sep'", out)
+        # gallery puts baselines on their own first row
+        self.assertIn("baselines-row", out)
 
 
 class TestLoadMethodSpecs(unittest.TestCase):
