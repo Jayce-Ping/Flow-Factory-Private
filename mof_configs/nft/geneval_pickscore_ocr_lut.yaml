@@ -61,15 +61,15 @@ train:
   # determine how to mix them per (timestep, prompt_set).
   teachers:
     - name: "teacher-geneval"
-      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"
+      path: "Jayce-Ping/GenEval-Teacher"
       sources: [geneval]                    # In-domain for composition/counting tasks
       reward_name: "geneval"                # In-domain reward for geneval source
     - name: "teacher-pickscore"
-      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"
+      path: "Jayce-Ping/Pickscore-Teacher"
       sources: [pickscore]                  # In-domain for aesthetic quality
       reward_name: "pick_score"             # In-domain reward for pickscore source
     - name: "teacher-ocr"
-      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"
+      path: "Jayce-Ping/OCR-Teacher"
       sources: [ocr]                        # In-domain for text rendering accuracy
       reward_name: "ocr"                    # In-domain reward for ocr source
 
