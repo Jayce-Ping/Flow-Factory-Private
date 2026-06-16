@@ -202,5 +202,83 @@ class TestLoadCachedRecordsSweep(unittest.TestCase):
             self.assertEqual(loaded[0]["scores"]["ocr"], 0.9)
 
 
+class TestLoadSweepRecordsAndMeta(unittest.TestCase):
+    """rebuild_plots must union the record shards, not trust a stale snapshot."""
+
+    @staticmethod
+    def _rec(pair, test_set, x, gidx, reward, value):
+        return {
+            "pair": pair,
+            "test_set": test_set,
+            "x": x,
+            "gidx": gidx,
+            "scores": {reward: value},
+        }
+
+    def test_shards_union_over_stale_sweep_data(self) -> None:
+        """A stale sweep_data.json (x up to 0.9) must not hide x=1.0 shards.
+
+        This is the bug behind "the curve stops at 0.9 even though the x=1.0
+        record shards exist": the rebuild used the per-run snapshot instead of
+        the authoritative per-shard records.
+        """
+        import json
+        import tempfile
+
+        pair = "Pickscore-Teacher__OCR-Teacher"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            stale = {
+                "meta": {"x_values": [0.0, 0.9], "test_sets": ["geneval"]},
+                "records": [
+                    self._rec(pair, "geneval", 0.0, 0, "geneval", 0.6),
+                    self._rec(pair, "geneval", 0.9, 0, "geneval", 0.7),
+                ],
+            }
+            (out / "sweep_data.json").write_text(json.dumps(stale), encoding="utf-8")
+            (out / "sweep_meta.json").write_text(
+                json.dumps({"x_values": [0.0, 0.9, 1.0], "test_sets": ["geneval"]}),
+                encoding="utf-8",
+            )
+            for x, score in [(0.0, 0.6), (0.9, 0.7), (1.0, 0.8)]:
+                rec = self._rec(pair, "geneval", float(x), 0, "geneval", score)
+                sw._write_record_shard(
+                    out / "records", "geneval", f"{pair}|{sw.x_dirname(x)}", 0, [rec]
+                )
+
+            meta, records = sw.load_sweep_records_and_meta(out)
+            xs = sorted({round(float(r["x"]), 3) for r in records})
+            self.assertIn(1.0, xs)  # the previously-dropped endpoint
+            self.assertEqual(xs, [0.0, 0.9, 1.0])
+            # meta comes from sweep_meta.json (full grid), not the stale snapshot.
+            self.assertEqual(meta["x_values"], [0.0, 0.9, 1.0])
+
+    def test_falls_back_to_sweep_data_when_no_shards(self) -> None:
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            snap = {
+                "meta": {"x_values": [0.0, 1.0], "test_sets": ["ocr"]},
+                "records": [
+                    self._rec("A__B", "ocr", 0.0, 0, "ocr", 0.5),
+                    self._rec("A__B", "ocr", 1.0, 0, "ocr", 0.9),
+                ],
+            }
+            (out / "sweep_data.json").write_text(json.dumps(snap), encoding="utf-8")
+            meta, records = sw.load_sweep_records_and_meta(out)
+            self.assertEqual(len(records), 2)
+            self.assertEqual(meta["x_values"], [0.0, 1.0])
+
+    def test_empty_dir_returns_no_records(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            meta, records = sw.load_sweep_records_and_meta(Path(tmp))
+            self.assertEqual(records, [])
+            self.assertEqual(meta, {})
+
+
 if __name__ == "__main__":
     unittest.main()

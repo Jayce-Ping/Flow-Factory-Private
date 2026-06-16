@@ -635,30 +635,54 @@ def _split_pair(pair: str) -> Tuple[str, str]:
     return teacher_a, teacher_b
 
 
-def rebuild_plots(output_dir: Path, gallery_num: int = 32) -> None:
-    """Re-render plots + index.html from a prior run (no torch/model/GPU).
+def _sweep_record_identity(r: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Dedup key for a sweep record shard: one entry per (pair, test_set, x, gidx)."""
+    return (r["pair"], r["test_set"], round(float(r["x"]), 3), int(r["gidx"]))
 
-    Source precedence: ``sweep_data.json`` (meta + records), else ``records/``
-    shards (+ ``sweep_meta.json`` if present). ``gallery_num`` is the number of
-    prompts the interactive viewer can page through (the slider covers all x).
+
+def load_sweep_records_and_meta(
+    output_dir: Path,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Resolve ``(meta, records)`` for a report (re)build.
+
+    The per-(pair, test_set, x, rank) shards under ``records/`` are the
+    authoritative, incrementally-unioned record source, so x points added by a
+    later or resumed run are always picked up. ``sweep_data.json``'s records are
+    only a fallback for runs with no ``records/`` dir -- it is a per-run snapshot
+    and can be stale (e.g. written before a resumed run added the x=1.0 endpoint),
+    which is exactly what dropped the last point from the curve. Meta precedence:
+    ``sweep_meta.json`` -> ``sweep_data.json`` meta -> ``{}``.
     """
     data_path = output_dir / "sweep_data.json"
     meta_path = output_dir / "sweep_meta.json"
+    records = _load_cached_records(output_dir, identity=_sweep_record_identity)
+    data_meta: Optional[Dict[str, Any]] = None
     if data_path.exists():
         data = json.loads(data_path.read_text(encoding="utf-8"))
-        meta, records = data["meta"], data["records"]
-    else:
-        records = _load_cached_records(
-            output_dir,
-            identity=lambda r: (r["pair"], r["test_set"], r["x"], int(r["gidx"])),
-        )
+        data_meta = data.get("meta")
         if not records:
-            raise FileNotFoundError(
-                f"--plot-only found neither {data_path} nor record shards under "
-                f"{output_dir / 'records'}; run the sweep first."
-            )
-        meta = (
-            json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            records = data.get("records", [])
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    else:
+        meta = data_meta if data_meta is not None else {}
+    return meta, records
+
+
+def rebuild_plots(output_dir: Path, gallery_num: int = 32) -> None:
+    """Re-render plots + index.html from a prior run (no torch/model/GPU).
+
+    Records come from the per-shard ``records/`` files (authoritative union), with
+    ``sweep_data.json`` only as a fallback; see :func:`load_sweep_records_and_meta`.
+    ``gallery_num`` is the number of prompts the interactive viewer can page
+    through (the slider covers all x).
+    """
+    output_dir = Path(output_dir)
+    meta, records = load_sweep_records_and_meta(output_dir)
+    if not records:
+        raise FileNotFoundError(
+            f"--plot-only found neither record shards under {output_dir / 'records'} "
+            f"nor a usable {output_dir / 'sweep_data.json'}; run the sweep first."
         )
     render_outputs(output_dir, meta, records, gallery_num)
 
@@ -681,7 +705,6 @@ def main() -> None:  # noqa: C901 - orchestration script
         rebuild_plots(Path(args.output_dir), gallery_num=args.gallery_num_prompts)
         return
 
-    from accelerate.utils import gather_object
     from tqdm.auto import tqdm
 
     import torch
@@ -782,7 +805,6 @@ def main() -> None:  # noqa: C901 - orchestration script
     trainer._effective_blend_mode = "weighted"
     trainer._pcgrad_generator = None
 
-    local_records: List[Dict[str, Any]] = []
     total_units = (
         sum(len(range(num_prompts_per_set[ts])[rank::world]) for ts in test_sets)
         * len(pairs)
@@ -885,19 +907,20 @@ def main() -> None:  # noqa: C901 - orchestration script
                             "prompt": str(sample.prompt) if sample.prompt is not None else "",
                         }
                     )
-                local_records.extend(shard_records)
                 _write_record_shard(
                     output_dir / "records", test_set, f"{pair}|{x_dirname(x)}", rank, shard_records
                 )
                 acc.wait_for_everyone()
 
     progress.close()
-
-    gathered: List[Dict[str, Any]] = list(gather_object(local_records))
     acc.wait_for_everyone()
 
     if is_main:
-        render_outputs(output_dir, meta, gathered, args.gallery_num_prompts)
+        # Render from the union of ALL shards on disk (this run plus any prior /
+        # resumed runs), so a partial re-run that only fills in some x points
+        # completes the report instead of overwriting it with just those points.
+        _, all_records = load_sweep_records_and_meta(output_dir)
+        render_outputs(output_dir, meta, all_records, args.gallery_num_prompts)
 
     acc.wait_for_everyone()
     try:
