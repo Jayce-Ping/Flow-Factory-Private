@@ -33,6 +33,7 @@ _TRAINER_REGISTRY: Dict[str, str] = {
     'mof-nft': 'flow_factory.trainers.mof.MoFNFTTrainer',
     'mof-grpo': 'flow_factory.trainers.mof.MoFGRPOTrainer',
     'mof-dmin': 'flow_factory.trainers.mof.dmin.MoFDMinTrainer',
+    'mof-klmin': 'flow_factory.trainers.mof.klmin.MoFKLMinTrainer',
     'mof-distill': 'flow_factory.trainers.mof.distill.MoFDistillTrainer',
     'awm': 'flow_factory.trainers.awm.AWMTrainer',
     'dgpo': 'flow_factory.trainers.dgpo.DGPOTrainer',

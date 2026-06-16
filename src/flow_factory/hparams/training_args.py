@@ -1212,6 +1212,90 @@ class MoFDMinTrainingArguments(MoFBaseTrainingArguments):
 
 
 @dataclass
+class MoFKLMinTrainingArguments(MoFBaseTrainingArguments):
+    r"""MoF with reward-free KL-to-base minimization.
+
+    Optimizes the convex mixing weights to minimize the per-step KL between the
+    teacher mixture and the pretrained base model, which under flow matching
+    equals velocity-MSE (see docs/opd/kl_weighted_teacher_fusion.tex, Prop. 1):
+
+        L = mean_b || v_lambda - v_base ||^2 ,   v_lambda = sum_k w_k v_k .
+
+    Since the softmax weights satisfy sum_k w_k = 1, this is equivalently
+    ``|| sum_k w_k (v_k - v_base) ||^2`` -- the squared norm of the convex
+    combination of teacher task vectors tau_k = v_k - v_base. No reward or
+    advantage enters the training loss; the rewards are computed only at
+    evaluation (inherited from MoFTrainerBase) to monitor the
+    closeness-to-base vs multi-teacher trade-off.
+
+    Two opt-in regularizers (default 0.0, i.e. pure KL-to-base) keep multiple
+    teachers active and counter the collapse-toward-base tendency:
+      - ``klmin_entropy_coeff``: adds ``-coeff * mean_b H(w)`` (maximize weight
+        entropy; requires weight_normalization='softmax' so the weights are a
+        valid distribution -- enforced in __post_init__).
+      - ``klmin_uniform_anchor_coeff``: adds ``coeff * mean_b ||w - 1/K||^2``
+        (pull weights toward uniform; valid for any normalization mode).
+
+    Inherits all mixing/teacher/timestep fields from MoFBaseTrainingArguments;
+    reward-specific fields (e.g. ood_bonus_gamma) and nft_beta are unused. The
+    inherited ``kl_beta`` (the NFT-style KL penalty added on top of a reward
+    loss) is also unused -- here the KL-to-base IS the objective; keep
+    kl_beta=0.
+
+    Register as trainer_type: 'mof-klmin'.
+    """
+
+    klmin_entropy_coeff: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Entropy bonus coefficient on the per-sample mixing weights "
+                "(adds -coeff * mean_b H(w), maximizing weight spread). 0 "
+                "disables (pure KL-to-base). Requires "
+                "weight_normalization='softmax' (non-negative weights); use "
+                "klmin_uniform_anchor_coeff for affine/none modes."
+            )
+        },
+    )
+    klmin_uniform_anchor_coeff: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Uniform-anchor penalty coefficient (adds coeff * mean_b "
+                "||w - 1/K||^2, pulling weights toward uniform). 0 disables. "
+                "Valid for any weight_normalization mode."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.klmin_entropy_coeff < 0:
+            raise ValueError(
+                f"klmin_entropy_coeff must be >= 0, got {self.klmin_entropy_coeff!r}."
+            )
+        if self.klmin_entropy_coeff > 0 and self.weight_normalization != "softmax":
+            raise ValueError(
+                "klmin_entropy_coeff>0 requires weight_normalization='softmax' "
+                "so the mixing weights form a valid distribution (non-negative, "
+                f"summing to 1); got weight_normalization={self.weight_normalization!r}. "
+                "'affine'/'none' admit negative weights, which make the entropy "
+                "H(w) = -sum_k w_k log w_k ill-defined (and silently flip the "
+                "bonus into a wrong-sign gradient). Use klmin_uniform_anchor_coeff "
+                "for a normalization-agnostic spread regularizer instead."
+            )
+        if self.klmin_uniform_anchor_coeff < 0:
+            raise ValueError(
+                "klmin_uniform_anchor_coeff must be >= 0, got "
+                f"{self.klmin_uniform_anchor_coeff!r}."
+            )
+        if self.kl_type not in ["v-based"]:
+            raise ValueError(
+                f"MoF-KLMin only supports kl_type='v-based', got {self.kl_type!r}."
+            )
+
+
+@dataclass
 class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
     r"""MoF with GRPO (PPO-clipped ratio) optimization.
 
@@ -2596,6 +2680,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "mof-nft": MoFNFTTrainingArguments,
     "mof-grpo": MoFGRPOTrainingArguments,
     "mof-dmin": MoFDMinTrainingArguments,
+    "mof-klmin": MoFKLMinTrainingArguments,
     "mof-distill": MoFDistillTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,

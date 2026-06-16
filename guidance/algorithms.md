@@ -25,6 +25,8 @@
 
 - [Ensemble Eval: Multi-Checkpoint Offline Evaluation](#ensemble-eval-multi-checkpoint-offline-evaluation)
 
+- [MoF: Mixture-of-Flow Teacher Mixture](#mof-mixture-of-flow-teacher-mixture)
+
 - [References](#references)
 
 ## Overview
@@ -538,6 +540,42 @@ Requires `model.finetune_type: lora`. Non-empty `checkpoint_paths` need matching
 Set top-level `num_processes` to your GPU count (default example uses `8`) so `eval.test_sets` preprocessing is sharded across ranks. Ensemble-eval does **not** preprocess the train split — only splits listed under `eval.test_sets`.
 
 Run: `ff-train ensemble-eval/lora/sd3_5/default.yaml`
+
+
+## MoF: Mixture-of-Flow Teacher Mixture
+
+**Trainers**: `mof-nft`, `mof-grpo`, `mof-dmin`, `mof-klmin`, `mof-distill` (`flow_factory.trainers.mof`)
+
+MoF freezes a set of teacher LoRA checkpoints and learns only a **convex mixing module** that blends their velocities. At each denoising step the combined velocity is `v_λ = Σ_k w_k · v_k`, where the per-teacher weights `w` come from a learnable `(K, T, S)` table (LUT mode) or a small neural router conditioned on `(t, prompt_embeds)` (router mode), passed through `softmax` so `Σ_k w_k = 1, w_k ≥ 0` (set `weight_normalization` to `affine`/`none` to relax). `K` = teachers, `T` = denoising steps, `S` = prompt sets (per-`source` routing). Only the mixing weights are trained; the teacher LoRAs and the base model stay frozen. Teacher forwards reuse the OPD weight-swap machinery (`use_named_parameters`, with the autocast-cache / DDP-bypass guards from `CLAUDE.md`); the base model is obtained via `use_ref_parameters` (LoRA disabled).
+
+The variants differ only in the objective that trains the mixture:
+
+| Trainer | Objective | Reward? |
+|---|---|---|
+| `mof-nft` | DiffusionNFT self-normalized MSE on the mixture, advantage-weighted | yes |
+| `mof-grpo` | GRPO PPO-clipped ratio on the mixture | yes |
+| `mof-dmin` | minimize teacher-disagreement variance `Σ_k w_k ‖v_k − v_λ‖²` | no |
+| `mof-klmin` | minimize KL-to-base `‖v_λ − v_base‖²` | no |
+| `mof-distill` | on-policy trajectory distillation | no |
+
+### `mof-klmin`: KL-to-base minimization
+
+Searches for the convex teacher combination with the **least distribution shift** from the pretrained base model. Under flow matching the per-step KL equals velocity-MSE (`docs/opd/kl_weighted_teacher_fusion.tex`, Prop. 1), so the reward-free loss is
+
+```
+L = mean_b ‖v_λ − v_base‖²  =  mean_b ‖Σ_k w_k (v_k − v_base)‖²    (since Σ_k w_k = 1)
+```
+
+i.e. the squared norm of the convex combination of teacher task vectors `τ_k = v_k − v_base`. The KL/velocity-MSE building block is the same one NFT exposes as its optional `kl_beta` penalty — here it is promoted to the sole objective. Rewards are computed only at eval (inherited from `MoFTrainerBase`) to monitor the trade-off.
+
+**Collapse caveat.** Minimizing distribution shift alone pulls the mixture toward the least-drifted teacher / the base — the `α<0` inverse-variance regime that the theory doc flags as *suppressing the active specialist* (on an OCR prompt it down-weights the OCR teacher). Analogous to `mof-dmin` collapsing to a vertex, this is a validation/guardrail objective by default. Two opt-in regularizers (default `0.0` = pure KL-to-base) counter the collapse and keep multiple teachers active:
+
+| Field | Effect |
+|---|---|
+| `klmin_entropy_coeff` | adds `−coeff · mean_b H(w)` (maximize weight entropy; for `softmax`/`affine`) |
+| `klmin_uniform_anchor_coeff` | adds `coeff · mean_b ‖w − 1/K‖²` (pull weights toward uniform; any mode) |
+
+Configs: `mof_configs/klmin/geneval_pickscore_ocr_lut.yaml` (LUT) and `..._adaln_router.yaml` (router). Run: `ff-train mof_configs/klmin/geneval_pickscore_ocr_lut.yaml`.
 
 
 ## References
