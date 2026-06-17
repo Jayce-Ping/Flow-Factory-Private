@@ -516,11 +516,7 @@ pink book''}。两张生成图都\emph{清晰包含}蓝色棒球棒与粉色书�
 再蒸馏到单模型。形式上 $Q_{\text{O3}}=$ 人类偏好胜率。
 
 \paragraph{分析.} 优点：\emph{training-free}，且以人眼为 ground truth，天然规避 reward
-false-negative 与自循环；确定最优混合后只需一次蒸馏。缺点：难以学习\emph{prompt-dependent}
-的最优权重——例如 GenEval prompt 上可能只需 GenEval$+$PickScore 而不需 OCR teacher，但
-离线、training-free 的偏好比较不易把 prompt domain 信息编码进 $\lambda(t,c)$（它更适合
-选出一个全局或粗粒度分组的 $\lambda$）。对应 \texttt{mof\_mixing\_quality\_analysis.tex}
-\S 打破循环 中的``独立裁判''。
+false-negative 与自循环；确定最优混合后只需一次蒸馏。
 
 \begin{figure}[ht]
 \centering
