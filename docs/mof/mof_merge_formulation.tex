@@ -58,27 +58,18 @@
 \maketitle
 
 \begin{abstract}
-本文把``将 $K$ 个在不同 prompt set 上、由 single-reward RL 各自训练的 teacher
-flow model 合并为单个 student''这一问题统一形式化，并理顺``如何得到一个\emph{更好的}
-混合''这一核心思路。我们的出发点是一个结构性事实：多个合法 flow-matching velocity
-field 的（仿射/凸）组合仍是合法 flow model，因此 student 可以被参数化为一个
-\emph{multi-teacher 路由凸组合} $v^\stu=\sum_k\lambda_k(t,c)\,v^{(k)}$。在这一形式化下，
-我们给出三组结论。\textbf{(i)} 先前工作 DiffusionOPD 的 per-step KL 蒸馏目标，其最优解
-恰是一个\emph{平凡路由}：当 prompt set 与 teacher 一一对应时 $\lambda^*$ 为 one-hot，
-当一个 prompt set 由多个 teacher 监督时 $\lambda^*$ 退化为各 teacher velocity 的
-（监督权重加权）均值。我们对后者给出闭式推导：在共享 scheduler 下，最优系数恰等于各
-teacher 的\emph{监督权重}，最优 student 为对应 teacher velocity 的加权均值。
-\textbf{(ii)} 平凡解存在固有病理：
-single-reward teacher 必在某 prompt 子集上 reward-hack（如 GenEval 上的背景消失过拟合），
-导致 in-domain 输出分布的\emph{坍缩/锐化}，而 OOD 上反而呈现平滑的多-teacher 泛化。
-\textbf{(iii)} 由于混合本身即合法 flow model，我们可以用任意 flow-model 微调方法在
-\emph{multi-teacher 凸包}内求``最优''，但``最优''的定义才是关键。我们把五条候选目标
-（旧 reward RL、强 reward RL、training-free user study、min-KL-to-pretrained、真实数据
-SFT）统一为凸包约束优化问题 $\max_\lambda Q(v_\lambda)$，逐条形式化其语义、局限与现状，
-并指出 reward 自循环下``更高分 $\neq$ 更好''这一根本困难。本文为 roadmap / position
-文档，交叉引用 \texttt{mof\_notes.tex}、\texttt{mof\_vs\_direct\_opd\_gap.tex}、
-\texttt{mof\_ood\_guarantee\_analysis.tex}、\texttt{mof\_mixing\_quality\_analysis.tex}
-等姊妹文档，不重复其重型推导。
+本文把``将 $K$ 个在不同 prompt set 上、由 single-reward RL 各自训练的 teacher flow model
+合并为单个 student''形式化为在 \emph{multi-teacher 路由凸组合}
+$v^\stu=\sum_k\lambda_k(t,c)\,v^{(k)}$ 上的优化问题，并理顺``如何得到更好的混合''这一思路。
+\textbf{(i)} 在该形式化下，先前工作 DiffusionOPD 的 per-step KL 蒸馏，其最优解恰是一个
+\emph{平凡路由}——单 teacher 监督时为 one-hot、多 teacher 监督时为各 teacher velocity 的
+监督权重加权均值。\textbf{(ii)} 平凡解继承 single-reward teacher 的
+reward-hacking，导致 in-domain 输出分布\emph{坍缩/锐化}，而 prompt-rewriting 只能缓解、不能根治坍缩。
+\textbf{(iii)} 由于混合本身即合法 flow model，``更好的混合''可统一写成凸包约束优化
+$\max_\lambda Q(v_\lambda)$，真正的难点在于\emph{如何定义} $Q$。我们逐条分析五条候选目标
+（旧 / 强 reward RL、training-free user study、min-KL-to-pretrained、真实数据 SFT），并指出
+reward 自循环下``更高分 $\neq$ 更好''这一根本困难。本文为 roadmap 文档，凸组合合法性的
+自包含证明见附录。
 \end{abstract}
 
 \tableofcontents
@@ -340,7 +331,7 @@ $R_k$ 持续上升，就\emph{必然}伴随一定程度的 reward hack——Poli
 与``利用 reward 盲区''两部分，二者在训练信号层面无法区分。
 \item \textbf{推论}：因此任何 RL-tuned teacher（及由其混合的 student）都\emph{必然}在训练
 分布的某些 prompt 上 hack，区别只在程度轻重，而非有无。
-\item \textbf{PE 的作用与局限}：PE 改写消除\emph{特定}触发 pattern（如诱发背景消失的措辞 "a photo of a ..."），
+\item \textbf{PE 的作用与局限}：PE 改写消除\emph{特定}触发 pattern（如诱发背景消失的措辞 ``a photo of a ...''），
 从而\emph{收窄}坍缩发生的 prompt 范围、\emph{减轻}其程度；但它不改变第 2 条``必然在某处
 hack''的事实——hack 只会\emph{转移}到改写后仍存在 reward 盲区的其它 prompt 子集上。即 PE
 平移 / 收窄了坍缩的支撑，却无法消去它。
@@ -364,7 +355,7 @@ hack''的事实——hack 只会\emph{转移}到改写后仍存在 reward 盲区
 即模型在 in-domain 上的输出分布\emph{不是}一个良好的平滑分布，而是被 reward 的盲区
 ``尖锐化''到了一个狭窄支撑上。
 
-\subsection{坍缩/锐化的形式化判据}
+\subsection{坍缩/锐化的形式化判据（TODO）}
 \label{ssec:formal_collapse}
 
 我们用一个\emph{无需 reward}、且以\emph{真实数据}为 ground truth 的量来刻画这一病理：
