@@ -371,6 +371,17 @@ table.peaks th.l, table.peaks td.l { text-align: left; }
 .gcell.empty .gthumb { border: 1px dashed #8886; background: transparent; }
 .gcell.empty .gthumb img { display: none; }
 .gcap { font-size: 11px; color: #888; word-break: break-word; }
+.nav { position: sticky; top: 0; z-index: 5; background: Canvas; border-bottom: 1px solid #8884;
+       display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 0; margin: -8px 0 12px; }
+.nav .navtitle { color: #888; font-size: 12px; margin-right: 4px; }
+.nav .navlink { font-size: 13px; padding: 3px 10px; border: 1px solid #8886; border-radius: 999px;
+                text-decoration: none; color: inherit; white-space: nowrap; }
+.nav .navlink:hover { background: #8882; }
+.nav .navlink.active { font-weight: 700; border-color: #2e7d32; color: #2e7d32; }
+.nav .pairsel { font-size: 14px; padding: 4px 10px; border-radius: 6px; border: 1px solid #8886;
+                background: Canvas; color: inherit; max-width: 100%; }
+.overview-pair { margin: 14px 0; }
+.overview-pair a { font-size: 16px; font-weight: 600; }
 """
 
 # Interactive per-(pair,test_set) viewer: a weight-ratio slider (x) over a grid of
@@ -580,34 +591,63 @@ def _viewer_html(
     )
 
 
+def _page_head(title: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{html.escape(title)}</title>"
+        f"<style>{_HTML_CSS}</style></head><body>"
+    )
+
+
+def _pair_page_name(pair: str) -> str:
+    """Filename of a single teacher pair's page (one page per combination)."""
+    return f"pair_{_safe_name(pair)}.html"
+
+
+def _selector_html(pairs: Sequence[str], current: str) -> str:
+    """Sticky top bar with a dropdown to jump to another teacher-setting page."""
+    opts = []
+    for p in pairs:
+        sel = " selected" if p == current else ""
+        opts.append(
+            f"<option value='{html.escape(_pair_page_name(p))}'{sel}>{html.escape(p)}</option>"
+        )
+    return (
+        "<div class='nav'><span class='navtitle'>teacher setting:</span>"
+        "<select class='pairsel' onchange='if(this.value)location.href=this.value'>"
+        + "".join(opts)
+        + "</select></div>"
+    )
+
+
 def render_outputs(
     output_dir: Path,
     meta: Dict[str, Any],
     records: List[Dict[str, Any]],
     gallery_num: int,
 ) -> None:
-    """Write all tables, per-(pair,test_set) figures, and index.html."""
+    """Write tables, per-(pair,test_set) figures, one HTML page per teacher pair,
+    and an ``index.html`` overview that links to (and switches between) them."""
     aggregated = aggregate_sweep(records)
     peaks = find_peaks(aggregated)
     _write_tables(output_dir, meta, records, aggregated, peaks)
 
     plots_dir = output_dir / "plots"
-    parts: List[str] = []
-    parts.append("<!doctype html><html><head><meta charset='utf-8'>")
-    parts.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
-    parts.append("<title>Teacher weight sweep</title>")
-    parts.append(f"<style>{_HTML_CSS}</style></head><body>")
-    parts.append("<h1>Teacher weight sweep</h1>")
+    pairs = sorted(aggregated.keys())
     meta_bits = (
         f"x grid={meta.get('x_values')}, seed={meta.get('seed')}, "
         f"steps={meta.get('num_inference_steps')}, guidance={meta.get('guidance_scale')}, "
         f"generated={_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
-    parts.append(f"<div class='meta'>{html.escape(meta_bits)}</div>")
 
-    for pair in sorted(aggregated.keys()):
+    # One self-contained page per teacher pair (figures generated here, once).
+    for pair in pairs:
         teacher_a, teacher_b = _split_pair(pair)
-        parts.append(f"<h2>{html.escape(pair)}</h2>")
+        parts: List[str] = [_page_head(f"Teacher weight sweep — {pair}")]
+        parts.append(_selector_html(pairs, pair))
+        parts.append(f"<h1>Teacher weight sweep <span class='meta'>· {html.escape(pair)}</span></h1>")
+        parts.append(f"<div class='meta'>{html.escape(meta_bits)}</div>")
         by_test_set = aggregated[pair]
         for test_set in sorted(by_test_set.keys()):
             by_reward = by_test_set[test_set]
@@ -623,11 +663,29 @@ def render_outputs(
             parts.append(
                 _viewer_html(output_dir, pair, test_set, records, gallery_num, teacher_a, teacher_b)
             )
+        parts.append(f"<script>{_VIEWER_JS}</script>")
+        parts.append("</body></html>")
+        (output_dir / _pair_page_name(pair)).write_text("".join(parts), encoding="utf-8")
 
-    parts.append(f"<script>{_VIEWER_JS}</script>")
-    parts.append("</body></html>")
-    (output_dir / "index.html").write_text("".join(parts), encoding="utf-8")
-    logger.info(f"Sweep report written: {output_dir / 'index.html'}")
+    # index.html is a thin redirect to the first setting (no separate router page);
+    # every page carries the dropdown to switch settings.
+    if pairs:
+        first = _pair_page_name(pairs[0])
+        index_html = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<meta http-equiv='refresh' content='0; url={html.escape(first)}'>"
+            f"<script>location.replace({json.dumps(first)})</script>"
+            "<title>Teacher weight sweep</title></head>"
+            f"<body><a href='{html.escape(first)}'>Open report</a></body></html>"
+        )
+    else:
+        index_html = _page_head("Teacher weight sweep") + "<p class='meta'>No data.</p></body></html>"
+    (output_dir / "index.html").write_text(index_html, encoding="utf-8")
+    logger.info(
+        f"Sweep report written: {len(pairs)} per-setting page"
+        f"{'s' if len(pairs) != 1 else ''}; index.html -> "
+        f"{_pair_page_name(pairs[0]) if pairs else '(none)'}"
+    )
 
 
 def _split_pair(pair: str) -> Tuple[str, str]:
