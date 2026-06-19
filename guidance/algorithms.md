@@ -585,7 +585,7 @@ Like GRPO, PPO is coupled and must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `C
 
 ### Value Critic
 
-The critic is an independent, lightweight, **resolution-agnostic** network (the policy backbone is untouched). It consumes the full generation latent: any layout is folded to `(B, seq, C)` (via `BaseAdapter.resolve_latent_axes`), encoded per token, aggregated over the sequence with learned-query multihead **attention pooling** (PMA-style, `O(seq)`), conditioned on a sinusoidal timestep embedding, and regressed to a scalar value. It is built eagerly in `_initialization()` from the channel count `C` returned by `BaseAdapter.compute_actual_latent_shape(height, width[, num_frames])`, so it needs no rollout to size and its checkpoint stays valid across resolutions. The critic has its own AdamW optimizer; policy and critic share a single backward and step independently. (A backbone+value-head critic was evaluated and deferred as a follow-up.)
+The critic is an independent, lightweight, **resolution-agnostic** network (the policy backbone is untouched). It consumes the full generation latent: any layout is folded to `(B, seq, C)` (via `BaseAdapter.resolve_latent_axes`), encoded per token, aggregated over the sequence with learned-query multihead **attention pooling** (PMA-style, `O(seq)`), conditioned on a sinusoidal timestep embedding, and regressed to a scalar value. It is built eagerly in `_initialization()` from the channel count `C` returned by `BaseAdapter.compute_actual_latent_shape(height, width[, num_frames])`, so it needs no rollout to size and its checkpoint stays valid across resolutions. The critic has its own AdamW optimizer; policy and critic use **separate backward passes** and step independently, which lets their update frequencies be decoupled (see [Decoupling critic / policy update frequency](#decoupling-critic--policy-update-frequency)). (A backbone+value-head critic was evaluated and deferred as a follow-up.)
 
 ### GAE & Losses
 
@@ -601,6 +601,20 @@ Per-step advantages are optionally whitened globally across ranks. The objective
 
 > **GAE assumes a contiguous SDE trajectory.** Configure the scheduler so every SDE step is trained and they are contiguous (`scheduler.sde_steps: null` → `[0 .. num_inference_steps-2]`, `scheduler.num_sde_steps = num_inference_steps - 1`); then the per-step bootstrap `V(z_{t+1})` is exactly the value of the next stored latent. See [`examples/ppo/lora/sd3_5/default.yaml`](../examples/ppo/lora/sd3_5/default.yaml).
 
+### Decoupling critic / policy update frequency
+
+Because the critic and policy use separate backward passes, they can step at different cadences. With `critic_update_interval` / `policy_update_interval` (in **optimizer rounds**; one round = `gradient_accumulation_steps` micro-steps), each network accumulates `interval * gas` micro-steps before one optimizer step. **Both networks forward+backward on every micro-step** (all data is used) — a larger interval only enlarges that network's effective batch and lowers its step frequency. Set `critic_update_interval=1, policy_update_interval=K` to make the critic relatively `K×` faster, or swap for the reverse; keep at least one at `1` (the per-round cadence). `accelerator.backward` already divides by `gas`, and the trainer additionally divides each loss by its interval so the effective learning rate is invariant to it.
+
+> **Caveat**: advantages/returns are computed once per epoch with the old critic and frozen during `optimize`, so a faster critic does **not** sharpen the current epoch's policy targets — its benefit is a better baseline for the next epoch's GAE. Compare [`critic_faster.yaml`](../examples/ppo/lora/sd3_5/critic_faster.yaml) and [`policy_faster.yaml`](../examples/ppo/lora/sd3_5/policy_faster.yaml).
+
+### Periodic critic re-warmup (catching the critic up)
+
+Interval decoupling cannot make the critic update *more often* than the policy (the finest cadence is one step per round). To let the critic periodically re-fit to a moving policy, enable **periodic critic re-warmup**: every `critic_rewarmup_interval` optimizer rounds (0 disables) the trainer resamples fresh rollouts from the current policy and trains **only** the critic for `critic_rewarmup_inner_epochs` passes. This shares one code path with the initial warmup, so `critic_warmup_steps` is now an up-front bootstrap (it no longer freezes the first epochs — the policy trains from epoch 0).
+
+`update_critic_in_optimize` (default `true`) selects the regime:
+- **`true` (mode A)**: the critic also trains jointly in `optimize`; bursts are an extra boost.
+- **`false` (mode B)**: the critic is frozen in `optimize` and trained **only** by the bootstrap + bursts — a policy/critic *alternation* (requires `critic_rewarmup_interval > 0`). Because each burst resamples from the current policy, it aligns the critic to the present distribution. See [`critic_rewarmup.yaml`](../examples/ppo/lora/sd3_5/critic_rewarmup.yaml) (policy every epoch; critic re-warmup every 100 rounds = 50 epochs). Cost: one extra rollout per burst.
+
 ### Key Hyperparameters
 
 ```yaml
@@ -614,11 +628,18 @@ train:
   critic_learning_rate: 1.0e-4
   vf_coef: 0.5
   value_clip_range: 0.2       # null to disable value clipping
-  critic_warmup_steps: 0
+  critic_warmup_steps: 30     # initial critic-only bootstrap (~N critic steps) before the loop
   critic_hidden_dim: 256
   critic_num_layers: 3
   critic_attn_heads: 8        # must divide critic_hidden_dim
   critic_num_query_tokens: 1
+  # Update-frequency decoupling (optimizer rounds; keep at least one at 1)
+  critic_update_interval: 1   # >1 => policy relatively faster
+  policy_update_interval: 1   # >1 => critic relatively faster
+  # Periodic critic re-warmup (resample + critic-only fit); 0 disables
+  critic_rewarmup_interval: 0
+  critic_rewarmup_inner_epochs: 1
+  update_critic_in_optimize: true  # false => critic trained only by bootstrap + bursts (mode B)
   # GAE
   gae_gamma: 1.0
   gae_lambda: 0.95

@@ -1,4 +1,7 @@
-# Critic-based PPO (value net + GAE) for SD3.5 + PickScore.
+# Critic-based PPO (value net + GAE) for SD3.5 + PickScore -- POLICY-FASTER variant.
+# Policy steps every optimizer round; the critic steps every 4 rounds (accumulating
+# 4*gas micro-steps per critic step, so it still uses all data but updates 4x less
+# often with a 4x larger effective batch). Diff vs default.yaml: critic_update_interval=4.
 # v1 runs on DDP (the critic uses a second optimizer; DeepSpeed/FSDP support is a follow-up).
 
 # Environment Configuration
@@ -59,14 +62,11 @@ train:
   critic_warmup_steps: 30  # Initial critic-only bootstrap (~N critic steps) before the epoch loop
 
   # Update-frequency decoupling (unit = optimizer rounds; 1 round = gradient_accumulation_steps
-  # micro-steps). Both networks forward+backward every micro-step (all data is used); a network
-  # with interval N accumulates N*gas micro-steps before each optimizer step. Keep at least one
-  # at 1 (the per-round cadence); set the other >1 to make THAT network update less often.
-  critic_update_interval: 1  # Step critic every N rounds (>1 => policy relatively faster)
-  policy_update_interval: 1  # Step policy every N rounds (>1 => critic relatively faster)
+  # micro-steps). POLICY-FASTER: policy steps every round, critic every 4 rounds.
+  critic_update_interval: 4  # Step critic every 4 rounds (accumulates 4*gas micro-steps per step)
+  policy_update_interval: 1  # Step policy every round
 
-  # Periodic critic re-warmup (resample + critic-only fit) to catch the critic up to the moving
-  # policy. 0 disables. update_critic_in_optimize=false => critic trains ONLY via bootstrap+bursts.
+  # Periodic critic re-warmup (resample + critic-only fit); 0 disables (off here).
   critic_rewarmup_interval: 0  # Every N optimizer rounds, run a critic-only burst (0 disables)
   critic_rewarmup_inner_epochs: 1  # Critic-only passes over the freshly sampled buffer per burst
   update_critic_in_optimize: true  # false => critic frozen in optimize(), trained only by bursts

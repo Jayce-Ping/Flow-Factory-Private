@@ -116,6 +116,62 @@ class PPOTrainingArguments(TrainingArguments):
         metadata={"help": "Device to store reference parameters (full finetune + kl_beta>0 only)."},
     )
 
+    # --- Update-frequency decoupling (critic vs policy) ---
+    # Unit = optimizer rounds (each round = ``gas`` micro-steps). Both networks
+    # still forward+backward every micro-step (all data is used); a network with
+    # interval N simply accumulates N*gas micro-steps before each optimizer step.
+    critic_update_interval: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Step the critic once every N optimizer rounds, accumulating N*gas "
+                "micro-steps. Set >1 to make the policy relatively faster."
+            )
+        },
+    )
+    policy_update_interval: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Step the policy once every N optimizer rounds, accumulating N*gas "
+                "micro-steps. Set >1 to make the critic relatively faster."
+            )
+        },
+    )
+
+    # --- Periodic critic re-warmup (resample + critic-only fit) ---
+    # The initial warmup (``critic_warmup_steps``) and these periodic bursts share one
+    # critic-only path. A burst resamples fresh rollouts, recomputes returns with the
+    # current critic, and fits ONLY the critic (policy frozen) to catch up to the
+    # current policy. ``critic_warmup_steps`` is the initial bootstrap done before the
+    # epoch loop (it no longer freezes the first epochs).
+    critic_rewarmup_interval: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Every N optimizer rounds, run a critic-only re-warmup burst on freshly "
+                "sampled rollouts (policy frozen, critic weights kept). 0 disables."
+            )
+        },
+    )
+    critic_rewarmup_inner_epochs: int = field(
+        default=1,
+        metadata={
+            "help": "Critic-only passes over the freshly sampled buffer per re-warmup burst."
+        },
+    )
+    update_critic_in_optimize: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True (default), the critic trains jointly with the policy in optimize(). "
+                "If False, the critic is NOT updated in optimize() and is trained ONLY by the "
+                "initial bootstrap (critic_warmup_steps) + periodic re-warmup bursts "
+                "(policy/critic alternation; requires critic_rewarmup_interval > 0)."
+            )
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         # Explicit float() casts guard against scientific-notation strings from CLI/YAML overrides.
@@ -142,6 +198,25 @@ class PPOTrainingArguments(TrainingArguments):
             )
         if not 0.0 <= self.gae_lambda <= 1.0:
             raise ValueError(f"`gae_lambda` must be in [0, 1], got {self.gae_lambda}.")
+        if self.critic_update_interval < 1 or self.policy_update_interval < 1:
+            raise ValueError(
+                f"`critic_update_interval`/`policy_update_interval` must be >= 1, got "
+                f"{self.critic_update_interval}/{self.policy_update_interval}."
+            )
+        if self.critic_rewarmup_interval < 0:
+            raise ValueError(
+                f"`critic_rewarmup_interval` must be >= 0, got {self.critic_rewarmup_interval}."
+            )
+        if self.critic_rewarmup_interval > 0 and self.critic_rewarmup_inner_epochs < 1:
+            raise ValueError(
+                f"`critic_rewarmup_inner_epochs` must be >= 1 when re-warmup is enabled, "
+                f"got {self.critic_rewarmup_inner_epochs}."
+            )
+        if not self.update_critic_in_optimize and self.critic_rewarmup_interval == 0:
+            raise ValueError(
+                "`update_critic_in_optimize=False` requires `critic_rewarmup_interval > 0` "
+                "(otherwise the critic is never updated after the initial bootstrap)."
+            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         """PPO accumulates one backward per SDE step, so the GAS multiplier is num_sde_steps."""

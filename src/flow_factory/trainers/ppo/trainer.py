@@ -18,10 +18,13 @@
 Actor-critic PPO: reuses the GRPO SDE rollout / per-step log-prob machinery, but
 replaces the single broadcast advantage with a value critic that provides a
 per-step baseline and GAE per-step advantages, plus a clipped value loss. Policy
-and critic share one backward and step their own optimizers.
+and critic use *separate* backward passes and their own optimizers, which lets
+their update frequencies be decoupled (``critic_update_interval`` /
+``policy_update_interval``); see :meth:`PPOTrainer.optimize`.
 """
 import os
 from collections import defaultdict
+from contextlib import nullcontext
 from functools import partial
 from typing import Dict, List, Optional
 
@@ -66,6 +69,16 @@ class PPOTrainer(BaseTrainer):
         """
         super()._initialization()
 
+        # Manual gradient-accumulation counter (0..gas-1). We drive accumulation
+        # ourselves instead of ``accelerator.accumulate`` so the critic and policy
+        # can step at different intervals; this counter persists across batches and
+        # epochs so the ``gas`` window stays continuous.
+        self.micro_in_round = 0
+        # Periodic critic re-warmup state: last triggered bucket (self.step // interval)
+        # and a monotonic call counter used to seed each burst's resampling distinctly.
+        self._last_rewarmup_bucket = 0
+        self._rewarmup_calls = 0
+
         ta = self.training_args
         num_frames = getattr(ta, "num_frames", None)
         latent_shape = self.adapter.compute_actual_latent_shape(
@@ -109,6 +122,8 @@ class PPOTrainer(BaseTrainer):
     # =========================== Main Loop ===========================
     def start(self):
         """Main training loop (Stages 2-6 per epoch)."""
+        # Initial critic-only bootstrap (the merged warmup) before any policy update.
+        self._bootstrap_critic()
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
 
@@ -131,6 +146,13 @@ class PPOTrainer(BaseTrainer):
             self.prepare_feedback(samples)
             self.optimize(samples)
 
+            # Periodic critic re-warmup burst (resample + critic-only fit) to catch the
+            # critic up to the moving policy; does not advance self.step / self.epoch.
+            interval = self.training_args.critic_rewarmup_interval
+            if interval > 0 and self.step // interval > self._last_rewarmup_bucket:
+                self._last_rewarmup_bucket = self.step // interval
+                self._rewarmup_critic(self.training_args.critic_rewarmup_inner_epochs)
+
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
 
@@ -148,13 +170,19 @@ class PPOTrainer(BaseTrainer):
         )
 
     # =========================== Feedback (Stages 4-5) ===========================
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+    def prepare_feedback(self, samples: List[BaseSample], metrics_prefix: str = "train") -> None:
         """Finalize rewards, run the old critic + GAE, and store per-step targets.
 
         Stores ``step_advantages``/``step_returns``/``step_old_values`` (each of
         shape ``(S,)`` aligned with the sorted SDE steps) on every sample's
         ``extra_kwargs``; these are stacked to ``(B, S)`` and indexed per step in
         :meth:`optimize`.
+
+        Args:
+            samples: Rollout samples to score and annotate with GAE targets.
+            metrics_prefix: Log-key prefix for feedback diagnostics (``"train"`` for
+                the normal epoch; ``"train_rewarmup"`` for re-warmup bursts so the
+                extra rollout's metrics do not collide at the same ``self.step``).
         """
         rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
         terminal_rewards = self._compute_terminal_rewards(samples, rewards)  # (N,)
@@ -173,7 +201,9 @@ class PPOTrainer(BaseTrainer):
             sample.extra_kwargs["step_returns"] = returns[i].clone()
             sample.extra_kwargs["step_old_values"] = old_values[i].clone()
 
-        self._log_feedback_metrics(terminal_rewards, old_values, advantages, returns)
+        self._log_feedback_metrics(
+            terminal_rewards, old_values, advantages, returns, metrics_prefix=metrics_prefix
+        )
 
     def _sorted_train_timesteps(self) -> List[int]:
         """Ordered (denoising-direction) SDE step indices for the current epoch."""
@@ -249,35 +279,54 @@ class PPOTrainer(BaseTrainer):
         old_values: torch.Tensor,
         advantages: torch.Tensor,
         returns: torch.Tensor,
+        metrics_prefix: str = "train",
     ) -> None:
         """Log global reward + local value/return/advantage diagnostics."""
         gathered = self.accelerator.gather(terminal_rewards.to(self.accelerator.device))
         self.log_data(
             {
-                "train/reward_mean": gathered.mean().item(),
-                "train/reward_std": gathered.std().item(),
-                "train/value_mean": old_values.mean().item(),
-                "train/return_mean": returns.mean().item(),
-                "train/advantage_mean": advantages.mean().item(),
-                "train/advantage_std": advantages.std().item(),
+                f"{metrics_prefix}/reward_mean": gathered.mean().item(),
+                f"{metrics_prefix}/reward_std": gathered.std().item(),
+                f"{metrics_prefix}/value_mean": old_values.mean().item(),
+                f"{metrics_prefix}/return_mean": returns.mean().item(),
+                f"{metrics_prefix}/advantage_mean": advantages.mean().item(),
+                f"{metrics_prefix}/advantage_std": advantages.std().item(),
             },
             step=self.step,
         )
 
     # =========================== Optimization (Stage 6) ===========================
     def optimize(self, samples: List[BaseSample]) -> None:
-        """Per-step clipped value loss + (post-warmup) PPO-clipped policy loss; dual optimizers.
+        """Per-step PPO-clipped policy loss + (mode A) clipped value loss; dual optimizers.
 
-        During the first ``critic_warmup_steps`` optimizer steps only the critic is
-        trained (the policy is frozen and its forward is skipped entirely).
+        Critic and policy use **separate** backward passes (each only traverses its
+        own sub-graph), so DDP gradient sync, accumulation and stepping are
+        independent. We do not use ``accelerator.accumulate``; instead a manual
+        ``micro_in_round`` counter marks each ``gas``-micro-step round, and each
+        network accumulates ``interval * gas`` micro-steps before one optimizer step
+        (``critic_update_interval`` / ``policy_update_interval``, in rounds).
+        ``accelerator.backward`` already divides by ``gas``; we additionally divide
+        each loss by its ``interval`` so the gradient is the mean over the full window.
+
+        The policy trains every micro-step here (the initial critic warmup is an
+        up-front bootstrap in :meth:`_bootstrap_critic`, not a frozen-policy phase).
+        The critic trains here only when ``update_critic_in_optimize`` is True
+        (mode A); in mode B it is trained solely by the bootstrap + periodic
+        :meth:`_rewarmup_critic` bursts.
         """
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
         clip_range = self.training_args.clip_range
         adv_clip_range = self.training_args.adv_clip_range
-        value_clip_range = self.training_args.value_clip_range
         vf_coef = self.training_args.vf_coef
+        # gas = base accumulation window (one optimizer "round"); ci/pi = per-network
+        # round multipliers. accelerator.backward divides by gas, the extra /ci|/pi
+        # makes each grad the mean over its interval*gas-micro-step window.
+        gas = self.accelerator.gradient_accumulation_steps
+        ci = self.training_args.critic_update_interval
+        pi = self.training_args.policy_update_interval
+        do_critic = self.training_args.update_critic_in_optimize
         sorted_ts = self._sorted_train_timesteps()
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
@@ -317,143 +366,289 @@ class PPOTrainer(BaseTrainer):
                         disable=not self.show_progress_bar,
                     )
                 ):
-                    in_warmup = self.step < self.training_args.critic_warmup_steps
-                    with self.accumulate_gradients(self.critic):
-                        # 1. Critic value loss (trained every step, including warmup)
-                        t = batch["timesteps"][:, timestep_index]
-                        latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                    round_idx = self.step
+                    boundary = self.micro_in_round == gas - 1
+                    # Critic trains here only in mode A; the policy trains every
+                    # micro-step (the initial warmup is an up-front bootstrap, not a
+                    # frozen-policy phase). Each net steps at its own window end.
+                    critic_step_now = do_critic and boundary and (round_idx + 1) % ci == 0
+                    policy_step_now = boundary and (round_idx + 1) % pi == 0
+
+                    t = batch["timesteps"][:, timestep_index]
+                    latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+
+                    # 1. Critic value loss (mode A only; mode B trains it via bursts).
+                    #    no_sync defers the DDP all-reduce until the critic's window end.
+                    value_critic_term = None  # detached vf_coef*value_loss for the logged total
+                    if do_critic:
                         returns_t = batch["step_returns"][:, step_idx]
                         old_values = batch["step_old_values"][:, step_idx]
-
-                        with self.autocast():
-                            value = self.critic(latents, t, self.latent_channel_dim)
-                        value = value.float()
-                        if value_clip_range is not None:
-                            value_clipped = old_values + torch.clamp(
-                                value - old_values, -value_clip_range, value_clip_range
-                            )
-                            value_loss = 0.5 * torch.mean(
-                                torch.maximum(
-                                    (value - returns_t) ** 2, (value_clipped - returns_t) ** 2
-                                )
-                            )
-                        else:
-                            value_loss = 0.5 * torch.mean((value - returns_t) ** 2)
-                        loss = vf_coef * value_loss
-
-                        # 2. Policy update (PPO-clip [+ KL]) -- skipped during critic warmup,
-                        #    so the policy stays frozen and no policy forward is wasted.
-                        policy_loss = None
-                        ratio = None
-                        if not in_warmup:
-                            old_log_prob = batch["log_probs"][
-                                :, log_probs_index_map[timestep_index]
-                            ]
-                            t_next = (
-                                batch["timesteps"][:, timestep_index + 1]
-                                if timestep_index + 1 < num_timesteps
-                                else torch.tensor(0, device=device)
-                            )
-                            next_latents = batch["all_latents"][
-                                :, latents_index_map[timestep_index + 1]
-                            ]
-                            adv = torch.clamp(
-                                batch["step_advantages"][:, step_idx],
-                                adv_clip_range[0],
-                                adv_clip_range[1],
-                            )
-                            forward_inputs = {
-                                **self.training_args,
-                                "t": t,
-                                "t_next": t_next,
-                                "latents": latents,
-                                "next_latents": next_latents,
-                                "compute_log_prob": True,
-                                "noise_level": self.adapter.scheduler.noise_level,
-                                **batch,
-                            }
-                            forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
-                            if self.enable_kl_loss:
-                                if self.training_args.kl_type == "v-based":
-                                    forward_inputs["return_kwargs"] = [
-                                        "log_prob",
-                                        "noise_pred",
-                                        "dt",
-                                    ]
-                                else:
-                                    forward_inputs["return_kwargs"] = [
-                                        "log_prob",
-                                        "next_latents_mean",
-                                        "dt",
-                                    ]
-                            else:
-                                forward_inputs["return_kwargs"] = ["log_prob", "dt"]
-
+                        critic_ctx = (
+                            nullcontext()
+                            if critic_step_now
+                            else self.accelerator.no_sync(self.critic)
+                        )
+                        with critic_ctx:
                             with self.autocast():
-                                output = self.adapter.forward(**forward_inputs)
-
-                            ratio = torch.exp(output.log_prob - old_log_prob)
-                            clipped_ratio = torch.clamp(
-                                ratio, 1.0 + clip_range[0], 1.0 + clip_range[1]
-                            )
-                            policy_loss = torch.mean(
-                                torch.maximum(-adv * ratio, -adv * clipped_ratio)
-                            )
-                            loss = loss + policy_loss
-
-                            if self.enable_kl_loss:
-                                kl_div = self._compute_kl(forward_inputs, output)
-                                kl_loss = self.training_args.kl_beta * kl_div
-                                loss = loss + kl_loss
-                                loss_info["kl_div"].append(kl_div.detach())
-                                loss_info["kl_loss"].append(kl_loss.detach())
-
-                        # 3. Backward + dual optimizer step
-                        self.accelerator.backward(loss)
-                        policy_grad_norm = None
-                        critic_grad_norm = None
-                        if self.accelerator.sync_gradients:
-                            critic_grad_norm = self.accelerator.clip_grad_norm_(
-                                self.critic.parameters(), self.training_args.max_grad_norm
-                            )
-                            if not in_warmup:
-                                policy_grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                            self.critic_optimizer.step()
-                            self.optimizer.zero_grad()
-                            self.critic_optimizer.zero_grad()
-
-                        # 4. Metrics (policy metrics only when the policy is updated)
+                                value = self.critic(latents, t, self.latent_channel_dim)
+                            value = value.float()
+                            value_loss = self._critic_value_loss(value, returns_t, old_values)
+                            # accelerate divides by gas; the extra /ci -> mean over ci*gas.
+                            self.accelerator.backward(vf_coef * value_loss / ci)
+                        value_critic_term = (vf_coef * value_loss).detach()
                         loss_info["value_loss"].append(value_loss.detach())
                         loss_info["explained_variance"].append(
                             self._explained_variance(value.detach(), returns_t).detach()
                         )
-                        loss_info["loss"].append(loss.detach())
-                        if policy_loss is not None:
-                            clip_frac_high = torch.mean((ratio > 1.0 + clip_range[1]).float())
-                            clip_frac_low = torch.mean((ratio < 1.0 + clip_range[0]).float())
-                            loss_info["ratio"].append(ratio.mean().detach())
-                            loss_info["policy_loss"].append(policy_loss.detach())
-                            loss_info["clip_frac_high"].append(clip_frac_high.detach())
-                            loss_info["clip_frac_low"].append(clip_frac_low.detach())
-                            loss_info["clip_frac_total"].append(
-                                (clip_frac_high + clip_frac_low).detach()
-                            )
 
-                        if self.accelerator.sync_gradients:
-                            reduced = reduce_loss_info(self.accelerator, loss_info)
+                    # 2. Policy update (PPO-clip [+ KL]) -- every micro-step.
+                    old_log_prob = batch["log_probs"][:, log_probs_index_map[timestep_index]]
+                    t_next = (
+                        batch["timesteps"][:, timestep_index + 1]
+                        if timestep_index + 1 < num_timesteps
+                        else torch.tensor(0, device=device)
+                    )
+                    next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
+                    adv = torch.clamp(
+                        batch["step_advantages"][:, step_idx],
+                        adv_clip_range[0],
+                        adv_clip_range[1],
+                    )
+                    forward_inputs = {
+                        **self.training_args,
+                        "t": t,
+                        "t_next": t_next,
+                        "latents": latents,
+                        "next_latents": next_latents,
+                        "compute_log_prob": True,
+                        "noise_level": self.adapter.scheduler.noise_level,
+                        **batch,
+                    }
+                    forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
+                    if self.enable_kl_loss:
+                        if self.training_args.kl_type == "v-based":
+                            forward_inputs["return_kwargs"] = ["log_prob", "noise_pred", "dt"]
+                        else:
+                            forward_inputs["return_kwargs"] = [
+                                "log_prob",
+                                "next_latents_mean",
+                                "dt",
+                            ]
+                    else:
+                        forward_inputs["return_kwargs"] = ["log_prob", "dt"]
+
+                    kl_loss = None
+                    policy_ctx = (
+                        nullcontext()
+                        if policy_step_now
+                        else self.accelerator.no_sync(self.model_bundle)
+                    )
+                    with policy_ctx:
+                        with self.autocast():
+                            output = self.adapter.forward(**forward_inputs)
+                        ratio = torch.exp(output.log_prob - old_log_prob)
+                        clipped_ratio = torch.clamp(ratio, 1.0 + clip_range[0], 1.0 + clip_range[1])
+                        policy_loss = torch.mean(torch.maximum(-adv * ratio, -adv * clipped_ratio))
+                        total = policy_loss
+                        if self.enable_kl_loss:
+                            kl_div = self._compute_kl(forward_inputs, output)
+                            kl_loss = self.training_args.kl_beta * kl_div
+                            total = total + kl_loss
+                            loss_info["kl_div"].append(kl_div.detach())
+                            loss_info["kl_loss"].append(kl_loss.detach())
+                        # accelerate divides by gas; the extra /pi -> mean over pi*gas.
+                        self.accelerator.backward(total / pi)
+
+                    # 3. Independent optimizer steps at each network's own window end.
+                    critic_grad_norm = None
+                    policy_grad_norm = None
+                    if critic_step_now:
+                        critic_grad_norm = self.accelerator.clip_grad_norm_(
+                            self.critic.parameters(), self.training_args.max_grad_norm
+                        )
+                        self.critic_optimizer.step()
+                        self.critic_optimizer.zero_grad()
+                    if policy_step_now:
+                        policy_grad_norm = self.accelerator.clip_grad_norm_(
+                            self.adapter.get_trainable_parameters(),
+                            self.training_args.max_grad_norm,
+                        )
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+
+                    # 4. Metrics (policy every micro-step; critic metrics logged in step 1).
+                    combined = policy_loss.detach()
+                    if kl_loss is not None:
+                        combined = combined + kl_loss.detach()
+                    if value_critic_term is not None:
+                        combined = combined + value_critic_term
+                    clip_frac_high = torch.mean((ratio > 1.0 + clip_range[1]).float())
+                    clip_frac_low = torch.mean((ratio < 1.0 + clip_range[0]).float())
+                    loss_info["ratio"].append(ratio.mean().detach())
+                    loss_info["policy_loss"].append(policy_loss.detach())
+                    loss_info["clip_frac_high"].append(clip_frac_high.detach())
+                    loss_info["clip_frac_low"].append(clip_frac_low.detach())
+                    loss_info["clip_frac_total"].append((clip_frac_high + clip_frac_low).detach())
+                    loss_info["loss"].append(combined)
+
+                    # 5. Round bookkeeping at the gas-window boundary.
+                    if boundary:
+                        reduced = reduce_loss_info(self.accelerator, loss_info)
+                        reduced["critic_updated"] = float(critic_step_now)
+                        reduced["policy_updated"] = float(policy_step_now)
+                        if critic_grad_norm is not None:
                             reduced["critic_grad_norm"] = critic_grad_norm
-                            if policy_grad_norm is not None:
-                                reduced["grad_norm"] = policy_grad_norm
-                            self.log_data(
-                                {f"train/{k}": v for k, v in reduced.items()},
-                                step=self.step,
-                            )
-                            self.step += 1
-                            loss_info = defaultdict(list)
+                        if policy_grad_norm is not None:
+                            reduced["grad_norm"] = policy_grad_norm
+                        self.log_data(
+                            {f"train/{k}": v for k, v in reduced.items()},
+                            step=self.step,
+                        )
+                        self.step += 1
+                        self.micro_in_round = 0
+                        loss_info = defaultdict(list)
+                    else:
+                        self.micro_in_round += 1
+
+    def _critic_value_loss(
+        self,
+        value: torch.Tensor,
+        returns_t: torch.Tensor,
+        old_values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Clipped (PPO-style) value-regression loss, shared by optimize() + re-warmup."""
+        value_clip_range = self.training_args.value_clip_range
+        if value_clip_range is not None:
+            value_clipped = old_values + torch.clamp(
+                value - old_values, -value_clip_range, value_clip_range
+            )
+            return 0.5 * torch.mean(
+                torch.maximum((value - returns_t) ** 2, (value_clipped - returns_t) ** 2)
+            )
+        return 0.5 * torch.mean((value - returns_t) ** 2)
+
+    # =========================== Critic re-warmup (Stage 6b) ===========================
+    def _bootstrap_critic(self) -> None:
+        """Initial critic-only bootstrap before the epoch loop (the merged warmup).
+
+        Repeatedly resamples fresh rollouts and fits ONLY the critic until it has
+        taken ~``critic_warmup_steps`` optimizer steps. Unlike the old in-loop warmup,
+        this does not freeze the first epochs: once the main loop starts, the policy
+        trains every epoch. No-op when ``critic_warmup_steps == 0``.
+        """
+        target = self.training_args.critic_warmup_steps
+        if target <= 0:
+            return
+        if self.accelerator.is_local_main_process:
+            logger.info(f"PPO critic bootstrap: ~{target} critic steps via resampled bursts.")
+        done = 0
+        while done < target:
+            steps = self._rewarmup_critic(num_passes=1)
+            if steps == 0:
+                logger.warning(
+                    "PPO critic bootstrap made no progress (gas > buffer?); stopping early."
+                )
+                break
+            done += steps
+
+    def _rewarmup_critic(self, num_passes: int) -> int:
+        """One critic re-warmup burst: resample fresh data, then a critic-only fit.
+
+        Args:
+            num_passes: Critic-only passes over the freshly sampled buffer.
+
+        Returns:
+            Number of critic optimizer steps taken in this burst.
+        """
+        # Distinct, reproducible seed per burst so each resample sees fresh noise.
+        self._rewarmup_calls += 1
+        self.adapter.scheduler.set_seed(self.training_args.seed + 1_000_000 + self._rewarmup_calls)
+        samples = self.sample()
+        self.prepare_feedback(samples, metrics_prefix="train_rewarmup")
+        return self._fit_critic_only(samples, num_passes)
+
+    def _fit_critic_only(self, samples: List[BaseSample], num_passes: int) -> int:
+        """Critic-only fit over ``samples`` for ``num_passes`` passes (policy untouched).
+
+        Mirrors the critic path of :meth:`optimize` (manual ``gas`` accumulation +
+        per-step ``no_sync``) but never forwards/steps the policy and never advances
+        ``self.step`` / ``self.epoch``. Logs under ``train_rewarmup/*``.
+
+        Returns:
+            Number of critic optimizer steps taken.
+        """
+        device = self.accelerator.device
+        per_device_batch_size = self.training_args.per_device_batch_size
+        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        vf_coef = self.training_args.vf_coef
+        gas = self.accelerator.gradient_accumulation_steps
+        sorted_ts = self._sorted_train_timesteps()
+
+        self.critic.train()
+        # Clean slate so a burst never mixes in stale grads from a prior phase.
+        self.critic_optimizer.zero_grad()
+        critic_steps = 0
+        micro = 0
+        loss_info = defaultdict(list)
+        for pass_idx in range(num_passes):
+            shuffled_samples = self._order_samples_for_optimize(samples, pass_idx)
+            for batch_idx in tqdm(
+                range(num_batches),
+                total=num_batches,
+                desc=f"Rewarmup {self._rewarmup_calls}",
+                leave=False,
+                disable=not self.show_progress_bar,
+            ):
+                start = batch_idx * per_device_batch_size
+                batch_samples = [
+                    s.to(device) for s in shuffled_samples[start : start + per_device_batch_size]
+                ]
+                batch = BaseSample.stack(batch_samples)
+                for key in ("step_returns", "step_old_values"):
+                    batch[key] = batch[key].to(device)
+                latents_index_map = batch["latent_index_map"]
+                for step_idx, timestep_index in enumerate(sorted_ts):
+                    boundary = micro == gas - 1
+                    t = batch["timesteps"][:, timestep_index]
+                    latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                    returns_t = batch["step_returns"][:, step_idx]
+                    old_values = batch["step_old_values"][:, step_idx]
+
+                    critic_ctx = (
+                        nullcontext() if boundary else self.accelerator.no_sync(self.critic)
+                    )
+                    with critic_ctx:
+                        with self.autocast():
+                            value = self.critic(latents, t, self.latent_channel_dim)
+                        value = value.float()
+                        value_loss = self._critic_value_loss(value, returns_t, old_values)
+                        self.accelerator.backward(vf_coef * value_loss)
+
+                    loss_info["value_loss"].append(value_loss.detach())
+                    loss_info["explained_variance"].append(
+                        self._explained_variance(value.detach(), returns_t).detach()
+                    )
+                    if boundary:
+                        self.accelerator.clip_grad_norm_(
+                            self.critic.parameters(), self.training_args.max_grad_norm
+                        )
+                        self.critic_optimizer.step()
+                        self.critic_optimizer.zero_grad()
+                        critic_steps += 1
+                        reduced = reduce_loss_info(self.accelerator, loss_info)
+                        self.log_data(
+                            {f"train_rewarmup/{k}": v for k, v in reduced.items()},
+                            step=self.step,
+                        )
+                        loss_info = defaultdict(list)
+                        micro = 0
+                    else:
+                        micro += 1
+        # Discard any trailing partial window (manual gas not dividing the buffer) so
+        # it never leaks into the next burst or the main optimize loop.
+        if micro != 0:
+            self.critic_optimizer.zero_grad()
+        return critic_steps
 
     @staticmethod
     def _explained_variance(values: torch.Tensor, returns: torch.Tensor) -> torch.Tensor:
