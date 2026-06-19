@@ -329,6 +329,25 @@ class PPOTrainer(BaseTrainer):
         do_critic = self.training_args.update_critic_in_optimize
         sorted_ts = self._sorted_train_timesteps()
 
+        # AcceleratedOptimizer.step()/zero_grad() gate on accelerator.sync_gradients; PPO drives
+        # accumulation manually (no accelerator.accumulate), so pin it True so the boundary
+        # step/zero always fire regardless of any prior state.
+        self.accelerator.sync_gradients = True
+
+        # Manual accumulation: micro_in_round is continuous across epochs, so one optimize()'s
+        # micro-step count must be a multiple of gas, else a window straddles two epochs'
+        # rollouts (mismatched old policy / advantages). auto-gas guarantees this by construction.
+        if self.training_args._manual_gradient_accumulation_steps:
+            steps_per_optimize = self.training_args.num_inner_epochs * num_batches * len(sorted_ts)
+            if steps_per_optimize % gas != 0:
+                raise ValueError(
+                    f"PPO manual gradient_accumulation_steps={gas} must divide the per-optimize "
+                    f"micro-step count ({steps_per_optimize} = num_inner_epochs "
+                    f"{self.training_args.num_inner_epochs} x num_batches {num_batches} x "
+                    f"num_sde_steps {len(sorted_ts)}); otherwise an accumulation window spans "
+                    f"two epochs' rollouts. Use a divisor or gradient_accumulation_steps='auto'."
+                )
+
         for inner_epoch in range(self.training_args.num_inner_epochs):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
@@ -585,6 +604,9 @@ class PPOTrainer(BaseTrainer):
         sorted_ts = self._sorted_train_timesteps()
 
         self.critic.train()
+        # AcceleratedOptimizer.step()/zero_grad() gate on accelerator.sync_gradients; pin it
+        # True here too so bootstrap/burst critic steps fire (see optimize()).
+        self.accelerator.sync_gradients = True
         # Clean slate so a burst never mixes in stale grads from a prior phase.
         self.critic_optimizer.zero_grad()
         critic_steps = 0

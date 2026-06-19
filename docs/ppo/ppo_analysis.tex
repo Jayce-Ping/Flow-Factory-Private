@@ -441,9 +441,12 @@ g \;=\; \frac{1}{p_i\,gas}\sum_{j=1}^{p_i\,gas}\nabla_\theta\big(\mathcal{L}^{\t
 \end{equation}
 so the effective learning rate is invariant to the interval. Gradient
 synchronization is deferred with per-network \texttt{no\_sync} until each window
-closes; stepping is gated by a self-maintained micro-step counter rather than
-Accelerate's shared \texttt{sync\_gradients} (which the manual scheme does not
-advance). This is the two-timescale idea of TD3 / DMD2 (update one network less
+closes; window boundaries are tracked by a self-maintained micro-step counter, not
+Accelerate's shared \texttt{sync\_gradients}. Since the prepared optimizers'
+\texttt{step}/\texttt{zero\_grad} are themselves gated on that flag, we pin
+\texttt{sync\_gradients}${=}$\texttt{True} at \texttt{optimize}/burst entry so they always
+fire, and (manual-\texttt{gas} only) assert the per-\texttt{optimize} micro-step count is a
+multiple of \texttt{gas} so a window never straddles two epochs' rollouts. This is the two-timescale idea of TD3 / DMD2 (update one network less
 often to stabilize the other), here realized as accumulation-window decoupling on a
 fixed on-policy buffer rather than as fresh-minibatch skipping.
 
