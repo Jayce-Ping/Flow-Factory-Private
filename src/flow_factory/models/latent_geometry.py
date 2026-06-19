@@ -97,3 +97,72 @@ def infer_latent_axes(ndim: int) -> LatentAxes:
             f"the adapter for non-standard layouts."
         )
     return axes
+
+
+# Per-layout latent-shape formulas shared by adapters' ``compute_actual_latent_shape``.
+# Pure functions (not adapter inheritance) so each adapter stays a thin one-liner that
+# supplies its own channel count / VAE scale factors -- consistent with the flat-adapter
+# convention (shared logic via helpers, never adapter-to-adapter inheritance).
+
+
+def conv_latent_shape(
+    channels: int, height: int, width: int, vae_scale_factor: int
+) -> Tuple[int, ...]:
+    """Conv latent shape ``(C, H/f, W/f)`` (channel axis 1). Used by SD3.5, Z-Image."""
+    return (channels, height // vae_scale_factor, width // vae_scale_factor)
+
+
+def _latent_frames(num_frames: Optional[int], temporal_scale: Optional[int]) -> int:
+    """Latent frame count for video, with a fail-fast on missing inputs."""
+    if num_frames is None or temporal_scale is None:
+        raise ValueError(
+            "latent_shape requires `num_frames` and `temporal_scale` for video latents; "
+            f"got num_frames={num_frames}, temporal_scale={temporal_scale}."
+        )
+    return (num_frames - 1) // temporal_scale + 1
+
+
+def latent_shape(
+    channels: int,
+    height: int,
+    width: int,
+    spatial_scale: int,
+    patch_size: Tuple[int, ...] = (1, 1),
+    num_frames: Optional[int] = None,
+    temporal_scale: Optional[int] = None,
+    packed: bool = False,
+) -> Tuple[int, ...]:
+    """Resolution-invariant latent shape, unifying packed / video / conv layouts.
+
+    Builds the per-axis latent grid as ``dim // spatial_scale // patch`` (spatial)
+    and ``((num_frames - 1) // temporal_scale + 1) // patch_t`` (temporal), then
+    returns it either folded into a token sequence (``packed=True`` -> ``(seq, C)``,
+    e.g. FLUX/Qwen, LTX2) or as explicit dims (``packed=False`` -> ``(C[, T'], H', W')``,
+    e.g. SD3.5/Z-Image, Wan2).
+
+    Args:
+        channels: Latent channel count ``C`` (post-fold for packed layouts).
+        height: Output height in pixels.
+        width: Output width in pixels.
+        spatial_scale: VAE spatial downscale factor.
+        patch_size: Per-axis patch ``(patch_h, patch_w[, patch_t])`` folded into the
+            stored latent (Wan-style per-axis patch). Pass ``1`` on an axis whose patch
+            is applied inside the transformer rather than baked into the stored latent
+            (e.g. Wan2, LTX2).
+        num_frames: Number of video frames (video layouts only).
+        temporal_scale: VAE temporal downscale factor (required when ``num_frames`` set).
+        packed: Whether the stored latent folds the grid into a token sequence.
+
+    Returns:
+        ``(seq, C)`` when ``packed`` else ``(C[, T'], H', W')``.
+    """
+    grid = [height // spatial_scale // patch_size[0], width // spatial_scale // patch_size[1]]
+    if num_frames is not None:
+        patch_t = patch_size[2] if len(patch_size) > 2 else 1
+        grid.insert(0, _latent_frames(num_frames, temporal_scale) // patch_t)
+    if packed:
+        seq_len = 1
+        for size in grid:
+            seq_len *= size
+        return (seq_len, channels)
+    return (channels, *grid)

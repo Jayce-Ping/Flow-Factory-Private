@@ -69,7 +69,7 @@ Defined in `models/abc.py` (`preprocessing_modules` / `inference_modules` proper
 
 ## Latent Geometry
 
-Model-agnostic description of latent tensor **axis roles** on `BaseAdapter`. Defined in `models/latent_geometry.py` + `models/abc.py`. Additive and information-preserving — it only locates axes; it does not summarize or pool latents (a future consumer, e.g. a critic/value head, will add task-specific encoders on top).
+Model-agnostic description of latent tensor **axis roles** on `BaseAdapter`. Defined in `models/latent_geometry.py` + `models/abc.py`. Additive and information-preserving — it locates axes and (via `compute_actual_latent_shape`) reports per-sample latent shapes; it does not summarize or pool latents. The PPO value critic is the first consumer: it folds latents to `(B, seq, C)` via `resolve_latent_axes` and sizes itself eagerly from `compute_actual_latent_shape`.
 
 ### API
 
@@ -78,6 +78,7 @@ Model-agnostic description of latent tensor **axis roles** on `BaseAdapter`. Def
 | `LATENT_AXES` (ClassVar) | Optional static `LatentAxes` override; `None` -> infer from ndim |
 | `resolve_latent_axes(latents)` | Returns `LatentAxes` (override, else ndim-inferred) |
 | `infer_latent_axes(ndim)` (module fn) | Maps rank 3/4/5 to canonical `LatentAxes`; fail-fasts on unsupported ranks |
+| `compute_actual_latent_shape(h, w, num_frames=None)` | Per-sample latent shape (no batch dim) matching `all_latents`/`forward`; concrete on `BaseAdapter` (raises by default), implemented by every adapter. Consumed by the PPO value critic for eager init. |
 
 ### Layouts (axis roles, resolution-invariant)
 

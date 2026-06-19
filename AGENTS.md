@@ -4,7 +4,7 @@
 
 Flow-Factory is a unified **online RL fine-tuning framework** for diffusion/flow-matching models. It provides a modular architecture where trainers, model adapters, and reward models are independently extensible via a registry-based plugin system.
 
-- **Algorithms**: GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD
+- **Algorithms**: GRPO, GRPO-Guard, DPPO, PPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD
 - **Models**: FLUX.1 (+Kontext), FLUX.2 (+Klein), SD3.5, Qwen-Image (+Edit-Plus), Z-Image, Wan2 (T2V/I2V/V2V), LTX2 (T2AV/I2AV), Bagel
 - **Rewards**: PickScore (+Rank), CLIP, CLAP, ImageBind, OCR, GenEval/GenEval2, HPSv2, VLM-Evaluate, rational-rewards, and custom rewards
 - **Python**: >=3.10 | **PyTorch**: >=2.6.0 | **License**: Apache-2.0

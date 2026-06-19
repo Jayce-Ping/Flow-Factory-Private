@@ -98,19 +98,24 @@ class BaseTrainer(ABC):
             return True
         return self.epoch < m
 
-    def accumulate_gradients(self):
-        """Context manager for gradient accumulation over the single prepared root.
+    def accumulate_gradients(self, *extra_models):
+        """Context manager for gradient accumulation over the prepared root(s).
 
         Centralizes ``accelerator.accumulate(self.model_bundle)`` so trainers do
         not couple to the prepared-root identity: ``self.model_bundle`` is the one
         object DDP/FSDP/DeepSpeed wraps, and accumulation must always target it.
+
+        Args:
+            *extra_models: Additional separately-prepared modules (e.g. PPO's
+                value critic) whose gradients should accumulate/sync in lockstep
+                with the bundle.
 
         Usage::
 
             with self.accumulate_gradients():
                 ...  # forward / loss / backward / step
         """
-        return self.accelerator.accumulate(self.model_bundle)
+        return self.accelerator.accumulate(self.model_bundle, *extra_models)
 
     def log_data(self, data: Dict[str, Any], step: int):
         """Log data using the initialized logger."""

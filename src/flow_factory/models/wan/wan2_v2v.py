@@ -29,6 +29,7 @@ from accelerate import Accelerator
 from peft import PeftModel
 
 from ..abc import BaseAdapter
+from ..latent_geometry import latent_shape
 from ...samples import V2VSample
 from ...hparams import *
 from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
@@ -276,6 +277,23 @@ class Wan2_V2V_Adapter(BaseAdapter):
     
 
     # ============================ Inference ============================
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Video latent ``(C, T', H', W')`` for Wan2 V2V (generated latent; the
+        video-condition channels are concatenated only inside ``forward``)."""
+        return latent_shape(
+            self.pipeline.vae.config.z_dim,
+            height,
+            width,
+            self.pipeline.vae_scale_factor_spatial,
+            num_frames=num_frames,
+            temporal_scale=self.pipeline.vae_scale_factor_temporal,
+        )
+
     def inference(
         self,
         # Ordinary inputs

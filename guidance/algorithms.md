@@ -27,6 +27,8 @@
 
 - [DiffusionOPD: On-Policy Distillation](#diffusionopd-on-policy-distillation)
 
+- [PPO: Critic-based PPO](#ppo-critic-based-ppo)
+
 - [References](#references)
 
 ## Overview
@@ -567,6 +569,65 @@ scheduler:
 ```
 
 Each teacher's `applicable_datasets` must reference declared `data.datasets[*].name` entries (validated at config load). The config schema allows several teachers to share a dataset for a future multi-teacher/ensemble trainer, but the current `DiffusionOPDTrainer` requires exactly one teacher per dataset and raises otherwise. See [`examples/opd/lora/sd3_5/`](../examples/opd/lora/sd3_5/) for two complete configs (`DiffusionOPD_aligned.yaml` to reproduce official results).
+
+## PPO: Critic-based PPO
+
+Critic-based PPO is a **coupled** actor-critic algorithm: it reuses the same SDE rollout and per-step log-probability machinery as GRPO, but replaces GRPO's single group-normalized advantage (broadcast to every step) with a learned **value critic** that provides a per-step baseline and **GAE** per-step advantages, plus a clipped value loss.
+
+To use this algorithm, set:
+
+```yaml
+train:
+    trainer_type: 'ppo'
+```
+
+Like GRPO, PPO is coupled and must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
+
+### Value Critic
+
+The critic is an independent, lightweight, **resolution-agnostic** network (the policy backbone is untouched). It consumes the full generation latent: any layout is folded to `(B, seq, C)` (via `BaseAdapter.resolve_latent_axes`), encoded per token, aggregated over the sequence with learned-query multihead **attention pooling** (PMA-style, `O(seq)`), conditioned on a sinusoidal timestep embedding, and regressed to a scalar value. It is built eagerly in `_initialization()` from the channel count `C` returned by `BaseAdapter.compute_actual_latent_shape(height, width[, num_frames])`, so it needs no rollout to size and its checkpoint stays valid across resolutions. The critic has its own AdamW optimizer; policy and critic share a single backward and step independently. (A backbone+value-head critic was evaluated and deferred as a follow-up.)
+
+### GAE & Losses
+
+The denoising trajectory is treated as an ordered RL episode over the SDE steps. The terminal reward (the weighted sum of the per-reward scores — the critic is the variance baseline, so no group normalization is applied) lands at the last SDE step with a terminal value of 0; GAE then produces per-step advantages and returns:
+
+```
+delta_t  = r_t + gamma * V(z_{t+1}) - V(z_t)
+A_t      = delta_t + gamma * lambda * A_{t+1}
+return_t = A_t + V(z_t)
+```
+
+Per-step advantages are optionally whitened globally across ranks. The objective is `policy_clip(A_t) + vf_coef * value_loss(return_t) [+ kl_beta * KL_ref]`, where the value loss optionally clips the value prediction around the old value (`value_clip_range`).
+
+> **GAE assumes a contiguous SDE trajectory.** Configure the scheduler so every SDE step is trained and they are contiguous (`scheduler.sde_steps: null` → `[0 .. num_inference_steps-2]`, `scheduler.num_sde_steps = num_inference_steps - 1`); then the per-step bootstrap `V(z_{t+1})` is exactly the value of the next stored latent. See [`examples/ppo/lora/sd3_5/default.yaml`](../examples/ppo/lora/sd3_5/default.yaml).
+
+### Key Hyperparameters
+
+```yaml
+train:
+  trainer_type: 'ppo'
+  # Policy
+  clip_range: 1.0e-4          # PPO policy ratio clip (flow log-probs are large; keep tiny)
+  adv_clip_range: 5.0
+  normalize_advantage: true   # globally whiten per-step advantages
+  # Critic / value
+  critic_learning_rate: 1.0e-4
+  vf_coef: 0.5
+  value_clip_range: 0.2       # null to disable value clipping
+  critic_warmup_steps: 0
+  critic_hidden_dim: 256
+  critic_num_layers: 3
+  critic_attn_heads: 8        # must divide critic_hidden_dim
+  critic_num_query_tokens: 1
+  # GAE
+  gae_gamma: 1.0
+  gae_lambda: 0.95
+  # Optional KL-to-reference (0 disables)
+  kl_beta: 0
+  kl_type: 'v-based'
+```
+
+> **Distributed**: v1 supports DDP. The critic's second optimizer under DeepSpeed / FSDP is a follow-up.
 
 ## References
 

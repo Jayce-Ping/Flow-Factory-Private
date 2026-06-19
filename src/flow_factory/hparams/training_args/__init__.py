@@ -30,6 +30,7 @@ from .dpo import DPOTrainingArguments
 from .dgpo import DGPOTrainingArguments
 from .crd import CRDTrainingArguments
 from .opd import DiffusionOPDTrainingArguments, TeacherConfig
+from .ppo import PPOTrainingArguments
 
 __all__ = [
     "EvaluationArguments",
@@ -42,6 +43,7 @@ __all__ = [
     "DGPOTrainingArguments",
     "CRDTrainingArguments",
     "DiffusionOPDTrainingArguments",
+    "PPOTrainingArguments",
     "TeacherConfig",
     "get_training_args_class",
     "list_registered_training_args",

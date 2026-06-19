@@ -109,6 +109,7 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 | `crd` | `CRDTrainer` | Decoupled | `BaseTrainer` |
 | `diffusion-opd` | `DiffusionOPDTrainer` | Distillation (on-policy) | `BaseTrainer` |
+| `ppo` | `PPOTrainer` | Coupled | `BaseTrainer` |
 
 **Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned exceptions are `GRPOGuardTrainer → GRPOTrainer` and `DPPOTrainer → GRPOTrainer` (strict GRPO loss variants; see constraint #11).
 

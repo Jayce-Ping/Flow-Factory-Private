@@ -29,6 +29,7 @@ from diffusers.pipelines.flux.pipeline_flux_kontext import FluxKontextPipeline
 from diffusers.utils.torch_utils import randn_tensor
 
 from ..abc import BaseAdapter
+from ..latent_geometry import latent_shape
 from ...samples import I2ISample
 from ...hparams import *
 from ...scheduler import (
@@ -333,6 +334,23 @@ class Flux1KontextAdapter(BaseAdapter):
         return latents, latent_ids
 
     # ======================== Inference =============================
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Packed latent ``(seq, C)`` for FLUX.1-Kontext (generated target latent;
+        condition image latents are concatenated only inside ``forward``)."""
+        return latent_shape(
+            self.pipeline.transformer.config.in_channels,
+            height,
+            width,
+            self.pipeline.vae_scale_factor,
+            patch_size=(2, 2),
+            packed=True,
+        )
+
     @torch.no_grad()
     def inference(
         self,

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
@@ -39,6 +39,7 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..latent_geometry import latent_shape
 from ._common import combine_modality_log_prob
 
 logger = setup_logger(__name__)
@@ -979,6 +980,23 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         return video_output
 
     # ============================== Inference ==============================
+
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Packed video latent ``(seq, C)`` for LTX2 T2AV (audio latent is a follow-up)."""
+        return latent_shape(
+            self.transformer_config.in_channels,
+            height,
+            width,
+            self.pipeline.vae_spatial_compression_ratio,
+            num_frames=num_frames,
+            temporal_scale=self.pipeline.vae_temporal_compression_ratio,
+            packed=True,
+        )
 
     @torch.no_grad()
     def inference(

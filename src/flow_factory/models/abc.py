@@ -2280,6 +2280,40 @@ class BaseAdapter(ABC):
             return self.LATENT_AXES
         return infer_latent_axes(latents.ndim)
 
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Return the per-sample latent shape (no batch dim) for a given output size.
+
+        The shape MUST match the latent tensor stored in ``BaseSample.all_latents``
+        and consumed by :meth:`forward` (i.e. packed for packed-layout models), so
+        that :meth:`resolve_latent_axes` locates the channel axis consistently.
+        Value/critic networks call this to size their input eagerly without a
+        rollout. Resolution-dependent dims (sequence length, height, width, frames)
+        are computed here; the channel size is the only dim a pooling critic needs.
+
+        Args:
+            height: Output image/video height in pixels.
+            width: Output image/video width in pixels.
+            num_frames: Number of video frames (video / audio-video models only).
+
+        Returns:
+            The latent shape without the batch dimension, e.g. ``(C, H', W')``
+            (conv), ``(seq, C)`` (packed), or ``(C, T', H', W')`` (video).
+
+        Raises:
+            NotImplementedError: If the adapter has not implemented this method.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement compute_actual_latent_shape, "
+            f"which the PPO critic requires to size its input. Implement it to return "
+            f"the per-sample latent shape for (height={height}, width={width}, "
+            f"num_frames={num_frames})."
+        )
+
     # ======================================= Sampling & Training =======================================
     @abstractmethod
     def forward(

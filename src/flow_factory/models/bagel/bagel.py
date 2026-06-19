@@ -986,6 +986,21 @@ class BagelAdapter(BaseAdapter):
 
     # ======================== Inference ========================
 
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Packed latent ``(seq, patch_dim)`` for Bagel (NaViT patch tokens)."""
+        bagel = self.pipeline.bagel
+        patch = bagel.latent_patch_size
+        channels = bagel.latent_channel
+        downsample = bagel.latent_downsample
+        seq_len = (height // downsample) * (width // downsample)
+        patch_dim = channels * patch * patch
+        return (seq_len, patch_dim)
+
     @torch.no_grad()
     def inference(
         self,

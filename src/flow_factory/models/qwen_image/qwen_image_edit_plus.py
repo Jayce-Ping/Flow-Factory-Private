@@ -31,6 +31,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImage
 from diffusers.utils.torch_utils import randn_tensor
 
 from ..abc import BaseAdapter
+from ..latent_geometry import latent_shape
 from ...samples import I2ISample
 from ...hparams import *
 from ...scheduler import (
@@ -865,6 +866,23 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         self.pipeline.maybe_free_model_hooks()
 
         return samples
+
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Packed latent ``(seq, C)`` for Qwen-Image-Edit-Plus (generated target
+        latent; condition image latents are concatenated only inside ``forward``)."""
+        return latent_shape(
+            self.pipeline.transformer.config.in_channels,
+            height,
+            width,
+            self.pipeline.vae_scale_factor,
+            patch_size=(2, 2),
+            packed=True,
+        )
 
     @torch.no_grad()
     def inference(

@@ -31,7 +31,7 @@ Every `BaseAdapter` subclass's `load_pipeline()` must return a `diffusers.Diffus
 The training loop executes: Data Preprocessing → K-Repeat Sampling → Trajectory Generation → Reward Computation → Advantage Computation → Policy Optimization. This order is invariant. Do not reorder or skip stages.
 
 ### 7. Coupled vs Decoupled Paradigm
-- **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
+- **Coupled** (GRPO, GRPO-Guard, DPPO, PPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
 - **Decoupled** (DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
 - **Distillation** (`diffusion-opd`): On-policy multi-teacher distillation; dynamics-agnostic (ODE or SDE) and has no reward/advantage stage.
 

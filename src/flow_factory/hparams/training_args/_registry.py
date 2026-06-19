@@ -27,6 +27,7 @@ from .dpo import DPOTrainingArguments
 from .dgpo import DGPOTrainingArguments
 from .crd import CRDTrainingArguments
 from .opd import DiffusionOPDTrainingArguments
+from .ppo import PPOTrainingArguments
 
 
 # ============================================================================
@@ -43,6 +44,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     'dpo': DPOTrainingArguments,
     'crd': CRDTrainingArguments,
     'diffusion-opd': DiffusionOPDTrainingArguments,
+    'ppo': PPOTrainingArguments,
 }
 
 

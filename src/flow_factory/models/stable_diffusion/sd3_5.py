@@ -28,6 +28,7 @@ from accelerate import Accelerator
 
 from ...hparams import *
 from ..abc import BaseAdapter
+from ..latent_geometry import conv_latent_shape
 from ...samples import BaseSample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
@@ -172,6 +173,20 @@ class SD3_5Adapter(BaseAdapter):
         return images
 
     # ============================ Inference ============================
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Conv latent ``(C, H/vae, W/vae)`` for SD3.5 (channel axis 1)."""
+        return conv_latent_shape(
+            self.pipeline.transformer.config.in_channels,
+            height,
+            width,
+            self.pipeline.vae_scale_factor,
+        )
+
     @torch.no_grad()
     def inference(
         self,

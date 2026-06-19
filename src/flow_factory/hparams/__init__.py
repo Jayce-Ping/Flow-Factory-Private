@@ -29,6 +29,7 @@ from .training_args import (
     DPOTrainingArguments,
     CRDTrainingArguments,
     DiffusionOPDTrainingArguments,
+    PPOTrainingArguments,
     TeacherConfig,
     get_training_args_class,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "DPOTrainingArguments",
     "CRDTrainingArguments",
     "DiffusionOPDTrainingArguments",
+    "PPOTrainingArguments",
     "TeacherConfig",
     "get_training_args_class",
     "RewardArguments",

@@ -29,6 +29,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from peft import PeftModel
 
 from ..abc import BaseAdapter
+from ..latent_geometry import latent_shape
 from ...samples import I2VSample
 from ...hparams import *
 from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
@@ -422,6 +423,23 @@ class Wan2_I2V_Adapter(BaseAdapter):
         return latents, torch.concat([mask_lat_size, latent_condition], dim=1)
 
     # ======================== Inference ========================
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Video latent ``(C, T', H', W')`` for Wan2 I2V (generated latent; the
+        image-condition channels are concatenated only inside ``forward``)."""
+        return latent_shape(
+            self.pipeline.vae.config.z_dim,
+            height,
+            width,
+            self.pipeline.vae_scale_factor_spatial,
+            num_frames=num_frames,
+            temporal_scale=self.pipeline.vae_scale_factor_temporal,
+        )
+
     def inference(
         self,
         # Oridinary arguments

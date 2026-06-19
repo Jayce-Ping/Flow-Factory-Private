@@ -27,6 +27,7 @@ from accelerate import Accelerator
 from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
 
 from ..abc import BaseAdapter
+from ..latent_geometry import conv_latent_shape
 from ...samples import T2ISample
 from ...hparams import *
 from ...scheduler import (
@@ -190,6 +191,20 @@ class ZImageAdapter(BaseAdapter):
         return images
     
     # ======================== Inference ========================
+
+    def compute_actual_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: Optional[int] = None,
+    ) -> Tuple[int, ...]:
+        """Conv latent ``(C, H/vae, W/vae)`` for Z-Image (channel axis 1)."""
+        return conv_latent_shape(
+            self.pipeline.transformer.in_channels,
+            height,
+            width,
+            self.pipeline.vae_scale_factor,
+        )
 
     @torch.no_grad()
     def inference(
