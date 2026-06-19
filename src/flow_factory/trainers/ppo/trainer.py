@@ -26,7 +26,7 @@ import os
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import tqdm as tqdm_
@@ -114,10 +114,45 @@ class PPOTrainer(BaseTrainer):
                 f"hidden_dim={ta.critic_hidden_dim}, params={num_params/1e6:.2f}M"
             )
 
+        self._validate_per_sample_sde()
+        if self.per_sample_sde and self.accelerator.is_local_main_process:
+            logger.info(
+                "PPO single-step SDE mode (sde_step_selection='per_sample'): one SDE "
+                "step per sample, exact bandit advantage A = R - V(z_k, t_k)."
+            )
+
     @property
     def enable_kl_loss(self) -> bool:
         """Whether the optional KL-to-reference penalty is enabled."""
         return self.training_args.kl_beta > 0.0
+
+    @property
+    def per_sample_sde(self) -> bool:
+        """True when single-step (per-sample) SDE selection is active.
+
+        In this mode each rollout sample injects noise at exactly one denoising step
+        (the rest are ODE), so the denoising MDP collapses to a per-step contextual
+        bandit: the advantage is the exact single-step ``A = R - V(z_k, t_k)`` and the
+        optimize loop trains only that one transition per sample (see
+        ``docs/ppo/single_step_sde_ppo``).
+        """
+        return getattr(self.adapter.scheduler, "sde_step_selection", "global") == "per_sample"
+
+    def _validate_per_sample_sde(self) -> None:
+        """Fail fast if per-sample SDE is requested but unsupported by the scheduler."""
+        if not self.per_sample_sde:
+            return
+        scheduler = self.adapter.scheduler
+        if scheduler.dynamics_type == "ODE":
+            raise ValueError(
+                "sde_step_selection='per_sample' needs a stochastic dynamics_type "
+                f"(Flow-SDE/Dance-SDE/CPS), got {scheduler.dynamics_type!r}."
+            )
+        if not hasattr(scheduler, "_resolve_per_sample_noise_level"):
+            raise ValueError(
+                "sde_step_selection='per_sample' requires FlowMatchEulerDiscreteSDEScheduler; "
+                f"got {type(scheduler).__name__}."
+            )
 
     # =========================== Main Loop ===========================
     def start(self):
@@ -169,6 +204,32 @@ class PPOTrainer(BaseTrainer):
             trajectory_indices=trajectory_indices,
         )
 
+    def sample_batch(self, batch: Dict[str, Any], reward_buffer=None, **extra_inference_kwargs):
+        """Per-batch sampling; in per-sample SDE mode, tag each sample with its step ``k``.
+
+        The scheduler chooses a single SDE step per sample during the rollout and records
+        it on ``scheduler._per_sample_k`` (batch order). We read it back here (one rollout
+        per ``sample_batch`` call) and stamp ``sde_step_k`` onto each sample so feedback /
+        optimize can gather the per-sample transition. No-op in the default global mode.
+        """
+        samples = super().sample_batch(batch, reward_buffer=reward_buffer, **extra_inference_kwargs)
+        if not self.per_sample_sde or self.adapter.scheduler.is_eval:
+            return samples
+        per_sample_k = self.adapter.scheduler._per_sample_k
+        if per_sample_k is None:
+            raise RuntimeError(
+                "per-sample SDE selection is on but the scheduler did not record "
+                "`_per_sample_k` during rollout (expected one SDE step per sample)."
+            )
+        if len(per_sample_k) != len(samples):
+            raise RuntimeError(
+                f"per-sample SDE mismatch: scheduler recorded {len(per_sample_k)} steps "
+                f"but {len(samples)} samples were produced for this batch."
+            )
+        for j, sample in enumerate(samples):
+            sample.extra_kwargs["sde_step_k"] = torch.tensor(int(per_sample_k[j].item()), dtype=torch.long)
+        return samples
+
     # =========================== Feedback (Stages 4-5) ===========================
     def prepare_feedback(self, samples: List[BaseSample], metrics_prefix: str = "train") -> None:
         """Finalize rewards, run the old critic + GAE, and store per-step targets.
@@ -184,6 +245,9 @@ class PPOTrainer(BaseTrainer):
                 the normal epoch; ``"train_rewarmup"`` for re-warmup bursts so the
                 extra rollout's metrics do not collide at the same ``self.step``).
         """
+        if self.per_sample_sde:
+            self._prepare_feedback_bandit(samples, metrics_prefix=metrics_prefix)
+            return
         rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
         terminal_rewards = self._compute_terminal_rewards(samples, rewards)  # (N,)
         old_values = self._compute_old_values(samples)  # (N, S)
@@ -295,6 +359,343 @@ class PPOTrainer(BaseTrainer):
             step=self.step,
         )
 
+    # ================= Per-sample single-SDE (bandit) path =================
+    def _bandit_gather(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+        """Gather each sample's single SDE transition by its own chosen step ``k``.
+
+        In per-sample mode every trajectory position is stored, so we index per sample by
+        ``sde_step_k`` through the shared latent / log-prob index maps. Returns the
+        per-sample state ``z_k`` (and its timestep ``t_k``), the action ``z_{k+1}`` (and
+        ``t_{k+1}``), and the rollout log-prob ``log pi_old(z_{k+1}|z_k)`` -- all ``(B, ...)``.
+        """
+        k = batch["sde_step_k"].to(device).long()  # (B,)
+        batch_size = k.shape[0]
+        ar = torch.arange(batch_size, device=device)
+        latent_index_map = batch["latent_index_map"].to(device)  # (T+1,)
+        log_prob_index_map = batch["log_prob_index_map"].to(device)  # (T+1,)
+        all_latents = batch["all_latents"]  # (B, P, ...)
+        timesteps = batch["timesteps"]  # (B, T)
+        log_probs = batch["log_probs"]  # (B, L)
+        num_timesteps = timesteps.shape[1]
+        k_next = torch.clamp(k + 1, max=num_timesteps - 1)
+
+        z_k = all_latents[ar, latent_index_map[k]]
+        z_k_next = all_latents[ar, latent_index_map[k_next]]
+        t_k = timesteps[ar, k]
+        has_next = (k + 1) < num_timesteps
+        t_k_next = torch.where(has_next, timesteps[ar, k_next], torch.zeros_like(t_k))
+        old_log_prob = log_probs[ar, log_prob_index_map[k]]
+        return {
+            "z_k": z_k,
+            "z_k_next": z_k_next,
+            "t_k": t_k,
+            "t_k_next": t_k_next,
+            "old_log_prob": old_log_prob,
+        }
+
+    def _compute_old_values_bandit(self, samples: List[BaseSample]) -> torch.Tensor:
+        """Old-critic value ``V(z_k, t_k)`` per sample, shape ``(N,)`` (no grad)."""
+        device = self.accelerator.device
+        per_device_batch_size = self.training_args.per_device_batch_size
+        offload = self.training_args.offload_samples_to_cpu
+
+        self.critic.eval()
+        chunks: List[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, len(samples), per_device_batch_size):
+                batch_samples = [
+                    s.to(device) for s in samples[start : start + per_device_batch_size]
+                ]
+                batch = BaseSample.stack(batch_samples)
+                g = self._bandit_gather(batch, device)
+                with self.autocast():
+                    value = self.critic(g["z_k"], g["t_k"], self.latent_channel_dim)
+                chunks.append(value.float().cpu())  # (b,)
+                if offload:
+                    for s in batch_samples:
+                        s.to("cpu")
+        return torch.cat(chunks, dim=0)  # (N,)
+
+    def _prepare_feedback_bandit(self, samples: List[BaseSample], metrics_prefix: str = "train") -> None:
+        """Bandit feedback: exact single-step advantage ``A = R - V(z_k, t_k)``.
+
+        With a single stochastic step the return is exactly the terminal reward and the
+        advantage is the exact single-action advantage (no GAE/bootstrap; see
+        ``docs/ppo/single_step_sde_ppo``). Stores per-sample scalars
+        ``bandit_advantage`` / ``bandit_return`` / ``bandit_old_value`` on ``extra_kwargs``
+        (stacked to ``(B,)`` in :meth:`_optimize_bandit`).
+        """
+        rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
+        terminal_rewards = self._compute_terminal_rewards(samples, rewards)  # (N,)
+        old_values = self._compute_old_values_bandit(samples)  # (N,)
+        advantages = terminal_rewards - old_values  # (N,) exact single-step advantage
+        if self.training_args.normalize_advantage:
+            advantages = whiten(advantages.to(self.accelerator.device), self.accelerator).cpu()
+        returns = terminal_rewards.clone()  # (N,) exact Monte-Carlo return G = R
+
+        for i, sample in enumerate(samples):
+            sample.extra_kwargs["bandit_advantage"] = advantages[i].clone()
+            sample.extra_kwargs["bandit_return"] = returns[i].clone()
+            sample.extra_kwargs["bandit_old_value"] = old_values[i].clone()
+
+        self._log_feedback_metrics(
+            terminal_rewards, old_values, advantages, returns, metrics_prefix=metrics_prefix
+        )
+
+    def _optimize_bandit(self, samples: List[BaseSample]) -> None:
+        """Single-step (bandit) PPO: one transition per sample, no per-timestep loop.
+
+        Mirrors :meth:`optimize` (dual optimizers, manual ``gas`` accumulation, decoupled
+        ``critic``/``policy`` update intervals, optional KL) but trains exactly the one SDE
+        transition each sample took, weighted by ``A = R - V(z_k, t_k)``.
+        """
+        device = self.accelerator.device
+        per_device_batch_size = self.training_args.per_device_batch_size
+        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        clip_range = self.training_args.clip_range
+        adv_clip_range = self.training_args.adv_clip_range
+        vf_coef = self.training_args.vf_coef
+        gas = self.accelerator.gradient_accumulation_steps
+        ci = self.training_args.critic_update_interval
+        pi = self.training_args.policy_update_interval
+        do_critic = self.training_args.update_critic_in_optimize
+
+        self.accelerator.sync_gradients = True
+
+        # One micro-step per (inner_epoch, micro-batch): the per-timestep factor is 1.
+        if self.training_args._manual_gradient_accumulation_steps:
+            steps_per_optimize = self.training_args.num_inner_epochs * num_batches
+            if steps_per_optimize % gas != 0:
+                raise ValueError(
+                    f"PPO manual gradient_accumulation_steps={gas} must divide the per-optimize "
+                    f"micro-step count ({steps_per_optimize} = num_inner_epochs "
+                    f"{self.training_args.num_inner_epochs} x num_batches {num_batches}); "
+                    "otherwise an accumulation window spans two epochs' rollouts. Use a divisor "
+                    "or gradient_accumulation_steps='auto'."
+                )
+
+        for inner_epoch in range(self.training_args.num_inner_epochs):
+            shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
+            self.adapter.train()
+            self.critic.train()
+            loss_info = defaultdict(list)
+
+            for batch_idx in tqdm(
+                range(num_batches),
+                total=num_batches,
+                desc=f"Epoch {self.epoch} Training",
+                position=0,
+                disable=not self.show_progress_bar,
+            ):
+                start = batch_idx * per_device_batch_size
+                batch_samples = [
+                    sample.to(device)
+                    for sample in shuffled_samples[start : start + per_device_batch_size]
+                ]
+                batch = BaseSample.stack(batch_samples)
+                for key in ("bandit_advantage", "bandit_return", "bandit_old_value"):
+                    batch[key] = batch[key].to(device)
+                g = self._bandit_gather(batch, device)
+
+                round_idx = self.step
+                boundary = self.micro_in_round == gas - 1
+                critic_step_now = do_critic and boundary and (round_idx + 1) % ci == 0
+                policy_step_now = boundary and (round_idx + 1) % pi == 0
+
+                t = g["t_k"]
+                latents = g["z_k"]
+
+                # 1. Critic value loss (mode A only).
+                value_critic_term = None
+                if do_critic:
+                    returns_t = batch["bandit_return"]
+                    old_values = batch["bandit_old_value"]
+                    critic_ctx = (
+                        nullcontext()
+                        if critic_step_now
+                        else self.accelerator.no_sync(self.critic)
+                    )
+                    with critic_ctx:
+                        with self.autocast():
+                            value = self.critic(latents, t, self.latent_channel_dim)
+                        value = value.float()
+                        value_loss = self._critic_value_loss(value, returns_t, old_values)
+                        self.accelerator.backward(vf_coef * value_loss / ci)
+                    value_critic_term = (vf_coef * value_loss).detach()
+                    loss_info["value_loss"].append(value_loss.detach())
+                    loss_info["explained_variance"].append(
+                        self._explained_variance(value.detach(), returns_t).detach()
+                    )
+
+                # 2. Policy update (PPO-clip [+ KL]) on the single transition.
+                old_log_prob = g["old_log_prob"]
+                adv = torch.clamp(
+                    batch["bandit_advantage"], adv_clip_range[0], adv_clip_range[1]
+                )
+                forward_inputs = {
+                    **self.training_args,
+                    "t": t,
+                    "t_next": g["t_k_next"],
+                    "latents": latents,
+                    "next_latents": g["z_k_next"],
+                    "compute_log_prob": True,
+                    "noise_level": self.adapter.scheduler.noise_level,
+                    **batch,
+                }
+                forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
+                if self.enable_kl_loss:
+                    if self.training_args.kl_type == "v-based":
+                        forward_inputs["return_kwargs"] = ["log_prob", "noise_pred", "dt"]
+                    else:
+                        forward_inputs["return_kwargs"] = ["log_prob", "next_latents_mean", "dt"]
+                else:
+                    forward_inputs["return_kwargs"] = ["log_prob", "dt"]
+
+                kl_loss = None
+                policy_ctx = (
+                    nullcontext()
+                    if policy_step_now
+                    else self.accelerator.no_sync(self.model_bundle)
+                )
+                with policy_ctx:
+                    with self.autocast():
+                        output = self.adapter.forward(**forward_inputs)
+                    ratio = torch.exp(output.log_prob - old_log_prob)
+                    clipped_ratio = torch.clamp(ratio, 1.0 + clip_range[0], 1.0 + clip_range[1])
+                    policy_loss = torch.mean(torch.maximum(-adv * ratio, -adv * clipped_ratio))
+                    total = policy_loss
+                    if self.enable_kl_loss:
+                        kl_div = self._compute_kl(forward_inputs, output)
+                        kl_loss = self.training_args.kl_beta * kl_div
+                        total = total + kl_loss
+                        loss_info["kl_div"].append(kl_div.detach())
+                        loss_info["kl_loss"].append(kl_loss.detach())
+                    self.accelerator.backward(total / pi)
+
+                # 3. Independent optimizer steps at each network's window end.
+                critic_grad_norm = None
+                policy_grad_norm = None
+                if critic_step_now:
+                    critic_grad_norm = self.accelerator.clip_grad_norm_(
+                        self.critic.parameters(), self.training_args.max_grad_norm
+                    )
+                    self.critic_optimizer.step()
+                    self.critic_optimizer.zero_grad()
+                if policy_step_now:
+                    policy_grad_norm = self.accelerator.clip_grad_norm_(
+                        self.adapter.get_trainable_parameters(),
+                        self.training_args.max_grad_norm,
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                # 4. Metrics.
+                combined = policy_loss.detach()
+                if kl_loss is not None:
+                    combined = combined + kl_loss.detach()
+                if value_critic_term is not None:
+                    combined = combined + value_critic_term
+                clip_frac_high = torch.mean((ratio > 1.0 + clip_range[1]).float())
+                clip_frac_low = torch.mean((ratio < 1.0 + clip_range[0]).float())
+                loss_info["ratio"].append(ratio.mean().detach())
+                loss_info["policy_loss"].append(policy_loss.detach())
+                loss_info["clip_frac_high"].append(clip_frac_high.detach())
+                loss_info["clip_frac_low"].append(clip_frac_low.detach())
+                loss_info["clip_frac_total"].append((clip_frac_high + clip_frac_low).detach())
+                loss_info["loss"].append(combined)
+
+                # 5. Round bookkeeping at the gas-window boundary.
+                if boundary:
+                    reduced = reduce_loss_info(self.accelerator, loss_info)
+                    reduced["critic_updated"] = float(critic_step_now)
+                    reduced["policy_updated"] = float(policy_step_now)
+                    if critic_grad_norm is not None:
+                        reduced["critic_grad_norm"] = critic_grad_norm
+                    if policy_grad_norm is not None:
+                        reduced["grad_norm"] = policy_grad_norm
+                    self.log_data(
+                        {f"train/{name}": v for name, v in reduced.items()},
+                        step=self.step,
+                    )
+                    self.step += 1
+                    self.micro_in_round = 0
+                    loss_info = defaultdict(list)
+                else:
+                    self.micro_in_round += 1
+
+    def _fit_critic_only_bandit(self, samples: List[BaseSample], num_passes: int) -> int:
+        """Critic-only fit (per-sample single-SDE): regress ``V(z_k, t_k) -> R`` per sample.
+
+        Bandit analogue of :meth:`_fit_critic_only`; never forwards/steps the policy and
+        never advances ``self.step`` / ``self.epoch``. Returns the number of critic steps.
+        """
+        device = self.accelerator.device
+        per_device_batch_size = self.training_args.per_device_batch_size
+        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        vf_coef = self.training_args.vf_coef
+        gas = self.accelerator.gradient_accumulation_steps
+
+        self.critic.train()
+        self.accelerator.sync_gradients = True
+        self.critic_optimizer.zero_grad()
+        critic_steps = 0
+        micro = 0
+        loss_info = defaultdict(list)
+        for pass_idx in range(num_passes):
+            shuffled_samples = self._order_samples_for_optimize(samples, pass_idx)
+            for batch_idx in tqdm(
+                range(num_batches),
+                total=num_batches,
+                desc=f"Rewarmup {self._rewarmup_calls}",
+                leave=False,
+                disable=not self.show_progress_bar,
+            ):
+                start = batch_idx * per_device_batch_size
+                batch_samples = [
+                    s.to(device) for s in shuffled_samples[start : start + per_device_batch_size]
+                ]
+                batch = BaseSample.stack(batch_samples)
+                for key in ("bandit_return", "bandit_old_value"):
+                    batch[key] = batch[key].to(device)
+                g = self._bandit_gather(batch, device)
+                boundary = micro == gas - 1
+                returns_t = batch["bandit_return"]
+                old_values = batch["bandit_old_value"]
+
+                critic_ctx = (
+                    nullcontext() if boundary else self.accelerator.no_sync(self.critic)
+                )
+                with critic_ctx:
+                    with self.autocast():
+                        value = self.critic(g["z_k"], g["t_k"], self.latent_channel_dim)
+                    value = value.float()
+                    value_loss = self._critic_value_loss(value, returns_t, old_values)
+                    self.accelerator.backward(vf_coef * value_loss)
+
+                loss_info["value_loss"].append(value_loss.detach())
+                loss_info["explained_variance"].append(
+                    self._explained_variance(value.detach(), returns_t).detach()
+                )
+                if boundary:
+                    self.accelerator.clip_grad_norm_(
+                        self.critic.parameters(), self.training_args.max_grad_norm
+                    )
+                    self.critic_optimizer.step()
+                    self.critic_optimizer.zero_grad()
+                    critic_steps += 1
+                    reduced = reduce_loss_info(self.accelerator, loss_info)
+                    self.log_data(
+                        {f"train_rewarmup/{name}": v for name, v in reduced.items()},
+                        step=self.step,
+                    )
+                    loss_info = defaultdict(list)
+                    micro = 0
+                else:
+                    micro += 1
+        if micro != 0:
+            self.critic_optimizer.zero_grad()
+        return critic_steps
+
     # =========================== Optimization (Stage 6) ===========================
     def optimize(self, samples: List[BaseSample]) -> None:
         """Per-step PPO-clipped policy loss + (mode A) clipped value loss; dual optimizers.
@@ -313,7 +714,13 @@ class PPOTrainer(BaseTrainer):
         The critic trains here only when ``update_critic_in_optimize`` is True
         (mode A); in mode B it is trained solely by the bootstrap + periodic
         :meth:`_warmup_critic` bursts.
+
+        In per-sample single-SDE mode the per-timestep loop collapses to a single
+        bandit transition per sample (:meth:`_optimize_bandit`).
         """
+        if self.per_sample_sde:
+            self._optimize_bandit(samples)
+            return
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
@@ -599,6 +1006,8 @@ class PPOTrainer(BaseTrainer):
         Returns:
             Number of critic optimizer steps taken.
         """
+        if self.per_sample_sde:
+            return self._fit_critic_only_bandit(samples, num_passes)
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size

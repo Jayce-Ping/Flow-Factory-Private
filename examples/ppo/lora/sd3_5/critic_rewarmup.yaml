@@ -131,6 +131,7 @@ scheduler:
   num_sde_steps: 9  # = num_inference_steps - 1
   sde_steps: null  # null -> all denoising steps except the last (contiguous from 0)
   seed: 42  # Scheduler seed (for noise step selection)
+  sde_step_selection: "global"  # Options: global, per_sample (single-step bandit PPO; see single_sde.yaml)
 
 # Evaluation settings
 eval:

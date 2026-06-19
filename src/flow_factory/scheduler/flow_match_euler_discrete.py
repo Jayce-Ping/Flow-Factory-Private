@@ -94,6 +94,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         num_sde_steps : Optional[int] = None,
         seed : int = 42,
         dynamics_type : Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = "Flow-SDE",
+        sde_step_selection : Literal['global', 'per_sample'] = 'global',
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -106,6 +107,16 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         self.seed = seed
         self.dynamics_type = dynamics_type
         self._is_eval = False
+
+        # Per-sample single-SDE rollout state (see `_resolve_per_sample_noise_level`).
+        # In 'per_sample' mode each sample injects noise at exactly one randomly chosen
+        # step; the rest are ODE. `_per_sample_k` holds the chosen step index per sample
+        # for the current rollout batch (resampled at step 0); the PPO trainer reads it
+        # back to tag each generated sample with its SDE step.
+        self.sde_step_selection = sde_step_selection
+        self._per_sample_sde_selection = sde_step_selection == 'per_sample'
+        self._per_sample_k: Optional[torch.Tensor] = None
+        self._per_sample_call_count = 0
 
     @property
     def is_eval(self):
@@ -184,10 +195,63 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         noise_levels[self.current_sde_steps] = self.noise_level
         return noise_levels
 
+    def _resolve_per_sample_noise_level(
+        self, timestep: Union[float, torch.Tensor], latents: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-sample single-SDE rollout mask: only each sample's chosen step gets noise.
+
+        Lazily (re)samples a fresh per-sample step assignment ``_per_sample_k`` of shape
+        ``(B,)`` at the start of each rollout (step index 0, or when the batch size
+        changes), drawing each ``k_i`` uniformly from ``0 .. num_steps-2`` (the last
+        index is never stochastic, matching the default ``sde_steps`` pool). Returns a
+        ``(B,)`` noise-level vector equal to ``noise_level`` for samples whose chosen
+        step equals the current step and ``0`` otherwise (so ``step`` runs an ODE update
+        for them).
+
+        Args:
+            timestep: The current denoising timestep (scalar or batched-equal tensor).
+            latents: Current latents ``(B, ...)``; provides batch size and device.
+
+        Returns:
+            ``(B,)`` per-sample noise level for this step.
+        """
+        batch_size = latents.shape[0]
+        if isinstance(timestep, torch.Tensor):
+            t_val = float(timestep.reshape(-1)[0].item())
+        else:
+            t_val = float(timestep)
+        step_index = int(self.index_for_timestep(t_val))
+
+        if (
+            self._per_sample_k is None
+            or self._per_sample_k.shape[0] != batch_size
+            or step_index == 0
+        ):
+            num_steps = len(self.timesteps)
+            high = max(1, num_steps - 1)  # k_i in [0, num_steps-2]; exclude the last step
+            self._per_sample_call_count += 1
+            generator = torch.Generator().manual_seed(
+                int(self.seed) * 1_000_003 + self._per_sample_call_count
+            )
+            self._per_sample_k = torch.randint(0, high, (batch_size,), generator=generator)
+
+        mask = (self._per_sample_k.to(latents.device) == step_index).to(latents.dtype)
+        return self.noise_level * mask
+
     def get_noise_level_for_timestep(self, timestep : Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
         """
             Return the noise level for a specific timestep.
         """
+        if self._per_sample_sde_selection and not self.is_eval and self.dynamics_type != 'ODE':
+            # Per-sample mode: keep every step "active" so the rollout collects a
+            # log-prob at each step. The actual single-step masking is applied inside
+            # `step()` via `_resolve_per_sample_noise_level`, so here we simply report a
+            # non-zero noise level (the adapter gate `current_noise_level > 0` then
+            # stays True at every step).
+            if isinstance(timestep, torch.Tensor) and timestep.ndim >= 1:
+                return torch.full_like(timestep.float(), self.noise_level)
+            return self.noise_level
+
         if not isinstance(timestep, torch.Tensor) or timestep.ndim == 0:
             t = timestep.item() if isinstance(timestep, torch.Tensor) else timestep
             timestep_index = self.index_for_timestep(t)
@@ -316,6 +380,11 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         dynamics_type = dynamics_type or self.dynamics_type
         if (self.is_eval or dynamics_type == 'ODE'):
             noise_level = 0.0
+        elif self._per_sample_sde_selection and next_latents is None:
+            # Per-sample single-SDE rollout (sampling path): override the incoming
+            # noise_level with the per-sample mask so only each sample's chosen step
+            # injects noise; every other sample takes a deterministic ODE step here.
+            noise_level = self._resolve_per_sample_noise_level(timestep, latents)
         elif noise_level is None:
             # Auto-infer the noise_level
             noise_level = self.get_noise_level_for_sigma(sigma)
@@ -362,7 +431,11 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
                 next_latents = next_latents.to(_input_dtype).float()
 
             if compute_log_prob:
-                std_variance = (std_dev_t * torch.sqrt(-1 * dt))
+                # clamp_min guards the per-sample single-SDE path, where ODE-masked
+                # rows have std_dev_t == 0; their numerator is exactly 0 (next == mean)
+                # so the log_prob stays finite (and unused). No effect on real SDE
+                # steps, whose std_variance is orders of magnitude above the floor.
+                std_variance = (std_dev_t * torch.sqrt(-1 * dt)).clamp_min(1e-8)
                 log_prob = (
                     -((next_latents.detach() - next_latents_mean) ** 2) / (2 * std_variance ** 2)
                     - torch.log(std_variance)
@@ -387,7 +460,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
                 next_latents = next_latents.to(_input_dtype).float()
 
             if compute_log_prob:
-                std_variance = (std_dev_t * torch.sqrt(-1 * dt))
+                std_variance = (std_dev_t * torch.sqrt(-1 * dt)).clamp_min(1e-8)
                 log_prob = (
                     (-((next_latents.detach() - next_latents_mean) ** 2) / (2 * std_variance ** 2))
                     - torch.log(std_variance)

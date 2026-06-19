@@ -931,6 +931,15 @@ class Arguments(ArgABC):
             sched.sde_steps = list(range(max(0, n_inf - 1)))
         if sched.num_sde_steps is None:
             sched.num_sde_steps = len(sched.sde_steps)
+
+        # Per-sample single-SDE: each sample's chosen step can be any index, so the
+        # rollout must store EVERY position (the trainer gathers the per-sample
+        # transition afterwards). Force the full pool here; the actual single-step
+        # masking happens inside the scheduler at rollout time.
+        if sched.sde_step_selection == 'per_sample':
+            sched.sde_steps = list(range(max(1, n_inf - 1)))
+            sched.num_sde_steps = len(sched.sde_steps)
+
         if sched.num_sde_steps <= 0:
             raise ValueError(
                 "scheduler.num_sde_steps must be positive after resolving nulls; "

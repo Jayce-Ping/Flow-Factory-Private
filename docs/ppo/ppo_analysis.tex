@@ -669,6 +669,73 @@ Hyperparameter & Default & Meaning \\
 
 \section{Limitations and Future Work}
 \label{sec:future}
+
+\subsection{Follow-up: DiffAC-style perturbed-state critic training}
+\label{sec:perturb-critic}
+
+\paragraph{Idea.}
+Today both the \emph{old values} (for GAE) and the in-loop critic regression target
+are evaluated on the \emph{rollout} latents the policy actually visited
+(\texttt{all\_latents} indexed per SDE step). A cheap, high-leverage upgrade---taken from
+DiffAC~\cite{zhou2024diffac}---is to additionally (or alternatively) train the critic on
+\emph{forward-perturbed} states: take the generated clean latent $\zt_S$ and re-noise it
+to many noise levels $t$ in closed form,
+\begin{equation}
+\label{eq:perturb}
+\zt_t = (1-\sigma_t)\,\zt_S + \sigma_t\,\bm{\epsilon},
+\quad \bm{\epsilon}\sim\mathcal N(0,\bm I),\;\; \sigma_t = \texttt{flow\_match\_sigma}(t),
+\end{equation}
+and regress the critic on each perturbed state toward that sample's terminal reward,
+$V_\phi(\zt_t,t)\to R(\zt_S)$ (DiffAC Eq.~8/9). One rollout then yields an
+\emph{arbitrarily large}, space-covering set of $(\zt_t,t,R)$ training points instead of
+the $S$ sparse on-trajectory states, which lowers value-estimation variance and
+improves time coverage. Under the consistency condition (DiffAC Lemma~4.2: when the
+backward SDE matches the forward perturbation process, $\zt_t\sim p_{t0}(\cdot\mid\zt_S)$
+is distributed as the true rollout marginal $q_t$) these perturbed states are a valid,
+on-distribution proxy for the states the GAE consumes.
+
+\paragraph{Why it is cheap here.}
+The forward-noising of Eq.~\eqref{eq:perturb} is \emph{already implemented} in the AWM
+trainer (\texttt{trainers/awm.py}: \texttt{noised\_latents = (1 - sigma) * clean\_latents
++ sigma * noise}), and the critic forward already accepts an arbitrary
+$(\text{latents}, t)$. The change is therefore self-contained.
+
+\paragraph{Plan.}
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{New hparam} \texttt{critic\_target: \{gae, perturb\_terminal\}} (default
+  \texttt{gae}, preserving current behavior), plus \texttt{critic\_perturb\_samples}
+  (number of noise levels drawn per clean latent) and a $t$-sampling strategy (reuse
+  AWM's \texttt{time\_sampling\_strategy}).
+  \item \textbf{Critic training path.} In \texttt{perturb\_terminal} mode, replace the
+  rollout-state critic batches in \texttt{\_fit\_critic\_only} (and the in-\texttt{optimize}
+  critic branch) with perturbed states from Eq.~\eqref{eq:perturb}, regressed to the
+  per-sample terminal reward $R(\zt_S)$ with a \emph{plain} MSE (no cross-step bootstrap;
+  this is the $\gamma{=}\lambda{=}1$ Monte-Carlo target). \texttt{\_critic\_value\_loss}
+  is reused; \texttt{value\_clip\_range} may be set \texttt{None} to match DiffAC's plain
+  MSE.
+  \item \textbf{Actor untouched.} The policy still uses PPO-clip; GAE still runs over the
+  rollout states, but now bootstraps off a better-calibrated $V_\phi$. (This is the
+  variance-reduction half of DiffAC; the full method also moves the \emph{actor} to a
+  one-step REINFORCE/DDPG on perturbed states, which is out of scope for this follow-up.)
+\end{enumerate}
+
+\paragraph{Caveats to respect.}
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Monte-Carlo target only.} Perturbed states are mutually independent
+  (no ``next'' state), so the critic must regress directly to $R(\zt_S)$; the per-step
+  bootstrap of \texttt{compute\_gae} does not apply to these points.
+  \item \textbf{Timestep scale.} The $t$ used to noise (Eq.~\eqref{eq:perturb}) and the
+  $t$ fed to the critic's time embedding must be on the same scheduler scale, or the
+  critic conditions on the wrong noise level.
+  \item \textbf{Consistency gap.} The proxy is exact only when the policy stays
+  consistent with the forward process; as RL pushes the policy off-distribution the gap
+  grows (DiffAC restores it with a score-matching--refit reference; we only borrow the
+  critic-side benefit, so treat this as an approximation).
+  \item \textbf{Not full DiffAC.} Training only the critic on perturbed states is an
+  incremental strengthening of our PPO baseline, not a reproduction of DiffAC.
+\end{itemize}
+
+\subsection{Other future work}
 \begin{itemize}[leftmargin=1.4em]
   \item \textbf{Backbone+value-head critic} (as in \cite{liang2026critic}): stronger
   value capacity and free conditioning, at $\sim$2$\times$ memory/compute; needs
@@ -685,6 +752,12 @@ Hyperparameter & Default & Meaning \\
 Zhengyang Liang, Qihang Zhang, Ceyuan Yang.
 \newblock Explicit Critic Guidance for Aligning Diffusion Models.
 \newblock arXiv:2605.27736, 2026. \url{https://arxiv.org/abs/2605.27736}
+
+\bibitem{zhou2024diffac}
+Xiangxin Zhou, Liang Wang, Yichi Zhou.
+\newblock Stabilizing Policy Gradients for Stochastic Differential Equations via
+Consistency with Perturbation Process (DiffAC).
+\newblock ICML 2024; arXiv:2403.04154. \url{https://arxiv.org/abs/2403.04154}
 \end{thebibliography}
 
 \end{document}

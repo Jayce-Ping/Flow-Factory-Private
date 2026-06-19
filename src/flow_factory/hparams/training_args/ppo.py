@@ -228,5 +228,13 @@ class PPOTrainingArguments(TrainingArguments):
             )
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        """PPO accumulates one backward per SDE step, so the GAS multiplier is num_sde_steps."""
+        """GAS multiplier = number of trained transitions per sample per rollout.
+
+        Full-SDE PPO accumulates one backward per SDE step, so the multiplier is
+        ``num_sde_steps``. In per-sample single-SDE mode each sample contributes exactly
+        ONE trained transition (its chosen step), so the multiplier is 1 regardless of
+        how many positions are stored for gathering.
+        """
+        if getattr(args.scheduler_args, "sde_step_selection", "global") == "per_sample":
+            return 1
         return args.scheduler_args.num_sde_steps

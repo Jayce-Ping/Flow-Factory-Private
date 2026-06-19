@@ -1,12 +1,13 @@
-# Critic-based PPO (value net + GAE) for SD3.5 + PickScore -- CRITIC-FASTER variant.
-# Critic steps every optimizer round; the policy steps every 4 rounds (accumulating
-# 4*gas micro-steps per policy step, so it still uses all data but updates 4x less
-# often with a 4x larger effective batch). Diff vs default.yaml: policy_update_interval=4.
-# v1 runs on DDP (the critic uses a second optimizer; DeepSpeed/FSDP support is a follow-up).
+# Single-step SDE PPO for SD3.5 + PickScore.
+# Each sample injects noise at exactly ONE denoising step (the rest are ODE), so the
+# terminal reward is attributable to that single step: the denoising MDP collapses to a
+# per-step contextual bandit with the EXACT advantage A = R - V(z_k, t_k) (no GAE /
+# bootstrap), and only that one transition is trained per sample. See the theory in
+# docs/ppo/single_step_sde_ppo. Runs on DDP (the critic uses a second optimizer).
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/accelerate_configs/multi_gpu.yaml  # DDP. PPO v1 requires DDP (no DeepSpeed/FSDP critic yet).
+config_file: config/accelerate_configs/multi_gpu.yaml  # DDP. PPO requires DDP (no DeepSpeed/FSDP critic yet).
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
@@ -52,8 +53,8 @@ train:
 
   # PPO policy clipping
   clip_range: 1.0e-4  # PPO policy ratio clip range (flow log-probs are large; keep tiny)
-  adv_clip_range: 5.0  # Per-step advantage clip range
-  normalize_advantage: true  # Globally whiten per-step advantages across ranks
+  adv_clip_range: 5.0  # Per-sample advantage clip range
+  normalize_advantage: true  # Globally whiten the single-step advantages across ranks
 
   # Critic / value loss
   critic_learning_rate: 1.0e-4  # Learning rate for the value critic (its own optimizer)
@@ -62,11 +63,12 @@ train:
   critic_warmup_steps: 30  # Initial critic-only bootstrap (~N critic steps) before the epoch loop
 
   # Update-frequency decoupling (unit = optimizer rounds; 1 round = gradient_accumulation_steps
-  # micro-steps). CRITIC-FASTER: critic steps every round, policy every 4 rounds.
-  critic_update_interval: 1  # Step critic every round
-  policy_update_interval: 4  # Step policy every 4 rounds (accumulates 4*gas micro-steps per step)
+  # micro-steps). In single-SDE mode there is one trained transition per sample, so a "round"
+  # accumulates gradient_accumulation_steps micro-batches.
+  critic_update_interval: 1  # Step critic every N rounds (>1 => policy relatively faster)
+  policy_update_interval: 1  # Step policy every N rounds (>1 => critic relatively faster)
 
-  # Periodic critic re-warmup (resample + critic-only fit, by critic steps); <=0 disables (off here).
+  # Periodic critic re-warmup (resample + critic-only fit, by critic steps).
   critic_warmup_interval: 0  # Periodic re-warmup every N optimizer rounds (<=0 disables)
   critic_rewarmup_steps: 0  # Target critic steps per periodic burst (>=1 required if interval>0)
   update_critic_in_optimize: true  # false => critic frozen in optimize(), trained only by bursts
@@ -78,9 +80,10 @@ train:
   critic_attn_heads: 8  # Attention-pool heads (must divide critic_hidden_dim)
   critic_num_query_tokens: 1  # Learnable query tokens for attention pooling
 
-  # GAE
-  gae_gamma: 1.0  # Discount per SDE step (1.0 fits a terminal-only reward)
-  gae_lambda: 0.95  # GAE lambda (bias/variance trade-off)
+  # GAE (UNUSED in single-SDE mode: the bandit return is exactly R and A = R - V(z_k);
+  # kept for schema compatibility / switching back to global full-SDE PPO).
+  gae_gamma: 1.0  # Discount per SDE step (ignored in per_sample mode)
+  gae_lambda: 0.95  # GAE lambda (ignored in per_sample mode)
 
   # Optional KL-to-reference (DPOK-style); 0 disables and saves memory
   kl_type: 'v-based' # Options: 'x-based', 'v-based'
@@ -89,12 +92,12 @@ train:
 
   # Sampling settings
   resolution: 512  # Can be int or [height, width]
-  num_inference_steps: 10  # Number of timesteps
+  num_inference_steps: 10  # Number of timesteps (each sample's single SDE step is drawn from 0..N-2)
   guidance_scale: 4.5  # Guidance scale for sampling
 
   # Batch and sampling
   per_device_batch_size: 8  # Batch size per device
-  group_size: 24  # Trajectories per prompt (PPO uses per-trajectory GAE, not group normalization)
+  group_size: 24  # Trajectories per prompt (PPO uses a learned baseline, not group normalization)
   unique_sample_num_per_epoch: 48  # Unique prompts per epoch
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
@@ -119,15 +122,14 @@ train:
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE (PPO is coupled -> must be SDE)
-  noise_level: 0.7  # Noise level for SDE sampling
-  # PPO trains on the full *contiguous* SDE trajectory so the GAE per-step bootstrap is exact.
-  # sde_steps null -> [0 .. num_inference_steps-2] (the final deterministic step is excluded);
-  # num_sde_steps must equal that count so every SDE step is trained and the GAS multiplier matches.
-  num_sde_steps: 9  # = num_inference_steps - 1
-  sde_steps: null  # null -> all denoising steps except the last (contiguous from 0)
-  seed: 42  # Scheduler seed (for noise step selection)
-  sde_step_selection: "global"  # Options: global, per_sample (single-step bandit PPO; see single_sde.yaml)
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE (single-SDE needs a stochastic type)
+  noise_level: 0.7  # Noise level injected at each sample's single SDE step
+  # In per_sample mode every position is stored (each sample's chosen step can be any index);
+  # num_sde_steps / sde_steps are auto-forced to the full pool, so leave them null here.
+  num_sde_steps: null  # auto -> full pool (forced in per_sample mode)
+  sde_steps: null  # auto -> all denoising steps except the last
+  seed: 42  # Scheduler seed (also seeds the per-sample step draw)
+  sde_step_selection: "per_sample"  # Options: global, per_sample (single SDE step per sample => exact bandit credit)
 
 # Evaluation settings
 eval:

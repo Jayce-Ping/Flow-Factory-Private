@@ -57,6 +57,7 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
         num_sde_steps : Optional[int] = None,
         seed : int = 42,
         dynamics_type : Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = "Flow-SDE",
+        sde_step_selection : Literal['global', 'per_sample'] = 'global',
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -70,6 +71,17 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
         self.seed = seed
         self.dynamics_type = dynamics_type
         self._is_eval = False
+
+        # Per-sample single-SDE selection is currently only implemented for
+        # FlowMatchEulerDiscreteSDEScheduler; fail fast rather than silently ignoring it.
+        self.sde_step_selection = sde_step_selection
+        self._per_sample_sde_selection = sde_step_selection == 'per_sample'
+        if self._per_sample_sde_selection:
+            raise NotImplementedError(
+                "sde_step_selection='per_sample' is not implemented for "
+                "UniPCMultistepSDEScheduler; use FlowMatchEulerDiscreteSDEScheduler "
+                "(e.g. SD3.5/FLUX) or set sde_step_selection='global'."
+            )
 
     @property
     def is_eval(self):

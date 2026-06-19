@@ -52,10 +52,35 @@ class SchedulerArguments(ArgABC):
         default=42,
         metadata={"help": "Random seed for selecting train steps."},
     )
+    sde_step_selection: Literal['global', 'per_sample'] = field(
+        default='global',
+        metadata={"help": (
+            "How the stochastic (SDE) step(s) are chosen during rollout. "
+            "'global' (default): one shared set of SDE steps for the whole batch each "
+            "epoch (drawn from `sde_steps`); this is the existing behavior. "
+            "'per_sample': each sample injects noise at exactly ONE randomly chosen "
+            "denoising step while every other step is ODE (deterministic). This makes "
+            "the terminal reward attributable to that single step (single-step / "
+            "bandit-style PPO credit assignment). Only supported by "
+            "FlowMatchEulerDiscreteSDEScheduler with a non-ODE `dynamics_type`."
+        )},
+    )
 
     def __post_init__(self):
         available_dynamics = ["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE']
         assert self.dynamics_type in available_dynamics, f"Invalid dynamics type {self.dynamics_type}. Must be one of {available_dynamics}."
+
+        available_selection = ['global', 'per_sample']
+        if self.sde_step_selection not in available_selection:
+            raise ValueError(
+                f"Invalid sde_step_selection {self.sde_step_selection!r}. "
+                f"Must be one of {available_selection}."
+            )
+        if self.sde_step_selection == 'per_sample' and self.dynamics_type == 'ODE':
+            raise ValueError(
+                "sde_step_selection='per_sample' requires a stochastic dynamics_type "
+                "(Flow-SDE/Dance-SDE/CPS), got dynamics_type='ODE' (no noise to inject)."
+            )
 
         # ODE has no stochastic steps — zero out SDE-related fields
         if self.dynamics_type == 'ODE':
