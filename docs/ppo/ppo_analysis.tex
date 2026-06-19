@@ -367,7 +367,7 @@ warmup unified with periodic critic re-warmup (\S\ref{sec:rewarmup}).
 \caption{Critic-based PPO --- current: separate backward, decoupled frequency + re-warmup (commit \texttt{4145161})}
 \label{alg:ppo}
 \begin{algorithmic}[1]
-\State \textbf{once, before training:} \textsc{BootstrapCritic} (\S\ref{sec:rewarmup}); \textbf{every} \texttt{critic\_rewarmup\_interval} \textbf{rounds:} \textsc{ReWarmupCritic}
+\State \textbf{once, before training:} \textsc{WarmupCritic}(\texttt{critic\_warmup\_steps}) (\S\ref{sec:rewarmup}); \textbf{every} \texttt{critic\_warmup\_interval} \textbf{rounds:} \textsc{WarmupCritic}(\texttt{critic\_rewarmup\_steps})
 \State $\mathcal{D} \gets \textsc{Sample}()$ \Comment{SDE rollout; store $\zt_{0:S}$, $\log\pi_{\mathrm{old}}$ at SDE steps}
 \State $\{R_i\} \gets \textsc{Reward}(\mathcal{D})$ \Comment{terminal weighted-sum score per sample}
 \State $\mathcal{S} \gets \mathrm{sorted}(\text{train SDE steps})$
@@ -464,15 +464,17 @@ here.
 
 Interval decoupling (\S\ref{sec:decouple}) cannot make the critic update \emph{more}
 often than the policy: the finest cadence is one step per round. To let the critic
-periodically ``catch up'' to a moving policy we add a \emph{re-warmup burst}, the same
-critic-only operation as the initial bootstrap. Every \texttt{critic\_rewarmup\_interval}
-optimizer rounds (checked after \texttt{optimize}; $0$ disables) the trainer runs
-\textsc{ReWarmupCritic}: set a fresh seed, \textsc{Sample} new rollouts from the current
-policy, recompute returns with the current critic via \textsc{prepare\_feedback}, and fit
-\emph{only} the critic for \texttt{critic\_rewarmup\_inner\_epochs} passes. A burst never
-forwards or steps the policy and never advances \texttt{self.step} / \texttt{self.epoch},
-so the policy still updates every epoch; bursts are extra critic-only work inserted between
-epochs (one resampled rollout each).
+periodically ``catch up'' to a moving policy we add a \emph{re-warmup}, the same
+critic-only operation as the initial bootstrap. Every \texttt{critic\_warmup\_interval}
+optimizer rounds (checked after \texttt{optimize}; ${\le}\,0$ disables) the trainer runs
+\textsc{WarmupCritic} with the periodic target \texttt{critic\_rewarmup\_steps}: it sets a
+fresh seed, \textsc{Sample}s new rollouts from the current policy, recomputes returns with
+the current critic via \textsc{prepare\_feedback}, and fits \emph{only} the critic, looping
+fresh resamples until it has taken ${\sim}\,$\texttt{critic\_rewarmup\_steps} optimizer
+steps. The initial bootstrap is the same routine with target \texttt{critic\_warmup\_steps};
+the two targets are \emph{independent} (a cold start usually wants more than a periodic
+catch-up). A burst never forwards or steps the policy and never advances \texttt{self.step}
+/ \texttt{self.epoch}, so the policy still updates every epoch.
 
 \paragraph{Two regimes via \texttt{update\_critic\_in\_optimize}.}
 With the default \texttt{True} (mode A) the critic also trains jointly inside
@@ -480,11 +482,11 @@ With the default \texttt{True} (mode A) the critic also trains jointly inside
 is frozen inside \texttt{optimize} and trained \emph{only} by the bootstrap and the periodic
 bursts -- a policy/critic \emph{alternation}: the policy advances every epoch on a frozen
 value baseline, and the critic re-fits in bursts (validated to require
-\texttt{critic\_rewarmup\_interval}${}>0$). Because the resample draws from the
+\texttt{critic\_warmup\_interval}${}>0$). Because the resample draws from the
 \emph{current} policy, a burst aligns the critic to the present distribution -- the
 ``moving target'' the per-epoch frozen returns (\S\ref{sec:decouple} caveat) cannot. The
-cost is one extra rollout per burst, so bursts are typically infrequent (e.g. every $50$
-epochs).
+cost scales with \texttt{critic\_rewarmup\_steps} (each burst loops enough resampled
+rollouts to reach that many critic steps).
 
 \section{Theoretical Analysis}
 \label{sec:theory}
@@ -650,7 +652,10 @@ Hyperparameter & Default & Meaning \\
 \texttt{value\_clip\_range} & $0.2$ & value clip $\epsilon_v$ (None to disable) \\
 \texttt{clip\_range} & $\pm 10^{-4}$ & policy ratio clip $(c_-,c_+)$ \\
 \texttt{normalize\_advantage} & true & global advantage whitening \\
-\texttt{critic\_warmup\_steps} & $30$ & critic-only warmup (policy frozen) \\
+\texttt{critic\_warmup\_steps} & $30$ & initial critic-only bootstrap target steps \\
+\texttt{critic\_warmup\_interval} & $0$ & periodic re-warmup every $N$ rounds (${\le}0$ off) \\
+\texttt{critic\_rewarmup\_steps} & $0$ & target critic steps per periodic re-warmup \\
+\texttt{update\_critic\_in\_optimize} & true & false $\Rightarrow$ critic only via warmup/bursts \\
 \texttt{critic\_update\_interval} & $1$ & step critic every $N$ rounds \\
 \texttt{policy\_update\_interval} & $1$ & step policy every $N$ rounds \\
 \texttt{critic\_hidden\_dim} / \texttt{\_num\_layers} & $256$ / $3$ & critic width / depth \\

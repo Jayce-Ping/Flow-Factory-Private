@@ -65,10 +65,10 @@ train:
   critic_update_interval: 1  # Step critic every N rounds (>1 => policy relatively faster)
   policy_update_interval: 1  # Step policy every N rounds (>1 => critic relatively faster)
 
-  # Periodic critic re-warmup (resample + critic-only fit) to catch the critic up to the moving
-  # policy. 0 disables. update_critic_in_optimize=false => critic trains ONLY via bootstrap+bursts.
-  critic_rewarmup_interval: 0  # Every N optimizer rounds, run a critic-only burst (0 disables)
-  critic_rewarmup_inner_epochs: 1  # Critic-only passes over the freshly sampled buffer per burst
+  # Periodic critic re-warmup (resample + critic-only fit, by critic steps) to catch the critic
+  # up to the moving policy. critic_warmup_interval <= 0 disables periodic re-warmup.
+  critic_warmup_interval: 0  # Periodic re-warmup every N optimizer rounds (<=0 disables)
+  critic_rewarmup_steps: 0  # Target critic steps per periodic burst (>=1 required if interval>0)
   update_critic_in_optimize: true  # false => critic frozen in optimize(), trained only by bursts
 
   # Critic architecture

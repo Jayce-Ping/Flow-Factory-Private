@@ -139,25 +139,28 @@ class PPOTrainingArguments(TrainingArguments):
         },
     )
 
-    # --- Periodic critic re-warmup (resample + critic-only fit) ---
-    # The initial warmup (``critic_warmup_steps``) and these periodic bursts share one
-    # critic-only path. A burst resamples fresh rollouts, recomputes returns with the
-    # current critic, and fits ONLY the critic (policy frozen) to catch up to the
-    # current policy. ``critic_warmup_steps`` is the initial bootstrap done before the
-    # epoch loop (it no longer freezes the first epochs).
-    critic_rewarmup_interval: int = field(
+    # --- Periodic critic re-warmup (resample + critic-only fit, measured in critic steps) ---
+    # The initial warmup and the periodic re-warmup share one routine: resample fresh
+    # rollouts and fit ONLY the critic (policy frozen) until a target number of critic
+    # optimizer steps is reached. The initial bootstrap (``critic_warmup_steps``) runs once
+    # before the epoch loop (it no longer freezes the first epochs); the periodic one repeats
+    # every ``critic_warmup_interval`` rounds with its own ``critic_rewarmup_steps`` target.
+    critic_warmup_interval: int = field(
         default=0,
         metadata={
             "help": (
-                "Every N optimizer rounds, run a critic-only re-warmup burst on freshly "
-                "sampled rollouts (policy frozen, critic weights kept). 0 disables."
+                "Run a periodic critic-only re-warmup every N optimizer rounds (on freshly "
+                "sampled rollouts, policy frozen). <= 0 disables periodic re-warmup."
             )
         },
     )
-    critic_rewarmup_inner_epochs: int = field(
-        default=1,
+    critic_rewarmup_steps: int = field(
+        default=0,
         metadata={
-            "help": "Critic-only passes over the freshly sampled buffer per re-warmup burst."
+            "help": (
+                "Target critic optimizer steps per periodic re-warmup burst (may differ from "
+                "critic_warmup_steps). Must be >= 1 when critic_warmup_interval > 0."
+            )
         },
     )
     update_critic_in_optimize: bool = field(
@@ -167,7 +170,7 @@ class PPOTrainingArguments(TrainingArguments):
                 "If True (default), the critic trains jointly with the policy in optimize(). "
                 "If False, the critic is NOT updated in optimize() and is trained ONLY by the "
                 "initial bootstrap (critic_warmup_steps) + periodic re-warmup bursts "
-                "(policy/critic alternation; requires critic_rewarmup_interval > 0)."
+                "(policy/critic alternation; requires critic_warmup_interval > 0)."
             )
         },
     )
@@ -203,19 +206,25 @@ class PPOTrainingArguments(TrainingArguments):
                 f"`critic_update_interval`/`policy_update_interval` must be >= 1, got "
                 f"{self.critic_update_interval}/{self.policy_update_interval}."
             )
-        if self.critic_rewarmup_interval < 0:
+        if self.critic_warmup_steps < 0:
+            raise ValueError(f"`critic_warmup_steps` must be >= 0, got {self.critic_warmup_steps}.")
+        if self.critic_rewarmup_steps < 0:
             raise ValueError(
-                f"`critic_rewarmup_interval` must be >= 0, got {self.critic_rewarmup_interval}."
+                f"`critic_rewarmup_steps` must be >= 0, got {self.critic_rewarmup_steps}."
             )
-        if self.critic_rewarmup_interval > 0 and self.critic_rewarmup_inner_epochs < 1:
+        # critic_warmup_interval <= 0 (0 or negative) disables periodic re-warmup.
+        if self.critic_warmup_interval > 0 and self.critic_rewarmup_steps < 1:
             raise ValueError(
-                f"`critic_rewarmup_inner_epochs` must be >= 1 when re-warmup is enabled, "
-                f"got {self.critic_rewarmup_inner_epochs}."
+                f"periodic re-warmup is enabled (critic_warmup_interval="
+                f"{self.critic_warmup_interval} > 0) but critic_rewarmup_steps="
+                f"{self.critic_rewarmup_steps} < 1; set it >= 1 or disable with "
+                f"critic_warmup_interval <= 0."
             )
-        if not self.update_critic_in_optimize and self.critic_rewarmup_interval == 0:
+        if not self.update_critic_in_optimize and self.critic_warmup_interval <= 0:
             raise ValueError(
-                "`update_critic_in_optimize=False` requires `critic_rewarmup_interval > 0` "
-                "(otherwise the critic is never updated after the initial bootstrap)."
+                "`update_critic_in_optimize=False` requires periodic re-warmup "
+                "(critic_warmup_interval > 0); otherwise the critic is never updated after "
+                "the initial bootstrap."
             )
 
     def get_num_train_timesteps(self, args: Any) -> int:

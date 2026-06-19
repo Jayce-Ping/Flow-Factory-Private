@@ -1,9 +1,9 @@
 # Critic-based PPO (value net + GAE) for SD3.5 + PickScore -- PERIODIC-CRITIC-REWARMUP (mode B).
 # The policy updates every epoch; the critic is FROZEN inside optimize() and is trained only by
 # the initial bootstrap + periodic critic-only bursts (policy/critic alternation). Every
-# critic_rewarmup_interval optimizer rounds (= policy steps when policy_update_interval=1) we
+# critic_warmup_interval optimizer rounds (= policy steps when policy_update_interval=1) we
 # resample fresh rollouts and re-fit ONLY the critic to catch it up to the current policy.
-# Diff vs default.yaml: update_critic_in_optimize=false, critic_rewarmup_interval=100.
+# Diff vs default.yaml: update_critic_in_optimize=false, critic_warmup_interval=100.
 # v1 runs on DDP (the critic uses a second optimizer; DeepSpeed/FSDP support is a follow-up).
 
 # Environment Configuration
@@ -69,9 +69,10 @@ train:
 
   # Mode B (alternation): critic is FROZEN inside optimize() and trained only by the initial
   # bootstrap + periodic bursts. Every 100 optimizer rounds (= 50 epochs @ gradient_step_per_epoch=2)
-  # resample fresh rollouts and re-fit the critic for 4 passes.
-  critic_rewarmup_interval: 100  # Critic-only burst every 100 optimizer rounds
-  critic_rewarmup_inner_epochs: 4  # Critic-only passes over the freshly sampled buffer per burst
+  # resample fresh rollouts and re-fit the critic to ~10 critic steps (may differ from the
+  # initial critic_warmup_steps=30).
+  critic_warmup_interval: 100  # Periodic re-warmup every 100 optimizer rounds (<=0 disables)
+  critic_rewarmup_steps: 10  # Target critic steps per periodic burst (independent of initial)
   update_critic_in_optimize: false  # Critic frozen in optimize(); trained only by bootstrap+bursts
 
   # Critic architecture

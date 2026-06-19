@@ -609,11 +609,11 @@ Because the critic and policy use separate backward passes, they can step at dif
 
 ### Periodic critic re-warmup (catching the critic up)
 
-Interval decoupling cannot make the critic update *more often* than the policy (the finest cadence is one step per round). To let the critic periodically re-fit to a moving policy, enable **periodic critic re-warmup**: every `critic_rewarmup_interval` optimizer rounds (0 disables) the trainer resamples fresh rollouts from the current policy and trains **only** the critic for `critic_rewarmup_inner_epochs` passes. This shares one code path with the initial warmup, so `critic_warmup_steps` is now an up-front bootstrap (it no longer freezes the first epochs — the policy trains from epoch 0).
+Interval decoupling cannot make the critic update *more often* than the policy (the finest cadence is one step per round). To let the critic periodically re-fit to a moving policy, enable **periodic critic re-warmup**: every `critic_warmup_interval` optimizer rounds (`<= 0` disables) the trainer resamples fresh rollouts from the current policy and fits **only** the critic until it reaches `critic_rewarmup_steps` critic optimizer steps (looping fresh resamples). This shares one routine with the initial warmup — `critic_warmup_steps` (initial) and `critic_rewarmup_steps` (periodic) are **independent** step targets — and `critic_warmup_steps` is now an up-front bootstrap (it no longer freezes the first epochs; the policy trains from epoch 0).
 
 `update_critic_in_optimize` (default `true`) selects the regime:
 - **`true` (mode A)**: the critic also trains jointly in `optimize`; bursts are an extra boost.
-- **`false` (mode B)**: the critic is frozen in `optimize` and trained **only** by the bootstrap + bursts — a policy/critic *alternation* (requires `critic_rewarmup_interval > 0`). Because each burst resamples from the current policy, it aligns the critic to the present distribution. See [`critic_rewarmup.yaml`](../examples/ppo/lora/sd3_5/critic_rewarmup.yaml) (policy every epoch; critic re-warmup every 100 rounds = 50 epochs). Cost: one extra rollout per burst.
+- **`false` (mode B)**: the critic is frozen in `optimize` and trained **only** by the bootstrap + bursts — a policy/critic *alternation* (requires `critic_warmup_interval > 0`). Because each burst resamples from the current policy, it aligns the critic to the present distribution. See [`critic_rewarmup.yaml`](../examples/ppo/lora/sd3_5/critic_rewarmup.yaml) (policy every epoch; critic re-warmup every 100 rounds = 50 epochs). Cost scales with `critic_rewarmup_steps` (each burst loops enough resampled rollouts to hit that step target).
 
 ### Key Hyperparameters
 
@@ -636,9 +636,9 @@ train:
   # Update-frequency decoupling (optimizer rounds; keep at least one at 1)
   critic_update_interval: 1   # >1 => policy relatively faster
   policy_update_interval: 1   # >1 => critic relatively faster
-  # Periodic critic re-warmup (resample + critic-only fit); 0 disables
-  critic_rewarmup_interval: 0
-  critic_rewarmup_inner_epochs: 1
+  # Periodic critic re-warmup (resample + critic-only fit, by critic steps); <=0 disables
+  critic_warmup_interval: 0    # periodic re-warmup every N optimizer rounds (<=0 disables)
+  critic_rewarmup_steps: 0     # target critic steps per periodic burst (>=1 if interval>0)
   update_critic_in_optimize: true  # false => critic trained only by bootstrap + bursts (mode B)
   # GAE
   gae_gamma: 1.0

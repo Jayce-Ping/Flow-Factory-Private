@@ -122,8 +122,8 @@ class PPOTrainer(BaseTrainer):
     # =========================== Main Loop ===========================
     def start(self):
         """Main training loop (Stages 2-6 per epoch)."""
-        # Initial critic-only bootstrap (the merged warmup) before any policy update.
-        self._bootstrap_critic()
+        # Initial critic-only warmup (bootstrap) before any policy update.
+        self._warmup_critic(self.training_args.critic_warmup_steps, "bootstrap")
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
 
@@ -146,12 +146,12 @@ class PPOTrainer(BaseTrainer):
             self.prepare_feedback(samples)
             self.optimize(samples)
 
-            # Periodic critic re-warmup burst (resample + critic-only fit) to catch the
-            # critic up to the moving policy; does not advance self.step / self.epoch.
-            interval = self.training_args.critic_rewarmup_interval
+            # Periodic critic re-warmup (resample + critic-only fit to a step target) to catch
+            # the critic up to the moving policy; does not advance self.step / self.epoch.
+            interval = self.training_args.critic_warmup_interval
             if interval > 0 and self.step // interval > self._last_rewarmup_bucket:
                 self._last_rewarmup_bucket = self.step // interval
-                self._rewarmup_critic(self.training_args.critic_rewarmup_inner_epochs)
+                self._warmup_critic(self.training_args.critic_rewarmup_steps, "rewarmup")
 
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
@@ -309,10 +309,10 @@ class PPOTrainer(BaseTrainer):
         each loss by its ``interval`` so the gradient is the mean over the full window.
 
         The policy trains every micro-step here (the initial critic warmup is an
-        up-front bootstrap in :meth:`_bootstrap_critic`, not a frozen-policy phase).
+        up-front bootstrap in :meth:`_warmup_critic`, not a frozen-policy phase).
         The critic trains here only when ``update_critic_in_optimize`` is True
         (mode A); in mode B it is trained solely by the bootstrap + periodic
-        :meth:`_rewarmup_critic` bursts.
+        :meth:`_warmup_critic` bursts.
         """
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
@@ -547,30 +547,33 @@ class PPOTrainer(BaseTrainer):
         return 0.5 * torch.mean((value - returns_t) ** 2)
 
     # =========================== Critic re-warmup (Stage 6b) ===========================
-    def _bootstrap_critic(self) -> None:
-        """Initial critic-only bootstrap before the epoch loop (the merged warmup).
+    def _warmup_critic(self, target_steps: int, label: str = "warmup") -> None:
+        """Critic-only warmup: resample fresh rollouts and fit ONLY the critic until it has
+        taken ~``target_steps`` critic optimizer steps (the policy is untouched).
 
-        Repeatedly resamples fresh rollouts and fits ONLY the critic until it has
-        taken ~``critic_warmup_steps`` optimizer steps. Unlike the old in-loop warmup,
-        this does not freeze the first epochs: once the main loop starts, the policy
-        trains every epoch. No-op when ``critic_warmup_steps == 0``.
+        Shared by the initial bootstrap (``critic_warmup_steps``, before the epoch loop) and
+        the periodic re-warmup (``critic_rewarmup_steps``, every ``critic_warmup_interval``
+        rounds); the two targets are independent. No-op when ``target_steps <= 0``.
+
+        Args:
+            target_steps: Critic optimizer steps to accumulate across resampled bursts.
+            label: Short tag for logging (e.g. ``"bootstrap"`` / ``"rewarmup"``).
         """
-        target = self.training_args.critic_warmup_steps
-        if target <= 0:
+        if target_steps <= 0:
             return
         if self.accelerator.is_local_main_process:
-            logger.info(f"PPO critic bootstrap: ~{target} critic steps via resampled bursts.")
+            logger.info(f"PPO critic {label}: ~{target_steps} critic steps via resampled bursts.")
         done = 0
-        while done < target:
-            steps = self._rewarmup_critic(num_passes=1)
+        while done < target_steps:
+            steps = self._rewarmup_critic()
             if steps == 0:
                 logger.warning(
-                    "PPO critic bootstrap made no progress (gas > buffer?); stopping early."
+                    f"PPO critic {label} made no progress (gas > buffer?); stopping early."
                 )
                 break
             done += steps
 
-    def _rewarmup_critic(self, num_passes: int) -> int:
+    def _rewarmup_critic(self, num_passes: int = 1) -> int:
         """One critic re-warmup burst: resample fresh data, then a critic-only fit.
 
         Args:

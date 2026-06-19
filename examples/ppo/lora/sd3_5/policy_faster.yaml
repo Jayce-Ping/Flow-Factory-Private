@@ -66,9 +66,9 @@ train:
   critic_update_interval: 4  # Step critic every 4 rounds (accumulates 4*gas micro-steps per step)
   policy_update_interval: 1  # Step policy every round
 
-  # Periodic critic re-warmup (resample + critic-only fit); 0 disables (off here).
-  critic_rewarmup_interval: 0  # Every N optimizer rounds, run a critic-only burst (0 disables)
-  critic_rewarmup_inner_epochs: 1  # Critic-only passes over the freshly sampled buffer per burst
+  # Periodic critic re-warmup (resample + critic-only fit, by critic steps); <=0 disables (off here).
+  critic_warmup_interval: 0  # Periodic re-warmup every N optimizer rounds (<=0 disables)
+  critic_rewarmup_steps: 0  # Target critic steps per periodic burst (>=1 required if interval>0)
   update_critic_in_optimize: true  # false => critic frozen in optimize(), trained only by bursts
 
   # Critic architecture
