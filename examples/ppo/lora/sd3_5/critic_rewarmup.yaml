@@ -76,9 +76,9 @@ train:
   update_critic_in_optimize: false  # Critic frozen in optimize(); trained only by bootstrap+bursts
 
   # Critic architecture
-  critic_hidden_dim: 256  # Critic hidden width
+  critic_hidden_dim: 512  # Critic hidden width
   critic_num_layers: 3  # Number of residual MLP blocks in the critic token encoder
-  critic_time_embed_dim: 256  # Sinusoidal timestep embedding dim (must be even)
+  critic_time_embed_dim: 512  # Sinusoidal timestep embedding dim (must be even)
   critic_attn_heads: 8  # Attention-pool heads (must divide critic_hidden_dim)
   critic_num_query_tokens: 1  # Learnable query tokens for attention pooling
 
