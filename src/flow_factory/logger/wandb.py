@@ -56,3 +56,10 @@ class WandbLogger(Logger):
 
     def _log_impl(self, data: Dict, step: int):
         self.platform.log(data, step=step)
+
+    def define_step_metric(self, metric: str, step_metric: str) -> None:
+        # Declare the x-axis metric, then bind `metric` (may be a glob like
+        # "train/critic/*") to it so wandb charts that group against `step_metric`'s
+        # logged value rather than the global step.
+        wandb.define_metric(step_metric)
+        wandb.define_metric(metric, step_metric=step_metric)

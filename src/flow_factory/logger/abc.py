@@ -66,6 +66,15 @@ class Logger(ABC):
             self._cleanup_temp_files(first_data)
         self._pending_cleanup.append(formatted_dict)
 
+    def define_step_metric(self, metric: str, step_metric: str) -> None:
+        """Bind a metric (or glob, e.g. ``"train/critic/*"``) to a custom x-axis.
+
+        Default no-op. Backends that support a per-metric x-axis (wandb via
+        ``define_metric``) override this; others (swanlab/tensorboard) ignore it and
+        fall back to the monotonic global step passed to :meth:`log_data`.
+        """
+        pass
+
     def _recursive_convert(
         self, 
         value: Any, 

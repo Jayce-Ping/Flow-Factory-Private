@@ -54,6 +54,10 @@ class PPOTrainer(BaseTrainer):
         [3] Flow-GRPO (shared SDE rollout machinery) - https://arxiv.org/abs/2505.05470
     """
 
+    # Metric keys logged on the critic (``critic_step``) axis; everything else in an
+    # optimize round goes on the policy (``step``) axis. See ``_log_optimize_round``.
+    _CRITIC_METRIC_KEYS = ("value_loss", "explained_variance", "critic_grad_norm", "critic_updated")
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.training_args: PPOTrainingArguments
@@ -78,6 +82,16 @@ class PPOTrainer(BaseTrainer):
         # and a monotonic call counter used to seed each burst's resampling distinctly.
         self._last_rewarmup_bucket = 0
         self._rewarmup_calls = 0
+        # Logging axes. PPO emits three semantic timelines that are not jointly monotonic
+        # (and the critic/feedback advance during warmup while ``self.step`` is frozen):
+        #   - ``self.step``        -> policy optimizer rounds      (train/policy/* panels)
+        #   - ``self.critic_step`` -> critic optimizer steps       (train/critic/* panels)
+        #   - ``self.rollout_step``-> rollouts / feedback events   (train/rollout/* panels)
+        # Each is logged as a value and bound to a panel via ``define_step_metric``. The
+        # backend itself receives ``_global_log_step`` (monotonic) so no point is dropped.
+        self.critic_step = 0
+        self.rollout_step = 0
+        self._global_log_step = 0
 
         ta = self.training_args
         num_frames = getattr(ta, "num_frames", None)
@@ -154,9 +168,84 @@ class PPOTrainer(BaseTrainer):
                 f"got {type(scheduler).__name__}."
             )
 
+    # =========================== Logging axes ===========================
+    def log_data(self, data: Dict[str, Any], step: int) -> None:
+        """Route every PPO log through a monotonic engine step.
+
+        Single-global-step backends (wandb/swanlab) drop non-monotonic logs, and PPO's
+        three semantic axes (policy ``step`` / ``critic_step`` / ``rollout_step``) are not
+        jointly monotonic -- warmup also logs while ``self.step`` is frozen. We therefore
+        pass an ever-increasing ``_global_log_step`` to the backend and carry the semantic
+        axis as a logged value (bound to a panel by :meth:`_configure_log_axes`). The
+        ``step`` argument from callers is intentionally ignored here.
+        """
+        self._global_log_step += 1
+        super().log_data(data, step=self._global_log_step)
+
+    def _configure_log_axes(self) -> None:
+        """Bind each metric namespace to its semantic x-axis (wandb; no-op elsewhere)."""
+        if self.logger is None:
+            return
+        self.logger.define_step_metric("train/policy/*", "train/step")
+        self.logger.define_step_metric("train/critic/*", "train/critic_step")
+        self.logger.define_step_metric("train/rollout/*", "train/rollout_step")
+        self.logger.define_step_metric("eval/*", "train/step")
+
+    def _log_optimize_round(
+        self,
+        reduced: Dict[str, Any],
+        *,
+        do_critic: bool,
+        critic_grad_norm: Optional[Any],
+        policy_grad_norm: Optional[Any],
+        critic_step_now: bool,
+        policy_step_now: bool,
+    ) -> None:
+        """Split one optimize round's reduced metrics into policy + critic panels.
+
+        Policy metrics go to ``train/policy/*`` (``step`` axis); critic metrics (mode A
+        only) go to ``train/critic/*`` (``critic_step`` axis). Both are emitted in one
+        payload carrying both axis values, so wandb's ``define_metric`` still routes them
+        to separate panels while the console keeps a single line per round. Advances
+        ``self.critic_step`` when critic metrics are emitted.
+        """
+        reduced["policy_updated"] = float(policy_step_now)
+        if policy_grad_norm is not None:
+            reduced["grad_norm"] = policy_grad_norm
+
+        payload: Dict[str, Any] = {}
+        has_critic = False
+        if do_critic:
+            reduced["critic_updated"] = float(critic_step_now)
+            if critic_grad_norm is not None:
+                reduced["critic_grad_norm"] = critic_grad_norm
+            for key in self._CRITIC_METRIC_KEYS:
+                if key in reduced:
+                    payload[f"train/critic/{key}"] = reduced.pop(key)
+                    has_critic = True
+
+        for key, value in reduced.items():
+            payload[f"train/policy/{key}"] = value
+        payload["train/step"] = self.step
+        if has_critic:
+            payload["train/critic_step"] = self.critic_step
+
+        self.log_data(payload, step=self.step)
+        if has_critic:
+            self.critic_step += 1
+
+    def _log_critic_only(self, reduced: Dict[str, Any]) -> None:
+        """Log a critic-only fit step (warmup bursts) on the ``critic_step`` axis."""
+        critic_metrics = {f"train/critic/{key}": v for key, v in reduced.items()}
+        critic_metrics["train/critic_step"] = self.critic_step
+        self.log_data(critic_metrics, step=self.critic_step)
+        self.critic_step += 1
+
     # =========================== Main Loop ===========================
     def start(self):
         """Main training loop (Stages 2-6 per epoch)."""
+        # Bind metric namespaces to their semantic x-axes before any logging.
+        self._configure_log_axes()
         # Initial critic-only warmup (bootstrap) before any policy update.
         self._warmup_critic(self.training_args.critic_warmup_steps, "bootstrap")
         while self.should_continue_training():
@@ -241,9 +330,10 @@ class PPOTrainer(BaseTrainer):
 
         Args:
             samples: Rollout samples to score and annotate with GAE targets.
-            metrics_prefix: Log-key prefix for feedback diagnostics (``"train"`` for
-                the normal epoch; ``"train_rewarmup"`` for re-warmup bursts so the
-                extra rollout's metrics do not collide at the same ``self.step``).
+            metrics_prefix: Marks the rollout phase for feedback diagnostics
+                (``"train_rewarmup"`` for re-warmup bursts, ``"train"`` otherwise).
+                Metrics always log to the ``train/rollout/*`` panel on the
+                ``rollout_step`` axis; the phase is recorded as ``train/rollout/phase``.
         """
         if self.per_sample_sde:
             self._prepare_feedback_bandit(samples, metrics_prefix=metrics_prefix)
@@ -345,19 +435,27 @@ class PPOTrainer(BaseTrainer):
         returns: torch.Tensor,
         metrics_prefix: str = "train",
     ) -> None:
-        """Log global reward + local value/return/advantage diagnostics."""
+        """Log reward + value/return/advantage diagnostics on the ``rollout_step`` axis.
+
+        Both the normal epoch and warmup resample bursts log here, so the rollout curves
+        stay continuous across warmup and training. ``metrics_prefix`` is recorded only as
+        a ``phase`` marker (1.0 for re-warmup bursts, 0.0 otherwise).
+        """
         gathered = self.accelerator.gather(terminal_rewards.to(self.accelerator.device))
         self.log_data(
             {
-                f"{metrics_prefix}/reward_mean": gathered.mean().item(),
-                f"{metrics_prefix}/reward_std": gathered.std().item(),
-                f"{metrics_prefix}/value_mean": old_values.mean().item(),
-                f"{metrics_prefix}/return_mean": returns.mean().item(),
-                f"{metrics_prefix}/advantage_mean": advantages.mean().item(),
-                f"{metrics_prefix}/advantage_std": advantages.std().item(),
+                "train/rollout/reward_mean": gathered.mean().item(),
+                "train/rollout/reward_std": gathered.std().item(),
+                "train/rollout/value_mean": old_values.mean().item(),
+                "train/rollout/return_mean": returns.mean().item(),
+                "train/rollout/advantage_mean": advantages.mean().item(),
+                "train/rollout/advantage_std": advantages.std().item(),
+                "train/rollout/phase": 1.0 if "rewarmup" in metrics_prefix else 0.0,
+                "train/rollout_step": self.rollout_step,
             },
             step=self.step,
         )
+        self.rollout_step += 1
 
     # ================= Per-sample single-SDE (bandit) path =================
     def _bandit_gather(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -607,15 +705,13 @@ class PPOTrainer(BaseTrainer):
                 # 5. Round bookkeeping at the gas-window boundary.
                 if boundary:
                     reduced = reduce_loss_info(self.accelerator, loss_info)
-                    reduced["critic_updated"] = float(critic_step_now)
-                    reduced["policy_updated"] = float(policy_step_now)
-                    if critic_grad_norm is not None:
-                        reduced["critic_grad_norm"] = critic_grad_norm
-                    if policy_grad_norm is not None:
-                        reduced["grad_norm"] = policy_grad_norm
-                    self.log_data(
-                        {f"train/{name}": v for name, v in reduced.items()},
-                        step=self.step,
+                    self._log_optimize_round(
+                        reduced,
+                        do_critic=do_critic,
+                        critic_grad_norm=critic_grad_norm,
+                        policy_grad_norm=policy_grad_norm,
+                        critic_step_now=critic_step_now,
+                        policy_step_now=policy_step_now,
                     )
                     self.step += 1
                     self.micro_in_round = 0
@@ -684,10 +780,7 @@ class PPOTrainer(BaseTrainer):
                     self.critic_optimizer.zero_grad()
                     critic_steps += 1
                     reduced = reduce_loss_info(self.accelerator, loss_info)
-                    self.log_data(
-                        {f"train_rewarmup/{name}": v for name, v in reduced.items()},
-                        step=self.step,
-                    )
+                    self._log_critic_only(reduced)
                     loss_info = defaultdict(list)
                     micro = 0
                 else:
@@ -920,15 +1013,13 @@ class PPOTrainer(BaseTrainer):
                     # 5. Round bookkeeping at the gas-window boundary.
                     if boundary:
                         reduced = reduce_loss_info(self.accelerator, loss_info)
-                        reduced["critic_updated"] = float(critic_step_now)
-                        reduced["policy_updated"] = float(policy_step_now)
-                        if critic_grad_norm is not None:
-                            reduced["critic_grad_norm"] = critic_grad_norm
-                        if policy_grad_norm is not None:
-                            reduced["grad_norm"] = policy_grad_norm
-                        self.log_data(
-                            {f"train/{k}": v for k, v in reduced.items()},
-                            step=self.step,
+                        self._log_optimize_round(
+                            reduced,
+                            do_critic=do_critic,
+                            critic_grad_norm=critic_grad_norm,
+                            policy_grad_norm=policy_grad_norm,
+                            critic_step_now=critic_step_now,
+                            policy_step_now=policy_step_now,
                         )
                         self.step += 1
                         self.micro_in_round = 0
@@ -1001,7 +1092,8 @@ class PPOTrainer(BaseTrainer):
 
         Mirrors the critic path of :meth:`optimize` (manual ``gas`` accumulation +
         per-step ``no_sync``) but never forwards/steps the policy and never advances
-        ``self.step`` / ``self.epoch``. Logs under ``train_rewarmup/*``.
+        ``self.step`` / ``self.epoch``. Logs to the ``train/critic/*`` panel on the
+        ``critic_step`` axis (continuous across bootstrap / re-warmup / optimize).
 
         Returns:
             Number of critic optimizer steps taken.
@@ -1070,10 +1162,7 @@ class PPOTrainer(BaseTrainer):
                         self.critic_optimizer.zero_grad()
                         critic_steps += 1
                         reduced = reduce_loss_info(self.accelerator, loss_info)
-                        self.log_data(
-                            {f"train_rewarmup/{k}": v for k, v in reduced.items()},
-                            step=self.step,
-                        )
+                        self._log_critic_only(reduced)
                         loss_info = defaultdict(list)
                         micro = 0
                     else:
