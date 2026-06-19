@@ -98,8 +98,8 @@ train:
 
   # Batch and sampling
   per_device_batch_size: 8  # Batch size per device
-  group_size: 24  # Trajectories per prompt (PPO uses per-trajectory GAE, not group normalization)
-  unique_sample_num_per_epoch: 48  # Unique prompts per epoch
+  group_size: 1  # Trajectories per prompt (1: PPO needs no group; it uses a learned critic baseline, not group normalization)
+  unique_sample_num_per_epoch: 128  # Unique prompts per epoch
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
 
