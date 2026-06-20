@@ -83,8 +83,8 @@ train:
   critic_time_embed_dim: 512  # Sinusoidal timestep embedding dim (must be even)
   critic_attn_heads: 8  # Attention-pool heads (must divide critic_hidden_dim)
   critic_num_query_tokens: 1  # Learnable query tokens for attention pooling
-  critic_lora_rank: 16  # LoRA rank for the 'critic' adapter on the transformer
-  critic_lora_alpha: 32  # LoRA alpha for the 'critic' adapter
+  critic_lora_rank: 32  # LoRA rank for the 'critic' adapter (aligned with policy lora_rank)
+  critic_lora_alpha: 64  # LoRA alpha for the 'critic' adapter (aligned with policy lora_alpha)
   # critic_lora_target_modules: null  # null reuses the model's default_target_modules (same as policy)
 
   # GAE

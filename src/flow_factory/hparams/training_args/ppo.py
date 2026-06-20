@@ -107,15 +107,21 @@ class PPOTrainingArguments(TrainingArguments):
         },
     )
     critic_lora_rank: int = field(
-        default=16,
+        default=8,
         metadata={
-            "help": "LoRA rank for the backbone critic 'critic' adapter (critic_type='backbone')."
+            "help": (
+                "LoRA rank for the backbone critic 'critic' adapter (critic_type='backbone'). "
+                "Defaults to the policy lora_rank default."
+            )
         },
     )
-    critic_lora_alpha: int = field(
-        default=32,
+    critic_lora_alpha: Optional[int] = field(
+        default=None,
         metadata={
-            "help": "LoRA alpha for the backbone critic 'critic' adapter (critic_type='backbone')."
+            "help": (
+                "LoRA alpha for the backbone critic 'critic' adapter. Defaults to "
+                "2 * critic_lora_rank when None (mirrors the policy lora_alpha convention)."
+            )
         },
     )
     critic_lora_target_modules: Optional[Union[str, List[str]]] = field(
@@ -273,12 +279,16 @@ class PPOTrainingArguments(TrainingArguments):
             # finetune_type / distributed backend depend on ModelArguments + the live
             # accelerator, so those are validated in PPOTrainer._initialization.
             self.critic_lora_rank = int(self.critic_lora_rank)
-            self.critic_lora_alpha = int(self.critic_lora_alpha)
             if self.critic_lora_rank < 1:
                 raise ValueError(
                     f"`critic_lora_rank` must be >= 1 for critic_type='backbone', got "
                     f"{self.critic_lora_rank}."
                 )
+            # Mirror the policy lora_alpha convention: default to 2 * rank when unset.
+            if self.critic_lora_alpha is None:
+                self.critic_lora_alpha = 2 * self.critic_lora_rank
+            else:
+                self.critic_lora_alpha = int(self.critic_lora_alpha)
             if self.critic_lora_alpha < 1:
                 raise ValueError(
                     f"`critic_lora_alpha` must be >= 1 for critic_type='backbone', got "
