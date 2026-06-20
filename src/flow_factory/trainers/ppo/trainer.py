@@ -73,7 +73,7 @@ class PPOTrainer(BaseTrainer):
     def _initialization(self):
         """Prepare policy (base), then build + prepare the value critic.
 
-        Two critic flavors (``critic_type``):
+        Three critic flavors (``critic_type``):
           - ``standalone`` (default): a lightweight latent-only ``ValueCritic`` eagerly
             built from the channel count ``C`` (via ``compute_actual_latent_shape``) and
             prepared as a second ``accelerator.prepare`` root.
@@ -87,8 +87,10 @@ class PPOTrainer(BaseTrainer):
         ta = self.training_args
         self._is_backbone_critic = ta.critic_type == "backbone"
         self._is_branch_critic = ta.critic_type == "backbone_branches"
-        # Both backbone modes put the critic inside the prepared ModelBundle (one DDP root).
+        # Both backbone modes put the critic inside the prepared ModelBundle (one DDP root);
+        # only Scheme B ('backbone') adds a trainable "critic" LoRA on the shared backbone.
         self._critic_in_bundle = self._is_backbone_critic or self._is_branch_critic
+        self._uses_critic_lora = self._is_backbone_critic
         self._critic_tap_layers = list(ta.critic_tap_layers) if self._is_branch_critic else []
         if self._critic_in_bundle:
             self._validate_backbone_critic()
@@ -128,41 +130,21 @@ class PPOTrainer(BaseTrainer):
         self.latent_channel_dim = axes.channel
         in_channels = probe.shape[axes.channel]
 
-        if self._is_branch_critic:
-            # DiTBranchCritic lives in the single prepared root (added by
-            # ``_extra_bundle_members``); it reads the actor backbone's features (no critic
-            # LoRA). Only its optimizer is prepared here. ``self.critic`` stays None;
-            # ``_critic_value`` dispatches.
-            self.critic = None
-            inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
-            self._value_head = inner_bundle.members[_VALUE_HEAD_MEMBER]
-            self._critic_param_list = list(self._value_head.parameters())
-            self.critic_optimizer = torch.optim.AdamW(
-                self._critic_param_list,
-                lr=ta.critic_learning_rate,
-                betas=ta.adam_betas,
-                weight_decay=ta.adam_weight_decay,
-                eps=ta.adam_epsilon,
-            )
-            self.critic_optimizer = self.accelerator.prepare(self.critic_optimizer)
-            if self.accelerator.is_local_main_process:
-                n_params = sum(p.numel() for p in self._critic_param_list)
-                logger.info(
-                    "Initialized PPO branch critic (arXiv:2605.27736): "
-                    f"backbone_feature_dim={self.adapter.backbone_feature_dim}, "
-                    f"tap_layers={self._critic_tap_layers}, params={n_params / 1e6:.2f}M"
-                )
-        elif self._is_backbone_critic:
-            # Value head + critic LoRA already live in the single prepared root (added by
-            # ``_extra_bundle_members``). Only the critic optimizer is prepared here (no
-            # second model root). ``self.critic`` stays None; ``_critic_value`` dispatches.
+        if self._critic_in_bundle:
+            # The value head (BackboneValueHead or DiTBranchCritic) already lives in the single
+            # prepared root (added by ``_extra_bundle_members``); only its optimizer is prepared
+            # here (no second model root). Scheme B ('backbone') also trains a "critic" LoRA on
+            # the shared backbone. ``self.critic`` stays None; ``_critic_value`` dispatches.
             self.critic = None
             inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
             self._value_head = inner_bundle.members[_VALUE_HEAD_MEMBER]
             # Cache once: the critic optimizer and every per-step grad clip share this list.
-            self._critic_param_list = list(
-                self.adapter.get_trainable_parameters(adapter_name=_CRITIC_ADAPTER)
-            ) + list(self._value_head.parameters())
+            self._critic_param_list = list(self._value_head.parameters())
+            if self._uses_critic_lora:
+                self._critic_param_list = (
+                    list(self.adapter.get_trainable_parameters(adapter_name=_CRITIC_ADAPTER))
+                    + self._critic_param_list
+                )
             self.critic_optimizer = torch.optim.AdamW(
                 self._critic_param_list,
                 lr=ta.critic_learning_rate,
@@ -175,9 +157,10 @@ class PPOTrainer(BaseTrainer):
                 n_head = sum(p.numel() for p in self._value_head.parameters())
                 n_lora = sum(p.numel() for p in self._critic_param_list) - n_head
                 logger.info(
-                    "Initialized PPO backbone critic: "
+                    f"Initialized PPO {ta.critic_type} critic: "
                     f"backbone_feature_dim={self.adapter.backbone_feature_dim}, "
-                    f"critic_lora={n_lora/1e6:.2f}M, value_head={n_head/1e6:.2f}M"
+                    f"value_head={n_head / 1e6:.2f}M, critic_lora={n_lora / 1e6:.2f}M, "
+                    f"tap_layers={self._critic_tap_layers or 'last'}"
                 )
         else:
             self._value_head = None
@@ -334,12 +317,11 @@ class PPOTrainer(BaseTrainer):
         old-value passes run deterministically in eval (matching the standalone critic's
         eval()). Standalone: just the ValueCritic.
         """
-        if self._is_branch_critic:
-            # The shared backbone is read no-grad for the critic, so only the branch heads
-            # toggle train/eval here.
-            self._value_head.train(mode)
-        elif self._is_backbone_critic:
-            self.adapter.train(mode)
+        if self._critic_in_bundle:
+            # Scheme B trains the shared backbone through the critic LoRA, so toggle the
+            # adapter too; the branch critic reads the backbone no-grad (value head only).
+            if self._uses_critic_lora:
+                self.adapter.train(mode)
             self._value_head.train(mode)
         else:
             self.critic.train(mode)
@@ -1442,20 +1424,17 @@ class PPOTrainer(BaseTrainer):
         if self.accelerator.is_main_process:
             os.makedirs(save_directory, exist_ok=True)
             critic_path = os.path.join(save_directory, "critic.pt")
-            if self._is_branch_critic:
+            if self._critic_in_bundle:
                 payload = {
                     "value_head": self.accelerator.unwrap_model(self._value_head).state_dict(),
                 }
-                torch.save(payload, critic_path)
-                logger.info(f"Saved PPO branch critic (DiTBranchCritic) to {critic_path}")
-            elif self._is_backbone_critic:
-                payload = {
-                    "value_head": self.accelerator.unwrap_model(self._value_head).state_dict(),
-                    "critic_lora": self.adapter.get_adapter_lora_state_dict(_CRITIC_ADAPTER),
-                }
+                if self._uses_critic_lora:
+                    payload["critic_lora"] = self.adapter.get_adapter_lora_state_dict(
+                        _CRITIC_ADAPTER
+                    )
                 torch.save(payload, critic_path)
                 logger.info(
-                    f"Saved PPO backbone critic (value head + critic LoRA) to {critic_path}"
+                    f"Saved PPO {self.training_args.critic_type} critic to {critic_path}"
                 )
             else:
                 critic = self.accelerator.unwrap_model(self.critic)
@@ -1482,20 +1461,16 @@ class PPOTrainer(BaseTrainer):
                     f"critic_type is '{self.training_args.critic_type}'. Set critic_type to "
                     "match the checkpoint to resume it."
                 )
-            if self._is_branch_critic:
+            if self._critic_in_bundle:
                 self.accelerator.unwrap_model(self._value_head).load_state_dict(
                     state_dict["value_head"]
                 )
-                logger.info(f"Loaded PPO branch critic (DiTBranchCritic) from {critic_path}")
-            elif self._is_backbone_critic:
-                self.accelerator.unwrap_model(self._value_head).load_state_dict(
-                    state_dict["value_head"]
-                )
-                self.adapter.load_adapter_lora_state_dict(
-                    _CRITIC_ADAPTER, state_dict["critic_lora"]
-                )
+                if self._uses_critic_lora:
+                    self.adapter.load_adapter_lora_state_dict(
+                        _CRITIC_ADAPTER, state_dict["critic_lora"]
+                    )
                 logger.info(
-                    f"Loaded PPO backbone critic (value head + critic LoRA) from {critic_path}"
+                    f"Loaded PPO {self.training_args.critic_type} critic from {critic_path}"
                 )
             else:
                 self.accelerator.unwrap_model(self.critic).load_state_dict(state_dict)

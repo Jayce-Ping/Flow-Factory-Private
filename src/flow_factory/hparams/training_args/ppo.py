@@ -105,7 +105,7 @@ class PPOTrainingArguments(TrainingArguments):
     #   PEFT adapter ("critic") + a value head on the last block's features (LoRA + DDP only).
     # 'backbone_branches' (arXiv:2605.27736): state-aligned latent critic -- critic-attention
     #   branches at `critic_tap_layers` with AdaLN time modulation, reading the actor backbone's
-    #   intermediate features in one shared forward (no critic LoRA; DDP only).
+    #   intermediate features (no critic LoRA; DDP only).
     # Both reuse the critic_* architecture knobs (hidden_dim / attn_heads / num_query_tokens /
     #   time_embed_dim) for the value head / branches.
     critic_type: Literal["standalone", "backbone", "backbone_branches"] = field(
@@ -115,7 +115,7 @@ class PPOTrainingArguments(TrainingArguments):
                 "Critic architecture. 'standalone': lightweight latent-only value net "
                 "(default). 'backbone': policy transformer via a separate 'critic' LoRA adapter "
                 "+ value head. 'backbone_branches': paper-faithful critic-attention branches at "
-                "critic_tap_layers with AdaLN, shared backbone single forward (no critic LoRA). "
+                "critic_tap_layers with AdaLN on shared backbone features (no critic LoRA). "
                 "Both backbone modes require DDP; 'backbone' also requires finetune_type='lora'."
             )
         },

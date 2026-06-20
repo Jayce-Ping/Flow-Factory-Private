@@ -480,10 +480,10 @@ class SD3_5Adapter(BaseAdapter):
     ) -> torch.Tensor:
         """Tap SD3.5 transformer per-token hidden features for the backbone critic.
 
-        Runs the transformer once WITHOUT CFG (single conditional pass) and captures the
-        last joint block's image-stream hidden state (before the AdaLN output projection)
-        via a forward hook. The active LoRA adapter (e.g. the critic adapter) must be set by
-        the caller (see ``BaseAdapter.use_adapter``).
+        Single-layer convenience wrapper over :meth:`extract_block_features`: captures the
+        LAST joint block's image-stream hidden state (before the output projection) in one
+        no-CFG forward. The active LoRA adapter (e.g. the critic adapter) and grad context are
+        set by the caller (see ``BaseAdapter.use_adapter``).
 
         Args:
             latents: Current latents ``(B, C, H, W)``.
@@ -493,43 +493,12 @@ class SD3_5Adapter(BaseAdapter):
             joint_attention_kwargs: Optional attention kwargs.
 
         Returns:
-            Per-token hidden features ``(B, num_patches, inner_dim)``.
-
-        Raises:
-            RuntimeError: If the hook captures no hidden state.
+            Per-token hidden features ``(B, num_patches, inner_dim)`` from the last block.
         """
-        batch_size = latents.shape[0]
-        timestep = t.expand(batch_size).to(latents.dtype)
-
-        transformer = self.transformer
-        last_block = self._unwrap(transformer).transformer_blocks[-1]
-
-        captured: Dict[str, torch.Tensor] = {}
-
-        def _capture_hook(module, args, output):
-            # SD3 JointTransformerBlock returns (encoder_hidden_states, hidden_states);
-            # the image-stream hidden_states is the pre-projection feature we want.
-            captured["features"] = output[1] if isinstance(output, (tuple, list)) else output
-
-        handle = last_block.register_forward_hook(_capture_hook)
-        try:
-            transformer(
-                hidden_states=latents,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt_embeds,
-                joint_attention_kwargs=joint_attention_kwargs,
-                return_dict=False,
-            )
-        finally:
-            handle.remove()
-
-        if "features" not in captured:
-            raise RuntimeError(
-                "extract_backbone_features failed to capture SD3.5 backbone hidden states; "
-                "the transformer's last block produced no output."
-            )
-        return captured["features"]
+        last = len(self._unwrap(self.transformer).transformer_blocks) - 1
+        return self.extract_block_features(
+            [last], latents, t, prompt_embeds, pooled_prompt_embeds, joint_attention_kwargs
+        )[last]
 
     def _validate_tap_layers(self, layers: List[int]) -> None:
         """Check that ``layers`` are valid SD3.5 ``transformer_blocks`` indices."""
