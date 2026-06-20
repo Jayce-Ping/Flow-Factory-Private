@@ -72,11 +72,16 @@ train:
   update_critic_in_optimize: true  # false => critic frozen in optimize(), trained only by bursts
 
   # Critic architecture
-  critic_hidden_dim: 512  # Critic hidden width
+  critic_type: 'standalone'  # Options: standalone (latent-only value net), backbone (reuse the policy transformer via a separate 'critic' LoRA adapter + value head; lora + DDP only). See backbone_critic.yaml.
+  critic_hidden_dim: 512  # Critic hidden width (value head width for both critic types)
   critic_num_layers: 3  # Number of residual MLP blocks in the critic token encoder
   critic_time_embed_dim: 512  # Sinusoidal timestep embedding dim (must be even)
   critic_attn_heads: 8  # Attention-pool heads (must divide critic_hidden_dim)
   critic_num_query_tokens: 1  # Learnable query tokens for attention pooling
+  # Backbone critic (critic_type='backbone') only: the 'critic' LoRA adapter on the transformer.
+  critic_lora_rank: 16  # LoRA rank for the critic adapter
+  critic_lora_alpha: 32  # LoRA alpha for the critic adapter
+  # critic_lora_target_modules: null  # null reuses the model's default_target_modules (same as policy)
 
   # GAE
   gae_gamma: 1.0  # Discount per SDE step (1.0 fits a terminal-only reward)

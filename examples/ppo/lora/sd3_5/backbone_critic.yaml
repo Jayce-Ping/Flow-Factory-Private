@@ -1,12 +1,16 @@
-# Critic-based PPO (value net + GAE) for SD3.5 + PickScore -- POLICY-FASTER variant.
-# Policy steps every optimizer round; the critic steps every 4 rounds (accumulating
-# 4*gas micro-steps per critic step, so it still uses all data but updates 4x less
-# often with a 4x larger effective batch). Diff vs default.yaml: critic_update_interval=4.
-# v1 runs on DDP (the critic uses a second optimizer; DeepSpeed/FSDP support is a follow-up).
+# Critic-based PPO (value net + GAE) for SD3.5 + PickScore, BACKBONE critic (Scheme B).
+#
+# Unlike the default standalone latent-only critic, the value critic here REUSES the policy
+# transformer's base weights through a SEPARATE PEFT adapter named "critic" (independent of the
+# policy "default" adapter) plus a value head on tapped backbone features. This needs
+# finetune_type='lora' and DDP (the critic uses a second optimizer over the shared root, which
+# DeepSpeed/FSDP do not support). The critic and policy step together, so
+# critic_update_interval must equal policy_update_interval; for asymmetric critic training use
+# update_critic_in_optimize=false + critic_warmup_interval > 0 (periodic re-warmup bursts).
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/accelerate_configs/multi_gpu.yaml  # DDP. PPO v1 requires DDP (no DeepSpeed/FSDP critic yet).
+config_file: config/accelerate_configs/multi_gpu.yaml  # DDP. Backbone critic requires DDP (no DeepSpeed/FSDP).
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
@@ -28,7 +32,7 @@ data:
 
 # Model Configuration
 model:
-  finetune_type: 'lora' # Options: full, lora
+  finetune_type: 'lora' # Backbone critic REQUIRES lora (it adds a second 'critic' LoRA adapter)
   lora_rank : 32
   lora_alpha : 64
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
@@ -61,23 +65,27 @@ train:
   value_clip_range: 0.2  # PPO value-clip epsilon around old values (null to disable)
   critic_warmup_steps: 30  # Initial critic-only bootstrap (~N critic steps) before the epoch loop
 
-  # Update-frequency decoupling (unit = optimizer rounds; 1 round = gradient_accumulation_steps
-  # micro-steps). POLICY-FASTER: policy steps every round, critic every 4 rounds.
-  critic_update_interval: 4  # Step critic every 4 rounds (accumulates 4*gas micro-steps per step)
-  policy_update_interval: 1  # Step policy every round
+  # Update-frequency decoupling. Backbone critic shares one DDP root, so critic and policy MUST
+  # step together: keep critic_update_interval == policy_update_interval.
+  critic_update_interval: 1  # Must equal policy_update_interval for critic_type='backbone'
+  policy_update_interval: 1  # Must equal critic_update_interval for critic_type='backbone'
 
-  # Periodic critic re-warmup (resample + critic-only fit, by critic steps); <=0 disables (off here).
+  # Periodic critic re-warmup (resample + critic-only fit, by critic steps) to catch the critic
+  # up to the moving policy. critic_warmup_interval <= 0 disables periodic re-warmup.
   critic_warmup_interval: 0  # Periodic re-warmup every N optimizer rounds (<=0 disables)
   critic_rewarmup_steps: 0  # Target critic steps per periodic burst (>=1 required if interval>0)
   update_critic_in_optimize: true  # false => critic frozen in optimize(), trained only by bursts
 
-  # Critic architecture
-  critic_hidden_dim: 512  # Critic hidden width
-  critic_num_layers: 3  # Number of residual MLP blocks in the critic token encoder
+  # Critic architecture (backbone critic)
+  critic_type: 'backbone'  # Reuse the policy transformer via a separate 'critic' LoRA adapter + value head
+  critic_hidden_dim: 512  # Value head hidden width
+  critic_num_layers: 3  # Number of residual MLP blocks in the value head token encoder
   critic_time_embed_dim: 512  # Sinusoidal timestep embedding dim (must be even)
   critic_attn_heads: 8  # Attention-pool heads (must divide critic_hidden_dim)
   critic_num_query_tokens: 1  # Learnable query tokens for attention pooling
-  critic_type: 'standalone'  # Options: standalone, backbone (see examples/ppo/lora/sd3_5/backbone_critic.yaml)
+  critic_lora_rank: 16  # LoRA rank for the 'critic' adapter on the transformer
+  critic_lora_alpha: 32  # LoRA alpha for the 'critic' adapter
+  # critic_lora_target_modules: null  # null reuses the model's default_target_modules (same as policy)
 
   # GAE
   gae_gamma: 1.0  # Discount per SDE step (1.0 fits a terminal-only reward)
@@ -128,7 +136,7 @@ scheduler:
   num_sde_steps: 9  # = num_inference_steps - 1
   sde_steps: null  # null -> all denoising steps except the last (contiguous from 0)
   seed: 42  # Scheduler seed (for noise step selection)
-  sde_step_selection: "global"  # Options: global, per_sample (single-step bandit PPO; see single_sde.yaml)
+  sde_step_selection: "global"  # Options: global (shared SDE steps per batch), per_sample (single-step bandit PPO; see examples/ppo/lora/sd3_5/single_sde.yaml)
 
 # Evaluation settings
 eval:

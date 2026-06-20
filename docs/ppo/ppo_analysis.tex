@@ -264,6 +264,24 @@ preserving more information than mean/std pooling.}
 \label{fig:critic}
 \end{figure}
 
+\paragraph{Backbone critic (\texttt{critic\_type=backbone}, Scheme B).}
+As an alternative to the standalone net above, the critic can reuse the policy
+transformer's own base weights through a \emph{separate} PEFT adapter named
+\texttt{"critic"} (independent of the policy \texttt{"default"} adapter) plus a value
+head on the transformer's per-token hidden features, tapped before the output
+projection via \texttt{BaseAdapter.extract\_backbone\_features}. The value head joins
+the single \texttt{accelerator.prepare} root (one DDP root, constraint~\#9) and is
+trained by its own optimizer over the critic-LoRA $+$ value-head parameters;
+\texttt{get\_trainable\_parameters()} excludes the \texttt{"critic"} adapter so the
+policy optimizer never sees it. The same learned-query attention pooling as
+Figure~\ref{fig:critic} aggregates the hidden features $(B,\mathrm{seq},D)$ (the
+backbone feature width $D$ replaces the latent channel $C$). Limits (v1): LoRA finetune
+and DDP only, and the critic and policy step together
+(\texttt{critic\_update\_interval}$=$\texttt{policy\_update\_interval}); asymmetric
+critic training uses periodic re-warmup bursts
+(\texttt{update\_critic\_in\_optimize=false}). It costs $\sim$2x forward (a separate
+critic backbone pass), so it pairs well with per-sample/bandit SDE. Supported for SD3.5.
+
 \subsection{Generalized Advantage Estimation}
 \label{sec:gae}
 

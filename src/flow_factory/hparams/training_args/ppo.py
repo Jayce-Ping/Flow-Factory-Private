@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional, Union
 
 from ._base import TrainingArguments, _standardize_clip_range
 
@@ -88,6 +88,44 @@ class PPOTrainingArguments(TrainingArguments):
     critic_num_query_tokens: int = field(
         default=1,
         metadata={"help": "Number of learnable query tokens for the critic's attention pooling."},
+    )
+
+    # --- Backbone critic (Scheme B): reuse the policy transformer + a value head ---
+    # With critic_type="backbone" the critic shares the policy transformer's base weights
+    # through a SEPARATE PEFT adapter ("critic") plus a value head on tapped backbone
+    # features (vs the standalone latent-only ValueCritic). LoRA finetune + DDP only. The
+    # value head reuses the critic_* architecture knobs above (hidden_dim / num_layers /
+    # attn_heads / num_query_tokens / time_embed_dim).
+    critic_type: Literal["standalone", "backbone"] = field(
+        default="standalone",
+        metadata={
+            "help": (
+                "Critic architecture. 'standalone': lightweight latent-only value net "
+                "(default). 'backbone': reuse the policy transformer via a separate 'critic' "
+                "LoRA adapter + value head (requires finetune_type='lora' and DDP)."
+            )
+        },
+    )
+    critic_lora_rank: int = field(
+        default=16,
+        metadata={
+            "help": "LoRA rank for the backbone critic 'critic' adapter (critic_type='backbone')."
+        },
+    )
+    critic_lora_alpha: int = field(
+        default=32,
+        metadata={
+            "help": "LoRA alpha for the backbone critic 'critic' adapter (critic_type='backbone')."
+        },
+    )
+    critic_lora_target_modules: Optional[Union[str, List[str]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Target modules for the backbone critic LoRA. None reuses the adapter's "
+                "default_target_modules (same set as the policy)."
+            )
+        },
     )
 
     # --- GAE ---
@@ -226,6 +264,34 @@ class PPOTrainingArguments(TrainingArguments):
                 "(critic_warmup_interval > 0); otherwise the critic is never updated after "
                 "the initial bootstrap."
             )
+        if self.critic_type not in ["standalone", "backbone"]:
+            raise ValueError(
+                f"Invalid critic_type: {self.critic_type}. Valid options: "
+                "['standalone', 'backbone']."
+            )
+        if self.critic_type == "backbone":
+            # finetune_type / distributed backend depend on ModelArguments + the live
+            # accelerator, so those are validated in PPOTrainer._initialization.
+            self.critic_lora_rank = int(self.critic_lora_rank)
+            self.critic_lora_alpha = int(self.critic_lora_alpha)
+            if self.critic_lora_rank < 1:
+                raise ValueError(
+                    f"`critic_lora_rank` must be >= 1 for critic_type='backbone', got "
+                    f"{self.critic_lora_rank}."
+                )
+            if self.critic_lora_alpha < 1:
+                raise ValueError(
+                    f"`critic_lora_alpha` must be >= 1 for critic_type='backbone', got "
+                    f"{self.critic_lora_alpha}."
+                )
+            if self.critic_update_interval != self.policy_update_interval:
+                raise ValueError(
+                    "critic_type='backbone' shares one DDP root, so the critic and policy "
+                    "must step together: require critic_update_interval == "
+                    f"policy_update_interval (got {self.critic_update_interval} != "
+                    f"{self.policy_update_interval}). For asymmetric critic training use "
+                    "update_critic_in_optimize=false with critic_warmup_interval > 0."
+                )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         """GAS multiplier = number of trained transitions per sample per rollout.

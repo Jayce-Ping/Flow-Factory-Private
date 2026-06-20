@@ -459,5 +459,73 @@ class SD3_5Adapter(BaseAdapter):
             return_kwargs=return_kwargs,
             noise_level=noise_level,
         )
-        
+
         return output
+
+    # ============================ Backbone Critic (Scheme B) ============================
+    @property
+    def backbone_feature_dim(self) -> int:
+        """SD3.5 transformer inner dim (``num_attention_heads * attention_head_dim``)."""
+        config = self.pipeline.transformer.config
+        return config.num_attention_heads * config.attention_head_dim
+
+    def extract_backbone_features(
+        self,
+        latents: torch.Tensor,
+        t: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Tap SD3.5 transformer per-token hidden features for the backbone critic.
+
+        Runs the transformer once WITHOUT CFG (single conditional pass) and captures the
+        last joint block's image-stream hidden state (before the AdaLN output projection)
+        via a forward hook. The active LoRA adapter (e.g. the critic adapter) must be set by
+        the caller (see ``BaseAdapter.use_adapter``).
+
+        Args:
+            latents: Current latents ``(B, C, H, W)``.
+            t: Current timestep tensor (scalar or ``(B,)``).
+            prompt_embeds: Text prompt embeddings.
+            pooled_prompt_embeds: Pooled text prompt embeddings.
+            joint_attention_kwargs: Optional attention kwargs.
+
+        Returns:
+            Per-token hidden features ``(B, num_patches, inner_dim)``.
+
+        Raises:
+            RuntimeError: If the hook captures no hidden state.
+        """
+        batch_size = latents.shape[0]
+        timestep = t.expand(batch_size).to(latents.dtype)
+
+        transformer = self.transformer
+        last_block = self._unwrap(transformer).transformer_blocks[-1]
+
+        captured: Dict[str, torch.Tensor] = {}
+
+        def _capture_hook(module, args, output):
+            # SD3 JointTransformerBlock returns (encoder_hidden_states, hidden_states);
+            # the image-stream hidden_states is the pre-projection feature we want.
+            captured["features"] = output[1] if isinstance(output, (tuple, list)) else output
+
+        handle = last_block.register_forward_hook(_capture_hook)
+        try:
+            transformer(
+                hidden_states=latents,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                joint_attention_kwargs=joint_attention_kwargs,
+                return_dict=False,
+            )
+        finally:
+            handle.remove()
+
+        if "features" not in captured:
+            raise RuntimeError(
+                "extract_backbone_features failed to capture SD3.5 backbone hidden states; "
+                "the transformer's last block produced no output."
+            )
+        return captured["features"]

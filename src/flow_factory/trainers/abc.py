@@ -285,6 +285,21 @@ class BaseTrainer(ABC):
         )
         return self.optimizer
 
+    def _extra_bundle_members(self) -> Dict[str, nn.Module]:
+        """Hook: extra modules to add to the prepared ``ModelBundle`` root (constraint #9).
+
+        Returns an empty mapping by default. Subclasses (e.g. PPO's backbone critic) override
+        this to attach auxiliary trainable modules -- such as a value head -- into the single
+        ``accelerator.prepare`` root alongside the transformer(s), instead of a second
+        ``prepare`` call. Called after the policy optimizer is built and before
+        ``accelerator.prepare``, so any LoRA adapters added here as a side effect are NOT
+        captured by the policy optimizer.
+
+        Returns:
+            Mapping from member name to ``nn.Module`` (empty by default).
+        """
+        return {}
+
     def _load_inference_components(self, trainable_module_names: List[str]):
         """
         Load non-trainable components needed at runtime to the accelerator device.
@@ -335,6 +350,11 @@ class BaseTrainer(ABC):
         # LoRA PeftModel for LoRA training (apply_lora stores it via set_component,
         # NOT in-place on the pipeline), matching the pre-refactor membership.
         bundle_members = {name: self.adapter.get_component(name) for name in bundle_names}
+        # Subclass hook: attach auxiliary trainable members (e.g. PPO's backbone-critic value
+        # head, plus any side-effect LoRA adapters) into the SAME prepared root so DeepSpeed /
+        # FSDP2 stay single-root (constraint #9). Not added to ``bundle_names``, so they are
+        # reached via ``self.model_bundle(name, ...)`` rather than a RoutedComponentProxy.
+        bundle_members.update(self._extra_bundle_members())
         model_bundle = ModelBundle(bundle_members)
 
         eval_dataloader_names = list(eval_dataloaders.keys())

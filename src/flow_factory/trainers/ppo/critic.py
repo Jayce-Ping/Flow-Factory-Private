@@ -129,24 +129,20 @@ class ValueCritic(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(
-        self,
-        latents: torch.Tensor,
-        timesteps: torch.Tensor,
-        channel_dim: int,
+    def _value_from_tokens(
+        self, tokens: torch.Tensor, timesteps: torch.Tensor
     ) -> torch.Tensor:
-        """Return per-sample scalar values ``(B,)``.
+        """Shared trunk: encode ``(B, seq, C)`` tokens + timesteps to a ``(B,)`` value.
 
         Args:
-            latents: Batched generation latents in any layout.
+            tokens: Per-token features ``(B, seq, C)`` (``C == in_channels``).
             timesteps: ``(B,)`` scheduler timesteps for the state.
-            channel_dim: Index of the latent channel axis (``resolve_latent_axes``).
 
         Returns:
             ``(B,)`` value estimates.
         """
         param_dtype = self.token_proj.weight.dtype
-        tokens = latents_to_tokens(latents, channel_dim).to(param_dtype)  # (B, seq, C)
+        tokens = tokens.to(param_dtype)
 
         hidden = self.token_proj(self.token_norm(tokens))  # (B, seq, hidden)
         for block in self.encoder:
@@ -163,3 +159,57 @@ class ValueCritic(nn.Module):
 
         feat = torch.cat([pooled, time_feat], dim=-1)
         return self.head(feat).squeeze(-1)  # (B,)
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        channel_dim: int,
+    ) -> torch.Tensor:
+        """Return per-sample scalar values ``(B,)``.
+
+        Args:
+            latents: Batched generation latents in any layout.
+            timesteps: ``(B,)`` scheduler timesteps for the state.
+            channel_dim: Index of the latent channel axis (``resolve_latent_axes``).
+
+        Returns:
+            ``(B,)`` value estimates.
+        """
+        tokens = latents_to_tokens(latents, channel_dim)  # (B, seq, C)
+        return self._value_from_tokens(tokens, timesteps)
+
+
+class BackboneValueHead(ValueCritic):
+    """Value head over backbone hidden features for the backbone critic (Scheme B).
+
+    Consumes the policy transformer's per-token hidden features ``(B, seq, D)`` (tapped
+    before the output projection by ``BaseAdapter.extract_backbone_features``) plus a
+    timestep, then regresses a scalar value. It reuses :class:`ValueCritic`'s encoder /
+    attention-pool / head trunk and parameter layout, but skips the latent-to-token fold
+    (its input is already tokenized) and reads the backbone feature width ``D`` as
+    ``in_channels``. Subclassing keeps the standalone :class:`ValueCritic` checkpoint
+    portable (its parameter names are unchanged).
+    """
+
+    def forward(self, features: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """Return per-sample scalar values ``(B,)`` from backbone features.
+
+        Args:
+            features: Backbone hidden features ``(B, seq, D)`` (``D == in_channels``).
+            timesteps: ``(B,)`` scheduler timesteps for the state.
+
+        Returns:
+            ``(B,)`` value estimates.
+        """
+        if features.ndim != 3:
+            raise ValueError(
+                "BackboneValueHead expects (B, seq, D) features, got shape "
+                f"{tuple(features.shape)}."
+            )
+        if features.shape[-1] != self.in_channels:
+            raise ValueError(
+                f"BackboneValueHead feature width ({features.shape[-1]}) != in_channels "
+                f"({self.in_channels})."
+            )
+        return self._value_from_tokens(features, timesteps)

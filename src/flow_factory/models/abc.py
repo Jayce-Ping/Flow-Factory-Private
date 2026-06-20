@@ -112,6 +112,15 @@ class BaseAdapter(ABC):
             "modules_to_save",  # Additional modules marked for saving
         ]
 
+    # Name of the auxiliary backbone-critic PEFT adapter (Scheme B), or None. When set
+    # (via ``apply_critic_lora``), ``get_trainable_parameters()`` excludes this adapter's
+    # params by default so the policy optimizer / EMA / clip never see critic params.
+    _critic_adapter_name: Optional[str] = None
+    # Caches populated by ``apply_critic_lora`` so per-forward adapter switching /
+    # requires_grad restoration is O(LoRA params), not O(all model params). None until set.
+    _peft_components_cache: Optional[List[PeftModel]] = None
+    _lora_param_cache: Optional[List[torch.nn.Parameter]] = None
+
     # Names of ``preprocess_func`` output columns that must be surfaced in the HF
     # "python" format (returned as PIL, never tensorized) instead of the torch
     # format. They are persisted via the HuggingFace ``Image`` feature (PNG bytes)
@@ -1008,6 +1017,226 @@ class BaseAdapter(ABC):
             return {}
 
         return next(iter(results.values())) if len(results) == 1 else results
+
+    # ============================== Backbone Critic (Scheme B) ==============================
+    def _peft_components(self) -> List[PeftModel]:
+        """Return the unwrapped ``PeftModel`` target components (cached; LoRA finetune only)."""
+        if self._peft_components_cache is not None:
+            return self._peft_components_cache
+        out: List[PeftModel] = []
+        for comp_name in self.model_args.target_components:
+            if not hasattr(self, comp_name):
+                continue
+            unwrapped = self._unwrap(self.get_component(comp_name))
+            if hasattr(unwrapped, "_orig_mod"):  # torch.compile
+                unwrapped = unwrapped._orig_mod
+            if isinstance(unwrapped, PeftModel):
+                out.append(unwrapped)
+        return out
+
+    def _set_active_adapter(self, adapter_name: str) -> None:
+        """Activate ``adapter_name`` on every target ``PeftModel`` (controls forward delta)."""
+        for peft_model in self._peft_components():
+            peft_model.set_adapter(adapter_name)
+
+    def _restore_lora_requires_grad(self) -> None:
+        """Re-enable grad on all LoRA params (counter PEFT ``set_adapter`` toggling).
+
+        ``set_adapter`` freezes inactive adapters' params; the backbone critic keeps BOTH
+        the policy and critic LoRA trainable so the DDP reducer sees a stable
+        ``requires_grad`` set and each optimizer steps its own params regardless of which
+        adapter is active for a given forward.
+        """
+        if self._lora_param_cache is not None:
+            for param in self._lora_param_cache:
+                param.requires_grad = True
+            return
+        for peft_model in self._peft_components():
+            for name, param in peft_model.named_parameters():
+                if any(lk in name for lk in self.lora_keys):
+                    param.requires_grad = True
+
+    def apply_critic_lora(
+        self,
+        target_modules: Optional[Union[str, List[str]]] = None,
+        components: Union[str, List[str]] = "transformer",
+        adapter_name: str = "critic",
+        rank: int = 16,
+        alpha: int = 32,
+    ) -> None:
+        """Add a second PEFT LoRA adapter for the backbone critic (Scheme B).
+
+        The policy's ``"default"`` adapter stays active; this attaches an independent
+        ``adapter_name`` adapter on the same base weights so the critic can adapt the
+        shared transformer without disturbing the policy. Both adapters are kept trainable;
+        ``get_trainable_parameters()`` excludes ``adapter_name`` by default (fetch its params
+        with ``get_trainable_parameters(adapter_name=...)``).
+
+        Args:
+            target_modules: LoRA target module patterns. ``None`` reuses
+                ``default_target_modules`` (same set as the policy).
+            components: Component(s) to attach the adapter to (default ``"transformer"``).
+            adapter_name: Name of the critic adapter (default ``"critic"``).
+            rank: LoRA rank.
+            alpha: LoRA alpha.
+
+        Raises:
+            RuntimeError: If a target component is not already a ``PeftModel`` (apply the
+                policy LoRA first) or already has an adapter named ``adapter_name``.
+        """
+        if isinstance(components, str):
+            components = [components]
+        if target_modules is None:
+            target_modules = self.default_target_modules
+        component_modules = self._parse_target_modules(target_modules, components)
+        added = 0
+        for comp in components:
+            modules = component_modules.get(comp)
+            if modules == "default":
+                modules = self.default_target_modules
+            elif not modules:
+                logger.warning(f"No critic LoRA target modules for {comp}, skipping")
+                continue
+
+            peft_model = self._unwrap(self.get_component(comp))
+            if not isinstance(peft_model, PeftModel):
+                raise RuntimeError(
+                    f"apply_critic_lora requires component '{comp}' to already be a "
+                    f"PeftModel (apply the policy LoRA first); got "
+                    f"{type(peft_model).__name__}."
+                )
+            if adapter_name in peft_model.peft_config:
+                raise RuntimeError(
+                    f"Component '{comp}' already has a '{adapter_name}' adapter."
+                )
+            lora_config = LoraConfig(
+                r=rank,
+                lora_alpha=alpha,
+                init_lora_weights="gaussian",
+                target_modules=modules,
+            )
+            peft_model.add_adapter(adapter_name, lora_config)
+            added += 1
+            logger.info(
+                f"Added critic LoRA adapter '{adapter_name}' to {comp} with modules: {modules}"
+            )
+
+        if added == 0:
+            raise RuntimeError(
+                f"apply_critic_lora added no '{adapter_name}' adapter: none of the target "
+                f"components {components} resolved to LoRA modules (target_modules="
+                f"{target_modules}). Set critic_lora_target_modules or check target_components."
+            )
+
+        self._critic_adapter_name = adapter_name
+        # Cache PEFT components + all LoRA params once so per-forward adapter switching /
+        # requires_grad restoration is O(LoRA params), not O(all model params).
+        self._peft_components_cache = self._peft_components()
+        self._lora_param_cache = [
+            param
+            for peft_model in self._peft_components_cache
+            for name, param in peft_model.named_parameters()
+            if any(lk in name for lk in self.lora_keys)
+        ]
+        # Keep the policy adapter active for normal forwards; both LoRA sets stay trainable.
+        self._set_active_adapter("default")
+        self._restore_lora_requires_grad()
+
+    @contextmanager
+    def use_adapter(self, adapter_name: str):
+        """Temporarily activate a PEFT adapter for the enclosed forward(s).
+
+        Switches every target ``PeftModel`` to ``adapter_name`` (only that adapter's delta
+        is applied), then restores the policy ``"default"`` adapter on exit. Re-asserts LoRA
+        ``requires_grad`` on enter and exit so the DDP reducer / dual optimizers see a stable
+        trainable set.
+
+        Args:
+            adapter_name: Adapter to activate for the duration of the context.
+        """
+        self._set_active_adapter(adapter_name)
+        self._restore_lora_requires_grad()
+        try:
+            yield
+        finally:
+            self._set_active_adapter("default")
+            self._restore_lora_requires_grad()
+
+    def get_adapter_lora_state_dict(self, adapter_name: str) -> Dict[str, torch.Tensor]:
+        """CPU state dict of one adapter's LoRA params across target components.
+
+        Keyed by ``"{component}.{param_name}"`` so it round-trips through
+        :meth:`load_adapter_lora_state_dict`. Used to checkpoint the backbone critic adapter.
+
+        Args:
+            adapter_name: PEFT adapter name (e.g. ``"critic"``).
+
+        Returns:
+            Mapping from ``"{component}.{param}"`` to detached CPU tensors.
+        """
+        state: Dict[str, torch.Tensor] = {}
+        for comp_name in self.model_args.target_components:
+            if not hasattr(self, comp_name):
+                continue
+            component = self._unwrap(self.get_component(comp_name))
+            for name, param in component.named_parameters():
+                if f".{adapter_name}." in name and any(lk in name for lk in self.lora_keys):
+                    state[f"{comp_name}.{name}"] = param.detach().cpu().clone()
+        return state
+
+    def load_adapter_lora_state_dict(
+        self, adapter_name: str, state_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        """Load adapter LoRA params saved by :meth:`get_adapter_lora_state_dict` (in place).
+
+        Args:
+            adapter_name: PEFT adapter name (e.g. ``"critic"``).
+            state_dict: Mapping from ``"{component}.{param}"`` to tensors.
+
+        Raises:
+            KeyError: If an expected component-qualified key is missing from ``state_dict``.
+        """
+        for comp_name in self.model_args.target_components:
+            if not hasattr(self, comp_name):
+                continue
+            component = self._unwrap(self.get_component(comp_name))
+            for name, param in component.named_parameters():
+                if f".{adapter_name}." in name and any(lk in name for lk in self.lora_keys):
+                    key = f"{comp_name}.{name}"
+                    if key not in state_dict:
+                        raise KeyError(
+                            f"Missing critic LoRA key '{key}' in checkpoint state dict "
+                            f"(adapter '{adapter_name}')."
+                        )
+                    param.data.copy_(state_dict[key].to(param.device, param.dtype))
+
+    @property
+    def backbone_feature_dim(self) -> int:
+        """Per-token hidden width of the denoising backbone (for the backbone critic).
+
+        Override in adapters that support ``critic_type='backbone'``.
+
+        Raises:
+            NotImplementedError: If the adapter does not implement backbone-critic support.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement backbone_feature_dim; "
+            "critic_type='backbone' is unsupported for this model."
+        )
+
+    def extract_backbone_features(self, *args, **kwargs) -> torch.Tensor:
+        """Run the denoising backbone and return per-token hidden features ``(B, seq, D)``.
+
+        Tapped before the output projection, for the backbone critic's value head. Override
+        in adapters that support ``critic_type='backbone'``.
+
+        Raises:
+            NotImplementedError: If the adapter does not implement backbone-critic support.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement extract_backbone_features; "
+            "critic_type='backbone' is unsupported for this model."
+        )
 
     # ============================== Distributed Utils ==================================
 
@@ -1932,13 +2161,46 @@ class BaseAdapter(ABC):
 
 
     # ============================== Trainable Parameters ==============================
-    def get_trainable_parameters(self) -> List[torch.nn.Parameter]:
-        """Get trainable parameters from all target components."""
+    def get_trainable_parameters(
+        self, adapter_name: Optional[str] = None
+    ) -> List[torch.nn.Parameter]:
+        """Get trainable parameters from all target components.
+
+        Args:
+            adapter_name: If given, return ONLY the LoRA parameters of this PEFT adapter
+                (matched by the ``.{adapter_name}.`` name segment). If ``None`` (default),
+                return every trainable parameter EXCEPT those of the auxiliary
+                backbone-critic adapter (``_critic_adapter_name``), so the policy
+                optimizer / EMA / clip never see critic params.
+
+        Returns:
+            List of trainable ``nn.Parameter`` objects.
+        """
+        critic_name = self._critic_adapter_name
+        # Fast path (the common case: no critic adapter, no filter): iterate ``parameters()``
+        # directly so we never build per-parameter name strings. Only the backbone critic
+        # needs the name-based adapter filter/exclusion below.
+        if adapter_name is None and critic_name is None:
+            params: List[torch.nn.Parameter] = []
+            for comp_name in self.model_args.target_components:
+                if hasattr(self, comp_name):
+                    component = self.get_component(comp_name)
+                    params.extend(p for p in component.parameters() if p.requires_grad)
+            return params
+
         params = []
         for comp_name in self.model_args.target_components:
-            if hasattr(self, comp_name):
-                component = self.get_component(comp_name)
-                params.extend(filter(lambda p: p.requires_grad, component.parameters()))
+            if not hasattr(self, comp_name):
+                continue
+            component = self.get_component(comp_name)
+            for name, param in component.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if adapter_name is not None:
+                    if f".{adapter_name}." in name:
+                        params.append(param)
+                elif f".{critic_name}." not in name:
+                    params.append(param)
         return params
 
     def log_trainable_parameters(self):

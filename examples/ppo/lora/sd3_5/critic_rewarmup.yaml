@@ -81,6 +81,7 @@ train:
   critic_time_embed_dim: 512  # Sinusoidal timestep embedding dim (must be even)
   critic_attn_heads: 8  # Attention-pool heads (must divide critic_hidden_dim)
   critic_num_query_tokens: 1  # Learnable query tokens for attention pooling
+  critic_type: 'standalone'  # Options: standalone, backbone (see examples/ppo/lora/sd3_5/backbone_critic.yaml)
 
   # GAE
   gae_gamma: 1.0  # Discount per SDE step (1.0 fits a terminal-only reward)

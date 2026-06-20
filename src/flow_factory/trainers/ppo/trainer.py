@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import tqdm as tqdm_
+from accelerate.utils import DistributedType
 
 from ...hparams import PPOTrainingArguments
 from ...samples import BaseSample
@@ -38,11 +39,16 @@ from ...utils.dist import reduce_loss_info
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..abc import BaseTrainer
-from .critic import ValueCritic
+from .critic import BackboneValueHead, ValueCritic
 from .gae import compute_gae, whiten
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 logger = setup_logger(__name__)
+
+# Backbone-critic (Scheme B) names: the PEFT adapter on the transformer and the value-head
+# member inside the prepared ``ModelBundle``. Single source so they never drift across sites.
+_CRITIC_ADAPTER = "critic"
+_VALUE_HEAD_MEMBER = "value_head"
 
 
 class PPOTrainer(BaseTrainer):
@@ -65,12 +71,25 @@ class PPOTrainer(BaseTrainer):
 
     # =========================== Initialization ===========================
     def _initialization(self):
-        """Prepare policy (base), then eagerly build + prepare the value critic.
+        """Prepare policy (base), then build + prepare the value critic.
 
-        The critic input channel count ``C`` is resolved up front from
-        ``adapter.compute_actual_latent_shape`` so the critic is fully materialized
-        before ``accelerator.prepare`` (clean DDP wrapping, no lazy first layer).
+        Two critic flavors (``critic_type``):
+          - ``standalone`` (default): a lightweight latent-only ``ValueCritic`` eagerly
+            built from the channel count ``C`` (via ``compute_actual_latent_shape``) and
+            prepared as a second ``accelerator.prepare`` root.
+          - ``backbone`` (Scheme B): a separate ``"critic"`` LoRA adapter on the policy
+            transformer + a ``BackboneValueHead``; the value head is bundled into the SINGLE
+            prepared root (via ``_extra_bundle_members``) and only its optimizer is prepared.
         """
+        ta = self.training_args
+        self._is_backbone_critic = ta.critic_type == "backbone"
+        if self._is_backbone_critic:
+            self._validate_backbone_critic()
+
+        # NOTE: ``super()._initialization()`` calls ``_extra_bundle_members()``, which (for
+        # the backbone critic) adds the "critic" LoRA adapter and the value head BEFORE
+        # ``accelerator.prepare`` -- after the policy optimizer is built, so the policy
+        # optimizer keeps only the "default" adapter params.
         super()._initialization()
 
         # Manual gradient-accumulation counter (0..gas-1). We drive accumulation
@@ -93,7 +112,6 @@ class PPOTrainer(BaseTrainer):
         self.rollout_step = 0
         self._global_log_step = 0
 
-        ta = self.training_args
         num_frames = getattr(ta, "num_frames", None)
         latent_shape = self.adapter.compute_actual_latent_shape(
             height=ta.height, width=ta.width, num_frames=num_frames
@@ -103,30 +121,60 @@ class PPOTrainer(BaseTrainer):
         self.latent_channel_dim = axes.channel
         in_channels = probe.shape[axes.channel]
 
-        self.critic = ValueCritic(
-            in_channels=in_channels,
-            hidden_dim=ta.critic_hidden_dim,
-            num_layers=ta.critic_num_layers,
-            time_embed_dim=ta.critic_time_embed_dim,
-            num_heads=ta.critic_attn_heads,
-            num_query_tokens=ta.critic_num_query_tokens,
-        )
-        self.critic_optimizer = torch.optim.AdamW(
-            self.critic.parameters(),
-            lr=ta.critic_learning_rate,
-            betas=ta.adam_betas,
-            weight_decay=ta.adam_weight_decay,
-            eps=ta.adam_epsilon,
-        )
-        self.critic, self.critic_optimizer = self.accelerator.prepare(
-            self.critic, self.critic_optimizer
-        )
-        if self.accelerator.is_local_main_process:
-            num_params = sum(p.numel() for p in self.critic.parameters())
-            logger.info(
-                f"Initialized PPO value critic: in_channels={in_channels}, "
-                f"hidden_dim={ta.critic_hidden_dim}, params={num_params/1e6:.2f}M"
+        if self._is_backbone_critic:
+            # Value head + critic LoRA already live in the single prepared root (added by
+            # ``_extra_bundle_members``). Only the critic optimizer is prepared here (no
+            # second model root). ``self.critic`` stays None; ``_critic_value`` dispatches.
+            self.critic = None
+            inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
+            self._value_head = inner_bundle.members[_VALUE_HEAD_MEMBER]
+            # Cache once: the critic optimizer and every per-step grad clip share this list.
+            self._critic_param_list = list(
+                self.adapter.get_trainable_parameters(adapter_name=_CRITIC_ADAPTER)
+            ) + list(self._value_head.parameters())
+            self.critic_optimizer = torch.optim.AdamW(
+                self._critic_param_list,
+                lr=ta.critic_learning_rate,
+                betas=ta.adam_betas,
+                weight_decay=ta.adam_weight_decay,
+                eps=ta.adam_epsilon,
             )
+            self.critic_optimizer = self.accelerator.prepare(self.critic_optimizer)
+            if self.accelerator.is_local_main_process:
+                n_head = sum(p.numel() for p in self._value_head.parameters())
+                n_lora = sum(p.numel() for p in self._critic_param_list) - n_head
+                logger.info(
+                    "Initialized PPO backbone critic: "
+                    f"backbone_feature_dim={self.adapter.backbone_feature_dim}, "
+                    f"critic_lora={n_lora/1e6:.2f}M, value_head={n_head/1e6:.2f}M"
+                )
+        else:
+            self._value_head = None
+            self.critic = ValueCritic(
+                in_channels=in_channels,
+                hidden_dim=ta.critic_hidden_dim,
+                num_layers=ta.critic_num_layers,
+                time_embed_dim=ta.critic_time_embed_dim,
+                num_heads=ta.critic_attn_heads,
+                num_query_tokens=ta.critic_num_query_tokens,
+            )
+            self.critic_optimizer = torch.optim.AdamW(
+                self.critic.parameters(),
+                lr=ta.critic_learning_rate,
+                betas=ta.adam_betas,
+                weight_decay=ta.adam_weight_decay,
+                eps=ta.adam_epsilon,
+            )
+            self.critic, self.critic_optimizer = self.accelerator.prepare(
+                self.critic, self.critic_optimizer
+            )
+            self._critic_param_list = list(self.critic.parameters())
+            if self.accelerator.is_local_main_process:
+                num_params = sum(p.numel() for p in self._critic_param_list)
+                logger.info(
+                    f"Initialized PPO value critic: in_channels={in_channels}, "
+                    f"hidden_dim={ta.critic_hidden_dim}, params={num_params/1e6:.2f}M"
+                )
 
         self._validate_per_sample_sde()
         if self.per_sample_sde and self.accelerator.is_local_main_process:
@@ -134,6 +182,105 @@ class PPOTrainer(BaseTrainer):
                 "PPO single-step SDE mode (sde_step_selection='per_sample'): one SDE "
                 "step per sample, exact bandit advantage A = R - V(z_k, t_k)."
             )
+
+    def _validate_backbone_critic(self) -> None:
+        """Fail fast if critic_type='backbone' is requested under an unsupported setup."""
+        finetune_type = self.adapter.model_args.finetune_type
+        if finetune_type != "lora":
+            raise ValueError(
+                "critic_type='backbone' requires finetune_type='lora' (it adds a separate "
+                f"'critic' LoRA adapter), got finetune_type={finetune_type!r}."
+            )
+        dist_type = self.accelerator.distributed_type
+        allowed = (DistributedType.NO, DistributedType.MULTI_GPU)
+        if dist_type not in allowed:
+            raise ValueError(
+                "critic_type='backbone' (v1) supports only DDP / single-GPU (got "
+                f"distributed_type={dist_type}); it prepares a second optimizer over one "
+                "shared root, which DeepSpeed / FSDP2 do not support. Use "
+                "critic_type='standalone' for those backends."
+            )
+
+    def _extra_bundle_members(self) -> Dict[str, torch.nn.Module]:
+        """Backbone critic: add the 'critic' LoRA adapter + value head to the prepared root.
+
+        Runs inside ``BaseTrainer._initialization`` (after the policy optimizer is built,
+        before ``accelerator.prepare``), so the policy optimizer never captures the critic
+        adapter params, and the value head is wrapped in the SAME single root as the
+        transformer (constraint #9). No-op for the standalone critic.
+
+        Returns:
+            Bundle members to merge (``{"value_head": ...}`` for the backbone critic).
+        """
+        members = super()._extra_bundle_members()
+        if not self._is_backbone_critic:
+            return members
+        ta = self.training_args
+        self.adapter.apply_critic_lora(
+            target_modules=ta.critic_lora_target_modules,
+            components="transformer",
+            adapter_name=_CRITIC_ADAPTER,
+            rank=ta.critic_lora_rank,
+            alpha=ta.critic_lora_alpha,
+        )
+        members[_VALUE_HEAD_MEMBER] = BackboneValueHead(
+            in_channels=self.adapter.backbone_feature_dim,
+            hidden_dim=ta.critic_hidden_dim,
+            num_layers=ta.critic_num_layers,
+            time_embed_dim=ta.critic_time_embed_dim,
+            num_heads=ta.critic_attn_heads,
+            num_query_tokens=ta.critic_num_query_tokens,
+        )
+        return members
+
+    # ===================== Critic dispatch (standalone / backbone) =====================
+    def _critic_value(
+        self, latents: torch.Tensor, t: torch.Tensor, batch: Dict[str, Any]
+    ) -> torch.Tensor:
+        """Per-sample value estimate ``(B,)`` for a state, dispatching on ``critic_type``.
+
+        Backbone: activate the ``"critic"`` LoRA adapter, tap backbone features (no CFG),
+        then the value head (routed through the prepared bundle root). Standalone: the
+        latent-only ``ValueCritic``. Must be called inside ``self.autocast()`` by the caller.
+
+        Args:
+            latents: State latents for this transition.
+            t: ``(B,)`` timesteps for the state.
+            batch: Stacked sample batch supplying the backbone conditioning (prompt embeds).
+
+        Returns:
+            ``(B,)`` value estimates.
+        """
+        if not self._is_backbone_critic:
+            return self.critic(latents, t, self.latent_channel_dim)
+        cond = filter_kwargs(self.adapter.extract_backbone_features, **batch)
+        cond.pop("latents", None)
+        cond.pop("t", None)
+        with self.adapter.use_adapter(_CRITIC_ADAPTER):
+            features = self.adapter.extract_backbone_features(latents=latents, t=t, **cond)
+        return self.model_bundle(_VALUE_HEAD_MEMBER, features, t)
+
+    @property
+    def _critic_sync_module(self) -> torch.nn.Module:
+        """Module whose DDP grad-sync the critic backward drives (``no_sync`` target)."""
+        return self.model_bundle if self._is_backbone_critic else self.critic
+
+    def _critic_trainable_params(self) -> List[torch.nn.Parameter]:
+        """Critic params to clip / optimize (cached: critic LoRA + value head, or ValueCritic)."""
+        return self._critic_param_list
+
+    def _set_critic_train(self, mode: bool) -> None:
+        """Set train/eval on the critic-side trainable modules.
+
+        Backbone: toggle BOTH the value head and the shared transformer, so backbone
+        old-value passes run deterministically in eval (matching the standalone critic's
+        eval()). Standalone: just the ValueCritic.
+        """
+        if self._is_backbone_critic:
+            self.adapter.train(mode)
+            self._value_head.train(mode)
+        else:
+            self.critic.train(mode)
 
     @property
     def enable_kl_loss(self) -> bool:
@@ -403,7 +550,7 @@ class PPOTrainer(BaseTrainer):
         sorted_ts = self._sorted_train_timesteps()
         offload = self.training_args.offload_samples_to_cpu
 
-        self.critic.eval()
+        self._set_critic_train(False)
         chunks: List[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, len(samples), per_device_batch_size):
@@ -419,7 +566,7 @@ class PPOTrainer(BaseTrainer):
                     latents = all_latents[:, latent_index_map[timestep_index]]
                     t = timesteps[:, timestep_index]
                     with self.autocast():
-                        value = self.critic(latents, t, self.latent_channel_dim)
+                        value = self._critic_value(latents, t, batch)
                     step_values.append(value.float())
                 chunks.append(torch.stack(step_values, dim=1).cpu())  # (b, S)
                 if offload:
@@ -497,7 +644,7 @@ class PPOTrainer(BaseTrainer):
         per_device_batch_size = self.training_args.per_device_batch_size
         offload = self.training_args.offload_samples_to_cpu
 
-        self.critic.eval()
+        self._set_critic_train(False)
         chunks: List[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, len(samples), per_device_batch_size):
@@ -507,7 +654,7 @@ class PPOTrainer(BaseTrainer):
                 batch = BaseSample.stack(batch_samples)
                 g = self._bandit_gather(batch, device)
                 with self.autocast():
-                    value = self.critic(g["z_k"], g["t_k"], self.latent_channel_dim)
+                    value = self._critic_value(g["z_k"], g["t_k"], batch)
                 chunks.append(value.float().cpu())  # (b,)
                 if offload:
                     for s in batch_samples:
@@ -575,7 +722,7 @@ class PPOTrainer(BaseTrainer):
         for inner_epoch in range(self.training_args.num_inner_epochs):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
             self.adapter.train()
-            self.critic.train()
+            self._set_critic_train(True)
             loss_info = defaultdict(list)
 
             for batch_idx in tqdm(
@@ -611,11 +758,11 @@ class PPOTrainer(BaseTrainer):
                     critic_ctx = (
                         nullcontext()
                         if critic_step_now
-                        else self.accelerator.no_sync(self.critic)
+                        else self.accelerator.no_sync(self._critic_sync_module)
                     )
                     with critic_ctx:
                         with self.autocast():
-                            value = self.critic(latents, t, self.latent_channel_dim)
+                            value = self._critic_value(latents, t, batch)
                         value = value.float()
                         value_loss = self._critic_value_loss(value, returns_t, old_values)
                         self.accelerator.backward(vf_coef * value_loss / ci)
@@ -675,7 +822,7 @@ class PPOTrainer(BaseTrainer):
                 policy_grad_norm = None
                 if critic_step_now:
                     critic_grad_norm = self.accelerator.clip_grad_norm_(
-                        self.critic.parameters(), self.training_args.max_grad_norm
+                        self._critic_trainable_params(), self.training_args.max_grad_norm
                     )
                     self.critic_optimizer.step()
                     self.critic_optimizer.zero_grad()
@@ -731,7 +878,7 @@ class PPOTrainer(BaseTrainer):
         vf_coef = self.training_args.vf_coef
         gas = self.accelerator.gradient_accumulation_steps
 
-        self.critic.train()
+        self._set_critic_train(True)
         self.accelerator.sync_gradients = True
         self.critic_optimizer.zero_grad()
         critic_steps = 0
@@ -759,11 +906,13 @@ class PPOTrainer(BaseTrainer):
                 old_values = batch["bandit_old_value"]
 
                 critic_ctx = (
-                    nullcontext() if boundary else self.accelerator.no_sync(self.critic)
+                    nullcontext()
+                    if boundary
+                    else self.accelerator.no_sync(self._critic_sync_module)
                 )
                 with critic_ctx:
                     with self.autocast():
-                        value = self.critic(g["z_k"], g["t_k"], self.latent_channel_dim)
+                        value = self._critic_value(g["z_k"], g["t_k"], batch)
                     value = value.float()
                     value_loss = self._critic_value_loss(value, returns_t, old_values)
                     self.accelerator.backward(vf_coef * value_loss)
@@ -774,7 +923,7 @@ class PPOTrainer(BaseTrainer):
                 )
                 if boundary:
                     self.accelerator.clip_grad_norm_(
-                        self.critic.parameters(), self.training_args.max_grad_norm
+                        self._critic_trainable_params(), self.training_args.max_grad_norm
                     )
                     self.critic_optimizer.step()
                     self.critic_optimizer.zero_grad()
@@ -852,7 +1001,7 @@ class PPOTrainer(BaseTrainer):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
             self.adapter.train()
-            self.critic.train()
+            self._set_critic_train(True)
             loss_info = defaultdict(list)
 
             for batch_idx in tqdm(
@@ -905,11 +1054,11 @@ class PPOTrainer(BaseTrainer):
                         critic_ctx = (
                             nullcontext()
                             if critic_step_now
-                            else self.accelerator.no_sync(self.critic)
+                            else self.accelerator.no_sync(self._critic_sync_module)
                         )
                         with critic_ctx:
                             with self.autocast():
-                                value = self.critic(latents, t, self.latent_channel_dim)
+                                value = self._critic_value(latents, t, batch)
                             value = value.float()
                             value_loss = self._critic_value_loss(value, returns_t, old_values)
                             # accelerate divides by gas; the extra /ci -> mean over ci*gas.
@@ -983,7 +1132,7 @@ class PPOTrainer(BaseTrainer):
                     policy_grad_norm = None
                     if critic_step_now:
                         critic_grad_norm = self.accelerator.clip_grad_norm_(
-                            self.critic.parameters(), self.training_args.max_grad_norm
+                            self._critic_trainable_params(), self.training_args.max_grad_norm
                         )
                         self.critic_optimizer.step()
                         self.critic_optimizer.zero_grad()
@@ -1107,7 +1256,7 @@ class PPOTrainer(BaseTrainer):
         gas = self.accelerator.gradient_accumulation_steps
         sorted_ts = self._sorted_train_timesteps()
 
-        self.critic.train()
+        self._set_critic_train(True)
         # AcceleratedOptimizer.step()/zero_grad() gate on accelerator.sync_gradients; pin it
         # True here too so bootstrap/burst critic steps fire (see optimize()).
         self.accelerator.sync_gradients = True
@@ -1141,11 +1290,13 @@ class PPOTrainer(BaseTrainer):
                     old_values = batch["step_old_values"][:, step_idx]
 
                     critic_ctx = (
-                        nullcontext() if boundary else self.accelerator.no_sync(self.critic)
+                        nullcontext()
+                        if boundary
+                        else self.accelerator.no_sync(self._critic_sync_module)
                     )
                     with critic_ctx:
                         with self.autocast():
-                            value = self.critic(latents, t, self.latent_channel_dim)
+                            value = self._critic_value(latents, t, batch)
                         value = value.float()
                         value_loss = self._critic_value_loss(value, returns_t, old_values)
                         self.accelerator.backward(vf_coef * value_loss)
@@ -1156,7 +1307,7 @@ class PPOTrainer(BaseTrainer):
                     )
                     if boundary:
                         self.accelerator.clip_grad_norm_(
-                            self.critic.parameters(), self.training_args.max_grad_norm
+                            self._critic_trainable_params(), self.training_args.max_grad_norm
                         )
                         self.critic_optimizer.step()
                         self.critic_optimizer.zero_grad()
@@ -1209,25 +1360,60 @@ class PPOTrainer(BaseTrainer):
 
     # =========================== Checkpoint ===========================
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
-        """Save the policy (via adapter) and the value critic side-by-side."""
+        """Save the policy (via adapter) and the critic side-by-side in ``critic.pt``.
+
+        Standalone: the ``ValueCritic`` state dict. Backbone: ``{"value_head", "critic_lora"}``
+        -- the value head state dict plus the ``"critic"`` LoRA adapter params (the policy
+        ``"default"`` LoRA is saved by the base adapter checkpoint).
+        """
         super().save_checkpoint(save_directory, epoch=epoch)
         if epoch is not None:
             save_directory = os.path.join(save_directory, f"checkpoint-{epoch}")
         if self.accelerator.is_main_process:
             os.makedirs(save_directory, exist_ok=True)
-            critic = self.accelerator.unwrap_model(self.critic)
-            torch.save(critic.state_dict(), os.path.join(save_directory, "critic.pt"))
-            logger.info(f"Saved PPO value critic to {save_directory}/critic.pt")
+            critic_path = os.path.join(save_directory, "critic.pt")
+            if self._is_backbone_critic:
+                payload = {
+                    "value_head": self.accelerator.unwrap_model(self._value_head).state_dict(),
+                    "critic_lora": self.adapter.get_adapter_lora_state_dict(_CRITIC_ADAPTER),
+                }
+                torch.save(payload, critic_path)
+                logger.info(
+                    f"Saved PPO backbone critic (value head + critic LoRA) to {critic_path}"
+                )
+            else:
+                critic = self.accelerator.unwrap_model(self.critic)
+                torch.save(critic.state_dict(), critic_path)
+                logger.info(f"Saved PPO value critic to {critic_path}")
         self.accelerator.wait_for_everyone()
 
     def load_checkpoint(self, path: str, resume_type: Optional[str] = None):
-        """Load the policy (via adapter) and the value critic if present."""
+        """Load the policy (via adapter) and the critic if present."""
         super().load_checkpoint(path, resume_type=resume_type)
         critic_path = os.path.join(path, "critic.pt")
         if os.path.exists(critic_path):
             state_dict = torch.load(critic_path, map_location=self.accelerator.device)
-            self.accelerator.unwrap_model(self.critic).load_state_dict(state_dict)
-            logger.info(f"Loaded PPO value critic from {critic_path}")
+            is_backbone_ckpt = isinstance(state_dict, dict) and "critic_lora" in state_dict
+            if is_backbone_ckpt != self._is_backbone_critic:
+                raise ValueError(
+                    f"critic.pt at {critic_path} is a "
+                    f"{'backbone' if is_backbone_ckpt else 'standalone'} critic checkpoint but "
+                    f"critic_type is '{self.training_args.critic_type}'. Set critic_type to "
+                    "match the checkpoint to resume it."
+                )
+            if self._is_backbone_critic:
+                self.accelerator.unwrap_model(self._value_head).load_state_dict(
+                    state_dict["value_head"]
+                )
+                self.adapter.load_adapter_lora_state_dict(
+                    _CRITIC_ADAPTER, state_dict["critic_lora"]
+                )
+                logger.info(
+                    f"Loaded PPO backbone critic (value head + critic LoRA) from {critic_path}"
+                )
+            else:
+                self.accelerator.unwrap_model(self.critic).load_state_dict(state_dict)
+                logger.info(f"Loaded PPO value critic from {critic_path}")
         else:
             logger.warning(
                 f"No critic checkpoint at {critic_path}; keeping freshly initialized critic."

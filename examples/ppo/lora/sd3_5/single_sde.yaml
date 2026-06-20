@@ -79,6 +79,7 @@ train:
   critic_time_embed_dim: 512  # Sinusoidal timestep embedding dim (must be even)
   critic_attn_heads: 8  # Attention-pool heads (must divide critic_hidden_dim)
   critic_num_query_tokens: 1  # Learnable query tokens for attention pooling
+  critic_type: 'standalone'  # Options: standalone, backbone (see examples/ppo/lora/sd3_5/backbone_critic.yaml)
 
   # GAE (UNUSED in single-SDE mode: the bandit return is exactly R and A = R - V(z_k);
   # kept for schema compatibility / switching back to global full-SDE PPO).
