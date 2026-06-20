@@ -517,6 +517,16 @@ do not have. Our \texttt{ppo\_analysis} already names this ``diffusion-model-as-
 direction as the backbone+value-head critic we evaluated and deferred --- this paper is
 direct evidence the deferred direction pays off.
 
+\paragraph{Status: implemented (core).}
+Flow-Factory now ships this paper's critic as \texttt{critic\_type=backbone\_branches}
+(\texttt{DiTBranchCritic}): per-layer critic-attention branches at \texttt{critic\_tap\_layers}
+(default layers $7/15/23$) with AdaLN timestep modulation, reading the actor backbone's
+intermediate features with no critic LoRA, trained with the unchanged PPO+GAE+value-pretraining
+machinery and the paper preset ($\gamma=\lambda=1$, value-target clip $[-5,5]$, advantage clip
+$[-10,10]$, CFG-free, $40$ SDE steps; \texttt{examples/ppo/lora/sd3\_5/explicit\_critic.yaml}).
+Single-reward, SD3.5M, DDP. The inference-time $\nabla_{\zt}V$ steering and per-reward value
+heads remain deferred.
+
 \paragraph{Implementation in Flow-Factory.}
 Because we are already PPO+GAE, this is the one paper we adopt by \emph{extending}, not
 replacing, the trainer. The GAE code, dual-optimizer scaffolding, value warmup,

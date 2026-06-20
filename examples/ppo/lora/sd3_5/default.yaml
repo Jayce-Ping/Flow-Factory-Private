@@ -94,7 +94,7 @@ train:
 
   # Sampling settings
   resolution: 512  # Can be int or [height, width]
-  num_inference_steps: 10  # Number of timesteps
+  num_inference_steps: 40  # Number of timesteps
   guidance_scale: 1.0  # Guidance scale for sampling (1.0 = CFG-free)
 
   # Batch and sampling
@@ -129,7 +129,7 @@ scheduler:
   # PPO trains on the full *contiguous* SDE trajectory so the GAE per-step bootstrap is exact.
   # sde_steps null -> [0 .. num_inference_steps-2] (the final deterministic step is excluded);
   # num_sde_steps must equal that count so every SDE step is trained and the GAS multiplier matches.
-  num_sde_steps: 9  # = num_inference_steps - 1
+  num_sde_steps: null  # auto -> num_inference_steps - 1 (full SDE trajectory)
   sde_steps: null  # null -> all denoising steps except the last (contiguous from 0)
   seed: 42  # Scheduler seed (for noise step selection)
   sde_step_selection: "global"  # Options: global (shared SDE steps per batch), per_sample (single-step bandit PPO; see examples/ppo/lora/sd3_5/single_sde.yaml)

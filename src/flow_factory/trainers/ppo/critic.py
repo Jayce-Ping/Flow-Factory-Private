@@ -25,9 +25,11 @@ of resolution / frame count and its checkpoint stays portable across resolutions
 from __future__ import annotations
 
 import math
+from typing import List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def latents_to_tokens(latents: torch.Tensor, channel_dim: int) -> torch.Tensor:
@@ -213,3 +215,161 @@ class BackboneValueHead(ValueCritic):
                 f"({self.in_channels})."
             )
         return self._value_from_tokens(features, timesteps)
+
+
+class CriticAttentionBranch(nn.Module):
+    """One critic-attention branch (arXiv:2605.27736, Fig. 10).
+
+    A single learnable query token cross-attends to a transformer layer's image tokens (Q from
+    the query, K/V from the projected tokens) with QK-norm and AdaLN timestep modulation, then
+    an FFN, producing one critic token per sample. The tokens are first projected from the
+    backbone feature width to ``hidden_dim`` to keep the branch lightweight. AdaLN is zero-init
+    so each branch starts as (gated) identity for stable warmup.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+        time_embed_dim: int = 256,
+        ffn_mult: float = 4.0,
+    ):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"critic_hidden_dim ({hidden_dim}) must be divisible by "
+                f"critic_attn_heads ({num_heads})."
+            )
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.token_proj = nn.Linear(in_channels, hidden_dim)
+        self.query = nn.Parameter(torch.randn(1, hidden_dim) * 0.02)
+
+        # AdaLN: temb -> (scale, shift, gate) for the attention block and the FFN block.
+        self.adaln = nn.Sequential(nn.SiLU(), nn.Linear(time_embed_dim, 6 * hidden_dim))
+        nn.init.zeros_(self.adaln[-1].weight)
+        nn.init.zeros_(self.adaln[-1].bias)
+
+        self.q_norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
+        self.kv_norm = nn.RMSNorm(hidden_dim)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.q_qknorm = nn.RMSNorm(self.head_dim)
+        self.k_qknorm = nn.RMSNorm(self.head_dim)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        self.ffn_norm = nn.RMSNorm(hidden_dim, elementwise_affine=False)
+        ffn_hidden = int(hidden_dim * ffn_mult)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_hidden),
+            nn.GELU(),
+            nn.Linear(ffn_hidden, hidden_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor, time_feat: torch.Tensor) -> torch.Tensor:
+        """Aggregate ``(B, seq, in_channels)`` tokens into one critic token ``(B, hidden_dim)``.
+
+        Args:
+            tokens: Backbone image-stream features for this layer ``(B, seq, in_channels)``.
+            time_feat: Shared timestep embedding ``(B, time_embed_dim)`` for AdaLN.
+
+        Returns:
+            Critic token ``(B, hidden_dim)``.
+        """
+        param_dtype = self.token_proj.weight.dtype
+        tokens = self.token_proj(tokens.to(param_dtype))  # (B, seq, hidden)
+        batch_size, seq_len, _ = tokens.shape
+
+        a_scale, a_shift, a_gate, f_scale, f_shift, f_gate = self.adaln(
+            time_feat.to(param_dtype)
+        ).chunk(6, dim=-1)
+
+        query = self.query.unsqueeze(0).expand(batch_size, -1, -1).to(param_dtype)  # (B,1,hidden)
+        q_in = self.q_norm(query) * (1 + a_scale.unsqueeze(1)) + a_shift.unsqueeze(1)
+        kv = self.kv_norm(tokens)
+
+        q = self.q_proj(q_in).view(batch_size, 1, self.num_heads, self.head_dim)
+        k = self.k_proj(kv).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(kv).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        q = self.q_qknorm(q).transpose(1, 2)  # (B, heads, 1, head_dim)
+        k = self.k_qknorm(k).transpose(1, 2)  # (B, heads, seq, head_dim)
+        v = v.transpose(1, 2)
+        attn = F.scaled_dot_product_attention(q, k, v)  # (B, heads, 1, head_dim)
+        attn = attn.transpose(1, 2).reshape(batch_size, 1, self.hidden_dim)
+        attn = self.o_proj(attn)
+
+        x = query + a_gate.unsqueeze(1) * attn
+        ffn_in = self.ffn_norm(x) * (1 + f_scale.unsqueeze(1)) + f_shift.unsqueeze(1)
+        x = x + f_gate.unsqueeze(1) * self.ffn(ffn_in)
+        return x.squeeze(1)  # (B, hidden_dim)
+
+
+class DiTBranchCritic(nn.Module):
+    """State-aligned latent critic (arXiv:2605.27736): per-layer branches -> concat -> scalar.
+
+    Reads the diffusion backbone's intermediate image features at several layers (each
+    ``(B, seq, D)``) plus the timestep, runs one :class:`CriticAttentionBranch` per layer, and
+    maps the concatenated critic tokens to a scalar value ``V(z_t, t)`` via an MLP head. Built
+    eagerly from the backbone feature width ``D`` (``= BaseAdapter.backbone_feature_dim``).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_branches: int,
+        hidden_dim: int = 512,
+        time_embed_dim: int = 256,
+        num_heads: int = 8,
+        ffn_mult: float = 4.0,
+    ):
+        super().__init__()
+        if num_branches < 1:
+            raise ValueError(f"num_branches must be >= 1, got {num_branches}.")
+        self.in_channels = in_channels
+        self.num_branches = num_branches
+        self.time_embed_dim = time_embed_dim
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+        self.branches = nn.ModuleList(
+            CriticAttentionBranch(in_channels, hidden_dim, num_heads, time_embed_dim, ffn_mult)
+            for _ in range(num_branches)
+        )
+        head_in = num_branches * hidden_dim
+        self.head = nn.Sequential(
+            nn.LayerNorm(head_in),
+            nn.Linear(head_in, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, features: List[torch.Tensor], timesteps: torch.Tensor) -> torch.Tensor:
+        """Return per-sample scalar values ``(B,)`` from per-layer backbone features.
+
+        Args:
+            features: One tensor per tap layer, each ``(B, seq, in_channels)`` (order must match
+                the branch order).
+            timesteps: ``(B,)`` scheduler timesteps for the state.
+
+        Returns:
+            ``(B,)`` value estimates.
+        """
+        if len(features) != self.num_branches:
+            raise ValueError(
+                f"DiTBranchCritic expects {self.num_branches} feature tensors (one per tap "
+                f"layer), got {len(features)}."
+            )
+        param_dtype = self.time_mlp[0].weight.dtype
+        time_emb = sinusoidal_time_embedding(timesteps, self.time_embed_dim).to(param_dtype)
+        time_feat = self.time_mlp(time_emb)  # (B, time_embed_dim)
+
+        tokens = [branch(feat, time_feat) for branch, feat in zip(self.branches, features)]
+        x = torch.cat(tokens, dim=-1)  # (B, num_branches * hidden_dim)
+        return self.head(x).squeeze(-1)  # (B,)

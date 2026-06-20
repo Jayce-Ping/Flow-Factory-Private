@@ -1238,6 +1238,40 @@ class BaseAdapter(ABC):
             "critic_type='backbone' is unsupported for this model."
         )
 
+    def capture_block_features(self, layers: List[int]):
+        """Context manager capturing per-layer backbone features during a forward.
+
+        Registers forward hooks on the denoising backbone's blocks at ``layers`` and yields a
+        dict ``{layer_index: hidden_states (B, seq, D)}`` that gets populated when a transformer
+        forward runs inside the context. Used by the ``backbone_branches`` critic to read the
+        actor's intermediate features in the SAME forward as the policy. Override (as a
+        ``@contextmanager``) in adapters that support ``critic_type='backbone_branches'``.
+
+        Args:
+            layers: Backbone block indices to capture.
+
+        Raises:
+            NotImplementedError: If the adapter does not implement backbone-branch support.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement capture_block_features; "
+            "critic_type='backbone_branches' is unsupported for this model."
+        )
+
+    def extract_block_features(self, *args, **kwargs) -> Dict[int, torch.Tensor]:
+        """Run the backbone once (no CFG) and return per-layer features ``{layer: (B, seq, D)}``.
+
+        For the ``backbone_branches`` critic's no-grad old-value / warmup paths (no policy
+        forward to share). Override in adapters that support ``critic_type='backbone_branches'``.
+
+        Raises:
+            NotImplementedError: If the adapter does not implement backbone-branch support.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement extract_block_features; "
+            "critic_type='backbone_branches' is unsupported for this model."
+        )
+
     # ============================== Distributed Utils ==================================
 
     # ------------------------------ Dist Types -----------------------------------------

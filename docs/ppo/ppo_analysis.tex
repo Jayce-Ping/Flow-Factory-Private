@@ -282,6 +282,23 @@ critic training uses periodic re-warmup bursts
 (\texttt{update\_critic\_in\_optimize=false}). It costs $\sim$2x forward (a separate
 critic backbone pass), so it pairs well with per-sample/bandit SDE. Supported for SD3.5.
 
+\paragraph{State-aligned latent critic (\texttt{critic\_type=backbone\_branches}, arXiv:2605.27736).}
+A paper-faithful reproduction of \emph{Explicit Critic Guidance}: the diffusion backbone is
+its own timestep-conditioned value function via \texttt{DiTBranchCritic} --- per-layer
+critic-attention branches at \texttt{critic\_tap\_layers} (default layers $7/15/23$), each a
+learnable query token that cross-attends to that block's image tokens with QK-norm and
+AdaLN timestep modulation, concatenated and mapped to a scalar by an MLP head. The branches
+read the actor backbone's intermediate features (captured by forward hooks via
+\texttt{BaseAdapter.extract\_block\_features} / \texttt{capture\_block\_features}) with
+\emph{no} critic LoRA; the backbone is read no-grad for the critic, so the value loss trains
+only the branch heads (clean actor/critic separation). The critic joins the single
+\texttt{accelerator.prepare} root with its own optimizer. Limits (v1): DDP only and the critic
+and policy step together; works with \texttt{lora} or \texttt{full} policy fine-tuning. Pair
+with the paper preset ($\gamma=\lambda=1$, value-target clip $[-5,5]$, advantage clip
+$[-10,10]$, CFG-free, $40$ SDE steps) in \texttt{examples/ppo/lora/sd3\_5/explicit\_critic.yaml}.
+v1 runs a separate no-grad backbone forward for the critic value (identical detached features);
+sharing the policy's forward is a deferred efficiency optimization.
+
 \subsection{Generalized Advantage Estimation}
 \label{sec:gae}
 

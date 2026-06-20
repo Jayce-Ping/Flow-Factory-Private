@@ -19,6 +19,7 @@ import os
 from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar, Literal
 from dataclasses import dataclass
 from collections import defaultdict
+from contextlib import contextmanager
 
 import torch
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
@@ -529,3 +530,94 @@ class SD3_5Adapter(BaseAdapter):
                 "the transformer's last block produced no output."
             )
         return captured["features"]
+
+    def _validate_tap_layers(self, layers: List[int]) -> None:
+        """Check that ``layers`` are valid SD3.5 ``transformer_blocks`` indices."""
+        num_blocks = len(self._unwrap(self.transformer).transformer_blocks)
+        bad = [layer for layer in layers if not 0 <= layer < num_blocks]
+        if bad:
+            raise ValueError(
+                f"critic_tap_layers {bad} out of range for SD3.5 transformer with "
+                f"{num_blocks} blocks (valid indices 0..{num_blocks - 1})."
+            )
+
+    @contextmanager
+    def capture_block_features(self, layers: List[int]):
+        """Capture image-stream hidden states at ``layers`` during a transformer forward.
+
+        Registers forward hooks on ``transformer_blocks[i]`` for ``i in layers`` (each SD3
+        ``JointTransformerBlock`` returns ``(encoder_hidden_states, hidden_states)``; we keep
+        the image-stream ``hidden_states``) and yields a dict ``{layer: (B, seq, inner_dim)}``
+        populated when a forward runs inside the context. Used by the backbone-branches critic
+        to read the actor's features in the SAME forward as the policy.
+
+        Args:
+            layers: ``transformer_blocks`` indices to capture.
+
+        Yields:
+            Dict mapping each layer index to its captured hidden state.
+        """
+        self._validate_tap_layers(layers)
+        blocks = self._unwrap(self.transformer).transformer_blocks
+        captured: Dict[int, torch.Tensor] = {}
+        handles = []
+
+        def _make_hook(layer_idx: int):
+            def _hook(module, args, output):
+                captured[layer_idx] = output[1] if isinstance(output, (tuple, list)) else output
+
+            return _hook
+
+        for layer in layers:
+            handles.append(blocks[layer].register_forward_hook(_make_hook(layer)))
+        try:
+            yield captured
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def extract_block_features(
+        self,
+        layers: List[int],
+        latents: torch.Tensor,
+        t: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[int, torch.Tensor]:
+        """Run the SD3.5 transformer once (no CFG) and return per-layer features.
+
+        For the backbone-branches critic's no-grad old-value / warmup paths (no policy forward
+        to share). Captures the image-stream hidden state at each requested block.
+
+        Args:
+            layers: ``transformer_blocks`` indices to capture.
+            latents: Current latents ``(B, C, H, W)``.
+            t: Current timestep tensor (scalar or ``(B,)``).
+            prompt_embeds: Text prompt embeddings.
+            pooled_prompt_embeds: Pooled text prompt embeddings.
+            joint_attention_kwargs: Optional attention kwargs.
+
+        Returns:
+            Dict mapping each layer index to ``(B, num_patches, inner_dim)``.
+
+        Raises:
+            RuntimeError: If any requested layer captured no hidden state.
+        """
+        batch_size = latents.shape[0]
+        timestep = t.expand(batch_size).to(latents.dtype)
+        with self.capture_block_features(layers) as captured:
+            self.transformer(
+                hidden_states=latents,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                joint_attention_kwargs=joint_attention_kwargs,
+                return_dict=False,
+            )
+        missing = [layer for layer in layers if layer not in captured]
+        if missing:
+            raise RuntimeError(
+                f"extract_block_features failed to capture SD3.5 layers {missing}."
+            )
+        return captured

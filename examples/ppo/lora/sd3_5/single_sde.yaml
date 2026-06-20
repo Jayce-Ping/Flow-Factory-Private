@@ -93,7 +93,7 @@ train:
 
   # Sampling settings
   resolution: 512  # Can be int or [height, width]
-  num_inference_steps: 10  # Number of timesteps (each sample's single SDE step is drawn from 0..N-2)
+  num_inference_steps: 40  # Number of timesteps (each sample's single SDE step is drawn from 0..N-2)
   guidance_scale: 1.0  # Guidance scale for sampling (1.0 = CFG-free)
 
   # Batch and sampling

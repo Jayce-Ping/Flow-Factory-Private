@@ -61,6 +61,16 @@ class PPOTrainingArguments(TrainingArguments):
             "help": "PPO value-clipping epsilon around old values. None disables value clipping."
         },
     )
+    value_target_clip_range: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Clamp the value-regression TARGETS (GAE returns and old values) to "
+                "[-c, c] before the value loss. None disables it. arXiv:2605.27736 uses 5.0 "
+                "(set value_clip_range=null to use target-clipping alone)."
+            )
+        },
+    )
     critic_warmup_steps: int = field(
         default=30,
         metadata={
@@ -90,19 +100,23 @@ class PPOTrainingArguments(TrainingArguments):
         metadata={"help": "Number of learnable query tokens for the critic's attention pooling."},
     )
 
-    # --- Backbone critic (Scheme B): reuse the policy transformer + a value head ---
-    # With critic_type="backbone" the critic shares the policy transformer's base weights
-    # through a SEPARATE PEFT adapter ("critic") plus a value head on tapped backbone
-    # features (vs the standalone latent-only ValueCritic). LoRA finetune + DDP only. The
-    # value head reuses the critic_* architecture knobs above (hidden_dim / num_layers /
-    # attn_heads / num_query_tokens / time_embed_dim).
-    critic_type: Literal["standalone", "backbone"] = field(
+    # --- Backbone critic: reuse the policy transformer as its own value function ---
+    # 'backbone' (Scheme B): shares the policy transformer's base weights through a SEPARATE
+    #   PEFT adapter ("critic") + a value head on the last block's features (LoRA + DDP only).
+    # 'backbone_branches' (arXiv:2605.27736): state-aligned latent critic -- critic-attention
+    #   branches at `critic_tap_layers` with AdaLN time modulation, reading the actor backbone's
+    #   intermediate features in one shared forward (no critic LoRA; DDP only).
+    # Both reuse the critic_* architecture knobs (hidden_dim / attn_heads / num_query_tokens /
+    #   time_embed_dim) for the value head / branches.
+    critic_type: Literal["standalone", "backbone", "backbone_branches"] = field(
         default="standalone",
         metadata={
             "help": (
                 "Critic architecture. 'standalone': lightweight latent-only value net "
-                "(default). 'backbone': reuse the policy transformer via a separate 'critic' "
-                "LoRA adapter + value head (requires finetune_type='lora' and DDP)."
+                "(default). 'backbone': policy transformer via a separate 'critic' LoRA adapter "
+                "+ value head. 'backbone_branches': paper-faithful critic-attention branches at "
+                "critic_tap_layers with AdaLN, shared backbone single forward (no critic LoRA). "
+                "Both backbone modes require DDP; 'backbone' also requires finetune_type='lora'."
             )
         },
     )
@@ -130,6 +144,15 @@ class PPOTrainingArguments(TrainingArguments):
             "help": (
                 "Target modules for the backbone critic LoRA. None reuses the adapter's "
                 "default_target_modules (same set as the policy)."
+            )
+        },
+    )
+    critic_tap_layers: List[int] = field(
+        default_factory=lambda: [7, 15, 23],
+        metadata={
+            "help": (
+                "Transformer block indices whose features feed the critic-attention branches "
+                "(critic_type='backbone_branches'). Paper default: [7, 15, 23]."
             )
         },
     )
@@ -235,6 +258,13 @@ class PPOTrainingArguments(TrainingArguments):
                 raise ValueError(
                     f"`value_clip_range` must be > 0 or None to disable, got {self.value_clip_range}."
                 )
+        if self.value_target_clip_range is not None:
+            self.value_target_clip_range = float(self.value_target_clip_range)
+            if self.value_target_clip_range <= 0:
+                raise ValueError(
+                    "`value_target_clip_range` must be > 0 or None to disable, got "
+                    f"{self.value_target_clip_range}."
+                )
         if self.kl_type not in ["v-based", "x-based"]:
             raise ValueError(
                 f"Invalid kl_type: {self.kl_type}. Valid options: ['v-based', 'x-based']."
@@ -270,14 +300,24 @@ class PPOTrainingArguments(TrainingArguments):
                 "(critic_warmup_interval > 0); otherwise the critic is never updated after "
                 "the initial bootstrap."
             )
-        if self.critic_type not in ["standalone", "backbone"]:
+        if self.critic_type not in ["standalone", "backbone", "backbone_branches"]:
             raise ValueError(
                 f"Invalid critic_type: {self.critic_type}. Valid options: "
-                "['standalone', 'backbone']."
+                "['standalone', 'backbone', 'backbone_branches']."
             )
+        # Both backbone modes share one DDP root, so the critic and policy step together.
+        # (finetune_type / distributed backend depend on ModelArguments + the live accelerator,
+        # so those are validated in PPOTrainer._initialization.)
+        if self.critic_type in ["backbone", "backbone_branches"]:
+            if self.critic_update_interval != self.policy_update_interval:
+                raise ValueError(
+                    f"critic_type='{self.critic_type}' shares one DDP root, so the critic and "
+                    "policy must step together: require critic_update_interval == "
+                    f"policy_update_interval (got {self.critic_update_interval} != "
+                    f"{self.policy_update_interval}). For asymmetric critic training use "
+                    "update_critic_in_optimize=false with critic_warmup_interval > 0."
+                )
         if self.critic_type == "backbone":
-            # finetune_type / distributed backend depend on ModelArguments + the live
-            # accelerator, so those are validated in PPOTrainer._initialization.
             self.critic_lora_rank = int(self.critic_lora_rank)
             if self.critic_lora_rank < 1:
                 raise ValueError(
@@ -294,13 +334,16 @@ class PPOTrainingArguments(TrainingArguments):
                     f"`critic_lora_alpha` must be >= 1 for critic_type='backbone', got "
                     f"{self.critic_lora_alpha}."
                 )
-            if self.critic_update_interval != self.policy_update_interval:
+        if self.critic_type == "backbone_branches":
+            if not self.critic_tap_layers:
                 raise ValueError(
-                    "critic_type='backbone' shares one DDP root, so the critic and policy "
-                    "must step together: require critic_update_interval == "
-                    f"policy_update_interval (got {self.critic_update_interval} != "
-                    f"{self.policy_update_interval}). For asymmetric critic training use "
-                    "update_critic_in_optimize=false with critic_warmup_interval > 0."
+                    "critic_type='backbone_branches' requires a non-empty critic_tap_layers."
+                )
+            self.critic_tap_layers = [int(layer) for layer in self.critic_tap_layers]
+            if any(layer < 0 for layer in self.critic_tap_layers):
+                raise ValueError(
+                    f"critic_tap_layers must be non-negative block indices, got "
+                    f"{self.critic_tap_layers}."
                 )
 
     def get_num_train_timesteps(self, args: Any) -> int:
