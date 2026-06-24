@@ -49,12 +49,12 @@ train:
   assume_shared_vae_text_encoder: true    # Assume 9B/4B share VAE + text encoder (klein family); false raises (separate pipeline unsupported)
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
-  teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
+  teacher_guidance_scale: 4.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
   student_guidance_scale: 1.0             # Student CFG for forward + rollout; synced into base guidance_scale
 
   # --- L0: velocity-regression warmup (teacher-generated data) ---
   l0_warmup_epochs: 20                    # Run L0 for the first N epochs, then switch to L1 (0 disables L0)
-  l0_num_inference_steps: 28              # Teacher rollout steps when generating z0 targets in L0
+  l0_num_inference_steps: 50              # Teacher rollout steps when generating z0 targets in L0
   l0_inner_steps: 4                       # Random-t regression sub-steps per generated z0 batch; MUST be a multiple of num_train_timesteps (else auto-rounded up + warned). L0 runs l0_inner_steps/num_train_timesteps optimizer steps/epoch; each z0 reused l0_inner_steps times.
   l0_time_sampling: "logit_normal"        # L0 t sampling. Options: logit_normal, uniform
   l0_weighting: "min_snr"                 # L0 loss weight w(t). Options: min_snr, snr, uniform
