@@ -2057,6 +2057,210 @@ class OPDTrainingArguments(TrainingArguments):
         return args.scheduler_args.num_sde_steps
 
 
+@dataclass
+class XOPDTrainingArguments(TrainingArguments):
+    r"""Training arguments for Cross-OPD (XOPD): cross-model distillation.
+
+    Standalone trainer (separate from OPDTrainer / MoF trainers) that distills a
+    larger frozen teacher model into a smaller student that SHARES the VAE, text
+    encoder, and scheduler (e.g. FLUX.2-klein-base-9B -> FLUX.2-klein-base-4B).
+    A single run runs two stages, switching on the outer epoch counter:
+
+    - L0 (epoch < ``l0_warmup_epochs``): velocity regression on
+      teacher-generated data (off-policy warmup).
+    - L1 (epoch >= ``l0_warmup_epochs``): on-policy transition matching
+      (per-step Gaussian KL ``D_k``, optional REINFORCE), reusing the OPD math
+      helpers via :mod:`flow_factory.trainers.xopd.common`.
+
+    Unlike OPD, the teacher is a SEPARATE full transformer (not a LoRA snapshot),
+    swapped in per forward via ``adapter.use_teacher_transformer``.
+
+    Register as trainer_type: 'xopd'.
+    """
+
+    # ---- Cross-model teacher ----
+    teacher_model_name_or_path: str = field(
+        default="",
+        metadata={
+            "help": (
+                "HF repo id or local path of the teacher model. Only its "
+                "`transformer` subfolder is loaded; the student pipeline's VAE / "
+                "text encoder / scheduler are reused (shared latent space)."
+            )
+        },
+    )
+    teacher_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={
+            "help": (
+                "Device for the frozen teacher transformer. 'cuda' keeps it "
+                "on-device for fast forwards; 'cpu' minimizes VRAM at high H2D cost."
+            )
+        },
+    )
+    assume_shared_vae_text_encoder: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Assume teacher and student share the VAE and text encoder "
+                "(klein family). When False, raises -- a separate teacher "
+                "pipeline is not yet supported."
+            )
+        },
+    )
+
+    # ---- Dual classifier-free guidance ----
+    teacher_guidance_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "CFG scale for teacher forwards. >1 runs cond+uncond passes and "
+                "requires negative prompt embeddings to be preprocessed."
+            )
+        },
+    )
+    student_guidance_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "CFG scale for student forwards and rollout. Synced into the base "
+                "`guidance_scale` field so sampling/forward use it."
+            )
+        },
+    )
+
+    # ---- L0: velocity regression warmup (teacher-generated data) ----
+    l0_warmup_epochs: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of outer epochs to run L0 velocity regression before "
+                "switching to L1 on-policy. 0 disables L0 (pure L1)."
+            )
+        },
+    )
+    l0_num_inference_steps: int = field(
+        default=28,
+        metadata={"help": "Teacher rollout steps used to generate z0 targets in L0."},
+    )
+    l0_inner_steps: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "Number of random-t velocity-regression sub-steps per generated "
+                "z0 batch in L0 (also the gradient-accumulation count for L0)."
+            )
+        },
+    )
+    l0_time_sampling: Literal["logit_normal", "uniform"] = field(
+        default="logit_normal",
+        metadata={"help": "Time sampling for L0. Options: 'logit_normal', 'uniform'."},
+    )
+    l0_weighting: Literal["min_snr", "snr", "uniform"] = field(
+        default="min_snr",
+        metadata={"help": "L0 loss weight w(t). Options: 'min_snr', 'snr', 'uniform'."},
+    )
+    l0_snr_gamma: float = field(
+        default=5.0,
+        metadata={"help": "Min-SNR-gamma clamp for l0_weighting='min_snr'."},
+    )
+
+    # ---- L1: on-policy transition matching (semantics mirror OPD) ----
+    pathwise_coef: float = field(
+        default=1.0,
+        metadata={"help": "Coefficient on the per-step Gaussian KL D_k (transition mean matching)."},
+    )
+    reinforce_coef: float = field(
+        default=0.0,
+        metadata={"help": "Coefficient on the REINFORCE trajectory term. 0 disables it (pure pathwise)."},
+    )
+    reinforce_horizon: Optional[int] = field(
+        default=None,
+        metadata={"help": "Max future steps aggregated into R_bar; None = all j > k."},
+    )
+    reinforce_future_reduction: Literal["sum", "mean"] = field(
+        default="mean",
+        metadata={"help": "How to aggregate future D_j into R_bar. Options: 'sum', 'mean'."},
+    )
+    normalize_d_k: bool = field(
+        default=False,
+        metadata={"help": "If True, divide D_k by 2*sigma_bar^2; otherwise plain MSE."},
+    )
+    kl_type: Literal["x-based", "v-based"] = field(
+        default="x-based",
+        metadata={"help": "KL anchor type vs the base model. Options: 'x-based', 'v-based'."},
+    )
+    kl_beta: float = field(
+        default=0.0,
+        metadata={"help": "KL anchor coefficient against the base model; 0 disables."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.teacher_model_name_or_path:
+            raise ValueError(
+                "XOPDTrainingArguments requires `teacher_model_name_or_path`, got "
+                f"teacher_model_name_or_path={self.teacher_model_name_or_path!r}."
+            )
+        if not self.assume_shared_vae_text_encoder:
+            raise ValueError(
+                "XOPD currently requires a shared VAE/text encoder between teacher "
+                "and student (assume_shared_vae_text_encoder=True); a separate "
+                "teacher pipeline is not yet supported."
+            )
+        if self.l0_warmup_epochs < 0:
+            raise ValueError(
+                f"`l0_warmup_epochs` must be >= 0, got l0_warmup_epochs={self.l0_warmup_epochs!r}."
+            )
+        if self.l0_inner_steps < 1:
+            raise ValueError(
+                f"`l0_inner_steps` must be >= 1, got l0_inner_steps={self.l0_inner_steps!r}."
+            )
+        if self.l0_num_inference_steps < 1:
+            raise ValueError(
+                f"`l0_num_inference_steps` must be >= 1, got "
+                f"l0_num_inference_steps={self.l0_num_inference_steps!r}."
+            )
+        if self.l0_snr_gamma <= 0:
+            raise ValueError(f"`l0_snr_gamma` must be > 0, got l0_snr_gamma={self.l0_snr_gamma!r}.")
+        if self.pathwise_coef < 0:
+            raise ValueError(
+                f"`pathwise_coef` must be >= 0, got pathwise_coef={self.pathwise_coef!r}."
+            )
+        if self.reinforce_coef < 0:
+            raise ValueError(
+                f"`reinforce_coef` must be >= 0, got reinforce_coef={self.reinforce_coef!r}."
+            )
+        if self.reinforce_future_reduction not in ("sum", "mean"):
+            raise ValueError(
+                f"`reinforce_future_reduction` must be 'sum' or 'mean', got "
+                f"reinforce_future_reduction={self.reinforce_future_reduction!r}."
+            )
+        if self.kl_beta < 0:
+            raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")
+        if self.kl_type not in ("x-based", "v-based"):
+            raise ValueError(
+                f"Invalid kl_type for XOPD: {self.kl_type!r}; expected 'x-based' or 'v-based'."
+            )
+        # Student guidance drives sampling and the gradient-bearing forward; sync
+        # it into the base `guidance_scale` field consumed by adapter.inference.
+        self.guidance_scale = self.student_guidance_scale
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        # L1 enters accelerator.accumulate() once per training timestep (like OPD),
+        # so GAS is multiplied by T. L0 manages its own accumulation separately.
+        if args.scheduler_args.dynamics_type == "ODE":
+            return self.num_inference_steps
+        return args.scheduler_args.num_sde_steps
+
+    def get_preprocess_guidance_scale(self) -> float:
+        # Encode negative prompts when EITHER teacher or student uses CFG.
+        return max(
+            self.teacher_guidance_scale,
+            self.student_guidance_scale,
+            self.guidance_scale,
+        )
+
 
 @dataclass
 class MoFDistillTrainingArguments(TrainingArguments):
@@ -2704,6 +2908,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "dpo": DPOTrainingArguments,
     "crd": CRDTrainingArguments,
     "opd": OPDTrainingArguments,
+    "xopd": XOPDTrainingArguments,
     "diffusion-opd": DiffusionOPDTrainingArguments,
     "ensemble-eval": EnsembleEvalTrainingArguments,
 }

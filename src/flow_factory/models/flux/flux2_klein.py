@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
 from dataclasses import dataclass
+from contextlib import contextmanager
 from PIL import Image
 from collections import defaultdict
 import numpy as np
@@ -83,6 +84,11 @@ class Flux2KleinAdapter(BaseAdapter):
 
         self._has_warned_inference_fallback = False
         self._has_warned_forward_fallback = False
+
+        # Cross-model distillation (XOPD): a frozen teacher transformer loaded
+        # on demand via `load_teacher_transformer`. Shares the student
+        # pipeline's VAE / text encoder / scheduler. None until loaded.
+        self._teacher_transformer: Optional[torch.nn.Module] = None
 
     def load_pipeline(self) -> Flux2KleinPipeline:
         return Flux2KleinPipeline.from_pretrained(
@@ -799,6 +805,119 @@ class Flux2KleinAdapter(BaseAdapter):
         return samples
 
     # ======================== Forward ========================
+    def _predict_velocity(
+        self,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        text_ids: torch.Tensor,
+        # Optional for I2I
+        image_latents: Optional[torch.Tensor] = None,
+        image_latent_ids: Optional[torch.Tensor] = None,
+        # Optional for CFG
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_text_ids: Optional[torch.Tensor] = None,
+        guidance_scale: float = 4.0,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Transformer velocity prediction at ``(latents, t)`` with optional CFG.
+
+        Runs the conditional pass and, when ``guidance_scale > 1.0`` and
+        ``negative_prompt_embeds`` is given, the unconditional pass, returning
+        the CFG-combined velocity ``neg + s * (cond - neg)``. Uses
+        ``self.transformer`` (the active component), so a teacher transformer
+        swapped in via :meth:`use_teacher_transformer` is honored, and both the
+        ``cache_context`` and the forward call target the same module.
+
+        Unlike :meth:`forward`, this does NOT run the scheduler step, so it does
+        not require ``t_next`` or a timestep on the scheduler grid -- suitable
+        for L0 velocity regression at random continuous ``t``.
+
+        Returns:
+            Predicted velocity ``noise_pred`` of shape ``(B, seq_len, C)``.
+        """
+        batch_size = latents.shape[0]
+        transformer = self.transformer
+
+        if guidance_scale > 1.0 and negative_prompt_embeds is None:
+            logger.warning(
+                "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` provided. Classifier-free guidance will be disabled."
+            )
+        do_classifier_free_guidance = guidance_scale > 1.0 and negative_prompt_embeds is not None
+
+        # 1. Prepare model input (concatenate condition latents for I2I)
+        latent_model_input = latents.to(torch.float32)
+        latent_image_ids = latent_ids
+
+        if image_latents is not None:
+            latent_model_input = torch.cat([latents, image_latents], dim=1).to(torch.float32)
+            latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+
+        # 2. Conditional forward pass
+        with transformer.cache_context("cond"):
+            noise_pred = transformer(
+                hidden_states=latent_model_input,
+                timestep=t.expand(batch_size) / 1000,
+                guidance=None,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                joint_attention_kwargs=joint_attention_kwargs,
+                return_dict=False,
+            )[0]
+
+        # Extract only target latent predictions (exclude condition image part)
+        noise_pred = noise_pred[:, : latents.shape[1]]
+
+        # 3. CFG: unconditional forward pass
+        if do_classifier_free_guidance:
+            with transformer.cache_context("uncond"):
+                neg_noise_pred = transformer(
+                    hidden_states=latent_model_input,
+                    timestep=t.expand(batch_size) / 1000,
+                    guidance=None,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    txt_ids=negative_text_ids,
+                    img_ids=latent_image_ids,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
+
+            neg_noise_pred = neg_noise_pred[:, : latents.shape[1]]
+            noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+
+        return noise_pred
+
+    def predict_velocity(
+        self,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        text_ids: torch.Tensor,
+        image_latents: Optional[torch.Tensor] = None,
+        image_latent_ids: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_text_ids: Optional[torch.Tensor] = None,
+        guidance_scale: float = 4.0,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Public velocity-only forward (no scheduler step). See :meth:`_predict_velocity`."""
+        return self._predict_velocity(
+            t=t,
+            latents=latents,
+            latent_ids=latent_ids,
+            prompt_embeds=prompt_embeds,
+            text_ids=text_ids,
+            image_latents=image_latents,
+            image_latent_ids=image_latent_ids,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
+            guidance_scale=guidance_scale,
+            joint_attention_kwargs=joint_attention_kwargs,
+        )
+
     def _forward(
         self,
         t: torch.Tensor,
@@ -854,54 +973,24 @@ class Flux2KleinAdapter(BaseAdapter):
         Returns:
             SDESchedulerOutput containing requested outputs.
         """
-        batch_size = latents.shape[0]
-
-        if guidance_scale > 1.0 and negative_prompt_embeds is None:
-            logger.warning(
-                "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` provided. Classifier-free guidance will be disabled."
-            )
-        do_classifier_free_guidance = guidance_scale > 1.0 and negative_prompt_embeds is not None
-
-        # 1. Prepare model input (concatenate condition latents for I2I)
-        latent_model_input = latents.to(torch.float32)
-        latent_image_ids = latent_ids
-
-        if image_latents is not None:
-            latent_model_input = torch.cat([latents, image_latents], dim=1).to(torch.float32)
-            latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
-
-        # 2. Conditional forward pass
-        with self.pipeline.transformer.cache_context("cond"):
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=t.expand(batch_size) / 1000,
-                guidance=None,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                joint_attention_kwargs=joint_attention_kwargs,
-                return_dict=False,
-            )[0]
-
-        # Extract only target latent predictions (exclude condition image part)
-        noise_pred = noise_pred[:, : latents.shape[1]]
-
-        # 3. CFG: unconditional forward pass
-        if do_classifier_free_guidance:
-            with self.pipeline.transformer.cache_context("uncond"):
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=t.expand(batch_size) / 1000,
-                    guidance=None,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_image_ids,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
-
-            neg_noise_pred = neg_noise_pred[:, : latents.shape[1]]
-            noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+        # 1-3. Transformer velocity prediction (cond + optional CFG uncond).
+        # Factored into `_predict_velocity` so cross-model teacher distillation
+        # (XOPD) and L0 velocity regression can reuse the exact same CFG
+        # combination without running the scheduler step, and so a teacher
+        # transformer swapped in via `use_teacher_transformer` is honored.
+        noise_pred = self._predict_velocity(
+            t=t,
+            latents=latents,
+            latent_ids=latent_ids,
+            prompt_embeds=prompt_embeds,
+            text_ids=text_ids,
+            image_latents=image_latents,
+            image_latent_ids=image_latent_ids,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
+            guidance_scale=guidance_scale,
+            joint_attention_kwargs=joint_attention_kwargs,
+        )
 
         # 4. Scheduler step
         output = self.scheduler.step(
@@ -1058,3 +1147,83 @@ class Flux2KleinAdapter(BaseAdapter):
                 for k in outputs_dict[0].keys()
             }
         )
+
+    # ======================== Cross-model teacher (XOPD) ========================
+    def load_teacher_transformer(
+        self,
+        teacher_path: str,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.nn.Module:
+        """Load a frozen teacher transformer for cross-model distillation (XOPD).
+
+        Loads ONLY the ``transformer`` subfolder from ``teacher_path`` (e.g. the
+        FLUX.2-klein-base-9B repo) and reuses the student pipeline's VAE / text
+        encoder / scheduler -- this assumes the teacher and student share the
+        same latent space (klein family). The teacher is frozen, set to eval
+        mode, and is NOT wrapped by ``accelerator.prepare`` (inference-only).
+
+        Args:
+            teacher_path: HF repo id or local path with a ``transformer`` subfolder.
+            device: Target device; defaults to the adapter device.
+            dtype: Target dtype; defaults to the student transformer dtype.
+
+        Returns:
+            The loaded teacher transformer module.
+        """
+        if device is None:
+            device = self.device
+        if dtype is None:
+            dtype = self.pipeline.transformer.dtype
+
+        transformer_cls = type(self.pipeline.transformer)
+        teacher = transformer_cls.from_pretrained(
+            teacher_path,
+            subfolder="transformer",
+            torch_dtype=dtype,
+        )
+        teacher.requires_grad_(False)
+        teacher.eval()
+        teacher.to(device)
+        self._teacher_transformer = teacher
+
+        logger.info(
+            f"Loaded teacher transformer from {teacher_path!r} "
+            f"(class={transformer_cls.__name__}, dtype={dtype}, device={device}); "
+            "reusing the student pipeline's VAE / text encoder / scheduler."
+        )
+        return teacher
+
+    @contextmanager
+    def use_teacher_transformer(self):
+        """Temporarily swap the active ``transformer`` component to the teacher.
+
+        Mirrors MoF's DDP-bypass weight-swap pattern, but swaps the WHOLE module
+        (a distinct ``data_ptr``) rather than copying weight ``.data`` into the
+        student, so:
+          - the DDP/ZeRO-wrapped student is bypassed for teacher forwards
+            (intended for ``no_grad`` inference only), and
+          - the autocast cache (keyed by ``data_ptr``) is not a correctness
+            concern; it is disabled here as defensive insurance.
+
+        Raises:
+            RuntimeError: if :meth:`load_teacher_transformer` was not called first.
+        """
+        if self._teacher_transformer is None:
+            raise RuntimeError(
+                "use_teacher_transformer() called before load_teacher_transformer(); "
+                "no teacher transformer is loaded."
+            )
+
+        prev = self._components.get("transformer")
+        prev_cache = torch.is_autocast_cache_enabled()
+        torch.set_autocast_cache_enabled(False)
+        self.set_component("transformer", self._teacher_transformer)
+        try:
+            yield
+        finally:
+            torch.set_autocast_cache_enabled(prev_cache)
+            if prev is not None:
+                self.set_component("transformer", prev)
+            else:
+                self._components.pop("transformer", None)
