@@ -2204,9 +2204,12 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         if not self.assume_shared_vae_text_encoder:
             raise ValueError(
-                "XOPD currently requires a shared VAE/text encoder between teacher "
-                "and student (assume_shared_vae_text_encoder=True); a separate "
-                "teacher pipeline is not yet supported."
+                "XOPD requires a shared VAE between teacher and student "
+                "(assume_shared_vae_text_encoder=True) so teacher velocities live "
+                "in the student's latent space (enforced by the transformer "
+                "in_channels check). The teacher's text encoder may differ and is "
+                "loaded separately for cross-model text conditioning, so a fully "
+                "separate teacher pipeline is still not required."
             )
         if self.l0_warmup_epochs < 0:
             raise ValueError(

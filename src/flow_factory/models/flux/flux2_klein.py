@@ -87,8 +87,15 @@ class Flux2KleinAdapter(BaseAdapter):
 
         # Cross-model distillation (XOPD): a frozen teacher transformer loaded
         # on demand via `load_teacher_transformer`. Shares the student
-        # pipeline's VAE / text encoder / scheduler. None until loaded.
+        # pipeline's VAE / scheduler. None until loaded.
         self._teacher_transformer: Optional[torch.nn.Module] = None
+        # Teacher's OWN Qwen3 text encoder + tokenizer (XOPD cross-model): the
+        # teacher transformer's `joint_attention_dim` differs from the student's
+        # (e.g. 12288 vs 7680), so the teacher needs text embeddings built from
+        # its own encoder -- the prompt is shared, the embedding is not. None
+        # until loaded via `load_teacher_text_encoder`.
+        self._teacher_text_encoder: Optional[torch.nn.Module] = None
+        self._teacher_tokenizer: Optional[Qwen2TokenizerFast] = None
 
     def load_pipeline(self) -> Flux2KleinPipeline:
         return Flux2KleinPipeline.from_pretrained(
@@ -1212,9 +1219,129 @@ class Flux2KleinAdapter(BaseAdapter):
         logger.info(
             f"Loaded teacher transformer from {teacher_path!r} "
             f"(class={transformer_cls.__name__}, dtype={dtype}, device={device}); "
-            "reusing the student pipeline's VAE / text encoder / scheduler."
+            "reusing the student pipeline's VAE / scheduler. The teacher text "
+            "encoder is loaded separately (see load_teacher_text_encoder)."
         )
         return teacher
+
+    def load_teacher_text_encoder(
+        self,
+        teacher_path: str,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.nn.Module:
+        """Load the teacher's own Qwen3 text encoder for cross-model XOPD.
+
+        The teacher (e.g. FLUX.2-klein-base-9B) was trained with a larger Qwen3
+        than the student, so its transformer's ``joint_attention_dim`` differs
+        (3 x hidden_size). The teacher therefore needs text embeddings from its
+        OWN encoder; the prompt is shared, the embedding is not. Loads ONLY the
+        ``text_encoder`` (+ ``tokenizer``) subfolders; frozen, eval, inference-only.
+
+        Args:
+            teacher_path: HF repo id or local path with ``text_encoder`` / ``tokenizer``.
+            device: Target device; defaults to the adapter device.
+            dtype: Target dtype; defaults to the student text encoder's dtype.
+
+        Returns:
+            The loaded teacher text encoder module.
+        """
+        if device is None:
+            device = self.device
+        if dtype is None:
+            dtype = self.pipeline.text_encoder.dtype
+
+        teacher_te = Qwen3ForCausalLM.from_pretrained(
+            teacher_path,
+            subfolder="text_encoder",
+            torch_dtype=dtype,
+        )
+        teacher_te.requires_grad_(False)
+        teacher_te.eval()
+        teacher_te.to(device)
+        self._teacher_text_encoder = teacher_te
+        self._teacher_tokenizer = Qwen2TokenizerFast.from_pretrained(
+            teacher_path,
+            subfolder="tokenizer",
+        )
+
+        logger.info(
+            f"Loaded teacher text encoder from {teacher_path!r} "
+            f"(hidden_size={teacher_te.config.hidden_size}, dtype={dtype}, device={device})."
+        )
+        return teacher_te
+
+    def encode_teacher_prompt(
+        self,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        guidance_scale: float = 1.0,
+        device: Optional[torch.device] = None,
+        max_sequence_length: int = 512,
+        hidden_states_layers: Tuple[int, ...] = (9, 18, 27),
+    ) -> Dict[str, torch.Tensor]:
+        """Encode prompt(s) with the TEACHER's Qwen3 text encoder (XOPD cross-model).
+
+        Mirrors :meth:`encode_prompt` but uses ``self._teacher_text_encoder`` /
+        ``self._teacher_tokenizer`` so the embeddings match the teacher
+        transformer's ``joint_attention_dim``. ``text_ids`` depend only on
+        sequence length, so the student pipeline's ``_prepare_text_ids`` is reused.
+        """
+        if self._teacher_text_encoder is None or self._teacher_tokenizer is None:
+            raise RuntimeError(
+                "encode_teacher_prompt() called before load_teacher_text_encoder(); "
+                "no teacher text encoder is loaded."
+            )
+        device = self._teacher_text_encoder.device if device is None else device
+        do_classifier_free_guidance = guidance_scale > 1.0
+        if prompt is None:
+            prompt = ""
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        prompt_ids, prompt_embeds = self._get_qwen3_prompt_embeds(
+            text_encoder=self._teacher_text_encoder,
+            tokenizer=self._teacher_tokenizer,
+            prompt=prompt,
+            dtype=self._teacher_text_encoder.dtype,
+            device=device,
+            max_sequence_length=max_sequence_length,
+            hidden_states_layers=hidden_states_layers,
+        )
+        text_ids = self.pipeline._prepare_text_ids(prompt_embeds).to(device)
+        results = {
+            "prompt_ids": prompt_ids,
+            "prompt_embeds": prompt_embeds,
+            "text_ids": text_ids,
+        }
+        if do_classifier_free_guidance:
+            negative_prompt = "" if negative_prompt is None else negative_prompt
+            negative_prompt = (
+                [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            )
+            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt))
+            if len(negative_prompt) != len(prompt):
+                raise ValueError(
+                    f"teacher negative_prompt count ({len(negative_prompt)}) must match "
+                    f"prompt count ({len(prompt)})."
+                )
+            negative_prompt_ids, negative_prompt_embeds = self._get_qwen3_prompt_embeds(
+                text_encoder=self._teacher_text_encoder,
+                tokenizer=self._teacher_tokenizer,
+                prompt=negative_prompt,
+                dtype=self._teacher_text_encoder.dtype,
+                device=device,
+                max_sequence_length=max_sequence_length,
+                hidden_states_layers=hidden_states_layers,
+            )
+            negative_text_ids = self.pipeline._prepare_text_ids(negative_prompt_embeds).to(device)
+            results.update(
+                {
+                    "negative_prompt_ids": negative_prompt_ids,
+                    "negative_prompt_embeds": negative_prompt_embeds,
+                    "negative_text_ids": negative_text_ids,
+                }
+            )
+        return results
 
     @contextmanager
     def use_teacher_transformer(self):

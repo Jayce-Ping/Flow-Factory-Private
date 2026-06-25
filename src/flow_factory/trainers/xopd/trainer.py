@@ -123,6 +123,15 @@ class XOPDTrainer(BaseTrainer):
             device=self.accelerator.device,
             dtype=self.adapter._inference_dtype,
         )
+        # Cross-model XOPD: the teacher transformer expects text embeddings from
+        # its own (larger) Qwen3 -- its joint_attention_dim differs from the
+        # student's -- so load the teacher text encoder too. The prompt is shared;
+        # the embedding is encoded per-model (see encode_teacher_prompt).
+        self.adapter.load_teacher_text_encoder(
+            ta.teacher_model_name_or_path,
+            device=self.accelerator.device,
+            dtype=self.adapter._inference_dtype,
+        )
 
         if (
             self.pathwise_coef == 0
@@ -255,6 +264,15 @@ class XOPDTrainer(BaseTrainer):
         ):
             prompt_batch = next(data_iter)
 
+            # XOPD cross-model: the teacher needs text embeddings from its own
+            # Qwen3; the student keeps the precomputed student embeddings from the
+            # dataloader batch. Encode the teacher conditioning once per batch.
+            teacher_text_cond = self.adapter.encode_teacher_prompt(
+                prompt_batch["prompt"],
+                guidance_scale=self.teacher_gs,
+                device=device,
+            )
+
             # 1. Teacher rollout (no_grad, rollout mode) -> clean latent z0.
             self.adapter.rollout()
             infer_kwargs = {
@@ -264,6 +282,17 @@ class XOPDTrainer(BaseTrainer):
                 "num_inference_steps": ta.l0_num_inference_steps,
                 "compute_log_prob": False,
             }
+            # Route teacher-encoded conditioning into the teacher rollout.
+            infer_kwargs["prompt_embeds"] = teacher_text_cond["prompt_embeds"]
+            infer_kwargs["text_ids"] = teacher_text_cond["text_ids"]
+            infer_kwargs["prompt_ids"] = teacher_text_cond["prompt_ids"]
+            if "negative_prompt_embeds" in teacher_text_cond:
+                infer_kwargs["negative_prompt_embeds"] = teacher_text_cond["negative_prompt_embeds"]
+                infer_kwargs["negative_text_ids"] = teacher_text_cond["negative_text_ids"]
+                infer_kwargs["negative_prompt_ids"] = teacher_text_cond["negative_prompt_ids"]
+            else:
+                for _k in ("negative_prompt_embeds", "negative_text_ids", "negative_prompt_ids"):
+                    infer_kwargs.pop(_k, None)
             infer_kwargs = filter_kwargs(self.adapter.inference, **infer_kwargs)
             with torch.no_grad(), self.autocast(), self.adapter.use_teacher_transformer():
                 teacher_samples = self.adapter.inference(**infer_kwargs)
@@ -271,11 +300,20 @@ class XOPDTrainer(BaseTrainer):
             tb = BaseSample.stack([s.to(device) for s in teacher_samples])
             z0 = tb["all_latents"][:, -1]  # (B, seq_len, C) clean latent
             latent_ids = tb["latent_ids"]
-            prompt_embeds = tb["prompt_embeds"]
-            text_ids = tb["text_ids"]
-            negative_prompt_embeds = tb.get("negative_prompt_embeds")
-            negative_text_ids = tb.get("negative_text_ids")
             batch_size = z0.shape[0]
+            # Teacher branch uses teacher embeds; student branch uses student
+            # embeds (from the dataloader batch, same prompt order as z0).
+            teacher_prompt_embeds = teacher_text_cond["prompt_embeds"]
+            teacher_text_ids = teacher_text_cond["text_ids"]
+            teacher_neg_embeds = teacher_text_cond.get("negative_prompt_embeds")
+            teacher_neg_text_ids = teacher_text_cond.get("negative_text_ids")
+            student_prompt_embeds = prompt_batch["prompt_embeds"].to(device)
+            student_text_ids = prompt_batch["text_ids"].to(device)
+            student_neg_embeds = prompt_batch.get("negative_prompt_embeds")
+            student_neg_text_ids = prompt_batch.get("negative_text_ids")
+            if student_neg_embeds is not None:
+                student_neg_embeds = student_neg_embeds.to(device)
+                student_neg_text_ids = student_neg_text_ids.to(device)
 
             # 2. Student velocity regression (train mode) over random continuous t.
             # self.l0_inner_steps is aligned to a multiple of num_train_timesteps so
@@ -295,20 +333,20 @@ class XOPDTrainer(BaseTrainer):
                                 t=t,
                                 latents=z_t,
                                 latent_ids=latent_ids,
-                                prompt_embeds=prompt_embeds,
-                                text_ids=text_ids,
-                                negative_prompt_embeds=negative_prompt_embeds,
-                                negative_text_ids=negative_text_ids,
+                                prompt_embeds=teacher_prompt_embeds,
+                                text_ids=teacher_text_ids,
+                                negative_prompt_embeds=teacher_neg_embeds,
+                                negative_text_ids=teacher_neg_text_ids,
                                 guidance_scale=self.teacher_gs,
                             )
                         v_student = self.adapter.predict_velocity(
                             t=t,
                             latents=z_t,
                             latent_ids=latent_ids,
-                            prompt_embeds=prompt_embeds,
-                            text_ids=text_ids,
-                            negative_prompt_embeds=negative_prompt_embeds,
-                            negative_text_ids=negative_text_ids,
+                            prompt_embeds=student_prompt_embeds,
+                            text_ids=student_text_ids,
+                            negative_prompt_embeds=student_neg_embeds,
+                            negative_text_ids=student_neg_text_ids,
                             guidance_scale=self.student_gs,
                         )
 
@@ -487,10 +525,31 @@ class XOPDTrainer(BaseTrainer):
             forward_kwargs["guidance_scale"] = guidance_scale
         return forward_kwargs
 
-    def _teacher_next_latents_mean(self, forward_kwargs: Dict[str, Any]) -> torch.Tensor:
-        """Teacher transition mean via a whole-module transformer swap (no_grad)."""
+    def _teacher_next_latents_mean(
+        self,
+        forward_kwargs: Dict[str, Any],
+        teacher_text_cond: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Teacher transition mean via a whole-module transformer swap (no_grad).
+
+        For cross-model XOPD, ``teacher_text_cond`` (from ``encode_teacher_prompt``)
+        replaces the student-encoded text conditioning so the teacher transformer
+        receives embeddings of its own ``joint_attention_dim``.
+        """
         teacher_kwargs = dict(forward_kwargs)
         teacher_kwargs["guidance_scale"] = self.teacher_gs
+        if teacher_text_cond is not None:
+            teacher_kwargs["prompt_embeds"] = teacher_text_cond["prompt_embeds"]
+            teacher_kwargs["text_ids"] = teacher_text_cond["text_ids"]
+            if "negative_prompt_embeds" in teacher_text_cond:
+                teacher_kwargs["negative_prompt_embeds"] = teacher_text_cond[
+                    "negative_prompt_embeds"
+                ]
+                teacher_kwargs["negative_text_ids"] = teacher_text_cond["negative_text_ids"]
+            else:
+                # teacher_gs == 1.0: no CFG; drop any student-dim negatives.
+                teacher_kwargs.pop("negative_prompt_embeds", None)
+                teacher_kwargs.pop("negative_text_ids", None)
         with self.adapter.use_teacher_transformer():
             out = self.adapter.forward(**teacher_kwargs)
         if out.next_latents_mean is None:
@@ -512,6 +571,13 @@ class XOPDTrainer(BaseTrainer):
         device = self.accelerator.device
 
         with torch.no_grad(), self.autocast():
+            # XOPD cross-model: encode the teacher's own text embeddings once
+            # (prompt is constant across timesteps) and reuse for every step.
+            teacher_text_cond = self.adapter.encode_teacher_prompt(
+                batch["prompt"],
+                guidance_scale=self.teacher_gs,
+                device=device,
+            )
             for timestep_index in self._train_timestep_indices:
                 t = batch["timesteps"][:, timestep_index]
                 t_next = (
@@ -540,7 +606,9 @@ class XOPDTrainer(BaseTrainer):
                         f"pre-pass; requested return_kwargs={_TEACHER_RETURN_KWARGS!r}."
                     )
 
-                mu_teacher = self._teacher_next_latents_mean(forward_kwargs)
+                mu_teacher = self._teacher_next_latents_mean(
+                    forward_kwargs, teacher_text_cond
+                )
 
                 d_k = compute_per_step_kl(
                     mu_student=student_out.next_latents_mean,
