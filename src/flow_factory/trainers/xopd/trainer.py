@@ -385,7 +385,11 @@ class XOPDTrainer(BaseTrainer):
                 batch = next(data_iter)
                 sample_kwargs = {
                     **self.training_args,
-                    "compute_log_prob": True,
+                    # ODE rollouts (noise_level=0) collect no per-step log-probs
+                    # (flux2_klein._inference gates collection on noise_level>0), and log-probs
+                    # feed only the SDE-only REINFORCE term. Requesting them under ODE would
+                    # stack an empty list; skip them.
+                    "compute_log_prob": not self._is_ode,
                     "trajectory_indices": trajectory_indices,
                     **batch,
                 }
@@ -588,7 +592,8 @@ class XOPDTrainer(BaseTrainer):
                         t_next=t_next,
                         latents=latents,
                         next_latents=next_latents,
-                        compute_log_prob=True,
+                        # See sample(): no log-probs under ODE (unused without REINFORCE).
+                        compute_log_prob=not self._is_ode,
                         return_kwargs=self._student_return_kwargs_for_train(),
                         guidance_scale=self.student_gs,
                     )
