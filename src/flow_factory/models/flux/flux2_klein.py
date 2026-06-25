@@ -825,10 +825,11 @@ class Flux2KleinAdapter(BaseAdapter):
 
         Runs the conditional pass and, when ``guidance_scale > 1.0`` and
         ``negative_prompt_embeds`` is given, the unconditional pass, returning
-        the CFG-combined velocity ``neg + s * (cond - neg)``. Uses
-        ``self.transformer`` (the active component), so a teacher transformer
-        swapped in via :meth:`use_teacher_transformer` is honored, and both the
-        ``cache_context`` and the forward call target the same module.
+        the CFG-combined velocity ``neg + s * (cond - neg)``. The forward runs on
+        ``self.transformer`` (the active component -- the DeepSpeed/DDP-wrapped
+        student for grad sync, or the teacher when swapped in via
+        :meth:`use_teacher_transformer`), while ``cache_context`` (a diffusers
+        module method not forwarded by wrappers) runs on the unwrapped module.
 
         Unlike :meth:`forward`, this does NOT run the scheduler step, so it does
         not require ``t_next`` or a timestep on the scheduler grid -- suitable
@@ -839,6 +840,14 @@ class Flux2KleinAdapter(BaseAdapter):
         """
         batch_size = latents.shape[0]
         transformer = self.transformer
+        # `cache_context` is a diffusers-module method; `self.transformer` may be a
+        # DeepSpeed/DDP wrapper that does NOT forward it (raises AttributeError).
+        # Run the forward on the wrapper (gradient sync for the student; the
+        # teacher module when swapped in via `use_teacher_transformer`), but enter
+        # the cache context on the unwrapped underlying module. For the student
+        # `engine.module is self.pipeline.transformer`, so caching and the forward
+        # hit the same instance; for the swapped teacher both are the teacher.
+        cache_module = self._unwrap(transformer)
 
         if guidance_scale > 1.0 and negative_prompt_embeds is None:
             logger.warning(
@@ -855,7 +864,7 @@ class Flux2KleinAdapter(BaseAdapter):
             latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
         # 2. Conditional forward pass
-        with transformer.cache_context("cond"):
+        with cache_module.cache_context("cond"):
             noise_pred = transformer(
                 hidden_states=latent_model_input,
                 timestep=t.expand(batch_size) / 1000,
@@ -872,7 +881,7 @@ class Flux2KleinAdapter(BaseAdapter):
 
         # 3. CFG: unconditional forward pass
         if do_classifier_free_guidance:
-            with transformer.cache_context("uncond"):
+            with cache_module.cache_context("uncond"):
                 neg_noise_pred = transformer(
                     hidden_states=latent_model_input,
                     timestep=t.expand(batch_size) / 1000,
@@ -1182,6 +1191,19 @@ class Flux2KleinAdapter(BaseAdapter):
             subfolder="transformer",
             torch_dtype=dtype,
         )
+
+        # Shared-latent-space invariant: teacher velocities are consumed in the
+        # student's latent space (the student VAE is reused), so the two
+        # transformers must agree on latent channels. Fail fast otherwise.
+        student_in_channels = self.pipeline.transformer.config.in_channels
+        teacher_in_channels = teacher.config.in_channels
+        if teacher_in_channels != student_in_channels:
+            raise ValueError(
+                f"XOPD teacher transformer in_channels ({teacher_in_channels}) does not match "
+                f"the student ({student_in_channels}); the shared-latent-space assumption is "
+                f"violated. Teacher path: {teacher_path!r}."
+            )
+
         teacher.requires_grad_(False)
         teacher.eval()
         teacher.to(device)

@@ -34,9 +34,13 @@ Adapter additions in [`models/flux/flux2_klein.py`](../../src/flow_factory/model
   DDP/ZeRO for `no_grad` inference. Mirrors MoF's DDP-bypass pattern; the
   autocast cache is disabled inside as defensive insurance.
 - `_predict_velocity` / `predict_velocity` — the CFG-combined velocity prediction
-  factored out of `_forward` (no scheduler step). `_forward` now binds
-  `transformer = self.transformer` once so `cache_context` and the call target
-  the same module (correct under a teacher swap).
+  factored out of `_forward` (no scheduler step). The transformer **forward** runs
+  on `self.transformer` (the DeepSpeed/DDP-wrapped student for gradient sync, or
+  the teacher when swapped), while `cache_context` runs on the **unwrapped** module
+  (`self._unwrap(self.transformer)`). This matters because `cache_context` is a
+  diffusers-module method that DeepSpeed/DDP wrappers do not forward — calling it
+  on the wrapper raises `AttributeError`. `load_teacher_transformer` also asserts
+  the teacher and student share `in_channels` (shared latent space).
 
 Because teacher and student **share the text encoder**, preprocessed
 `prompt_embeds` / `text_ids` are reused for both — no re-encoding.
@@ -121,3 +125,10 @@ ODE timestep-subset selection is a future extension (everything routes through o
 ```bash
 ff-train xopd_configs/flux2_klein_9b_to_4b.yaml
 ```
+
+**Storage / HF cache (avoid network-FS lock failures):** put the HuggingFace
+datasets cache on local disk, not a shared network filesystem (CephFS/NFS).
+Multi-rank runs contend on `*_builder.lock` under the datasets cache, and an
+unstable FUSE mount surfaces as `OSError: [Errno 107] Transport endpoint is not
+connected` during `_init_dataloader`. Set e.g. `HF_DATASETS_CACHE=/root/.cache/huggingface/datasets`
+(local) in the launch env, and reschedule to a healthy node if a mount has died.
