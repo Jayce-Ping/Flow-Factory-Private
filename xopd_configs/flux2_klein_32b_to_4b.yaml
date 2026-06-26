@@ -138,3 +138,9 @@ rewards:
     device: "cuda"                        # Device
     dtype: float32                        # GenEval forces fp32 internally (autocast off + model.float()); this is a placeholder
     async_reward: false                   # Compute reward synchronously
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
