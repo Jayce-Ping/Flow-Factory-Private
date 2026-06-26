@@ -124,14 +124,12 @@ class XOPDTrainer(BaseTrainer):
             dtype=self.adapter._inference_dtype,
         )
         # Cross-model XOPD: the teacher transformer expects text embeddings from
-        # its own (larger) Qwen3 -- its joint_attention_dim differs from the
-        # student's -- so load the teacher text encoder too. The prompt is shared;
-        # the embedding is encoded per-model (see encode_teacher_prompt).
-        self.adapter.load_teacher_text_encoder(
-            ta.teacher_model_name_or_path,
-            device=self.accelerator.device,
-            dtype=self.adapter._inference_dtype,
-        )
+        # its OWN encoder (its joint_attention_dim differs from the student's).
+        # Those teacher embeddings are PRECOMPUTED during preprocessing and cached
+        # (Flux2KleinAdapter.preprocess_func); the teacher text encoder is loaded
+        # only for that offline pass and freed afterwards (see _init_dataloader),
+        # so it never stays resident during training. This is what makes large
+        # teachers viable (e.g. FLUX.2-dev's 48 GB Mistral3 text encoder).
 
         if (
             self.pathwise_coef == 0
@@ -183,6 +181,36 @@ class XOPDTrainer(BaseTrainer):
                 f"(GAS={ta.gradient_accumulation_steps}, num_batches={ta.num_batches_per_epoch}, "
                 f"T={self.num_train_timesteps})."
             )
+
+    # ============================ Dataloader / preprocess =====================
+    def _init_dataloader(self):
+        """Load the teacher text encoder only for offline preprocessing, then free it.
+
+        XOPD precomputes the teacher's text embeddings during preprocessing so the
+        (potentially very large, e.g. 48 GB for FLUX.2-dev) teacher text encoder is
+        never resident during training. The teacher text encoder is loaded right
+        before the base preprocessing pass (which runs ``adapter.preprocess_func``
+        over the train split) and unloaded immediately after, regardless of
+        outcome. Runs inside ``super().__init__()`` (before the teacher transformer
+        is loaded), so peak preprocessing memory is teacher TE + student TE + VAE.
+        """
+        ta = self.training_args
+        if not self.config.data_args.enable_preprocess:
+            raise ValueError(
+                "XOPD requires data.enable_preprocess=True: the teacher text "
+                "embeddings are precomputed during preprocessing and cached so the "
+                "(large) teacher text encoder can be offloaded before training. "
+                "Got enable_preprocess=False."
+            )
+        self.adapter.load_teacher_text_encoder(
+            ta.teacher_model_name_or_path,
+            device=self.accelerator.device,
+            dtype=self.adapter._inference_dtype,
+        )
+        try:
+            return super()._init_dataloader()
+        finally:
+            self.adapter.unload_teacher_text_encoder()
 
     # =============================== Properties ===============================
     @property
@@ -264,14 +292,17 @@ class XOPDTrainer(BaseTrainer):
         ):
             prompt_batch = next(data_iter)
 
-            # XOPD cross-model: the teacher needs text embeddings from its own
-            # Qwen3; the student keeps the precomputed student embeddings from the
-            # dataloader batch. Encode the teacher conditioning once per batch.
-            teacher_text_cond = self.adapter.encode_teacher_prompt(
-                prompt_batch["prompt"],
-                guidance_scale=self.teacher_gs,
-                device=device,
-            )
+            # XOPD cross-model: the teacher's own text embeddings are precomputed
+            # offline and cached in the batch (teacher_* columns); the student
+            # keeps its own precomputed embeddings. No teacher text encoder is
+            # resident -- read both directly from the dataloader batch.
+            teacher_prompt_embeds = prompt_batch["teacher_prompt_embeds"].to(device)
+            teacher_text_ids = prompt_batch["teacher_text_ids"].to(device)
+            teacher_neg_embeds = prompt_batch.get("teacher_negative_prompt_embeds")
+            teacher_neg_text_ids = prompt_batch.get("teacher_negative_text_ids")
+            if teacher_neg_embeds is not None:
+                teacher_neg_embeds = teacher_neg_embeds.to(device)
+                teacher_neg_text_ids = teacher_neg_text_ids.to(device)
 
             # 1. Teacher rollout (no_grad, rollout mode) -> clean latent z0.
             self.adapter.rollout()
@@ -282,14 +313,15 @@ class XOPDTrainer(BaseTrainer):
                 "num_inference_steps": ta.l0_num_inference_steps,
                 "compute_log_prob": False,
             }
-            # Route teacher-encoded conditioning into the teacher rollout.
-            infer_kwargs["prompt_embeds"] = teacher_text_cond["prompt_embeds"]
-            infer_kwargs["text_ids"] = teacher_text_cond["text_ids"]
-            infer_kwargs["prompt_ids"] = teacher_text_cond["prompt_ids"]
-            if "negative_prompt_embeds" in teacher_text_cond:
-                infer_kwargs["negative_prompt_embeds"] = teacher_text_cond["negative_prompt_embeds"]
-                infer_kwargs["negative_text_ids"] = teacher_text_cond["negative_text_ids"]
-                infer_kwargs["negative_prompt_ids"] = teacher_text_cond["negative_prompt_ids"]
+            # Route the cached teacher conditioning into the teacher rollout
+            # (override the student embeds; teacher embeds carry no prompt_ids).
+            infer_kwargs["prompt_embeds"] = teacher_prompt_embeds
+            infer_kwargs["text_ids"] = teacher_text_ids
+            infer_kwargs.pop("prompt_ids", None)
+            if teacher_neg_embeds is not None:
+                infer_kwargs["negative_prompt_embeds"] = teacher_neg_embeds
+                infer_kwargs["negative_text_ids"] = teacher_neg_text_ids
+                infer_kwargs.pop("negative_prompt_ids", None)
             else:
                 for _k in ("negative_prompt_embeds", "negative_text_ids", "negative_prompt_ids"):
                     infer_kwargs.pop(_k, None)
@@ -301,12 +333,8 @@ class XOPDTrainer(BaseTrainer):
             z0 = tb["all_latents"][:, -1]  # (B, seq_len, C) clean latent
             latent_ids = tb["latent_ids"]
             batch_size = z0.shape[0]
-            # Teacher branch uses teacher embeds; student branch uses student
-            # embeds (from the dataloader batch, same prompt order as z0).
-            teacher_prompt_embeds = teacher_text_cond["prompt_embeds"]
-            teacher_text_ids = teacher_text_cond["text_ids"]
-            teacher_neg_embeds = teacher_text_cond.get("negative_prompt_embeds")
-            teacher_neg_text_ids = teacher_text_cond.get("negative_text_ids")
+            # Student branch uses student embeds (from the dataloader batch, same
+            # prompt order as z0).
             student_prompt_embeds = prompt_batch["prompt_embeds"].to(device)
             student_text_ids = prompt_batch["text_ids"].to(device)
             student_neg_embeds = prompt_batch.get("negative_prompt_embeds")
@@ -571,13 +599,19 @@ class XOPDTrainer(BaseTrainer):
         device = self.accelerator.device
 
         with torch.no_grad(), self.autocast():
-            # XOPD cross-model: encode the teacher's own text embeddings once
-            # (prompt is constant across timesteps) and reuse for every step.
-            teacher_text_cond = self.adapter.encode_teacher_prompt(
-                batch["prompt"],
-                guidance_scale=self.teacher_gs,
-                device=device,
-            )
+            # XOPD cross-model: the teacher's own text embeddings are precomputed
+            # offline and carried on the rollout samples (teacher_* fields), so the
+            # stacked batch already holds them (constant across timesteps); no
+            # teacher text encoder is resident.
+            teacher_text_cond = {
+                "prompt_embeds": batch["teacher_prompt_embeds"],
+                "text_ids": batch["teacher_text_ids"],
+            }
+            if self.teacher_gs > 1.0:
+                teacher_text_cond["negative_prompt_embeds"] = batch[
+                    "teacher_negative_prompt_embeds"
+                ]
+                teacher_text_cond["negative_text_ids"] = batch["teacher_negative_text_ids"]
             for timestep_index in self._train_timestep_indices:
                 t = batch["timesteps"][:, timestep_index]
                 t_next = (

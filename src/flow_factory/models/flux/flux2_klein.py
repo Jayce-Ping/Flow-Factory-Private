@@ -25,6 +25,7 @@ import numpy as np
 from accelerate import Accelerator
 import torch
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
+from diffusers import DiffusionPipeline
 from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline, compute_empirical_mu
 import logging
 
@@ -71,6 +72,13 @@ class Flux2KleinSample(I2ISample):
     negative_text_ids: Optional[torch.Tensor] = None
     image_latents: Optional[torch.Tensor] = None
     image_latent_ids: Optional[torch.Tensor] = None
+    # Teacher-encoded prompt (XOPD cross-model): precomputed offline by the
+    # teacher's OWN text encoder and carried through the student rollout so the
+    # L1 teacher pre-pass can consume it without a resident teacher text encoder.
+    teacher_prompt_embeds: Optional[torch.Tensor] = None
+    teacher_text_ids: Optional[torch.Tensor] = None
+    teacher_negative_prompt_embeds: Optional[torch.Tensor] = None
+    teacher_negative_text_ids: Optional[torch.Tensor] = None
 
 
 CONDITION_IMAGE_SIZE = (1024, 1024)
@@ -89,13 +97,15 @@ class Flux2KleinAdapter(BaseAdapter):
         # on demand via `load_teacher_transformer`. Shares the student
         # pipeline's VAE / scheduler. None until loaded.
         self._teacher_transformer: Optional[torch.nn.Module] = None
-        # Teacher's OWN Qwen3 text encoder + tokenizer (XOPD cross-model): the
-        # teacher transformer's `joint_attention_dim` differs from the student's
-        # (e.g. 12288 vs 7680), so the teacher needs text embeddings built from
-        # its own encoder -- the prompt is shared, the embedding is not. None
-        # until loaded via `load_teacher_text_encoder`.
-        self._teacher_text_encoder: Optional[torch.nn.Module] = None
-        self._teacher_tokenizer: Optional[Qwen2TokenizerFast] = None
+        # Teacher's OWN text encoder (XOPD cross-model), held as a text-only
+        # diffusers pipeline so encoding stays architecture-agnostic: the teacher
+        # transformer's `joint_attention_dim` differs from the student's (e.g.
+        # 12288 for the 9B Qwen3 teacher, 15360 for the FLUX.2-dev Mistral3
+        # teacher), so the teacher needs text embeddings built by its OWN encoder
+        # -- the prompt is shared, the embedding is not. Loaded with transformer
+        # and VAE skipped (text components only) for offline preprocessing, then
+        # freed via `unload_teacher_text_encoder`. None until loaded.
+        self._teacher_pipeline: Optional[DiffusionPipeline] = None
 
     def load_pipeline(self) -> Flux2KleinPipeline:
         return Flux2KleinPipeline.from_pretrained(
@@ -301,6 +311,66 @@ class Flux2KleinAdapter(BaseAdapter):
             "image_latent_ids": image_latent_ids_list,  # List[torch.Tensor (seq_len, 3)]
         }
 
+    # ======================== Preprocessing ========================
+    def preprocess_func(
+        self,
+        prompt: List[str],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        guidance_scale: float = 4.0,
+        teacher_guidance_scale: float = 1.0,
+        images: Optional[MultiImageBatch] = None,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        max_sequence_length: int = 512,
+        hidden_states_layers: Tuple[int, ...] = (9, 18, 27),
+        is_train: bool = True,
+        generator: Optional[torch.Generator] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Union[List[Any], torch.Tensor]]:
+        """Offline preprocessing for cross-model XOPD: student + teacher text embeds.
+
+        Encodes the prompt with BOTH the student text encoder (``encode_prompt``)
+        and, when a teacher text encoder is loaded for a train split, the teacher's
+        own text encoder (``encode_teacher_prompt``), caching the teacher
+        embeddings under ``teacher_*`` keys so the (large) teacher text encoder can
+        be offloaded before training (see ``load_teacher_text_encoder`` /
+        ``unload_teacher_text_encoder``).
+
+        ``teacher_guidance_scale`` is an explicit (cache-relevant) parameter so the
+        teacher CFG negatives are re-encoded if it changes. Teacher embeddings are
+        only computed for the train split (``is_train=True``); eval generates with
+        the student and never consumes teacher conditioning. Falls back to
+        student-only encoding when no teacher text encoder is loaded.
+        """
+        batch = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            device=device,
+            max_sequence_length=max_sequence_length,
+            hidden_states_layers=hidden_states_layers,
+        )
+
+        if is_train and self._teacher_pipeline is not None:
+            teacher = self.encode_teacher_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                guidance_scale=teacher_guidance_scale,
+                device=device,
+                max_sequence_length=max_sequence_length,
+            )
+            batch.update({f"teacher_{k}": v for k, v in teacher.items()})
+
+        if images is not None:
+            image_dict = self.encode_image(
+                images=images,
+                condition_image_size=condition_image_size,
+                device=device,
+                generator=generator,
+            )
+            batch.update(image_dict)
+
+        return batch
+
     @staticmethod
     def _is_multi_images_batch(images: Union[ImageBatch, MultiImageBatch]):
         return images is not None and is_multi_image_batch(images)
@@ -431,6 +501,12 @@ class Flux2KleinAdapter(BaseAdapter):
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_text_ids: Optional[torch.Tensor] = None,
+        # Teacher-encoded prompt (XOPD cross-model; carried through to samples,
+        # not used in the student denoising loop)
+        teacher_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_text_ids: Optional[torch.Tensor] = None,
+        teacher_negative_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_negative_text_ids: Optional[torch.Tensor] = None,
         # Image encoding arguments
         condition_images: Optional[
             MultiImageBatch
@@ -455,13 +531,13 @@ class Flux2KleinAdapter(BaseAdapter):
         if isinstance(prompt, str):
             prompt = [prompt]
 
-        if (prompt_embeds is None or prompt_ids is None or text_ids is None) or (
+        # ``prompt_ids`` is optional metadata (never consumed by the forward), so
+        # it is intentionally NOT required here: the teacher's precomputed
+        # conditioning (XOPD) provides ``prompt_embeds`` + ``text_ids`` without
+        # ``prompt_ids``, and must not trigger a (student) re-encode.
+        if (prompt_embeds is None or text_ids is None) or (
             do_classifier_free_guidance
-            and (
-                negative_prompt_embeds is None
-                or negative_prompt_ids is None
-                or negative_text_ids is None
-            )
+            and (negative_prompt_embeds is None or negative_text_ids is None)
         ):
             prompt_encoding = self.encode_prompt(
                 prompt=prompt,
@@ -479,7 +555,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 negative_prompt_embeds = prompt_encoding["negative_prompt_embeds"]
                 negative_text_ids = prompt_encoding["negative_text_ids"]
         else:
-            prompt_ids = prompt_ids.to(device)
+            prompt_ids = prompt_ids.to(device) if prompt_ids is not None else None
             prompt_embeds = prompt_embeds.to(device)
             text_ids = text_ids.to(device)
             negative_prompt_ids = (
@@ -491,6 +567,22 @@ class Flux2KleinAdapter(BaseAdapter):
             negative_text_ids = (
                 negative_text_ids.to(device) if negative_text_ids is not None else None
             )
+
+        # Teacher-encoded prompt (XOPD): move to device; carried onto samples only.
+        teacher_prompt_embeds = (
+            teacher_prompt_embeds.to(device) if teacher_prompt_embeds is not None else None
+        )
+        teacher_text_ids = teacher_text_ids.to(device) if teacher_text_ids is not None else None
+        teacher_negative_prompt_embeds = (
+            teacher_negative_prompt_embeds.to(device)
+            if teacher_negative_prompt_embeds is not None
+            else None
+        )
+        teacher_negative_text_ids = (
+            teacher_negative_text_ids.to(device)
+            if teacher_negative_text_ids is not None
+            else None
+        )
 
         batch_size = prompt_embeds.shape[0]
 
@@ -627,7 +719,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 latent_ids=latent_ids[b],
                 # Prompt & condition info
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
-                prompt_ids=prompt_ids[b],
+                prompt_ids=prompt_ids[b] if prompt_ids is not None else None,
                 prompt_embeds=prompt_embeds[b],
                 text_ids=text_ids[b],
                 # Negative prompt info
@@ -639,6 +731,23 @@ class Flux2KleinAdapter(BaseAdapter):
                     negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
                 ),
                 negative_text_ids=negative_text_ids[b] if negative_text_ids is not None else None,
+                # Teacher-encoded prompt (XOPD cross-model passthrough)
+                teacher_prompt_embeds=(
+                    teacher_prompt_embeds[b] if teacher_prompt_embeds is not None else None
+                ),
+                teacher_text_ids=(
+                    teacher_text_ids[b] if teacher_text_ids is not None else None
+                ),
+                teacher_negative_prompt_embeds=(
+                    teacher_negative_prompt_embeds[b]
+                    if teacher_negative_prompt_embeds is not None
+                    else None
+                ),
+                teacher_negative_text_ids=(
+                    teacher_negative_text_ids[b]
+                    if teacher_negative_text_ids is not None
+                    else None
+                ),
                 # Condition images & latents
                 condition_images=condition_images[b] if condition_images is not None else None,
                 image_latents=image_latents[b] if image_latents is not None else None,
@@ -679,6 +788,12 @@ class Flux2KleinAdapter(BaseAdapter):
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_text_ids: Optional[torch.Tensor] = None,
+        # Teacher-encoded prompt (XOPD cross-model; carried through to samples,
+        # not used in the student denoising loop)
+        teacher_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_text_ids: Optional[torch.Tensor] = None,
+        teacher_negative_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_negative_text_ids: Optional[torch.Tensor] = None,
         # Encoded images
         condition_images: Optional[MultiImageBatch] = None,
         image_latents: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
@@ -719,6 +834,11 @@ class Flux2KleinAdapter(BaseAdapter):
                 negative_prompt_ids=negative_prompt_ids,
                 negative_prompt_embeds=negative_prompt_embeds,
                 negative_text_ids=negative_text_ids,
+                # Teacher-encoded prompt passthrough (XOPD)
+                teacher_prompt_embeds=teacher_prompt_embeds,
+                teacher_text_ids=teacher_text_ids,
+                teacher_negative_prompt_embeds=teacher_negative_prompt_embeds,
+                teacher_negative_text_ids=teacher_negative_text_ids,
                 # Image encoding args
                 condition_images=condition_images,
                 image_latents=image_latents,
@@ -764,6 +884,25 @@ class Flux2KleinAdapter(BaseAdapter):
             this_negative_text_ids = (
                 negative_text_ids[idx].unsqueeze(0) if negative_text_ids is not None else None
             )
+            # Teacher-encoded prompt (XOPD passthrough)
+            this_teacher_prompt_embeds = (
+                teacher_prompt_embeds[idx].unsqueeze(0)
+                if teacher_prompt_embeds is not None
+                else None
+            )
+            this_teacher_text_ids = (
+                teacher_text_ids[idx].unsqueeze(0) if teacher_text_ids is not None else None
+            )
+            this_teacher_negative_prompt_embeds = (
+                teacher_negative_prompt_embeds[idx].unsqueeze(0)
+                if teacher_negative_prompt_embeds is not None
+                else None
+            )
+            this_teacher_negative_text_ids = (
+                teacher_negative_text_ids[idx].unsqueeze(0)
+                if teacher_negative_text_ids is not None
+                else None
+            )
             # Image
             this_images = (
                 images[idx] if images is not None else None
@@ -795,6 +934,11 @@ class Flux2KleinAdapter(BaseAdapter):
                 negative_prompt_ids=this_negative_prompt_ids,
                 negative_prompt_embeds=this_negative_prompt_embeds,
                 negative_text_ids=this_negative_text_ids,
+                # Teacher-encoded prompt passthrough (XOPD)
+                teacher_prompt_embeds=this_teacher_prompt_embeds,
+                teacher_text_ids=this_teacher_text_ids,
+                teacher_negative_prompt_embeds=this_teacher_negative_prompt_embeds,
+                teacher_negative_text_ids=this_teacher_negative_text_ids,
                 # Image encoding args
                 condition_images=this_condition_images,
                 image_latents=this_image_latents,
@@ -1230,16 +1374,25 @@ class Flux2KleinAdapter(BaseAdapter):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> torch.nn.Module:
-        """Load the teacher's own Qwen3 text encoder for cross-model XOPD.
+        """Load the teacher's OWN text encoder for cross-model XOPD (offload-ready).
 
-        The teacher (e.g. FLUX.2-klein-base-9B) was trained with a larger Qwen3
-        than the student, so its transformer's ``joint_attention_dim`` differs
-        (3 x hidden_size). The teacher therefore needs text embeddings from its
-        OWN encoder; the prompt is shared, the embedding is not. Loads ONLY the
-        ``text_encoder`` (+ ``tokenizer``) subfolders; frozen, eval, inference-only.
+        The teacher (e.g. FLUX.2-klein-base-9B or FLUX.2-dev) was trained with a
+        different text encoder than the student, so its transformer's
+        ``joint_attention_dim`` differs and it needs text embeddings from its own
+        encoder -- the prompt is shared, the embedding is not.
+
+        To stay architecture-agnostic (the 9B teacher uses Qwen3, FLUX.2-dev uses
+        Mistral3 / Pixtral), this loads the teacher as a diffusers pipeline with
+        the transformer and VAE SKIPPED (``transformer=None, vae=None``) -- i.e.
+        only the text encoder + tokenizer/processor -- and delegates encoding to
+        that pipeline's own ``encode_prompt`` (see :meth:`encode_teacher_prompt`).
+        Frozen, eval, inference-only. Intended to be loaded ONLY for offline
+        preprocessing and then freed via :meth:`unload_teacher_text_encoder`, so
+        the (potentially very large, e.g. 48 GB for FLUX.2-dev) teacher text
+        encoder never stays resident during training.
 
         Args:
-            teacher_path: HF repo id or local path with ``text_encoder`` / ``tokenizer``.
+            teacher_path: HF repo id or local path with a ``text_encoder`` subfolder.
             device: Target device; defaults to the adapter device.
             dtype: Target dtype; defaults to the student text encoder's dtype.
 
@@ -1251,25 +1404,53 @@ class Flux2KleinAdapter(BaseAdapter):
         if dtype is None:
             dtype = self.pipeline.text_encoder.dtype
 
-        teacher_te = Qwen3ForCausalLM.from_pretrained(
+        # Skip the (large) transformer + VAE: only the text encoder is needed, and
+        # the student's VAE is reused (shared latent space). Passing a component as
+        # None makes diffusers skip loading it (DiffusionPipeline.from_pretrained
+        # `load_module`), so neither the teacher transformer nor VAE is downloaded
+        # onto the device here.
+        teacher_pipe = DiffusionPipeline.from_pretrained(
             teacher_path,
-            subfolder="text_encoder",
+            transformer=None,
+            vae=None,
             torch_dtype=dtype,
         )
-        teacher_te.requires_grad_(False)
-        teacher_te.eval()
-        teacher_te.to(device)
-        self._teacher_text_encoder = teacher_te
-        self._teacher_tokenizer = Qwen2TokenizerFast.from_pretrained(
-            teacher_path,
-            subfolder="tokenizer",
-        )
+        if getattr(teacher_pipe, "text_encoder", None) is None:
+            raise ValueError(
+                f"Teacher pipeline loaded from {teacher_path!r} has no `text_encoder`; "
+                f"cannot build teacher text conditioning "
+                f"(pipeline={type(teacher_pipe).__name__})."
+            )
+        teacher_pipe.text_encoder.requires_grad_(False)
+        teacher_pipe.text_encoder.eval()
+        teacher_pipe.to(device)
+        self._teacher_pipeline = teacher_pipe
 
         logger.info(
             f"Loaded teacher text encoder from {teacher_path!r} "
-            f"(hidden_size={teacher_te.config.hidden_size}, dtype={dtype}, device={device})."
+            f"(pipeline={type(teacher_pipe).__name__}, "
+            f"text_encoder={type(teacher_pipe.text_encoder).__name__}, "
+            f"dtype={dtype}, device={device}); transformer / VAE skipped."
         )
-        return teacher_te
+        return teacher_pipe.text_encoder
+
+    def unload_teacher_text_encoder(self) -> None:
+        """Free the teacher text encoder (XOPD): move to CPU, drop, empty cache.
+
+        Called after offline preprocessing has cached the teacher embeddings so
+        the (potentially very large, e.g. 48 GB for FLUX.2-dev) teacher text
+        encoder does not stay resident during training. A plain ``.to('cpu')`` is
+        not enough to release the VRAM, so the module is deleted and the CUDA
+        caching allocator is flushed.
+        """
+        if self._teacher_pipeline is not None:
+            text_encoder = getattr(self._teacher_pipeline, "text_encoder", None)
+            if text_encoder is not None:
+                text_encoder.to("cpu")
+            del self._teacher_pipeline
+            self._teacher_pipeline = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def encode_teacher_prompt(
         self,
@@ -1278,42 +1459,38 @@ class Flux2KleinAdapter(BaseAdapter):
         guidance_scale: float = 1.0,
         device: Optional[torch.device] = None,
         max_sequence_length: int = 512,
-        hidden_states_layers: Tuple[int, ...] = (9, 18, 27),
     ) -> Dict[str, torch.Tensor]:
-        """Encode prompt(s) with the TEACHER's Qwen3 text encoder (XOPD cross-model).
+        """Encode prompt(s) with the TEACHER's own text encoder (XOPD cross-model).
 
-        Mirrors :meth:`encode_prompt` but uses ``self._teacher_text_encoder`` /
-        ``self._teacher_tokenizer`` so the embeddings match the teacher
-        transformer's ``joint_attention_dim``. ``text_ids`` depend only on
-        sequence length, so the student pipeline's ``_prepare_text_ids`` is reused.
+        Delegates to the teacher pipeline's ``encode_prompt`` so the embedding
+        architecture matches the teacher transformer's ``joint_attention_dim``
+        regardless of the teacher's text-encoder type (Qwen3 for klein-9B,
+        Mistral3 for FLUX.2-dev). Returns ``prompt_embeds`` / ``text_ids`` and,
+        when ``guidance_scale > 1.0``, the negative counterparts. The teacher
+        pipeline produces no ``prompt_ids`` (the teacher forward does not need
+        them), so none are returned.
         """
-        if self._teacher_text_encoder is None or self._teacher_tokenizer is None:
+        if self._teacher_pipeline is None:
             raise RuntimeError(
                 "encode_teacher_prompt() called before load_teacher_text_encoder(); "
                 "no teacher text encoder is loaded."
             )
-        device = self._teacher_text_encoder.device if device is None else device
-        do_classifier_free_guidance = guidance_scale > 1.0
+        if device is None:
+            device = self._teacher_pipeline.text_encoder.device
         if prompt is None:
             prompt = ""
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
-        prompt_ids, prompt_embeds = self._get_qwen3_prompt_embeds(
-            text_encoder=self._teacher_text_encoder,
-            tokenizer=self._teacher_tokenizer,
-            prompt=prompt,
-            dtype=self._teacher_text_encoder.dtype,
+        prompt_embeds, text_ids = self._teacher_pipeline.encode_prompt(
+            prompt,
             device=device,
             max_sequence_length=max_sequence_length,
-            hidden_states_layers=hidden_states_layers,
         )
-        text_ids = self.pipeline._prepare_text_ids(prompt_embeds).to(device)
         results = {
-            "prompt_ids": prompt_ids,
             "prompt_embeds": prompt_embeds,
             "text_ids": text_ids,
         }
-        if do_classifier_free_guidance:
+        if guidance_scale > 1.0:
             negative_prompt = "" if negative_prompt is None else negative_prompt
             negative_prompt = (
                 [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
@@ -1324,19 +1501,13 @@ class Flux2KleinAdapter(BaseAdapter):
                     f"teacher negative_prompt count ({len(negative_prompt)}) must match "
                     f"prompt count ({len(prompt)})."
                 )
-            negative_prompt_ids, negative_prompt_embeds = self._get_qwen3_prompt_embeds(
-                text_encoder=self._teacher_text_encoder,
-                tokenizer=self._teacher_tokenizer,
-                prompt=negative_prompt,
-                dtype=self._teacher_text_encoder.dtype,
+            negative_prompt_embeds, negative_text_ids = self._teacher_pipeline.encode_prompt(
+                negative_prompt,
                 device=device,
                 max_sequence_length=max_sequence_length,
-                hidden_states_layers=hidden_states_layers,
             )
-            negative_text_ids = self.pipeline._prepare_text_ids(negative_prompt_embeds).to(device)
             results.update(
                 {
-                    "negative_prompt_ids": negative_prompt_ids,
                     "negative_prompt_embeds": negative_prompt_embeds,
                     "negative_text_ids": negative_text_ids,
                 }

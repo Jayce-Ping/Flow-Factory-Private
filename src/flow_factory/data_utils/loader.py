@@ -419,16 +419,28 @@ def get_dataloader(
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
     preprocess_parallelism = getattr(data_args, "preprocess_parallelism", "local")
 
+    # Cache-discriminating identifiers: student model info, plus (for cross-model
+    # distillation, e.g. XOPD) the teacher model path -- teacher text embeddings
+    # are cached alongside the student's, so the teacher identity must invalidate
+    # the cache too. Only appended when present, to avoid perturbing other models'
+    # cache fingerprints.
+    extra_hash_strs = [
+        config.model_args.model_type,
+        config.model_args.model_name_or_path,
+    ]
+    teacher_model_name_or_path = getattr(
+        config.training_args, "teacher_model_name_or_path", None
+    )
+    if teacher_model_name_or_path:
+        extra_hash_strs.append(teacher_model_name_or_path)
+
     # Common dataset kwargs
     base_kwargs = {
         "preprocess_func": preprocess_func,
         "preprocess_kwargs": (
             filter_kwargs(preprocess_func, **data_args) if preprocess_func else None
         ),  # Preprocess kwargs
-        "extra_hash_strs": [
-            config.model_args.model_type,
-            config.model_args.model_name_or_path,
-        ],  # Use model info to differentiate caches
+        "extra_hash_strs": extra_hash_strs,  # Use model info to differentiate caches
     }
     base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
     base_kwargs["force_reprocess"] = data_args.force_reprocess
