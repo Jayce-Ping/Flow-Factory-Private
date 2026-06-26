@@ -16,7 +16,15 @@ mixed_precision: "bf16"                   # Mixed precision. Options: no, fp16, 
 
 # ===== Data (prompts only; L0's z0 is teacher-generated) =====
 data:
-  dataset_dir: "dataset/geneval"          # Dataset folder containing train.txt / train.jsonl (T2I prompts)
+  dataset_dir: "dataset/geneval"          # Eval/test fallback (test split is read from here when eval.test_sets omits a dataset_dir).
+  # --- Multi-source training (geneval + ocr + pickscore, equal weights) ---
+  # Each directory is preprocessed independently (teacher text embeddings are
+  # precomputed per source) and L0/L1 sampling block-cycles across them per
+  # train.source_ratio below. The source name is the basename of each directory.
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/ocr"
+    - "dataset/pickscore"
   preprocessing_batch_size: 8             # Batch size for offline text encoding
   dataloader_num_workers: 16              # DataLoader worker processes
   force_reprocess: false                  # true: ignore cache and re-preprocess
@@ -74,12 +82,15 @@ train:
   kl_type: "x-based"                      # KL anchor type vs base. Options: x-based, v-based
   kl_beta: 0.0                            # KL anchor coefficient; 0 disables
 
+  # --- Multi-source sampling ratio (active; requires data.dataset_dirs) ---
+  source_ratio: {geneval: 1, ocr: 1, pickscore: 1}   # Equal block-cycle weights (one G·O·P cycle per period). num_batches_per_epoch must be divisible by sum(values)=3 (see unique_sample_num_per_epoch).
+
   # --- Sampling / batch ---
   resolution: 512                         # Generation resolution (int or [H, W]); klein native is 1024, lower to save memory
   num_inference_steps: 28                 # L1 student rollout steps (undistilled base models need more steps)
   per_device_batch_size: 1                # Conservative start: the FLUX.2-dev teacher transformer is ~64GB resident, so bs=4 (9B optimum) OOMs even with the 48GB teacher TE offloaded. Re-run a batch search once GPUs are free to raise it.
   group_size: 1                           # Group size (XOPD default 1; only >1 if you add grouped REINFORCE)
-  unique_sample_num_per_epoch: 128        # Unique prompts per epoch (kept = 9B baseline; with bs=1 on 32 GPUs -> 4 micro-batches/GPU, same effective batch)
+  unique_sample_num_per_epoch: 192        # Unique prompts/epoch. =3*64 so num_batches_per_epoch is a multiple of 3 (= source_ratio period): 6 batches/epoch on 32 GPUs (pdbs=1) -> two clean geneval·ocr·pickscore cycles.
   gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps)
   num_inner_epochs: 1                     # MUST be 1 for XOPD (no rollout reuse); enforced at startup
   gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps

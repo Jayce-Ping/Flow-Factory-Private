@@ -22,9 +22,11 @@ from flow_factory.hparams.training_args import XOPDTrainingArguments
 from flow_factory.trainers.xopd.common import (
     align_l0_inner_steps,
     compute_per_step_kl,
+    interleaved_source_iter,
     l0_loss_weight,
     reverse_cumulative,
     validate_l1_one_step_per_epoch,
+    validate_source_ratio,
 )
 
 
@@ -182,5 +184,98 @@ class TestXOPDTrainingArguments(unittest.TestCase):
         self.assertEqual(args.get_preprocess_guidance_scale(), 4.0)
 
 
+def _fake_source_dataloaders():
+    """Per-source 'dataloaders' as plain lists of batch dicts (re-iterable).
+
+    ``interleaved_source_iter`` only needs ``iter(dl)`` to restart on
+    exhaustion, so a list stands in for a real DataLoader. Each batch carries a
+    ``metadata`` list so the ``__source__`` per-row injection path is exercised.
+    """
+    return {
+        "geneval": [
+            {"prompt": ["g0"], "metadata": [{}]},
+            {"prompt": ["g1"], "metadata": [{}]},
+        ],
+        "ocr": [
+            {"prompt": ["o0"], "metadata": [{}]},
+        ],
+    }
+
+
+class TestXOPDInterleavedSourceIter(unittest.TestCase):
+    def test_equal_round_robin_order_and_tag(self) -> None:
+        dls = _fake_source_dataloaders()
+        it = interleaved_source_iter(dls, source_ratio=None)
+        # Sorted source order: geneval, ocr, geneval, ocr, ...
+        seen = [next(it) for _ in range(4)]
+        self.assertEqual([b["__source__"] for b in seen], ["geneval", "ocr", "geneval", "ocr"])
+        # Source is also injected into per-row metadata.
+        self.assertEqual(seen[0]["metadata"][0]["__source__"], "geneval")
+        self.assertEqual(seen[1]["metadata"][0]["__source__"], "ocr")
+
+    def test_exhausted_source_restarts(self) -> None:
+        dls = _fake_source_dataloaders()  # ocr has a single batch
+        it = interleaved_source_iter(dls, source_ratio=None)
+        ocr_batches = [b for b in (next(it) for _ in range(6)) if b["__source__"] == "ocr"]
+        # ocr re-cycles its lone batch every round (never raises StopIteration).
+        self.assertEqual(len(ocr_batches), 3)
+        self.assertTrue(all(b["prompt"] == ["o0"] for b in ocr_batches))
+
+    def test_source_ratio_block_cycle(self) -> None:
+        dls = _fake_source_dataloaders()
+        it = interleaved_source_iter(dls, source_ratio={"geneval": 2, "ocr": 1})
+        # Pattern (sorted): G G O repeating.
+        order = [next(it)["__source__"] for _ in range(6)]
+        self.assertEqual(order, ["geneval", "geneval", "ocr", "geneval", "geneval", "ocr"])
+
+    def test_unknown_source_raises(self) -> None:
+        dls = _fake_source_dataloaders()
+        with self.assertRaises(ValueError):
+            next(interleaved_source_iter(dls, source_ratio={"geneval": 1, "ocr": 1, "nope": 1}))
+
+    def test_missing_source_raises(self) -> None:
+        dls = _fake_source_dataloaders()
+        with self.assertRaises(ValueError):
+            next(interleaved_source_iter(dls, source_ratio={"geneval": 1}))
+
+    def test_non_integer_weight_raises(self) -> None:
+        dls = _fake_source_dataloaders()
+        with self.assertRaises(ValueError):
+            next(interleaved_source_iter(dls, source_ratio={"geneval": 1.5, "ocr": 1}))
+
+
+class TestXOPDValidateSourceRatio(unittest.TestCase):
+    def test_none_is_noop(self) -> None:
+        validate_source_ratio(None, num_batches_per_epoch=6, train_dataloaders_by_source={"a": []})
+
+    def test_empty_sources_is_noop(self) -> None:
+        # Single-source mode (no per-source dataloaders) skips validation.
+        validate_source_ratio({"a": 2}, num_batches_per_epoch=5, train_dataloaders_by_source={})
+
+    def test_divisible_passes(self) -> None:
+        validate_source_ratio(
+            {"a": 2, "b": 1},
+            num_batches_per_epoch=6,
+            train_dataloaders_by_source={"a": [], "b": []},
+        )
+
+    def test_indivisible_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_source_ratio(
+                {"a": 2, "b": 1},  # period 3
+                num_batches_per_epoch=7,
+                train_dataloaders_by_source={"a": [], "b": []},
+            )
+
+    def test_zero_sum_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_source_ratio(
+                {"a": 0, "b": 0},
+                num_batches_per_epoch=6,
+                train_dataloaders_by_source={"a": [], "b": []},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
+

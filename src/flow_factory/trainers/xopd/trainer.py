@@ -64,9 +64,11 @@ from .common import (
     build_forward_kwargs,
     cache_forward_signature,
     compute_per_step_kl,
+    interleaved_source_iter,
     l0_loss_weight,
     reverse_cumulative,
     validate_l1_one_step_per_epoch,
+    validate_source_ratio,
 )
 
 logger = setup_logger(__name__)
@@ -182,6 +184,40 @@ class XOPDTrainer(BaseTrainer):
                 f"T={self.num_train_timesteps})."
             )
 
+        # Multi-source training (data.dataset_dirs): the base class builds
+        # `self.train_dataloaders_by_source` (one DataLoader per source, each
+        # independently preprocessed -- so the teacher text embeddings are
+        # precomputed per source). XOPD uses a single teacher, so the source tag
+        # only feeds eval/reward metadata; sampling block-cycles across sources
+        # via `_make_train_iter`. Fail fast if `source_ratio` cannot tile the
+        # per-epoch budget.
+        validate_source_ratio(
+            ta.source_ratio,
+            ta.num_batches_per_epoch,
+            self.train_dataloaders_by_source,
+        )
+
+    # ============================ Data iteration ==============================
+    def _make_train_iter(self):
+        """Unified train iterator: single dataloader or block-cycle over sources.
+
+        Single-source (``data.dataset_dir``) yields from ``self.dataloader``.
+        Multi-source (``data.dataset_dirs``) block-cycles across
+        ``self.train_dataloaders_by_source`` honoring ``source_ratio`` (each
+        batch tagged with ``__source__``; infinite cycle with auto-restart).
+        """
+        if self.train_dataloaders_by_source:
+            return interleaved_source_iter(
+                self.train_dataloaders_by_source,
+                source_ratio=self.training_args.source_ratio,
+            )
+        if self.dataloader is None:
+            raise RuntimeError(
+                "XOPD requires training data: set data.dataset_dir (single source) "
+                "or data.dataset_dirs (multi-source)."
+            )
+        return iter(self.dataloader)
+
     # ============================ Dataloader / preprocess =====================
     def _init_dataloader(self):
         """Load the teacher text encoder only for offline preprocessing, then free it.
@@ -274,15 +310,9 @@ class XOPDTrainer(BaseTrainer):
     # ===================== Stage L0: velocity regression =====================
     def _l0_epoch(self) -> None:
         """L0 warmup: teacher-generated ``z0`` then student velocity regression."""
-        if self.dataloader is None:
-            raise RuntimeError(
-                "XOPD requires a single train dataloader (data.dataset_dir); "
-                "multi-source data.dataset_dirs is not supported."
-            )
-
         ta = self.training_args
         device = self.accelerator.device
-        data_iter = iter(self.dataloader)
+        data_iter = self._make_train_iter()
         loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         for batch_idx in tqdm(
@@ -427,15 +457,9 @@ class XOPDTrainer(BaseTrainer):
     # ===================== Stage L1: on-policy distillation =====================
     def sample(self) -> List[BaseSample]:
         """Generate student rollouts (full trajectory + on-policy log-probs)."""
-        if self.dataloader is None:
-            raise RuntimeError(
-                "XOPD requires a single train dataloader (data.dataset_dir); "
-                "multi-source data.dataset_dirs is not supported."
-            )
-
         self.adapter.rollout()
         samples: List[BaseSample] = []
-        data_iter = iter(self.dataloader)
+        data_iter = self._make_train_iter()
 
         trajectory_indices = compute_trajectory_indices(
             train_timestep_indices=self._train_timestep_indices,

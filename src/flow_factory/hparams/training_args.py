@@ -2195,6 +2195,23 @@ class XOPDTrainingArguments(TrainingArguments):
         metadata={"help": "KL anchor coefficient against the base model; 0 disables."},
     )
 
+    # ---- Multi-source training data (optional) ----
+    source_ratio: Optional[Dict[str, float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-source sampling ratio dict (e.g. {'geneval': 2, 'ocr': 1}). "
+                "Values must be non-negative integer-valued floats. None means "
+                "equal 1:1:... round-robin (default). Only meaningful with "
+                "multi-source training (data.dataset_dirs); ignored when a single "
+                "data.dataset_dir is used. Constraint: num_batches_per_epoch must "
+                "be divisible by int(sum(values)) so each epoch contains an "
+                "integer number of full source-cycles. Must specify a weight for "
+                "every source present in the data."
+            )
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         if not self.teacher_model_name_or_path:
