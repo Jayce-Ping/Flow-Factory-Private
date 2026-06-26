@@ -123,30 +123,40 @@ eval:
   guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
   eval_freq: 20                           # Eval every N epochs (0 disables)
   seed: 42                                # Eval seed
-  test_sets:                              # Same geneval test set evaluated at two CFG scales
-    - name: geneval_gs1                   # gs=1.0: no CFG (no negative embeds)
-      dataset_dir: dataset/geneval
-      split: test
-      guidance_scale: 1.0
-    - name: geneval_gs4                   # gs=4.0: CFG (uses negative-prompt embeds)
-      dataset_dir: dataset/geneval
-      split: test
-      guidance_scale: 4.0
+  test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
+                                          # eval_reward_names selects which reward (from the `rewards` list below) runs per set;
+                                          # [] = generate images only, no scoring. wandb keys: eval/{name}/reward_{reward}_mean.
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: []}       # OCR reward deps not staged yet -> images only
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: []}       # OCR reward deps not staged yet -> images only
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
 
 # ===== Rewards (optional for XOPD; logging only, NOT part of the distillation loss) =====
+# These also serve as the EVAL rewards (no separate `eval_rewards` block -> eval falls back
+# to this list, indexed by `name`). eval.test_sets[*].eval_reward_names reference these names.
 # GenEval deps (mmcv 2.1.0 + mmdet 3.3.0 + open_clip) installed on all nodes via
 # Flow-Factory/scripts/install_geneval_deps.sh; Mask2Former + CLIP ViT-L-14 weights pre-staged.
 rewards:
-  - name: "geneval"                       # Reward name (for logging)
+  - name: "geneval"                       # Reward name (referenced by eval_reward_names: [geneval])
     reward_model: "geneval"               # Reward model type (matches dataset/geneval)
     weight: 1                             # Weight (for multi-reward aggregation)
     batch_size: 64                        # Reward inference batch size
     device: "cuda"                        # Device
     dtype: float32                        # GenEval forces fp32 internally (autocast off + model.float()); this is a placeholder
     async_reward: false                   # Compute reward synchronously
-  - name: "pick_score"
+  - name: "pick_score"                    # Referenced by eval_reward_names: [pick_score]
     reward_model: "PickScore"
     batch_size: 64
     device: "cuda"
     dtype: bfloat16
     async_reward: false
+  # OCR reward: enable once OCR deps (e.g. PaddleOCR) are staged on all nodes, then set the
+  # ocr_gs1/ocr_gs4 test sets' eval_reward_names to [ocr].
+  # - name: "ocr"
+  #   reward_model: "ocr"
+  #   batch_size: 64
+  #   device: "cuda"
+  #   dtype: bfloat16
+  #   async_reward: false
