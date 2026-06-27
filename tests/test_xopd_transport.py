@@ -19,6 +19,7 @@ import unittest
 import torch
 
 from flow_factory.trainers.xopd.transport import (
+    AdaLNTransport,
     IdentityTransport,
     LinearTransport,
     MLPTransport,
@@ -202,6 +203,66 @@ class TestWhiteningTransport(unittest.TestCase):
         torch.testing.assert_close(out, probe, atol=1e-2, rtol=1e-2)
 
 
+class TestAdaLNTransport(unittest.TestCase):
+    def _make(self, C_T=4, C_S=4):
+        return AdaLNTransport(
+            teacher_to_spatial=_bchw_identity,
+            teacher_from_spatial=_bchw_identity,
+            student_to_spatial=_bchw_identity,
+            student_from_spatial=_bchw_identity,
+            teacher_channels=C_T,
+            student_channels=C_S,
+        )
+
+    def test_is_nn_module_with_params(self):
+        import torch.nn as nn
+
+        t = self._make()
+        self.assertIsInstance(t, nn.Module)
+        names = {n for n, _ in t.named_parameters()}
+        self.assertEqual(names, {"log_gamma", "beta"})
+        self.assertTrue(t.requires_warmup)
+
+    def test_default_is_identity(self):
+        # log_gamma=0, beta=0 -> identity before any init.
+        t = self._make()
+        z = torch.randn(2, 4, 6, 6)
+        torch.testing.assert_close(t.transport_sample(z), z, atol=1e-5, rtol=1e-5)
+
+    def test_moment_init_and_analytic_inverse(self):
+        torch.manual_seed(0)
+        C = 4
+        scale = torch.tensor([2.0, 0.5, 3.0, 1.0]).view(1, C, 1, 1)
+        shift = torch.tensor([1.0, -1.0, 0.0, 5.0]).view(1, C, 1, 1)
+        z_T = [torch.randn(8, C, 6, 6) for _ in range(3)]
+        z_S = [z * scale + shift for z in z_T]
+        t = self._make()
+        t.fit(z_T, z_S)
+        self.assertTrue(t.is_fitted)
+        out = t.transport_sample(z_T[0])
+        torch.testing.assert_close(
+            out.mean(dim=(0, 2, 3)), z_S[0].mean(dim=(0, 2, 3)), atol=1e-2, rtol=1e-2
+        )
+        # analytic inverse round trip (identity teacher mean)
+        x_S = torch.randn(2, C, 6, 6)
+        rt = t.transition_mean_to_student(x_S, query_teacher_mean=lambda x_T: x_T)
+        torch.testing.assert_close(rt, x_S, atol=1e-4, rtol=1e-4)
+
+    def test_gradients_flow_to_params(self):
+        t = self._make()
+        z = torch.randn(2, 4, 5, 5)
+        out = t.transport_sample(z)
+        out.pow(2).mean().backward()
+        self.assertIsNotNone(t.log_gamma.grad)
+        self.assertIsNotNone(t.beta.grad)
+
+    def test_channel_mismatch(self):
+        t = self._make(C_T=6, C_S=4)
+        z_T = torch.randn(2, 6, 5, 5)
+        out = t.transport_sample(z_T)
+        self.assertEqual(tuple(out.shape), (2, 4, 5, 5))
+
+
 class TestMLPTransportPlaceholder(unittest.TestCase):
     def test_raises(self):
         with self.assertRaises(NotImplementedError):
@@ -230,6 +291,42 @@ class TestBuildTransport(unittest.TestCase):
     def test_mlp_raises(self):
         with self.assertRaises(NotImplementedError):
             build_transport("mlp")
+
+
+class TestTransportStateDict(unittest.TestCase):
+    def _affine_converters(self):
+        return dict(
+            teacher_to_spatial=_bchw_identity,
+            teacher_from_spatial=_bchw_identity,
+            student_to_spatial=_bchw_identity,
+            student_from_spatial=_bchw_identity,
+        )
+
+    def test_linear_roundtrip(self):
+        torch.manual_seed(0)
+        z_T = [torch.randn(4, 4, 6, 6) for _ in range(2)]
+        z_S = [channel_affine(z, torch.randn(4, 4), torch.randn(4)) for z in z_T]
+        t = LinearTransport(**self._affine_converters(), ridge=0.0)
+        t.fit(z_T, z_S)
+        sd = t.state_dict()
+        t2 = LinearTransport(**self._affine_converters())
+        t2.load_state_dict(sd)
+        probe = torch.randn(2, 4, 6, 6)
+        torch.testing.assert_close(t2.transport_sample(probe), t.transport_sample(probe))
+
+    def test_adaln_roundtrip(self):
+        torch.manual_seed(0)
+        z_T = [torch.randn(4, 4, 6, 6) for _ in range(2)]
+        z_S = [z * 2.0 + 1.0 for z in z_T]
+        t = AdaLNTransport(**self._affine_converters(), teacher_channels=4, student_channels=4)
+        t.fit(z_T, z_S)
+        sd = t.state_dict()
+        self.assertIn("_student_grid", sd)
+        t2 = AdaLNTransport(**self._affine_converters(), teacher_channels=4, student_channels=4)
+        t2.load_state_dict(sd)
+        self.assertTrue(t2.is_fitted)
+        probe = torch.randn(2, 4, 6, 6)
+        torch.testing.assert_close(t2.transport_sample(probe), t.transport_sample(probe))
 
 
 if __name__ == "__main__":

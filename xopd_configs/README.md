@@ -45,25 +45,37 @@ Key knobs (pathwise only, `reinforce_coef=0`, ODE):
 - `vae_transport`: the **L1 transition-mean transport baseline** (the configs
   default to `whitening`):
   - `whitening` (M7): diagonal AdaLN affine (per-channel scale+shift), moment-
-    matched, **analytically invertible**, and **neutral = identity when the two
-    spaces coincide** — the most robust default and the cleanest answer to "how
-    to initialize the transport" (see the theory doc § "传输的初始化与 AdaLN…").
-  - `linear` (M2): full channel affine (least-squares), richer than whitening.
+    matched **closed-form**, **analytically invertible**, and **neutral = identity
+    when the two spaces coincide** — the most robust default and the cleanest
+    answer to "how to initialize the transport" (see the theory doc § "传输的初始化
+    与 AdaLN…").
+  - `linear` (M2): full channel affine (closed-form least-squares).
+  - `adaln`: **learnable** diagonal AdaLN affine — moment-match init then a short
+    latent-reconstruction warm-up (gradient: `transport_lr`,
+    `transport_warmup_epochs`), then **frozen** for L1. Training it on the
+    distillation `D_k` would be degenerate (L1's `mu_teacher` is cached/detached,
+    so that gradient would collapse the teacher target onto the student), so it is
+    trained only on its own reconstruction objective during warm-up.
   - `pixel` (M1): decode-encode bridge, no training, lossy, slow.
   - `mlp`: non-linear placeholder (NotImplementedError).
 
-  **Flip among `whitening` / `linear` / `pixel` to compare L1 transport
-  baselines.** L0 always uses the pixel bridge regardless of this knob.
-- `transport_warmup_batches`: paired-latent batches used to fit the affine
-  `A, b` (`whitening`/`linear`); ignored for `pixel`/`identity`.
+  **Flip among `whitening` / `linear` / `adaln` / `pixel` to compare L1 transport
+  baselines.** All non-pixel transports are **frozen during L1** (student-only
+  update); L0 always uses the pixel bridge regardless of this knob.
+- `transport_warmup_batches`: paired-latent batches collected for warm-up
+  (closed-form fit for `whitening`/`linear`; gradient loop for `adaln`); ignored
+  for `pixel`/`identity`.
+- `transport_lr` / `transport_warmup_epochs`: Adam LR and number of passes for the
+  `adaln` warm-up reconstruction loop (ignored otherwise). The fitted/trained
+  transport is persisted to `transport.pt` in checkpoints (resume skips re-warm-up).
 
-> **Status / boundary:** the transport math, `encode_pixels`, `predict_velocity`,
-> hparams, and the full trainer wiring (L0 / L1-pixel / L1-linear / warm-up) are
-> implemented and unit-tested where unit-testable. The one piece that still needs
-> per-adapter work before an end-to-end SD3.5-student run is **teacher text
-> conditioning via precompute+offload on the SD3.5 student adapter** (currently
-> implemented on `Flux2KleinAdapter` only); `XOPDTrainer._init_dataloader` raises a
-> clear `NotImplementedError` at that boundary. See `.scratch/xopd_cross_vae_plan.md`.
+> **Status:** the transport layer (pixel / linear / whitening / learnable adaln +
+> placeholders), `encode_pixels`, `predict_velocity`, the teacher text-encoder
+> precompute+offload (now on `BaseAdapter`, so any student adapter incl. SD3.5
+> works), the full trainer wiring (L0 / L1 pixel & affine / transport warm-up &
+> freeze / checkpoint persistence) and hparams are implemented and unit-tested
+> where unit-testable. GPU end-to-end validation is pending (the user runs it
+> separately). See `.scratch/xopd_cross_vae_plan.md`.
 
 
 Each group holds the same 2×2 matrix of **teacher × stage**:

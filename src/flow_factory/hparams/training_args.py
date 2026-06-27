@@ -2124,7 +2124,7 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    vae_transport: Literal["identity", "pixel", "linear", "whitening", "mlp"] = field(
+    vae_transport: Literal["identity", "pixel", "linear", "whitening", "adaln", "mlp"] = field(
         default="identity",
         metadata={
             "help": (
@@ -2132,13 +2132,15 @@ class XOPDTrainingArguments(TrainingArguments):
                 "'identity' (default): shared VAE, no transport. 'pixel': M1 "
                 "decode-encode bridge (no training, lossy, expensive for L1). "
                 "'whitening': M7 diagonal AdaLN affine (per-channel scale+shift, "
-                "moment-matched, analytically invertible, neutral=identity when the "
-                "spaces coincide); the most robust cross-VAE default. 'linear': M2 "
-                "full channel affine (least-squares, richer than whitening). Both "
-                "are fit once during warm-up then frozen (clean for L1). 'mlp': "
-                "non-linear placeholder (NotImplementedError). L0 always uses the "
-                "pixel bridge regardless of this setting; this selects the L1 "
-                "transition-mean transport."
+                "moment-matched closed-form, analytically invertible, neutral=identity "
+                "when the spaces coincide); the most robust cross-VAE default. "
+                "'linear': M2 full channel affine (closed-form least-squares). "
+                "'adaln': LEARNABLE diagonal AdaLN affine — moment-match init then a "
+                "short latent-reconstruction warm-up (gradient), then FROZEN for L1 "
+                "(training it on D_k would be degenerate since mu_teacher is cached/"
+                "detached). 'mlp': non-linear placeholder (NotImplementedError). All "
+                "non-pixel transports are frozen during L1; L0 always uses the pixel "
+                "bridge. This selects the L1 transition-mean transport."
             )
         },
     )
@@ -2146,10 +2148,30 @@ class XOPDTrainingArguments(TrainingArguments):
         default=64,
         metadata={
             "help": (
-                "Number of teacher-rollout batches used to fit the 'linear' "
-                "vae_transport before training (paired (z_T, z_S) latents via the "
-                "pixel bridge, least-squares fit, then frozen). Ignored for "
-                "'identity'/'pixel'. Must be > 0 when vae_transport='linear'."
+                "Number of teacher-rollout batches used to warm up the transport "
+                "(paired (z_T, z_S) latents via the pixel bridge). Closed-form "
+                "('linear'/'whitening') fit once; 'adaln' trains a gradient loop on "
+                "these batches. Ignored for 'identity'/'pixel'. Must be > 0 for "
+                "'linear'/'whitening'/'adaln'."
+            )
+        },
+    )
+    transport_lr: float = field(
+        default=1.0e-3,
+        metadata={
+            "help": (
+                "Adam learning rate for the LEARNABLE 'adaln' transport warm-up "
+                "(latent-reconstruction objective). Ignored for other transports."
+            )
+        },
+    )
+    transport_warmup_epochs: int = field(
+        default=50,
+        metadata={
+            "help": (
+                "Number of passes over the collected warm-up batches when training "
+                "the 'adaln' transport. Ignored for closed-form/non-learnable "
+                "transports. After warm-up the transport is frozen for L1."
             )
         },
     )
@@ -2292,10 +2314,10 @@ class XOPDTrainingArguments(TrainingArguments):
                     "vae_transport (one of {'pixel', 'linear', 'mlp'}); got "
                     "vae_transport='identity'."
                 )
-            if self.vae_transport in ("linear", "whitening") and self.transport_warmup_batches <= 0:
+            if self.vae_transport in ("linear", "whitening", "adaln") and self.transport_warmup_batches <= 0:
                 raise ValueError(
                     f"vae_transport={self.vae_transport!r} requires "
-                    "transport_warmup_batches > 0 to fit the affine map; "
+                    "transport_warmup_batches > 0 to fit/warm-up the transport; "
                     f"got {self.transport_warmup_batches}."
                 )
         else:

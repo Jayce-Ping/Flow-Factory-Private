@@ -167,6 +167,46 @@ class SD3_5Adapter(BaseAdapter):
 
         return result
 
+    def preprocess_func(
+        self,
+        prompt: List[str],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        guidance_scale: float = 7.5,
+        teacher_guidance_scale: float = 1.0,
+        max_sequence_length: int = 512,
+        is_train: bool = True,
+        device: Optional[torch.device] = None,
+        **kwargs,
+    ) -> Dict[str, Union[List[Any], torch.Tensor]]:
+        """SD3.5 preprocessing: student text embeds (+ teacher_* for cross-VAE XOPD).
+
+        Encodes the prompt with the SD3.5 text encoders, then — when a teacher
+        text encoder is loaded (cross-VAE XOPD) — caches the teacher's own text
+        embeddings under ``teacher_*`` keys via the shared
+        :meth:`BaseAdapter._apply_teacher_text_encoding`, so the (large) teacher
+        TE can be offloaded before training. ``teacher_guidance_scale`` is an
+        explicit (cache-relevant) param so changing it re-encodes teacher
+        negatives. Falls back to student-only when no teacher TE is loaded.
+        """
+        batch = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
+        batch = self._apply_teacher_text_encoding(
+            batch=batch,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            teacher_guidance_scale=teacher_guidance_scale,
+            is_train=is_train,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
+        return batch
+
     def encode_image(self, images: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
         """Not needed for SD3 text-to-image models."""
         pass

@@ -77,7 +77,7 @@ from .common import (
     validate_l1_one_step_per_epoch,
     validate_source_ratio,
 )
-from .transport import build_transport
+from .transport import AdaLNTransport, build_transport
 
 logger = setup_logger(__name__)
 
@@ -319,10 +319,94 @@ class XOPDTrainer(BaseTrainer):
                 student_to_spatial=self._student_to_spatial,
                 student_from_spatial=self._student_from_spatial,
             )
+        elif ta.vae_transport == "adaln":
+            # Learnable AdaLN affine: a 2nd module trained ONLY during warm-up on a
+            # latent-reconstruction objective, then frozen (see _warmup_transport).
+            # Channel counts come from each VAE's latent channels; spatial grids are
+            # inferred from data at warm-up (init_from_moments).
+            self.transport = build_transport(
+                "adaln",
+                teacher_to_spatial=self._teacher_to_spatial,
+                teacher_from_spatial=self._teacher_from_spatial,
+                student_to_spatial=self._student_to_spatial,
+                student_from_spatial=self._student_from_spatial,
+                teacher_channels=self._adapter_latent_channels(self.teacher_adapter),
+                student_channels=self._adapter_latent_channels(self.adapter),
+            )
         else:  # "mlp" -> placeholder (raises in build_transport/constructor)
             self.transport = build_transport(ta.vae_transport)
 
+    # -- Checkpointing: persist the (frozen) transport alongside the model --
+    def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
+        """Save the student checkpoint plus the cross-VAE transport state.
+
+        The transport (linear/whitening A,b or AdaLN params + grids) is frozen
+        after warm-up but must be persisted so a resumed run skips re-warm-up and
+        keeps an identical teacher->student mapping. Written as ``transport.pt``
+        next to the model checkpoint (main process only). No-op for identity.
+        """
+        super().save_checkpoint(save_directory, epoch=epoch)
+        if (
+            self._cross_vae
+            and self.transport is not None
+            and self.accelerator.is_main_process
+        ):
+            ckpt_dir = save_directory
+            if epoch is not None:
+                ckpt_dir = os.path.join(save_directory, f"checkpoint-{epoch}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(
+                {
+                    "vae_transport": self.training_args.vae_transport,
+                    "state": self.transport.state_dict(),
+                },
+                os.path.join(ckpt_dir, "transport.pt"),
+            )
+        self.accelerator.wait_for_everyone()
+
+    def load_checkpoint(self, path: str, resume_type=None):
+        """Load the student checkpoint plus the cross-VAE transport state (if present)."""
+        super().load_checkpoint(path, resume_type=resume_type)
+        if self._cross_vae and self.transport is not None:
+            transport_path = os.path.join(path, "transport.pt")
+            if os.path.isfile(transport_path):
+                blob = torch.load(transport_path, map_location="cpu")
+                if blob.get("vae_transport") != self.training_args.vae_transport:
+                    logger.warning(
+                        f"Checkpoint transport type {blob.get('vae_transport')!r} != "
+                        f"config {self.training_args.vae_transport!r}; loading anyway."
+                    )
+                self.transport.load_state_dict(blob["state"])
+                if isinstance(self.transport, AdaLNTransport):
+                    self.transport.to(self.accelerator.device)
+                logger.info(f"Loaded cross-VAE transport state from {transport_path}.")
+            else:
+                logger.warning(
+                    f"No transport.pt under {path}; the transport will be re-warmed "
+                    "up at start() (requires_warmup)."
+                )
+        self.accelerator.wait_for_everyone()
+
     # -- Canonical latent-layout converters (native <-> (B,C,H,W)) --
+    @staticmethod
+    def _adapter_latent_channels(adapter) -> int:
+        """Number of VAE latent channels for an adapter (canonical BCHW channels).
+
+        Prefers the VAE's ``latent_channels`` config; falls back to the VAE
+        decoder ``in_channels`` (== latent channels). Used to size the AdaLN
+        transport's per-channel parameters.
+        """
+        vae = getattr(adapter.pipeline, "vae", None)
+        if vae is not None and hasattr(vae, "config"):
+            cfg = vae.config
+            for key in ("latent_channels", "in_channels"):
+                if hasattr(cfg, key):
+                    return int(getattr(cfg, key))
+        raise RuntimeError(
+            f"Could not infer latent channels for {type(adapter).__name__}; "
+            "AdaLN transport needs teacher/student channel counts."
+        )
+
     @staticmethod
     def _adapter_to_spatial(adapter, z, **ctx):
         """Native latent -> (B,C,H,W). Uses adapter.to_spatial_latent if provided,
@@ -391,25 +475,11 @@ class XOPDTrainer(BaseTrainer):
                 "Got enable_preprocess=False."
             )
         # Teacher text embeddings are precomputed offline (teacher_* columns) and
-        # the teacher text encoder is freed before training. The encode+cache hook
-        # lives on the STUDENT adapter (Flux2KleinAdapter.preprocess_func writes
-        # teacher_* when a teacher TE is loaded). This requires the student adapter
-        # to expose load_teacher_text_encoder / unload_teacher_text_encoder.
-        #
-        # Cross-VAE caveat: when the student adapter lacks these hooks (e.g.
-        # SD3_5Adapter), teacher text conditioning via precompute+offload is not
-        # yet wired on that adapter. Fail fast with a clear message rather than
-        # silently producing no teacher_* columns.
-        if not hasattr(self.adapter, "load_teacher_text_encoder"):
-            raise NotImplementedError(
-                "Cross-VAE XOPD teacher text conditioning (precompute+offload) "
-                f"requires the student adapter ({type(self.adapter).__name__}) to "
-                "expose load_teacher_text_encoder / unload_teacher_text_encoder and "
-                "a preprocess_func that caches teacher_* columns. This hook is "
-                "currently implemented on Flux2KleinAdapter only; port it to the "
-                "student adapter to enable a cross-architecture teacher. "
-                "See docs/mof/xopd_vae_space_align.tex and the .scratch plan."
-            )
+        # the teacher text encoder is freed before training. The encode+cache hooks
+        # (load_teacher_text_encoder / unload_teacher_text_encoder /
+        # encode_teacher_prompt + the preprocess_func teacher branch) live on
+        # BaseAdapter, so any student adapter (SD3.5, FLUX.2-klein, ...) supports
+        # this cross-architecture precompute+offload.
         self.adapter.load_teacher_text_encoder(
             ta.teacher_model_name_or_path,
             device=self.accelerator.device,
@@ -452,7 +522,7 @@ class XOPDTrainer(BaseTrainer):
             and getattr(self.transport, "requires_warmup", False)
             and not getattr(self.transport, "is_fitted", True)
         ):
-            self._warmup_linear_transport()
+            self._warmup_transport()
 
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
@@ -816,57 +886,105 @@ class XOPDTrainer(BaseTrainer):
         teacher_samples = self._teacher_rollout_samples(prompt_batch)
         return torch.stack([s.image for s in teacher_samples], dim=0)
 
-    def _warmup_linear_transport(self) -> None:
-        """Fit the linear (affine) transport once, then freeze (cold start).
+    def _collect_warmup_pairs(self):
+        """Collect paired (teacher native latent, student latent) for warm-up.
 
-        Collects ``transport_warmup_batches`` of paired teacher/student clean
-        latents for the SAME images — teacher native latent ``z0_T`` from the
-        teacher rollout, student latent ``z0_S = encode_pixels(teacher image)``
-        via the pixel bridge — and least-squares fits ``A, b`` (theory doc M2/M4).
-        Main process fits; the fitted ``A, b`` are broadcast to all ranks.
+        Teacher native clean latent ``z0_T`` from a teacher rollout; student latent
+        ``z0_S = encode_pixels(teacher image)`` via the pixel bridge. Also returns
+        the teacher images so a gradient warm-up can recompute the reconstruction
+        target. CPU-resident lists to bound VRAM.
         """
         ta = self.training_args
         device = self.accelerator.device
         data_iter = self._make_train_iter()
-        z_T_list: List[torch.Tensor] = []
-        z_S_list: List[torch.Tensor] = []
-
-        logger.info(
-            f"Cross-VAE linear transport warm-up: collecting "
-            f"{ta.transport_warmup_batches} paired-latent batches."
-        )
+        z_T_list, z_S_list, img_list = [], [], []
         for _ in tqdm(
             range(ta.transport_warmup_batches),
-            desc="Linear transport warm-up (paired latents)",
+            desc="Transport warm-up (paired latents)",
             disable=not self.show_progress_bar,
         ):
             prompt_batch = next(data_iter)
             teacher_samples = self._teacher_rollout_samples(prompt_batch)
-            # Teacher native clean latent (last trajectory step).
-            z0_T = torch.stack(
-                [s.all_latents[-1] for s in teacher_samples], dim=0
-            ).to(device)
+            z0_T = torch.stack([s.all_latents[-1] for s in teacher_samples], dim=0).to(device)
             images = torch.stack([s.image for s in teacher_samples], dim=0).to(device)
             with torch.no_grad():
                 z0_S = self.adapter.encode_pixels(images)
             z_T_list.append(z0_T.float().cpu())
             z_S_list.append(z0_S.float().cpu())
+            img_list.append(images.float().cpu())
+        return z_T_list, z_S_list, img_list
 
-        # Fit on the main process, broadcast A, b to all ranks for determinism.
-        self.transport.fit(z_T_list, z_S_list)
+    def _warmup_transport(self) -> None:
+        """Warm-up the transport before training, then freeze (cold start).
+
+        Dispatches on transport type:
+        - closed-form (``linear`` / ``whitening``): least-squares / moment-matching
+          ``fit`` on paired latents (no gradient), broadcast to all ranks.
+        - learnable (``adaln``): a short gradient loop on the latent reconstruction
+          objective ``||T(z_T) - z_S||^2`` (z_S = pixel-bridge target), since
+          training the transport on the distillation D_k would be degenerate
+          (mu_teacher is detached/cached in L1, so D_k gradient would collapse the
+          teacher target onto the student). After warm-up the transport is FROZEN,
+          so L1 trains the student only — keeping a fair comparison with the
+          non-learnable transports.
+        """
+        ta = self.training_args
+        device = self.accelerator.device
+        z_T_list, z_S_list, _img_list = self._collect_warmup_pairs()
+
+        if not isinstance(self.transport, AdaLNTransport):
+            # Closed-form fit (linear / whitening). Fit on all ranks (identical
+            # data is rank-local here, so broadcast A,b from rank 0 for determinism).
+            self.transport.fit(z_T_list, z_S_list)
+            if self.accelerator.num_processes > 1:
+                import torch.distributed as dist
+
+                A = self.transport.A.to(device)
+                b = self.transport.b.to(device)
+                dist.broadcast(A, src=0)
+                dist.broadcast(b, src=0)
+                self.transport.A, self.transport.b = A, b
+            logger.info(
+                f"Transport ({ta.vae_transport}) fitted (closed-form): "
+                f"A {tuple(self.transport.A.shape)}, b {tuple(self.transport.b.shape)}; frozen."
+            )
+            return
+
+        # ---- Learnable AdaLN: moment-match init, then a short reconstruction loop ----
+        self.transport.to(device)
+        self.transport.init_from_moments(z_T_list, z_S_list)  # neutral cold start
+        opt = torch.optim.Adam(self.transport.parameters(), lr=ta.transport_lr)
+        n_epochs = max(1, ta.transport_warmup_epochs)
+        self.transport.train()
+        logger.info(
+            f"AdaLN transport warm-up: {n_epochs} epoch(s) of latent-reconstruction "
+            f"training over {len(z_T_list)} batches (lr={ta.transport_lr}), then frozen."
+        )
+        for ep in range(n_epochs):
+            recon = 0.0
+            for z0_T_cpu, z0_S_cpu in zip(z_T_list, z_S_list):
+                z0_T = z0_T_cpu.to(device)
+                z0_S = z0_S_cpu.to(device)
+                opt.zero_grad()
+                # ||T(z_T) - z_S||^2 in student latent space (z_S = pixel-bridge target).
+                pred = self.transport.transport_sample(z0_T)
+                loss = (pred.float() - z0_S.float()).pow(2).mean()
+                loss.backward()
+                opt.step()
+                recon += float(loss.detach())
+            recon /= max(1, len(z_T_list))
+            logger.info(f"  AdaLN warm-up epoch {ep}: recon_mse={recon:.6f}")
+        # Freeze: no transport gradients during L1 (avoids the degenerate D_k path).
+        self.transport.eval()
+        for p in self.transport.parameters():
+            p.requires_grad_(False)
         if self.accelerator.num_processes > 1:
             import torch.distributed as dist
 
-            A = self.transport.A.to(device)
-            b = self.transport.b.to(device)
-            dist.broadcast(A, src=0)
-            dist.broadcast(b, src=0)
-            self.transport.A = A
-            self.transport.b = b
-        logger.info(
-            f"Linear transport fitted: A {tuple(self.transport.A.shape)}, "
-            f"b {tuple(self.transport.b.shape)} (frozen)."
-        )
+            for p in self.transport.parameters():
+                dist.broadcast(p.data, src=0)
+        self.transport._fitted = True
+        logger.info("AdaLN transport warm-up complete; frozen for L1.")
 
     def _l0_epoch_cross_vae(self) -> None:
         """Cross-VAE L0: pixel-bridge sample transport + analytic FM regression.

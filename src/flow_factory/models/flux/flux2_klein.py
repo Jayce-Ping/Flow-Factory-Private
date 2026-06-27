@@ -97,15 +97,10 @@ class Flux2KleinAdapter(BaseAdapter):
         # on demand via `load_teacher_transformer`. Shares the student
         # pipeline's VAE / scheduler. None until loaded.
         self._teacher_transformer: Optional[torch.nn.Module] = None
-        # Teacher's OWN text encoder (XOPD cross-model), held as a text-only
-        # diffusers pipeline so encoding stays architecture-agnostic: the teacher
-        # transformer's `joint_attention_dim` differs from the student's (e.g.
-        # 12288 for the 9B Qwen3 teacher, 15360 for the FLUX.2-dev Mistral3
-        # teacher), so the teacher needs text embeddings built by its OWN encoder
-        # -- the prompt is shared, the embedding is not. Loaded with transformer
-        # and VAE skipped (text components only) for offline preprocessing, then
-        # freed via `unload_teacher_text_encoder`. None until loaded.
-        self._teacher_pipeline: Optional[DiffusionPipeline] = None
+        # The teacher's OWN text encoder (XOPD cross-model) is managed by
+        # BaseAdapter (`_teacher_pipeline`, load/unload/encode_teacher_prompt):
+        # loaded text-only for offline preprocessing then freed, architecture-
+        # agnostic. BaseAdapter.__init__ already initialized `self._teacher_pipeline`.
 
     def load_pipeline(self) -> Flux2KleinPipeline:
         return Flux2KleinPipeline.from_pretrained(
@@ -358,21 +353,16 @@ class Flux2KleinAdapter(BaseAdapter):
             hidden_states_layers=hidden_states_layers,
         )
 
-        if self._teacher_pipeline is not None:
-            # Train: distillation uses teacher_guidance_scale. Test: the
-            # teacher-baseline eval runs the teacher under the SAME guidance as
-            # the student eval for that test set, i.e. this split's eval
-            # `guidance_scale`. Both are cache-relevant params, so changing
-            # either re-encodes the teacher negatives.
-            teacher_cfg = teacher_guidance_scale if is_train else guidance_scale
-            teacher = self.encode_teacher_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                guidance_scale=teacher_cfg,
-                device=device,
-                max_sequence_length=max_sequence_length,
-            )
-            batch.update({f"teacher_{k}": v for k, v in teacher.items()})
+        batch = self._apply_teacher_text_encoding(
+            batch=batch,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            teacher_guidance_scale=teacher_guidance_scale,
+            is_train=is_train,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
 
         if images is not None:
             image_dict = self.encode_image(
@@ -1382,151 +1372,11 @@ class Flux2KleinAdapter(BaseAdapter):
         )
         return teacher
 
-    def load_teacher_text_encoder(
-        self,
-        teacher_path: str,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> torch.nn.Module:
-        """Load the teacher's OWN text encoder for cross-model XOPD (offload-ready).
-
-        The teacher (e.g. FLUX.2-klein-base-9B or FLUX.2-dev) was trained with a
-        different text encoder than the student, so its transformer's
-        ``joint_attention_dim`` differs and it needs text embeddings from its own
-        encoder -- the prompt is shared, the embedding is not.
-
-        To stay architecture-agnostic (the 9B teacher uses Qwen3, FLUX.2-dev uses
-        Mistral3 / Pixtral), this loads the teacher as a diffusers pipeline with
-        the transformer and VAE SKIPPED (``transformer=None, vae=None``) -- i.e.
-        only the text encoder + tokenizer/processor -- and delegates encoding to
-        that pipeline's own ``encode_prompt`` (see :meth:`encode_teacher_prompt`).
-        Frozen, eval, inference-only. Intended to be loaded ONLY for offline
-        preprocessing and then freed via :meth:`unload_teacher_text_encoder`, so
-        the (potentially very large, e.g. 48 GB for FLUX.2-dev) teacher text
-        encoder never stays resident during training.
-
-        Args:
-            teacher_path: HF repo id or local path with a ``text_encoder`` subfolder.
-            device: Target device; defaults to the adapter device.
-            dtype: Target dtype; defaults to the student text encoder's dtype.
-
-        Returns:
-            The loaded teacher text encoder module.
-        """
-        if device is None:
-            device = self.device
-        if dtype is None:
-            dtype = self.pipeline.text_encoder.dtype
-
-        # Skip the (large) transformer + VAE: only the text encoder is needed, and
-        # the student's VAE is reused (shared latent space). Passing a component as
-        # None makes diffusers skip loading it (DiffusionPipeline.from_pretrained
-        # `load_module`), so neither the teacher transformer nor VAE is downloaded
-        # onto the device here.
-        teacher_pipe = DiffusionPipeline.from_pretrained(
-            teacher_path,
-            transformer=None,
-            vae=None,
-            torch_dtype=dtype,
-        )
-        if getattr(teacher_pipe, "text_encoder", None) is None:
-            raise ValueError(
-                f"Teacher pipeline loaded from {teacher_path!r} has no `text_encoder`; "
-                f"cannot build teacher text conditioning "
-                f"(pipeline={type(teacher_pipe).__name__})."
-            )
-        teacher_pipe.text_encoder.requires_grad_(False)
-        teacher_pipe.text_encoder.eval()
-        teacher_pipe.to(device)
-        self._teacher_pipeline = teacher_pipe
-
-        logger.info(
-            f"Loaded teacher text encoder from {teacher_path!r} "
-            f"(pipeline={type(teacher_pipe).__name__}, "
-            f"text_encoder={type(teacher_pipe.text_encoder).__name__}, "
-            f"dtype={dtype}, device={device}); transformer / VAE skipped."
-        )
-        return teacher_pipe.text_encoder
-
-    def unload_teacher_text_encoder(self) -> None:
-        """Free the teacher text encoder (XOPD): move to CPU, drop, empty cache.
-
-        Called after offline preprocessing has cached the teacher embeddings so
-        the (potentially very large, e.g. 48 GB for FLUX.2-dev) teacher text
-        encoder does not stay resident during training. A plain ``.to('cpu')`` is
-        not enough to release the VRAM, so the module is deleted and the CUDA
-        caching allocator is flushed.
-        """
-        if self._teacher_pipeline is not None:
-            text_encoder = getattr(self._teacher_pipeline, "text_encoder", None)
-            if text_encoder is not None:
-                text_encoder.to("cpu")
-            del self._teacher_pipeline
-            self._teacher_pipeline = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def encode_teacher_prompt(
-        self,
-        prompt: Union[str, List[str]],
-        negative_prompt: Optional[Union[str, List[str]]] = None,
-        guidance_scale: float = 1.0,
-        device: Optional[torch.device] = None,
-        max_sequence_length: int = 512,
-    ) -> Dict[str, torch.Tensor]:
-        """Encode prompt(s) with the TEACHER's own text encoder (XOPD cross-model).
-
-        Delegates to the teacher pipeline's ``encode_prompt`` so the embedding
-        architecture matches the teacher transformer's ``joint_attention_dim``
-        regardless of the teacher's text-encoder type (Qwen3 for klein-9B,
-        Mistral3 for FLUX.2-dev). Returns ``prompt_embeds`` / ``text_ids`` and,
-        when ``guidance_scale > 1.0``, the negative counterparts. The teacher
-        pipeline produces no ``prompt_ids`` (the teacher forward does not need
-        them), so none are returned.
-        """
-        if self._teacher_pipeline is None:
-            raise RuntimeError(
-                "encode_teacher_prompt() called before load_teacher_text_encoder(); "
-                "no teacher text encoder is loaded."
-            )
-        if device is None:
-            device = self._teacher_pipeline.text_encoder.device
-        if prompt is None:
-            prompt = ""
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        prompt_embeds, text_ids = self._teacher_pipeline.encode_prompt(
-            prompt,
-            device=device,
-            max_sequence_length=max_sequence_length,
-        )
-        results = {
-            "prompt_embeds": prompt_embeds,
-            "text_ids": text_ids,
-        }
-        if guidance_scale > 1.0:
-            negative_prompt = "" if negative_prompt is None else negative_prompt
-            negative_prompt = (
-                [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            )
-            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt))
-            if len(negative_prompt) != len(prompt):
-                raise ValueError(
-                    f"teacher negative_prompt count ({len(negative_prompt)}) must match "
-                    f"prompt count ({len(prompt)})."
-                )
-            negative_prompt_embeds, negative_text_ids = self._teacher_pipeline.encode_prompt(
-                negative_prompt,
-                device=device,
-                max_sequence_length=max_sequence_length,
-            )
-            results.update(
-                {
-                    "negative_prompt_embeds": negative_prompt_embeds,
-                    "negative_text_ids": negative_text_ids,
-                }
-            )
-        return results
+    # `load_teacher_text_encoder`, `unload_teacher_text_encoder`, and
+    # `encode_teacher_prompt` are inherited from BaseAdapter (architecture-agnostic
+    # teacher text-encoder precompute+offload). The teacher pipeline's
+    # `encode_prompt` returns (prompt_embeds, text_ids) for the FLUX.2 family,
+    # which is what the base implementation expects.
 
     @contextmanager
     def use_teacher_transformer(self):

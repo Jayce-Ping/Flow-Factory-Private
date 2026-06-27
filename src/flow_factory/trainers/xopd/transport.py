@@ -59,6 +59,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -197,6 +198,14 @@ class VAETransport(ABC):
         """Warm-up fit. No-op unless ``requires_warmup``."""
         return None
 
+    def state_dict(self) -> dict:
+        """Serializable transport state (fitted params + grids). Default: empty."""
+        return {}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore from :meth:`state_dict`. Default: no-op."""
+        return None
+
 
 class IdentityTransport(VAETransport):
     """Shared-VAE special case: ``Z_T == Z_S``, transport is the identity.
@@ -296,6 +305,22 @@ class LinearTransport(VAETransport):
     def is_fitted(self) -> bool:
         return self.A is not None
 
+    def state_dict(self) -> dict:
+        return {
+            "A": None if self.A is None else self.A.detach().cpu(),
+            "b": None if self.b is None else self.b.detach().cpu(),
+            "student_grid": self._student_grid,
+            "teacher_grid": self._teacher_grid,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        A = state.get("A")
+        b = state.get("b")
+        self.A = None if A is None else A.clone()
+        self.b = None if b is None else b.clone()
+        self._student_grid = state.get("student_grid")
+        self._teacher_grid = state.get("teacher_grid")
+
     def fit(self, z_T_list: List[torch.Tensor], z_S_list: List[torch.Tensor], **ctx) -> None:
         """Fit ``A, b`` from paired native latents (warm-up).
 
@@ -392,6 +417,155 @@ class WhiteningTransport(LinearTransport):
         self.b = b.to(T_spatial.device)
 
 
+class AdaLNTransport(VAETransport, nn.Module):
+    """Learnable AdaLN-style affine transport (per-channel scale + shift), trainable.
+
+    The trainable counterpart of :class:`WhiteningTransport`: the per-channel
+    ``gamma, beta`` are ``nn.Parameter`` s optimized jointly with the student
+    (a SECOND trainable module, DDP/DeepSpeed-prepared by the trainer). Theory:
+    docs/mof/xopd_vae_space_align.tex (M7 / "传输的初始化与 AdaLN…").
+
+    Design:
+    * ``gamma`` is parameterized in log space (``gamma = exp(log_gamma)``) so it
+      stays strictly positive and the map is **always analytically invertible**
+      (``z = (z' - beta) / gamma``) — no pseudo-inverse, no separate inverse net.
+    * Initialized by **moment matching** (the neutral init: identity when the two
+      spaces coincide); call :meth:`init_from_moments` during warm-up. Without it,
+      defaults to identity (log_gamma=0, beta=0).
+    * Channel-count mismatch (``C_T != C_S``) is handled by a fixed (non-learned)
+      ``channel_proj`` selection matrix mapping the first ``min(C_T,C_S)`` teacher
+      channels to student channels; the learnable affine then acts in student
+      channels. (A full learnable ``C_S x C_T`` mixing is the M2 non-diagonal
+      extension; kept diagonal here for invertibility + stability.)
+    * "Do no harm" non-linear extension (zero-init residual / AdaLN-Zero) is left
+      as a documented hook (``use_residual=False`` default); enabling it makes the
+      transport non-affine and would require the M5 inverse machinery for L1.
+
+    Layout: like :class:`LinearTransport`, holds ``to/from_spatial`` converters so
+    it accepts/returns native latents while operating in canonical ``BCHW``.
+    """
+
+    requires_warmup = True
+
+    def __init__(
+        self,
+        teacher_to_spatial: Callable,
+        teacher_from_spatial: Callable,
+        student_to_spatial: Callable,
+        student_from_spatial: Callable,
+        teacher_channels: int,
+        student_channels: int,
+        student_grid: Optional[Tuple[int, int]] = None,
+        teacher_grid: Optional[Tuple[int, int]] = None,
+        min_std: float = 1e-6,
+    ):
+        nn.Module.__init__(self)
+        self.t2s = teacher_to_spatial
+        self.t_from = teacher_from_spatial
+        self.s2s = student_to_spatial
+        self.s_from = student_from_spatial
+        self.C_T = teacher_channels
+        self.C_S = student_channels
+        self.min_std = min_std
+        self._student_grid = tuple(student_grid) if student_grid is not None else None
+        self._teacher_grid = tuple(teacher_grid) if teacher_grid is not None else None
+        self._fitted = False
+
+        # Learnable per-(student-)channel affine in log/linear space.
+        self.log_gamma = nn.Parameter(torch.zeros(self.C_S))
+        self.beta = nn.Parameter(torch.zeros(self.C_S))
+        # Fixed teacher->student channel selection (non-learned), C_S x C_T.
+        C = min(self.C_T, self.C_S)
+        proj = torch.zeros(self.C_S, self.C_T)
+        proj[torch.arange(C), torch.arange(C)] = 1.0
+        self.register_buffer("channel_proj", proj)
+
+    @property
+    def is_fitted(self) -> bool:
+        # The module is always usable (identity by default); `is_fitted` reports
+        # whether moment-matching init has run, for warm-up bookkeeping.
+        return self._fitted
+
+    def _gamma(self) -> torch.Tensor:
+        return torch.exp(self.log_gamma)
+
+    @torch.no_grad()
+    def init_from_moments(
+        self, z_T_list: List[torch.Tensor], z_S_list: List[torch.Tensor]
+    ) -> None:
+        """Initialize gamma/beta by per-channel moment matching (warm-up cold start)."""
+        T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+        S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+        self._teacher_grid = tuple(T_spatial.shape[-2:])
+        self._student_grid = tuple(S_spatial.shape[-2:])
+        T_rs = resample_spatial(T_spatial, self._student_grid)
+        # project teacher channels -> student channels, then match moments
+        T_proj = torch.einsum("sc,bchw->bshw", self.channel_proj.to(T_rs.dtype), T_rs)
+        mu_in = T_proj.mean(dim=(0, 2, 3)).double()
+        std_in = T_proj.std(dim=(0, 2, 3)).double().clamp_min(self.min_std)
+        mu_out = S_spatial.mean(dim=(0, 2, 3)).double()
+        std_out = S_spatial.std(dim=(0, 2, 3)).double().clamp_min(self.min_std)
+        gamma = (std_out / std_in).float()
+        beta = (mu_out - gamma.double() * mu_in).float()
+        self.log_gamma.data.copy_(torch.log(gamma.clamp_min(self.min_std)))
+        self.beta.data.copy_(beta)
+        self._fitted = True
+
+    # alias so the trainer warm-up can call .fit(...) uniformly across transports
+    def fit(self, z_T_list, z_S_list, **ctx) -> None:
+        self.init_from_moments(z_T_list, z_S_list)
+
+    def _to_student_spatial(self, T_spatial: torch.Tensor) -> torch.Tensor:
+        T_rs = (
+            resample_spatial(T_spatial, self._student_grid)
+            if self._student_grid is not None
+            else T_spatial
+        )
+        T_proj = torch.einsum("sc,bchw->bshw", self.channel_proj.to(T_rs.dtype), T_rs)
+        g = self._gamma().view(1, -1, 1, 1).to(T_proj.dtype)
+        b = self.beta.view(1, -1, 1, 1).to(T_proj.dtype)
+        return g * T_proj + b
+
+    def _to_teacher_spatial(self, S_spatial: torch.Tensor) -> torch.Tensor:
+        # invert affine (analytic), un-project channels, inverse resample
+        g = self._gamma().view(1, -1, 1, 1).to(S_spatial.dtype)
+        b = self.beta.view(1, -1, 1, 1).to(S_spatial.dtype)
+        T_proj = (S_spatial - b) / g
+        T_rs = torch.einsum("cs,bshw->bchw", self.channel_proj.t().to(T_proj.dtype), T_proj)
+        return (
+            resample_spatial(T_rs, self._teacher_grid)
+            if self._teacher_grid is not None
+            else T_rs
+        )
+
+    def transport_sample(self, z_T: torch.Tensor, **ctx) -> torch.Tensor:
+        S_spatial = self._to_student_spatial(self.t2s(z_T))
+        return self.s_from(S_spatial)
+
+    def transition_mean_to_student(self, x_S, query_teacher_mean, **ctx):
+        # Inverse to teacher space (gradient flows through gamma/beta), query, map back.
+        T_spatial = self._to_teacher_spatial(self.s2s(x_S))
+        x_T = self.t_from(T_spatial)
+        mu_T = query_teacher_mean(x_T)
+        muS_spatial = self._to_student_spatial(self.t2s(mu_T))
+        return self.s_from(muS_spatial)
+
+    def state_dict(self, *args, **kwargs) -> dict:
+        # nn.Module params + the non-parameter grid/fitted bookkeeping.
+        sd = dict(nn.Module.state_dict(self, *args, **kwargs))
+        sd["_student_grid"] = self._student_grid
+        sd["_teacher_grid"] = self._teacher_grid
+        sd["_fitted"] = self._fitted
+        return sd
+
+    def load_state_dict(self, state: dict, strict: bool = True) -> None:
+        state = dict(state)
+        self._student_grid = state.pop("_student_grid", None)
+        self._teacher_grid = state.pop("_teacher_grid", None)
+        self._fitted = state.pop("_fitted", False)
+        nn.Module.load_state_dict(self, state, strict=strict)
+
+
 class MLPTransport(VAETransport):
     """Placeholder for a future non-linear transport (and its inverse).
 
@@ -400,8 +574,9 @@ class MLPTransport(VAETransport):
     M2-nonlinear / M5 cycle-consistent). Deliberately unimplemented for now.
 
     Note: the "do no harm" non-linear init is a zero-init residual on top of the
-    diagonal moment-matching baseline (AdaLN-Zero style) — see the theory doc
-    Rem. on zero-init residual — NOT an identity-initialized non-linear map.
+    diagonal moment-matching baseline (AdaLN-Zero style, see AdaLNTransport's
+    use_residual hook and the theory doc) — NOT an identity-initialized
+    non-linear map.
     """
 
     requires_warmup = True
@@ -412,7 +587,7 @@ class MLPTransport(VAETransport):
             "It needs a learned forward map AND an inverse for the L1 teacher query "
             "(plus a JVP for the velocity pushforward). See "
             "docs/mof/xopd_vae_space_align.tex (M2-nonlinear, M5). Use "
-            "vae_transport.type in {pixel, linear} for now."
+            "vae_transport.type in {pixel, linear, whitening, adaln} for now."
         )
 
     def transport_sample(self, z_T, **ctx):  # pragma: no cover
@@ -423,7 +598,7 @@ class MLPTransport(VAETransport):
 
 
 def build_transport(transport_type: str, **kwargs) -> VAETransport:
-    """Factory: ``transport_type`` in {identity, pixel, linear, whitening, mlp}."""
+    """Factory: ``transport_type`` in {identity, pixel, linear, whitening, adaln, mlp}."""
     t = (transport_type or "identity").lower()
     if t == "identity":
         return IdentityTransport()
@@ -433,9 +608,11 @@ def build_transport(transport_type: str, **kwargs) -> VAETransport:
         return LinearTransport(**kwargs)
     if t == "whitening":
         return WhiteningTransport(**kwargs)
+    if t == "adaln":
+        return AdaLNTransport(**kwargs)
     if t == "mlp":
         return MLPTransport(**kwargs)
     raise ValueError(
         f"Unknown vae_transport type {transport_type!r}; "
-        "expected one of {'identity', 'pixel', 'linear', 'whitening', 'mlp'}."
+        "expected one of {'identity', 'pixel', 'linear', 'whitening', 'adaln', 'mlp'}."
     )
