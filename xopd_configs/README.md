@@ -16,8 +16,47 @@ transition is deterministic, `log_prob` is identically zero, and
 ```
 xopd_configs/
 ├── ode_pathwise/     # dynamics_type=ODE, reinforce_coef=0  (deterministic pathwise distillation only)
-└── sde_reinforce/    # dynamics_type=Flow-SDE, noise_level=0.7, reinforce_coef=1.0  (pathwise + REINFORCE)
+├── sde_reinforce/    # dynamics_type=Flow-SDE, noise_level=0.7, reinforce_coef=1.0  (pathwise + REINFORCE)
+└── cross_vae/        # heterogeneous VAE spaces (FLUX.2 teacher -> SD3.5 student) via a latent transport
 ```
+
+### cross_vae/ — heterogeneous latent spaces
+
+`ode_pathwise` / `sde_reinforce` assume teacher and student **share a VAE** (the
+teacher transformer is swapped into the student pipeline). `cross_vae/` distills
+across **different VAEs** (FLUX.2-dev/9B teacher → SD3.5-medium student): the
+teacher is an **independent frozen adapter** and a `vae_transport` carries its
+signal into the student latent space. Theory & method derivation:
+[`docs/mof/xopd_vae_space_align.tex`](../docs/mof/xopd_vae_space_align.tex).
+
+4 configs (2 teachers × {pure-L1, L0+L1}):
+
+| file | teacher | stage |
+|------|---------|-------|
+| `flux2_klein_9b_to_sd35_l1.yaml`   | FLUX.2-klein-base-9B | pure L1 |
+| `flux2_klein_9b_to_sd35_l0l1.yaml` | FLUX.2-klein-base-9B | L0 warmup → L1 |
+| `flux2_dev_32b_to_sd35_l1.yaml`    | FLUX.2-dev (~32B)    | pure L1 |
+| `flux2_dev_32b_to_sd35_l0l1.yaml`  | FLUX.2-dev (~32B)    | L0 warmup → L1 |
+
+Key knobs (pathwise only, `reinforce_coef=0`, ODE):
+
+- `teacher_model_type`: teacher adapter key (`flux2-klein` / `flux2`); its presence
+  switches on the cross-VAE path.
+- `vae_transport`: the **L1 transition-mean transport baseline** —
+  `linear` (M2, affine, fit once during warm-up then frozen; default) vs `pixel`
+  (M1, decode-encode bridge, no training, lossy, slow). **Flip `linear` → `pixel`
+  to compare the two L1 baselines.** `mlp` is a non-linear placeholder
+  (NotImplementedError). L0 always uses the pixel bridge regardless of this knob.
+- `transport_warmup_batches`: paired-latent batches used to fit the linear `A, b`.
+
+> **Status / boundary:** the transport math, `encode_pixels`, `predict_velocity`,
+> hparams, and the full trainer wiring (L0 / L1-pixel / L1-linear / warm-up) are
+> implemented and unit-tested where unit-testable. The one piece that still needs
+> per-adapter work before an end-to-end SD3.5-student run is **teacher text
+> conditioning via precompute+offload on the SD3.5 student adapter** (currently
+> implemented on `Flux2KleinAdapter` only); `XOPDTrainer._init_dataloader` raises a
+> clear `NotImplementedError` at that boundary. See `.scratch/xopd_cross_vae_plan.md`.
+
 
 Each group holds the same 2×2 matrix of **teacher × stage**:
 

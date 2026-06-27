@@ -1,0 +1,155 @@
+# Cross-VAE XOPD: FLUX.2-dev (~32B, teacher) -> SD3.5-medium (student)
+# HETEROGENEOUS latent spaces: teacher and student use DIFFERENT VAEs, so the
+# teacher signal is carried into the student latent space by a `vae_transport`
+# (see docs/mof/xopd_vae_space_align.tex). The teacher is built as an INDEPENDENT
+# frozen adapter (its own VAE / scheduler / text encoder); the student is SD3.5.
+#
+# This file: L0 warmup -> L1 with the LINEAR transport baseline.
+# Flip vae_transport: linear -> pixel for the pixel-bridge L1 baseline.
+# Pathwise only (reinforce_coef=0), ODE.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (prompts only; L0's z0 is teacher-generated) =====
+data:
+  dataset_dir: "dataset/geneval"          # Eval/test fallback.
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/ocr"
+    - "dataset/pickscore"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (student = SD3.5-medium, the small model being trained) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"  # Student (SD3.5)
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2dev_32b_to_sd35_l0l1_linear"
+  project: "Flow-Factory-XOPD-CrossVAE"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+# ===== Training (XOPD cross-VAE) =====
+train:
+  trainer_type: "xopd"
+
+  # --- Cross-VAE teacher (independent adapter) ---
+  teacher_model_type: "flux2"              # FLUX.2-dev; different architecture than the SD3.5 student -> cross-VAE path
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: false    # Cross-VAE: teacher VAE differs; transport bridges the spaces
+
+  # --- VAE latent-space transport (cross-VAE) ---
+  vae_transport: "linear"                  # L1 transport. Options: linear (M2, warm-up+freeze), pixel (M1, lossy baseline), mlp (placeholder)
+  transport_warmup_batches: 64             # Linear: paired-latent batches to fit A,b before training (ignored for pixel)
+
+  # --- Dual classifier-free guidance ---
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  # --- L0: velocity-regression warmup (DISABLED here: pure L1) ---
+  l0_warmup_epochs: 10                     # L0 warmup epochs (cross-VAE: pixel-bridge sample transport + analytic FM), then switch to L1.
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  # --- L1: on-policy transition matching (pathwise only) ---
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0                      # No REINFORCE this round (ODE)
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  # --- Multi-source sampling ratio ---
+  source_ratio: {geneval: 1, ocr: 1, pickscore: 1}
+
+  # --- Sampling / batch ---
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1                 # Cross-VAE L1 keeps teacher transformer + teacher VAE + student resident; start conservative
+  group_size: 1
+  unique_sample_num_per_epoch: 24          # =3*8 -> num_batches_per_epoch multiple of 3 (source_ratio period) on 8 GPUs
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  # --- Optimizer ---
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # --- EMA ---
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # --- Memory / misc ---
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation =====
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  num_inference_steps: 28
+  guidance_scale: 1.0
+  eval_freq: 20
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: []}       # OCR reward deps not staged -> images only
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: []}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (logging only; also serve as eval rewards) =====
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false

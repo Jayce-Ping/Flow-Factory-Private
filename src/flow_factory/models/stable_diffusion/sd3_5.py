@@ -190,6 +190,57 @@ class SD3_5Adapter(BaseAdapter):
 
         return images
 
+    @torch.no_grad()
+    def encode_pixels(
+        self,
+        images: Union[Image.Image, List[Image.Image], torch.Tensor],
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        sample_mode: Literal["sample", "argmax"] = "argmax",
+        device: Optional[torch.device] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Encode pixel image(s) into scaled SD3.5 latents (the inverse of ``decode_latents``).
+
+        Cross-model XOPD pixel bridge primitive: a teacher in a *different* VAE
+        space produces an image via ``teacher.decode_latents(..., output_type="pt")``;
+        this maps that image into the student's latent space so the two models can
+        be compared (see ``trainers/xopd/transport.py``). The returned latent uses
+        the SAME scaled+shifted convention that ``decode_latents`` undoes, i.e.
+        ``z = (E(x) - shift_factor) * scaling_factor``, so
+        ``decode_latents(encode_pixels(x)) == x`` up to VAE reconstruction error.
+
+        Args:
+            images: PIL image(s), or a ``(B,3,H,W)`` float tensor in ``[0, 1]``
+                (the ``output_type="pt"`` convention of ``decode_latents``).
+            height/width: optional resize; default keeps the input resolution.
+            sample_mode: ``"argmax"`` (deterministic posterior mean, default — best
+                for a stable distillation target) or ``"sample"``.
+            device: target device; defaults to the VAE device.
+            generator: RNG for ``sample_mode="sample"``.
+
+        Returns:
+            ``(B, C, H/8, W/8)`` scaled latent tensor on ``device``.
+        """
+        vae = self.pipeline.vae
+        device = device if device is not None else vae.device
+        dtype = vae.dtype
+
+        # Normalize to a (B,3,H,W) float tensor in [-1, 1] (VAE input convention).
+        pixel_values = self.pipeline.image_processor.preprocess(
+            images, height=height, width=width
+        ).to(device=device, dtype=dtype)
+
+        posterior = vae.encode(pixel_values).latent_dist
+        if sample_mode == "argmax":
+            z = posterior.mode()
+        else:
+            z = posterior.sample(generator=generator)
+
+        # Match decode_latents' inverse: z_scaled = (z - shift) * scaling.
+        z = (z - vae.config.shift_factor) * vae.config.scaling_factor
+        return z
+
     # ============================ Inference ============================
     @torch.no_grad()
     def inference(
@@ -392,6 +443,61 @@ class SD3_5Adapter(BaseAdapter):
         return samples
 
     # ============================ Training Forward ============================
+    def predict_velocity(
+        self,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+        guidance_scale: float = 7.5,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """CFG-combined velocity (noise) prediction, no scheduler step.
+
+        Cross-model XOPD L0 needs the velocity at an arbitrary continuous ``t``
+        (off the inference grid) without advancing the scheduler. This factors out
+        the transformer + CFG combination from :meth:`forward`. Returns the
+        ``(B, C, H, W)`` velocity prediction in the student latent layout.
+        """
+        batch_size = latents.shape[0]
+        timestep = t.expand(batch_size).to(latents.dtype)
+
+        do_cfg = (
+            negative_prompt_embeds is not None
+            and negative_pooled_prompt_embeds is not None
+            and guidance_scale > 1.0
+        )
+        if do_cfg:
+            prompt_embeds_input = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            pooled_input = torch.cat(
+                [negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0
+            )
+            latents_input = torch.cat([latents, latents], dim=0)
+            timestep_input = timestep.repeat(2)
+        else:
+            prompt_embeds_input = prompt_embeds
+            pooled_input = pooled_prompt_embeds
+            latents_input = latents
+            timestep_input = timestep
+
+        noise_pred = self.transformer(
+            hidden_states=latents_input,
+            timestep=timestep_input,
+            encoder_hidden_states=prompt_embeds_input,
+            pooled_projections=pooled_input,
+            joint_attention_kwargs=joint_attention_kwargs,
+            return_dict=False,
+        )[0]
+
+        if do_cfg:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_text - noise_pred_uncond
+            )
+        return noise_pred
+
     def forward(
         self,
         t: torch.Tensor,

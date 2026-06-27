@@ -2109,6 +2109,47 @@ class XOPDTrainingArguments(TrainingArguments):
         },
     )
 
+    # ---- Cross-VAE (heterogeneous latent space) distillation ----
+    teacher_model_type: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Adapter registry key of the teacher when it is a DIFFERENT "
+                "architecture than the student (e.g. 'flux2-klein' teacher with an "
+                "'sd3-5' student). None (default) means same-architecture: the "
+                "teacher transformer is swapped into the student pipeline (shared "
+                "VAE/scheduler). When set, the teacher is built as an independent "
+                "frozen adapter and a `vae_transport` carries its signal into the "
+                "student latent space (see docs/mof/xopd_vae_space_align.tex)."
+            )
+        },
+    )
+    vae_transport: Literal["identity", "pixel", "linear", "mlp"] = field(
+        default="identity",
+        metadata={
+            "help": (
+                "Latent-space transport T: Z_T -> Z_S for cross-VAE distillation. "
+                "'identity' (default): shared VAE, no transport. 'pixel': M1 "
+                "decode-encode bridge (no training, lossy, expensive for L1). "
+                "'linear': M2 affine transport, fit once during warm-up then frozen "
+                "(clean for L1). 'mlp': non-linear placeholder (NotImplementedError). "
+                "L0 always uses the pixel bridge regardless of this setting; this "
+                "selects the L1 transition-mean transport."
+            )
+        },
+    )
+    transport_warmup_batches: int = field(
+        default=64,
+        metadata={
+            "help": (
+                "Number of teacher-rollout batches used to fit the 'linear' "
+                "vae_transport before training (paired (z_T, z_S) latents via the "
+                "pixel bridge, least-squares fit, then frozen). Ignored for "
+                "'identity'/'pixel'. Must be > 0 when vae_transport='linear'."
+            )
+        },
+    )
+
     # ---- Dual classifier-free guidance ----
     teacher_guidance_scale: float = field(
         default=1.0,
@@ -2235,15 +2276,37 @@ class XOPDTrainingArguments(TrainingArguments):
                 "XOPDTrainingArguments requires `teacher_model_name_or_path`, got "
                 f"teacher_model_name_or_path={self.teacher_model_name_or_path!r}."
             )
-        if not self.assume_shared_vae_text_encoder:
-            raise ValueError(
-                "XOPD requires a shared VAE between teacher and student "
-                "(assume_shared_vae_text_encoder=True) so teacher velocities live "
-                "in the student's latent space (enforced by the transformer "
-                "in_channels check). The teacher's text encoder may differ and is "
-                "loaded separately for cross-model text conditioning, so a fully "
-                "separate teacher pipeline is still not required."
-            )
+        # Cross-VAE mode: a different-architecture teacher (teacher_model_type set)
+        # carries its signal into the student latent space via `vae_transport`, so
+        # a shared VAE is NOT required. Same-architecture mode still requires it.
+        self._cross_vae = self.teacher_model_type is not None
+        if self._cross_vae:
+            if self.vae_transport == "identity":
+                raise ValueError(
+                    "Cross-VAE XOPD (teacher_model_type set: "
+                    f"{self.teacher_model_type!r}) requires a non-identity "
+                    "vae_transport (one of {'pixel', 'linear', 'mlp'}); got "
+                    "vae_transport='identity'."
+                )
+            if self.vae_transport == "linear" and self.transport_warmup_batches <= 0:
+                raise ValueError(
+                    "vae_transport='linear' requires transport_warmup_batches > 0 "
+                    f"to fit the affine map; got {self.transport_warmup_batches}."
+                )
+        else:
+            if self.vae_transport != "identity":
+                raise ValueError(
+                    "vae_transport must be 'identity' for same-architecture XOPD "
+                    "(teacher_model_type=None). Set teacher_model_type to enable a "
+                    f"cross-VAE transport; got vae_transport={self.vae_transport!r}."
+                )
+            if not self.assume_shared_vae_text_encoder:
+                raise ValueError(
+                    "Same-architecture XOPD requires a shared VAE between teacher "
+                    "and student (assume_shared_vae_text_encoder=True) so teacher "
+                    "velocities live in the student's latent space. For a different "
+                    "teacher VAE, set teacher_model_type + vae_transport instead."
+                )
         if self.l0_warmup_epochs < 0:
             raise ValueError(
                 f"`l0_warmup_epochs` must be >= 0, got l0_warmup_epochs={self.l0_warmup_epochs!r}."
