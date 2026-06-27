@@ -352,12 +352,56 @@ class LinearTransport(VAETransport):
         return self.s_from(muS_spatial)
 
 
+class WhiteningTransport(LinearTransport):
+    """M7: diagonal AdaLN-style affine transport (per-channel scale + shift).
+
+    A robust, well-conditioned special case of :class:`LinearTransport` whose
+    ``A`` is diagonal: ``T(z) = gamma * resample(z) + beta`` with one
+    ``(gamma, beta)`` per channel. Theory: docs/mof/xopd_vae_space_align.tex
+    (§ "传输的初始化与 AdaLN 式可逆调制", M7). Properties:
+
+    * **Closed-form, no least squares** — fit by moment matching (align per-
+      channel mean/std), so warm-up is one pass over the paired latents.
+    * **Analytic inverse** — ``T^-1(z') = (z' - beta) / gamma`` (gamma > 0); no
+      pseudo-inverse, no separate inverse network. Gives the L1 teacher query its
+      inverse cheaply (Cor. on the L1 inverse requirement).
+    * **Neutral initialization** — when the two latent spaces coincide (same mean/
+      std), gamma=1, beta=0, i.e. the transport is the IDENTITY. This is the
+      correct generalization of "identity init" (a raw identity is ill-defined for
+      C_T != C_S and OOD for mismatched scales): moment matching reduces to
+      identity exactly when identity is right.
+
+    Stored as a dense diagonal ``A`` (C_S x C_T) so it reuses LinearTransport's
+    transport/transition-mean machinery unchanged. ``min_std`` clamps the per-
+    channel std for a stable (invertible) gamma.
+    """
+
+    def __init__(self, *args, min_std: float = 1e-6, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.min_std = min_std
+
+    def fit(self, z_T_list: List[torch.Tensor], z_S_list: List[torch.Tensor], **ctx) -> None:
+        """Diagonal moment-matching fit (per-channel mean/std alignment)."""
+        T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+        S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+        self._teacher_grid = tuple(T_spatial.shape[-2:])
+        self._student_grid = tuple(S_spatial.shape[-2:])
+        T_rs = resample_spatial(T_spatial, self._student_grid)
+        A, b = moment_matching_affine(T_rs, S_spatial, eps=self.min_std)
+        self.A = A.to(T_spatial.device)
+        self.b = b.to(T_spatial.device)
+
+
 class MLPTransport(VAETransport):
     """Placeholder for a future non-linear transport (and its inverse).
 
     Non-linear transports break the flow-matching path structure and require an
     explicit/learned inverse + JVP for the L1 pushforward (see theory doc
     M2-nonlinear / M5 cycle-consistent). Deliberately unimplemented for now.
+
+    Note: the "do no harm" non-linear init is a zero-init residual on top of the
+    diagonal moment-matching baseline (AdaLN-Zero style) — see the theory doc
+    Rem. on zero-init residual — NOT an identity-initialized non-linear map.
     """
 
     requires_warmup = True
@@ -379,7 +423,7 @@ class MLPTransport(VAETransport):
 
 
 def build_transport(transport_type: str, **kwargs) -> VAETransport:
-    """Factory: ``transport_type`` in {identity, pixel, linear, mlp}."""
+    """Factory: ``transport_type`` in {identity, pixel, linear, whitening, mlp}."""
     t = (transport_type or "identity").lower()
     if t == "identity":
         return IdentityTransport()
@@ -387,9 +431,11 @@ def build_transport(transport_type: str, **kwargs) -> VAETransport:
         return PixelBridgeTransport(**kwargs)
     if t == "linear":
         return LinearTransport(**kwargs)
+    if t == "whitening":
+        return WhiteningTransport(**kwargs)
     if t == "mlp":
         return MLPTransport(**kwargs)
     raise ValueError(
         f"Unknown vae_transport type {transport_type!r}; "
-        "expected one of {'identity', 'pixel', 'linear', 'mlp'}."
+        "expected one of {'identity', 'pixel', 'linear', 'whitening', 'mlp'}."
     )

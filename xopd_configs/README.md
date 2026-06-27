@@ -42,12 +42,20 @@ Key knobs (pathwise only, `reinforce_coef=0`, ODE):
 
 - `teacher_model_type`: teacher adapter key (`flux2-klein` / `flux2`); its presence
   switches on the cross-VAE path.
-- `vae_transport`: the **L1 transition-mean transport baseline** —
-  `linear` (M2, affine, fit once during warm-up then frozen; default) vs `pixel`
-  (M1, decode-encode bridge, no training, lossy, slow). **Flip `linear` → `pixel`
-  to compare the two L1 baselines.** `mlp` is a non-linear placeholder
-  (NotImplementedError). L0 always uses the pixel bridge regardless of this knob.
-- `transport_warmup_batches`: paired-latent batches used to fit the linear `A, b`.
+- `vae_transport`: the **L1 transition-mean transport baseline** (the configs
+  default to `whitening`):
+  - `whitening` (M7): diagonal AdaLN affine (per-channel scale+shift), moment-
+    matched, **analytically invertible**, and **neutral = identity when the two
+    spaces coincide** — the most robust default and the cleanest answer to "how
+    to initialize the transport" (see the theory doc § "传输的初始化与 AdaLN…").
+  - `linear` (M2): full channel affine (least-squares), richer than whitening.
+  - `pixel` (M1): decode-encode bridge, no training, lossy, slow.
+  - `mlp`: non-linear placeholder (NotImplementedError).
+
+  **Flip among `whitening` / `linear` / `pixel` to compare L1 transport
+  baselines.** L0 always uses the pixel bridge regardless of this knob.
+- `transport_warmup_batches`: paired-latent batches used to fit the affine
+  `A, b` (`whitening`/`linear`); ignored for `pixel`/`identity`.
 
 > **Status / boundary:** the transport math, `encode_pixels`, `predict_velocity`,
 > hparams, and the full trainer wiring (L0 / L1-pixel / L1-linear / warm-up) are

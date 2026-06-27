@@ -22,6 +22,7 @@ from flow_factory.trainers.xopd.transport import (
     IdentityTransport,
     LinearTransport,
     MLPTransport,
+    WhiteningTransport,
     build_transport,
     channel_affine,
     fit_channel_affine_lstsq,
@@ -161,6 +162,46 @@ class TestLinearTransport(unittest.TestCase):
         torch.testing.assert_close(out, x_S, atol=1e-3, rtol=1e-3)
 
 
+class TestWhiteningTransport(unittest.TestCase):
+    def _make(self):
+        return WhiteningTransport(
+            teacher_to_spatial=_bchw_identity,
+            teacher_from_spatial=_bchw_identity,
+            student_to_spatial=_bchw_identity,
+            student_from_spatial=_bchw_identity,
+        )
+
+    def test_diagonal_moment_match_and_inverse(self):
+        torch.manual_seed(0)
+        C = 4
+        scale = torch.tensor([2.0, 0.5, 3.0, 1.0]).view(1, C, 1, 1)
+        shift = torch.tensor([1.0, -1.0, 0.0, 5.0]).view(1, C, 1, 1)
+        z_T = [torch.randn(8, C, 6, 6) for _ in range(3)]
+        z_S = [z * scale + shift for z in z_T]
+        t = self._make()
+        t.fit(z_T, z_S)
+        # transported teacher latent should match per-channel moments of z_S
+        out = t.transport_sample(z_T[0])
+        torch.testing.assert_close(
+            out.mean(dim=(0, 2, 3)), z_S[0].mean(dim=(0, 2, 3)), atol=1e-2, rtol=1e-2
+        )
+        # identity teacher mean -> exact round trip (analytic inverse)
+        x_S = torch.randn(2, C, 6, 6)
+        rt = t.transition_mean_to_student(x_S, query_teacher_mean=lambda x_T: x_T)
+        torch.testing.assert_close(rt, x_S, atol=1e-3, rtol=1e-3)
+
+    def test_identity_when_spaces_coincide(self):
+        # Same space (z_S == z_T) -> moment matching gives gamma=1, beta=0.
+        torch.manual_seed(1)
+        C = 4
+        z = [torch.randn(8, C, 5, 5) for _ in range(2)]
+        t = self._make()
+        t.fit(z, [zz.clone() for zz in z])
+        probe = torch.randn(2, C, 5, 5)
+        out = t.transport_sample(probe)
+        torch.testing.assert_close(out, probe, atol=1e-2, rtol=1e-2)
+
+
 class TestMLPTransportPlaceholder(unittest.TestCase):
     def test_raises(self):
         with self.assertRaises(NotImplementedError):
@@ -170,6 +211,17 @@ class TestMLPTransportPlaceholder(unittest.TestCase):
 class TestBuildTransport(unittest.TestCase):
     def test_identity(self):
         self.assertIsInstance(build_transport("identity"), IdentityTransport)
+
+    def test_whitening(self):
+        t = build_transport(
+            "whitening",
+            teacher_to_spatial=_bchw_identity,
+            teacher_from_spatial=_bchw_identity,
+            student_to_spatial=_bchw_identity,
+            student_from_spatial=_bchw_identity,
+        )
+        self.assertIsInstance(t, WhiteningTransport)
+        self.assertTrue(t.requires_warmup)
 
     def test_unknown_raises(self):
         with self.assertRaises(ValueError):

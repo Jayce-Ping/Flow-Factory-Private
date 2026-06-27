@@ -510,6 +510,7 @@ M3 CV-VAE 重训       & 是（大） & 训后极低         & \ding{51} & \ding
 M4 矩匹配（初始化）  & 闭式     & 低（二阶对齐）   & \ding{51} & \ding{51}\,(仿射)      & 是 & 离线估计 $\mu,\Sigma$ \\
 M5 cycle 双向        & 是（中） & 低               & \ding{51} & \ding{51}              & 显式可逆 & 两网+JVP \\
 M6 shared-decoder    & 是（小） & 低               & \ding{51} & \ding{51}              & --- & 解码头微调 \\
+M7 白化/AdaLN 仿射   & 闭式     & 低（对角二阶）   & \ding{51} & \ding{51}\,(干净)      & 解析可逆 & 逐通道 $\gamma,\beta$ \\
 \bottomrule
 \end{tabular}
 \caption{六种 VAE 隐空间传输方法对 XOPD L0/L1 的适配性对比。\ding{51}=干净适配，
@@ -525,6 +526,117 @@ L0 warmup 可跑通，验证"teacher 数据是否对 student 有用"这一最关
 (iii) M3/M5/M6 作为后续提升项，当 $\delta_{\Tmap}$ 被测出过大（线性传输不足以对齐两个
 隐空间）时再投入。
 \end{tcolorbox}
+
+%% ============================================================
+\section{传输的初始化与 AdaLN 式可逆调制}
+\label{sec:init-adaln}
+%% ============================================================
+
+本节回应两个具体设计问题：(1) transport 权重应如何初始化——恒等映射是否合适？
+(2) 把 ODE 转成 SDE 后能否用 AdaLN 式的"高斯到高斯"全局调制来构造可逆传输？两个问题
+都指向同一个对象——\textbf{逐通道仿射（对角白化）传输}——但都需要先澄清一个分布前提。
+
+\subsection{初始化：恒等不是好默认，矩匹配才是"中性"初始化}
+
+\begin{proposition}[恒等初始化的失效模式]
+\label{prop:identity-bad}
+把线性传输 $\Tmap(z)=Az+b$ 初始化为恒等（$A=I,b=0$）在跨 VAE 下一般\textbf{不可用}：
+\begin{enumerate}[leftmargin=1.6em,label=(\alph*)]
+\item \textbf{维度不合法}：$C_T\neq C_S$ 时 $A=I$ 无定义（FLUX.2 与 SD3.5 通道数不同）；
+\item \textbf{尺度错位}：即使 $C_T=C_S$，两个 VAE 的 latent 一阶/二阶矩不同（SD3.5 用
+``scaling\_factor``/``shift\_factor``，FLUX.2 用 BatchNorm 标准化），$A=I$ 把 teacher
+latent 原样塞入 student 空间 $\Rightarrow$ OOD $\Rightarrow$ $\delta_{\Tmap}$ 巨大。
+\end{enumerate}
+\end{proposition}
+
+正确的"中性初始化"是\textbf{对角矩匹配（白化-再着色）}：对齐逐通道均值/标准差
+\begin{equation}
+A_{\mathrm{diag}}=\mathrm{diag}\!\Big(\tfrac{\sigma_S^{(c)}}{\sigma_T^{(c)}}\Big),
+\qquad
+b=\mu_S-A_{\mathrm{diag}}\,\mu_T,
+\label{eq:diag-mm}
+\end{equation}
+其中 $\mu_\bullet^{(c)},\sigma_\bullet^{(c)}$ 是两个 latent 边际的逐通道矩（离线估计，
+$C_T\neq C_S$ 时在前 $\min(C_T,C_S)$ 个通道上做、其余零填充）。
+
+\begin{remark}[为什么矩匹配是"恒等的正确推广"]
+\label{rem:mm-is-identity}
+\eqref{eq:diag-mm} 满足：当两个空间\emph{恰好相同}（同均值同方差）时
+$A_{\mathrm{diag}}=I,b=0$，自动退化为恒等。因此"该不该用恒等初始化"的精确答案是：
+\textbf{恒等只在退化（同空间）情形正确；一般情形应该用矩匹配——它在该退化时自己变成
+恒等}。这也正是 \S\ref{sec:methods} M4 闭式 \eqref{eq:gaussian-ot} 的对角特例：M4 的
+全协方差 Bures 解对齐二阶\emph{全}结构，\eqref{eq:diag-mm} 只对齐对角，更便宜、更稳。
+\end{remark}
+
+\begin{remark}[可训练非线性传输的"恒等初始化" = zero-init 残差]
+\label{rem:zero-init}
+若 transport 含可训练的\emph{非线性}部分 $g_\phi$，"do no harm" 初始化的正解不是把
+$g_\phi$ 设成恒等，而是 \textbf{zero-init 残差}：
+$\Tmap(z)=A_{\mathrm{diag}}z+b+g_\phi(z)$ 且 $g_\phi$ 末层零初始化（AdaLN-Zero /
+ControlNet zero-conv / LoRA-B 的思路）。则训练\emph{初始}时 $\Tmap$ 恰好等于良态的仿射
+baseline \eqref{eq:diag-mm}，非线性修正从 0 开始安全注入。这是想法 1 在非线性情形的正确
+落地，并自然衔接下一小节。
+\end{remark}
+
+\subsection{ODE\,$\to$\,SDE 与 AdaLN 式调制：纠正前提，保留机制}
+
+\paragraph{前提纠正：SDE 的高斯性在转移核，不在边际。}
+"把 ODE 转成 SDE（Flow-SDE / CPS），中间步为高斯，于是两个 latent 空间的 latent 都是
+高斯"——这里要区分两个分布（与 Rem.~\ref{rem:not-gaussian} 同源）：
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{转移核} $p(z_{t+dt}\mid z_t)$：SDE 下\emph{是}高斯（加性高斯噪声）。XOPD 的
+$D_k$ 闭式高斯 KL 用的正是它——这\emph{不需要}把 ODE 转成 SDE，pathwise $D_k$ 在两种
+dynamics 下都良定义。
+\item \textbf{边际} $p(z_t)$，其中 $z_t=(1-\sigma_t)z_0+\sigma_t\epsilon$：\emph{非}高斯
+（非高斯的 $p(z_0)$ 与高斯卷积），仅 $\sigma_t\to1$ 时趋于高斯。
+\end{itemize}
+所以 \textbf{ODE\,$\to$\,SDE 并不会使 latent 边际变高斯}；"两个空间的 latent 都是高斯"
+这一前提\textbf{不成立}，"在两个高斯之间做变换"的字面表述需要放弃。
+
+\paragraph{机制是对的：AdaLN 调制 $\equiv$ 可逆逐通道仿射（白化传输）。}
+尽管前提不成立，想法 2 的\emph{机制}是有价值的：AdaLN 的逐通道 scale+shift
+$\Tmap(z)=\gamma\odot z+\beta$ 恰是 Prop.~\ref{prop:affine} 的对角仿射，且
+\begin{equation}
+\Tmap^{-1}(z')=(z'-\beta)\oslash\gamma
+\label{eq:adaln-inverse}
+\end{equation}
+\textbf{解析可逆}（$\gamma>0$），无需像 M5 那样单独学一个逆网络——这正好提供
+Cor.~\ref{cor:l1-hard} 要求的 L1 逆映射。换言之，\textbf{想法 2 独立地重新发现了"仿射
+调制是天然的可逆传输"}，且其参数恰由 \eqref{eq:diag-mm} 的矩匹配给出闭式初始化。我们把
+这个对象命名为 \textbf{M7：WhiteningTransport（对角 AdaLN 仿射）}，作为 M2-线性的
+对角特例：参数量 $2\min(C_T,C_S)$、可逆、零病态、矩匹配即得，是最稳的中性默认。
+
+\begin{proposition}[时间条件对仿射传输无增益]
+\label{prop:no-time-cond}
+VAE 的 encode/decode 是与扩散时间 $\sigma$ \emph{无关}的固定映射，故两个 latent 空间的
+关系本身与 $\sigma$ 无关。由 Prop.~\ref{prop:affine}(a)，一个\emph{静态}仿射
+$\Tmap(z)=Az+b$ 已把\emph{所有} $\sigma$ 的状态正确传输（插值路径整体被仿射搬运）。因此
+给仿射调制再加\emph{时间条件} $\gamma(\sigma),\beta(\sigma)$（AdaLN$(t)$）对仿射情形
+\textbf{没有收益}——时间条件只有当 transport 是\emph{非线性}（不同 $\sigma$ 的边际形状差
+异需要不同的非线性校正）时才可能有用。
+\end{proposition}
+
+\begin{remark}[一个细致的 caveat：均值干净，噪声需正交]
+\label{rem:orthogonal-noise}
+仿射传输对\emph{转移均值}的搬运是干净的（$D_k$ 用的就是均值，Prop.~\ref{prop:affine}(b)），
+所以 pathwise 蒸馏不受影响。但若还想让传输后的\emph{噪声}也匹配 student 的各向同性标准
+噪声，需要 $A$ 为正交矩阵（保协方差为各向同性）；而矩匹配/白化的 $A$ 一般\emph{非}正交，
+故传输后的路径分布只是\emph{近似} on-distribution。这\textbf{不}影响 mean-matching 的
+$D_k$ 使用，但它（而非时间条件）才是引入更富表达传输（M5 cycle / 正交约束）的真正动机。
+若将来上 SDE+REINFORCE，则噪声项进入 log-prob，正交性才变得重要。
+\end{remark}
+
+\begin{tcolorbox}[colback=blue!4,colframe=blue!50!black,title=两个想法的结论]
+\textbf{想法 1}：恒等初始化一般不可用（维度/尺度，Prop.~\ref{prop:identity-bad}）；正解是
+\emph{矩匹配}中性初始化 \eqref{eq:diag-mm}（同空间时自动退化为恒等，
+Rem.~\ref{rem:mm-is-identity}），非线性情形用 zero-init 残差
+（Rem.~\ref{rem:zero-init}）。\\
+\textbf{想法 2}：ODE$\to$SDE 不使 latent 边际高斯（前提需放弃），但 AdaLN 式逐通道仿射
+调制是\emph{天然可逆}的传输（\eqref{eq:adaln-inverse}）、由矩匹配闭式初始化——即新增的
+\textbf{M7 WhiteningTransport}。时间条件对仿射无增益（Prop.~\ref{prop:no-time-cond}），
+故无需真的转 SDE；静态对角仿射即可。
+\end{tcolorbox}
+
 
 %% ============================================================
 \section{实现设计（不写生产代码，只做架构）}

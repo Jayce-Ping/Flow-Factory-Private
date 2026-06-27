@@ -308,9 +308,12 @@ class XOPDTrainer(BaseTrainer):
                 teacher_adapter=self.teacher_adapter,
                 student_adapter=self.adapter,
             )
-        elif ta.vae_transport == "linear":
+        elif ta.vae_transport in ("linear", "whitening"):
+            # Both are affine transports fit on paired latents during warm-up;
+            # 'whitening' (M7) is the diagonal/AdaLN special case, 'linear' (M2)
+            # the full channel affine. Same converter-based construction.
             self.transport = build_transport(
-                "linear",
+                ta.vae_transport,
                 teacher_to_spatial=self._teacher_to_spatial,
                 teacher_from_spatial=self._teacher_from_spatial,
                 student_to_spatial=self._student_to_spatial,

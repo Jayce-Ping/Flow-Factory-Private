@@ -2124,17 +2124,21 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    vae_transport: Literal["identity", "pixel", "linear", "mlp"] = field(
+    vae_transport: Literal["identity", "pixel", "linear", "whitening", "mlp"] = field(
         default="identity",
         metadata={
             "help": (
                 "Latent-space transport T: Z_T -> Z_S for cross-VAE distillation. "
                 "'identity' (default): shared VAE, no transport. 'pixel': M1 "
                 "decode-encode bridge (no training, lossy, expensive for L1). "
-                "'linear': M2 affine transport, fit once during warm-up then frozen "
-                "(clean for L1). 'mlp': non-linear placeholder (NotImplementedError). "
-                "L0 always uses the pixel bridge regardless of this setting; this "
-                "selects the L1 transition-mean transport."
+                "'whitening': M7 diagonal AdaLN affine (per-channel scale+shift, "
+                "moment-matched, analytically invertible, neutral=identity when the "
+                "spaces coincide); the most robust cross-VAE default. 'linear': M2 "
+                "full channel affine (least-squares, richer than whitening). Both "
+                "are fit once during warm-up then frozen (clean for L1). 'mlp': "
+                "non-linear placeholder (NotImplementedError). L0 always uses the "
+                "pixel bridge regardless of this setting; this selects the L1 "
+                "transition-mean transport."
             )
         },
     )
@@ -2288,10 +2292,11 @@ class XOPDTrainingArguments(TrainingArguments):
                     "vae_transport (one of {'pixel', 'linear', 'mlp'}); got "
                     "vae_transport='identity'."
                 )
-            if self.vae_transport == "linear" and self.transport_warmup_batches <= 0:
+            if self.vae_transport in ("linear", "whitening") and self.transport_warmup_batches <= 0:
                 raise ValueError(
-                    "vae_transport='linear' requires transport_warmup_batches > 0 "
-                    f"to fit the affine map; got {self.transport_warmup_batches}."
+                    f"vae_transport={self.vae_transport!r} requires "
+                    "transport_warmup_batches > 0 to fit the affine map; "
+                    f"got {self.transport_warmup_batches}."
                 )
         else:
             if self.vae_transport != "identity":

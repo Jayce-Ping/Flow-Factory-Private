@@ -4,8 +4,8 @@
 # (see docs/mof/xopd_vae_space_align.tex). The teacher is built as an INDEPENDENT
 # frozen adapter (its own VAE / scheduler / text encoder); the student is SD3.5.
 #
-# This file: L0 warmup -> L1 with the LINEAR transport baseline.
-# Flip vae_transport: linear -> pixel for the pixel-bridge L1 baseline.
+# This file: L0 warmup -> L1 with the WHITENING transport (M7).
+# Flip vae_transport among whitening / linear / pixel to compare L1 transport baselines.
 # Pathwise only (reinforce_coef=0), ODE.
 
 # ===== Environment =====
@@ -42,7 +42,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_9b_to_sd35_l0l1_linear"
+  run_name: "flux2klein_9b_to_sd35_l0l1_whitening"
   project: "Flow-Factory-XOPD-CrossVAE"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -60,7 +60,7 @@ train:
   assume_shared_vae_text_encoder: false    # Cross-VAE: teacher VAE differs; transport bridges the spaces
 
   # --- VAE latent-space transport (cross-VAE) ---
-  vae_transport: "linear"                  # L1 transport. Options: linear (M2, warm-up+freeze), pixel (M1, lossy baseline), mlp (placeholder)
+  vae_transport: "whitening"               # L1 transport (M7 diagonal AdaLN affine: moment-matched, invertible, neutral=identity; robust default). Options: whitening, linear (M2 full affine), pixel (M1 lossy baseline), mlp (placeholder)
   transport_warmup_batches: 64             # Linear: paired-latent batches to fit A,b before training (ignored for pixel)
 
   # --- Dual classifier-free guidance ---
