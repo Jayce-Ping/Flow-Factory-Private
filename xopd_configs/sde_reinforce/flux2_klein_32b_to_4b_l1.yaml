@@ -30,8 +30,8 @@ data:
   # train.source_ratio below. The source name is the basename of each directory.
   dataset_dirs:
     - "dataset/geneval"
-    - "dataset/ocr"
-    - "dataset/pickscore"
+    # - "dataset/ocr"   # disabled: train on geneval only
+    # - "dataset/pickscore"   # disabled: train on geneval only
   preprocessing_batch_size: 8             # Batch size for offline text encoding
   dataloader_num_workers: 16              # DataLoader worker processes
   force_reprocess: false                  # true: ignore cache and re-preprocess
@@ -90,14 +90,14 @@ train:
   kl_beta: 0.0                            # KL anchor coefficient; 0 disables
 
   # --- Multi-source sampling ratio (active; requires data.dataset_dirs) ---
-  source_ratio: {geneval: 1, ocr: 1, pickscore: 1}   # Equal block-cycle weights (one G·O·P cycle per period). num_batches_per_epoch must be divisible by sum(values)=3 (see unique_sample_num_per_epoch).
+  # source_ratio: {geneval: 1}   # disabled: single-source (geneval only); None -> round-robin over the lone source
 
   # --- Sampling / batch ---
   resolution: 512                         # Generation resolution (int or [H, W]); klein native is 1024, lower to save memory
   num_inference_steps: 28                 # L1 student rollout steps (undistilled base models need more steps)
   per_device_batch_size: 1                # Conservative start: the FLUX.2-dev teacher transformer is ~64GB resident, so bs=4 (9B optimum) OOMs even with the 48GB teacher TE offloaded. Re-run a batch search once GPUs are free to raise it.
   group_size: 1                           # Group size (XOPD default 1; only >1 if you add grouped REINFORCE)
-  unique_sample_num_per_epoch: 192        # Unique prompts/epoch. =3*64 so num_batches_per_epoch is a multiple of 3 (= source_ratio period): 6 batches/epoch on 32 GPUs (pdbs=1) -> two clean geneval·ocr·pickscore cycles.
+  unique_sample_num_per_epoch: 64        # geneval-only: 192/3 = 64 unique prompts/epoch
   gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps)
   num_inner_epochs: 1                     # MUST be 1 for XOPD (no rollout reuse); enforced at startup
   gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps

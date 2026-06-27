@@ -20,8 +20,8 @@ data:
   dataset_dir: "dataset/geneval"          # Eval/test fallback.
   dataset_dirs:
     - "dataset/geneval"
-    - "dataset/ocr"
-    - "dataset/pickscore"
+    # - "dataset/ocr"   # disabled: train on geneval only
+    # - "dataset/pickscore"   # disabled: train on geneval only
   preprocessing_batch_size: 8
   dataloader_num_workers: 16
   force_reprocess: false
@@ -85,14 +85,14 @@ train:
   kl_beta: 0.0
 
   # --- Multi-source sampling ratio ---
-  source_ratio: {geneval: 1, ocr: 1, pickscore: 1}
+  # source_ratio: {geneval: 1}   # disabled: single-source (geneval only); None -> round-robin over the lone source
 
   # --- Sampling / batch ---
   resolution: 512
   num_inference_steps: 28
   per_device_batch_size: 1                 # Cross-VAE L1 keeps teacher transformer + teacher VAE + student resident; start conservative
   group_size: 1
-  unique_sample_num_per_epoch: 24          # =3*8 -> num_batches_per_epoch multiple of 3 (source_ratio period) on 8 GPUs
+  unique_sample_num_per_epoch: 64        # aligned to the pdbs=1 ode/sde configs (geneval-only)
   gradient_step_per_epoch: 1
   num_inner_epochs: 1
   gradient_accumulation_steps: auto
