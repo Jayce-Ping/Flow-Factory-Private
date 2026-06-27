@@ -46,14 +46,21 @@ from collections import defaultdict
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ...hparams import XOPDTrainingArguments
+from ...rewards import RewardBuffer
 from ...samples import BaseSample
-from ...utils.base import create_generator, filter_kwargs, stitch_batch_metadata
+from ...utils.base import (
+    create_generator,
+    create_generator_by_prompt,
+    filter_kwargs,
+    stitch_batch_metadata,
+)
 from ...utils.dist import reduce_loss_info
 from ...utils.logger_utils import setup_logger
 from ...utils.noise_schedule import TimeSampler, flow_match_sigma
@@ -197,6 +204,13 @@ class XOPDTrainer(BaseTrainer):
             self.train_dataloaders_by_source,
         )
 
+        # Teacher-baseline eval: cache of the (constant) teacher reward scalars,
+        # keyed by wandb metric name. Populated once by evaluate_teacher_baseline()
+        # at epoch 0 and re-emitted at every evaluate() so the teacher renders as
+        # a flat reference line spanning the student's x-axis (single-chart
+        # overlay). Empty until the baseline runs.
+        self._teacher_baseline_scalars: Dict[str, float] = {}
+
     # ============================ Data iteration ==============================
     def _make_train_iter(self):
         """Unified train iterator: single dataloader or block-cycle over sources.
@@ -270,6 +284,9 @@ class XOPDTrainer(BaseTrainer):
     # =============================== Main loop ===============================
     def start(self):
         """Single-run training loop with L0 -> L1 stage switching on ``epoch``."""
+        if self.epoch == 0 and self.training_args.eval_teacher_at_start:
+            self.evaluate_teacher_baseline()
+
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
 
@@ -306,6 +323,143 @@ class XOPDTrainer(BaseTrainer):
         """
         if self.accelerator.is_main_process and samples:
             self.log_data({"train_samples": samples[:30]}, step=self.step)
+
+    # ===================== Teacher baseline evaluation =====================
+    def evaluate(self) -> None:
+        """Student eval + re-emit the constant teacher baseline for overlay.
+
+        Runs the standard student evaluation, then (main process) re-logs the
+        cached teacher-baseline scalars at the current step so the teacher shows
+        as a flat reference line spanning the student's x-axis in the SAME wandb
+        chart (both live under ``eval/{test_set}/...``). No-op for the teacher
+        part until :meth:`evaluate_teacher_baseline` has populated the cache.
+        """
+        super().evaluate()
+        if self.accelerator.is_main_process and self._teacher_baseline_scalars:
+            self.log_data(dict(self._teacher_baseline_scalars), step=self.step)
+
+    def evaluate_teacher_baseline(self) -> None:
+        """Evaluate the frozen teacher on every test set (fair student protocol).
+
+        For each test set the teacher is scored with the SAME prompts, seed,
+        num_inference_steps and per-test-set ``guidance_scale`` as the student
+        eval, swapping in the teacher transformer (``use_teacher_transformer``)
+        and routing the teacher's own cached text embeddings (``teacher_*``,
+        precomputed for the test split during preprocessing). Results are logged
+        under ``eval/{test_set}/teacher/...`` and cached in
+        ``self._teacher_baseline_scalars`` so :meth:`evaluate` can re-emit them
+        as a constant reference line.
+
+        ``use_teacher_transformer`` swaps the WHOLE transformer module (a
+        distinct ``data_ptr``), which already bypasses the DDP/ZeRO wrapper and
+        disables the autocast cache, so no extra weight-swap guards are needed
+        (unlike the ``use_named_parameters`` path).
+        """
+        if not self.test_dataloaders:
+            logger.info("XOPD teacher baseline: no test dataloaders; skipping.")
+            return
+
+        self.adapter.eval()
+        logger.info("XOPD: evaluating teacher baseline on all test sets")
+        for test_set_name in sorted(self.test_dataloaders.keys()):
+            self._evaluate_teacher_test_set(test_set_name)
+        self.accelerator.wait_for_everyone()
+
+    def _evaluate_teacher_test_set(self, test_set_name: str) -> None:
+        """Score the teacher on one test set and cache the reward scalars."""
+        self.eval_reward_buffer = RewardBuffer(
+            self._eval_reward_processor_for_test_set(test_set_name),
+            self.training_args.group_size,
+        )
+        merged_eval = self._merged_eval_args_for_test_set_name(test_set_name)
+        eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
+        # Teacher metrics share the student's ``eval/{test_set}/`` section so they
+        # can be overlaid in one chart; teacher curves get a ``/teacher`` suffix.
+        log_pfx = f"{self._eval_log_prefix(test_set_name)}/teacher"
+
+        with torch.no_grad(), self.autocast(), self.adapter.use_teacher_transformer():
+            all_samples = self._run_teacher_eval_inference_batches(
+                test_set_name, merged_eval, eval_seed
+            )
+            gathered_rewards = self._gather_eval_rewards()
+            gathered_tags = self._gather_eval_tags(all_samples)
+            if self.accelerator.is_main_process:
+                self._log_eval_reward_metrics(
+                    gathered_rewards, log_pfx, all_samples, gathered_tags=gathered_tags
+                )
+                # Cache scalar reward means/stds so evaluate() can re-emit a
+                # constant reference line at every subsequent eval step.
+                for key, value in gathered_rewards.items():
+                    self._teacher_baseline_scalars[f"{log_pfx}/reward_{key}_mean"] = float(
+                        np.mean(value)
+                    )
+                    self._teacher_baseline_scalars[f"{log_pfx}/reward_{key}_std"] = float(
+                        np.std(value)
+                    )
+        self.accelerator.wait_for_everyone()
+
+    def _run_teacher_eval_inference_batches(
+        self,
+        test_set_name: str,
+        merged_eval: Any,
+        eval_seed: int,
+    ) -> List[BaseSample]:
+        """Like ``_run_eval_inference_batches`` but routes teacher conditioning.
+
+        Overrides the student text embeddings in each batch with the teacher's
+        own cached ``teacher_*`` embeddings and applies the teacher's CFG
+        (== the test set's eval guidance_scale, the same value the teacher
+        negatives were cached under). Must be called inside
+        ``use_teacher_transformer``.
+        """
+        all_samples: List[BaseSample] = []
+        for batch in tqdm(
+            self.test_dataloaders[test_set_name],
+            desc=f"Teacher eval [{test_set_name}]",
+            disable=not self.show_progress_bar,
+        ):
+            if "teacher_prompt_embeds" not in batch:
+                raise RuntimeError(
+                    "XOPD teacher baseline requires cached teacher text embeddings "
+                    f"for test set {test_set_name!r} (key 'teacher_prompt_embeds'), "
+                    "but none were found. Re-preprocess with the teacher text "
+                    "encoder loaded (data.enable_preprocess=True) so teacher_* "
+                    "columns are cached for the test split."
+                )
+            generator = create_generator_by_prompt(batch["prompt"], eval_seed)
+            inference_kwargs = {
+                "compute_log_prob": False,
+                "generator": generator,
+                "trajectory_indices": None,
+                **merged_eval,
+                **batch,
+            }
+            # Route teacher conditioning (teacher embeds carry no prompt_ids).
+            inference_kwargs["prompt_embeds"] = batch["teacher_prompt_embeds"]
+            inference_kwargs["text_ids"] = batch["teacher_text_ids"]
+            inference_kwargs.pop("prompt_ids", None)
+            if "teacher_negative_prompt_embeds" in batch:
+                inference_kwargs["negative_prompt_embeds"] = batch[
+                    "teacher_negative_prompt_embeds"
+                ]
+                inference_kwargs["negative_text_ids"] = batch["teacher_negative_text_ids"]
+                inference_kwargs.pop("negative_prompt_ids", None)
+            else:
+                for _k in (
+                    "negative_prompt_embeds",
+                    "negative_text_ids",
+                    "negative_prompt_ids",
+                ):
+                    inference_kwargs.pop(_k, None)
+            inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
+            samples = self.adapter.inference(**inference_kwargs)
+
+            # Stitch dataset metadata onto generated samples for reward routing.
+            stitch_batch_metadata(batch, samples)
+
+            all_samples.extend(samples)
+            self.eval_reward_buffer.add_samples(samples)
+        return all_samples
 
     # ===================== Stage L0: velocity regression =====================
     def _l0_epoch(self) -> None:

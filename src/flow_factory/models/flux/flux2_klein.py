@@ -329,17 +329,25 @@ class Flux2KleinAdapter(BaseAdapter):
         """Offline preprocessing for cross-model XOPD: student + teacher text embeds.
 
         Encodes the prompt with BOTH the student text encoder (``encode_prompt``)
-        and, when a teacher text encoder is loaded for a train split, the teacher's
-        own text encoder (``encode_teacher_prompt``), caching the teacher
-        embeddings under ``teacher_*`` keys so the (large) teacher text encoder can
-        be offloaded before training (see ``load_teacher_text_encoder`` /
+        and, when a teacher text encoder is loaded, the teacher's own text encoder
+        (``encode_teacher_prompt``), caching the teacher embeddings under
+        ``teacher_*`` keys so the (large) teacher text encoder can be offloaded
+        before training (see ``load_teacher_text_encoder`` /
         ``unload_teacher_text_encoder``).
 
-        ``teacher_guidance_scale`` is an explicit (cache-relevant) parameter so the
-        teacher CFG negatives are re-encoded if it changes. Teacher embeddings are
-        only computed for the train split (``is_train=True``); eval generates with
-        the student and never consumes teacher conditioning. Falls back to
-        student-only encoding when no teacher text encoder is loaded.
+        Teacher embeddings are cached for BOTH splits:
+
+        - **train** (``is_train=True``): used by L0/L1 distillation; the teacher
+          CFG is the (cache-relevant) ``teacher_guidance_scale`` arg.
+        - **test** (``is_train=False``): used by the XOPD teacher-baseline eval
+          (``XOPDTrainer.evaluate_teacher_baseline``), which scores the teacher
+          on the same test sets / seed / steps as the student for a fair
+          comparison. The teacher CFG for the test split is the eval
+          ``guidance_scale`` (already cache-relevant), so teacher negatives are
+          cached iff that test set evaluates with CFG > 1.
+
+        Falls back to student-only encoding when no teacher text encoder is
+        loaded (e.g. non-XOPD runs).
         """
         batch = self.encode_prompt(
             prompt=prompt,
@@ -350,11 +358,17 @@ class Flux2KleinAdapter(BaseAdapter):
             hidden_states_layers=hidden_states_layers,
         )
 
-        if is_train and self._teacher_pipeline is not None:
+        if self._teacher_pipeline is not None:
+            # Train: distillation uses teacher_guidance_scale. Test: the
+            # teacher-baseline eval runs the teacher under the SAME guidance as
+            # the student eval for that test set, i.e. this split's eval
+            # `guidance_scale`. Both are cache-relevant params, so changing
+            # either re-encodes the teacher negatives.
+            teacher_cfg = teacher_guidance_scale if is_train else guidance_scale
             teacher = self.encode_teacher_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                guidance_scale=teacher_guidance_scale,
+                guidance_scale=teacher_cfg,
                 device=device,
                 max_sequence_length=max_sequence_length,
             )

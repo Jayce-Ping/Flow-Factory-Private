@@ -2212,6 +2212,22 @@ class XOPDTrainingArguments(TrainingArguments):
         },
     )
 
+    # ---- Teacher baseline evaluation ----
+    eval_teacher_at_start: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Evaluate the frozen teacher on every test set (same protocol as "
+                "the student: same prompts/seed/steps, per-test-set guidance_scale) "
+                "before training begins, to establish a fair reference. The teacher "
+                "is run via use_teacher_transformer with its own cached text "
+                "embeddings. Logged under teacher/{test_set}/... and (for "
+                "single-chart overlay with the student curve) re-emitted at every "
+                "subsequent evaluate() as a constant reference line."
+            )
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         if not self.teacher_model_name_or_path:
