@@ -14,7 +14,7 @@ import OPD internals.
 - Helpers: [`src/flow_factory/trainers/xopd/common.py`](../../src/flow_factory/trainers/xopd/common.py)
 - Args: `XOPDTrainingArguments` in [`src/flow_factory/hparams/training_args.py`](../../src/flow_factory/hparams/training_args.py)
 - Registry key: `trainer_type: "xopd"`
-- Example config: [`xopd_configs/flux2_klein_9b_to_4b.yaml`](../../xopd_configs/flux2_klein_9b_to_4b.yaml)
+- Example config: [`xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1.yaml`](../../xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1.yaml) (see [`xopd_configs/README.md`](../../xopd_configs/README.md) for the full config matrix)
 
 ## Teacher mechanism (vs OPD)
 
@@ -123,7 +123,7 @@ ODE timestep-subset selection is a future extension (everything routes through o
 ## Run
 
 ```bash
-ff-train xopd_configs/flux2_klein_9b_to_4b.yaml
+ff-train xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1.yaml
 ```
 
 **Storage / HF cache (avoid network-FS lock failures):** put the HuggingFace

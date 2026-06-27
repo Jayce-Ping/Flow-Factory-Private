@@ -1,0 +1,165 @@
+# Cross-OPD (XOPD) BASELINE: FLUX.2-klein-base-9B (teacher) -> FLUX.2-klein-base-4B (student)
+# L0-ONLY ablation: l0_warmup_epochs is set absurdly large (1_000_000) so every
+# epoch stays in the L0 velocity-regression stage and L1 on-policy transition
+# matching is NEVER reached. Pairs with the pure-L1 baseline (the sibling
+# flux2_klein_9b_to_4b_l1.yaml, l0_warmup_epochs=0) to isolate each stage's effect.
+# Stop the run via max_epochs or manual interrupt.
+
+# ===== Environment =====
+launcher: "accelerate"                    # Launcher. Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Distributed config; use zero3 / fsdp if VRAM-limited (9B teacher + 4B student)
+num_processes: 8                          # Number of processes (GPUs); overrides the config file
+main_process_port: 29500                  # Master process port
+mixed_precision: "bf16"                   # Mixed precision. Options: no, fp16, bf16
+
+# ===== Data (prompts only; L0's z0 is teacher-generated) =====
+data:
+  dataset_dir: "dataset/geneval"          # Eval/test fallback (test split is read from here when eval.test_sets omits a dataset_dir).
+  # --- Multi-source training (geneval + ocr + pickscore, equal weights) ---
+  # Each directory is preprocessed independently (teacher text embeddings are
+  # precomputed per source) and L0 sampling block-cycles across them per
+  # train.source_ratio below. The source name is the basename of each directory.
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/ocr"
+    - "dataset/pickscore"
+  preprocessing_batch_size: 8             # Batch size for offline text encoding
+  dataloader_num_workers: 16              # DataLoader worker processes
+  force_reprocess: false                  # true: ignore cache and re-preprocess
+  cache_dir: "~/.cache/flow_factory/datasets"  # Preprocess cache directory
+  max_dataset_size: null                  # Truncate dataset size; null = no limit
+  sampler_type: "auto"                    # Sampler. Options: auto, distributed_k_repeat, group_contiguous
+
+# ===== Model (student = the small model being trained) =====
+model:
+  finetune_type: "lora"                   # Finetune mode. Options: full, lora
+  lora_rank: 64                           # LoRA rank (used when finetune_type=lora)
+  lora_alpha: 128                         # LoRA alpha
+  target_modules: "default"               # LoRA targets. Options: all, default, or a list of module names
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"  # Student path (HF repo id or local)
+  model_type: "flux2-klein"               # Adapter registry key (fixed for klein)
+  resume_path: null                       # Checkpoint/LoRA to resume from; null = none
+  resume_type: null                       # Options: lora, full, state; null = auto by finetune_type
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_9b_to_4b_baseline_l0only"  # L0-only ablation: l0_warmup_epochs=1e6 (never reaches L1)
+  project: "Flow-Factory-XOPD"            # Logger project name
+  logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"                      # Checkpoint / log directory
+  save_freq: 0                            # Save every N epochs (0 disables)
+  save_model_only: true                   # Save only model weights (not optimizer/scheduler state)
+
+# ===== Training (XOPD) =====
+train:
+  trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
+
+  # --- Cross-model teacher ---
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"  # Teacher path; only its transformer is loaded, VAE/TE reused from student
+  teacher_param_device: "cuda"            # Teacher transformer device. Options: cuda (only cuda supported today), cpu
+  assume_shared_vae_text_encoder: true    # Assume 9B/4B share VAE + text encoder (klein family); false raises (separate pipeline unsupported)
+
+  # --- Dual classifier-free guidance (teacher / student independent) ---
+  teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
+  student_guidance_scale: 1.0             # Student CFG for forward + rollout; synced into base guidance_scale
+
+  # --- L0: velocity-regression warmup (teacher-generated data) ---
+  l0_warmup_epochs: 1000000               # L0-ONLY baseline: absurdly large so L1 is never reached (every epoch runs L0)
+  l0_num_inference_steps: 50              # Teacher rollout steps when generating z0 targets in L0
+  l0_inner_steps: 4                       # Random-t regression sub-steps per generated z0 batch; MUST be a multiple of num_train_timesteps (else auto-rounded up + warned). L0 runs l0_inner_steps/num_train_timesteps optimizer steps/epoch; each z0 reused l0_inner_steps times.
+  l0_time_sampling: "logit_normal"        # L0 t sampling. Options: logit_normal, uniform
+  l0_weighting: "min_snr"                 # L0 loss weight w(t). Options: min_snr, snr, uniform
+  l0_snr_gamma: 5.0                       # Min-SNR-gamma clamp (used when l0_weighting=min_snr)
+
+  # --- L1: on-policy transition matching (UNUSED in this L0-only baseline) ---
+  pathwise_coef: 1.0                      # Coefficient on per-step Gaussian KL D_k (mean matching); >= 0
+  reinforce_coef: 0.0                     # REINFORCE trajectory-term coefficient; 0 disables (pure pathwise)
+  reinforce_horizon: null                 # Future steps aggregated into R_bar; null = all j > k
+  reinforce_future_reduction: "mean"      # R_bar aggregation. Options: sum, mean
+  normalize_d_k: false                    # true: divide D_k by 2*sigma_bar^2; false: plain MSE
+  kl_type: "x-based"                      # KL anchor type vs base. Options: x-based, v-based
+  kl_beta: 0.0                            # KL anchor coefficient; 0 disables
+
+  # --- Multi-source sampling ratio (active; requires data.dataset_dirs) ---
+  source_ratio: {geneval: 1, ocr: 1, pickscore: 1}   # Equal block-cycle weights (one G·O·P cycle per period). num_batches_per_epoch must be divisible by sum(values)=3 (see unique_sample_num_per_epoch).
+
+  # --- Sampling / batch ---
+  resolution: 512                         # Generation resolution (int or [H, W]); klein native is 1024, lower to save memory
+  num_inference_steps: 28                 # L1 student rollout steps (undistilled base models need more steps)
+  per_device_batch_size: 4                # Per-device batch size (batch-search optimum; unique=128 -> 1 micro-batch/GPU on 32 GPUs; ~69GB/GPU)
+  group_size: 1                           # Group size (XOPD default 1; only >1 if you add grouped REINFORCE)
+  unique_sample_num_per_epoch: 384        # Unique prompts/epoch. =3*128 so num_batches_per_epoch is a multiple of 3 (= source_ratio period): 3 batches/epoch on 32 GPUs (pdbs=4) -> one clean geneval·ocr·pickscore cycle.
+  gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps)
+  num_inner_epochs: 1                     # MUST be 1 for XOPD (no rollout reuse); enforced at startup
+  gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps
+
+  # --- Optimizer ---
+  learning_rate: 1.0e-4                   # Learning rate
+  adam_weight_decay: 1.0e-4               # AdamW weight decay
+  adam_betas: [0.9, 0.999]               # AdamW betas
+  adam_epsilon: 1.0e-8                   # AdamW epsilon
+  max_grad_norm: 1.0                      # Gradient-norm clip threshold
+
+  # --- EMA ---
+  ema_decay: 0.9                          # EMA decay (0 disables)
+  ema_update_interval: 4                  # EMA update interval (epochs)
+  ema_device: "cuda"                      # EMA storage device. Options: cpu, cuda
+
+  # --- Memory / misc ---
+  enable_gradient_checkpointing: false    # Gradient checkpointing: save memory at extra compute
+  offload_samples_to_cpu: false           # Offload sample tensors to CPU between sample() and optimize() to cut peak VRAM
+  seed: 42                                # Random seed
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"               # Dynamics. Options: Flow-SDE, Dance-SDE, CPS, ODE (REINFORCE only meaningful under SDE)
+  noise_level: 0.0                        # SDE noise level a
+  num_sde_steps: null                        # Number of noise-injection steps per training step
+  sde_steps: null                       # Candidate noise window (randomly chosen during training); null = auto
+  seed: 42                                # Scheduler seed
+
+# ===== Evaluation =====
+eval:
+  resolution: 1024                        # Eval resolution
+  per_device_batch_size: 1                # Eval batch size
+  num_inference_steps: 28                 # Eval steps
+  guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
+  eval_freq: 20                           # Eval every N epochs (0 disables)
+  seed: 42                                # Eval seed
+  test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
+                                          # eval_reward_names selects which reward (from the `rewards` list below) runs per set;
+                                          # [] = generate images only, no scoring. wandb keys: eval/{name}/reward_{reward}_mean.
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: []}       # OCR reward deps not staged yet -> images only
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: []}       # OCR reward deps not staged yet -> images only
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (optional for XOPD; logging only, NOT part of the distillation loss) =====
+# These also serve as the EVAL rewards (no separate `eval_rewards` block -> eval falls back
+# to this list, indexed by `name`). eval.test_sets[*].eval_reward_names reference these names.
+# GenEval deps (mmcv 2.1.0 + mmdet 3.3.0 + open_clip) installed on all nodes via
+# Flow-Factory/scripts/install_geneval_deps.sh; Mask2Former + CLIP ViT-L-14 weights pre-staged.
+rewards:
+  - name: "geneval"                       # Reward name (referenced by eval_reward_names: [geneval])
+    reward_model: "geneval"               # Reward model type (matches dataset/geneval)
+    weight: 1                             # Weight (for multi-reward aggregation)
+    batch_size: 64                        # Reward inference batch size
+    device: "cuda"                        # Device
+    dtype: float32                        # GenEval forces fp32 internally (autocast off + model.float()); this is a placeholder
+    async_reward: false                   # Compute reward synchronously
+  - name: "pick_score"                    # Referenced by eval_reward_names: [pick_score]
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  # OCR reward: enable once OCR deps (e.g. PaddleOCR) are staged on all nodes, then set the
+  # ocr_gs1/ocr_gs4 test sets' eval_reward_names to [ocr].
+  # - name: "ocr"
+  #   reward_model: "ocr"
+  #   batch_size: 64
+  #   device: "cuda"
+  #   dtype: bfloat16
+  #   async_reward: false

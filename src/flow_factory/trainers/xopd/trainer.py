@@ -103,6 +103,24 @@ class XOPDTrainer(BaseTrainer):
         self.teacher_gs = ta.teacher_guidance_scale
         self.student_gs = ta.student_guidance_scale
 
+        # Fail fast: the REINFORCE trajectory term is well-defined only under a
+        # stochastic (SDE) transition. Under ODE the transition is deterministic
+        # (std_dev_t == 0), so the scheduler returns log_prob == 0 / None and the
+        # term `reinforce_coef * (R_bar * log_prob)` silently contributes nothing
+        # to the loss. Rather than let `reinforce_coef > 0` look effective while
+        # being a no-op, reject the combination outright (use a Flow-SDE /
+        # Dance-SDE / CPS scheduler with noise_level > 0 to enable REINFORCE).
+        if self._is_ode and self.reinforce_coef > 0:
+            raise ValueError(
+                "XOPD: reinforce_coef > 0 requires a stochastic scheduler "
+                "(dynamics_type in {'Flow-SDE', 'Dance-SDE', 'CPS'} with "
+                "noise_level > 0). Under ODE the transition is deterministic, so "
+                "the REINFORCE term's log_prob is identically zero and the term is "
+                f"a no-op. Got dynamics_type='ODE' and reinforce_coef="
+                f"{self.reinforce_coef}. Set reinforce_coef=0 for ODE, or switch "
+                "to an SDE scheduler to use REINFORCE."
+            )
+
         # Cache adapter.forward signature once for cheap per-step kwarg filtering.
         self._forward_param_names, self._forward_accepts_var_kwargs = cache_forward_signature(
             self.adapter.forward
