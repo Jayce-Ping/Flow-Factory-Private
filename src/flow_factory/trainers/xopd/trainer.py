@@ -142,6 +142,10 @@ class XOPDTrainer(BaseTrainer):
         self._cross_vae = ta.teacher_model_type is not None
         self.teacher_adapter = None  # set in cross-VAE mode
         self.transport = None        # set below
+        # Cross-VAE FLUX teacher packed-latent layout (position ids + spatial size),
+        # captured at warm-up and injected into the affine-transport converters.
+        self._teacher_latent_ids = None
+        self._teacher_spatial_hw = None
         if self._cross_vae:
             self._init_cross_vae_teacher()
         else:
@@ -284,10 +288,16 @@ class XOPDTrainer(BaseTrainer):
         teacher_config.model_args.finetune_type = "full"  # teacher is frozen, no LoRA
         teacher_config.model_args.resume_path = None
         teacher_config.model_args.resume_type = None
+        # The teacher VAE: some teacher repos ship NO vae/ subfolder (FLUX.2-klein-
+        # base-9B is a transformer-only release sharing the 4B VAE). Resolve a VAE
+        # source so the teacher pipeline can be built; auto-fall back to the klein
+        # 4B VAE for a klein teacher whose repo lacks one.
+        teacher_config.model_args.vae_name_or_path = self._resolve_teacher_vae_path()
 
         logger.info(
             f"Cross-VAE XOPD: building independent teacher adapter "
-            f"(model_type={ta.teacher_model_type!r}, path={ta.teacher_model_name_or_path!r}); "
+            f"(model_type={ta.teacher_model_type!r}, path={ta.teacher_model_name_or_path!r}, "
+            f"vae={teacher_config.model_args.vae_name_or_path!r}); "
             f"transport={ta.vae_transport!r}."
         )
         self.teacher_adapter = load_model(teacher_config, self.accelerator)
@@ -396,6 +406,17 @@ class XOPDTrainer(BaseTrainer):
         decoder ``in_channels`` (== latent channels). Used to size the AdaLN
         transport's per-channel parameters.
         """
+        # The transport operates on the canonical patchified spatial latent that
+        # `to_spatial_latent` produces, whose channel count equals the transformer
+        # `in_channels` (FLUX.2: 128 = vae_latent_channels*4 after patchify; SD3.5:
+        # 16 = raw VAE latent_channels, to_spatial is identity). Prefer that over
+        # the VAE's raw `latent_channels` (which is pre-patchify, 32 for klein and
+        # would mis-size the AdaLN params).
+        transformer = getattr(adapter.pipeline, "transformer", None)
+        if transformer is not None and hasattr(transformer, "config"):
+            tcfg = transformer.config
+            if hasattr(tcfg, "in_channels"):
+                return int(tcfg.in_channels)
         vae = getattr(adapter.pipeline, "vae", None)
         if vae is not None and hasattr(vae, "config"):
             cfg = vae.config
@@ -422,6 +443,20 @@ class XOPDTrainer(BaseTrainer):
         return z_spatial
 
     def _teacher_to_spatial(self, z, **ctx):
+        # FLUX.2 to_spatial_latent needs the packed latents' position ids. They are
+        # fixed for a given resolution (all geneval prompts share one), so we cache
+        # them at warm-up (_capture_teacher_layout) and inject here. SD3.5 student is
+        # already BCHW (no to_spatial_latent) so the student path ignores this.
+        if "latent_ids" not in ctx and self._teacher_latent_ids is not None:
+            ids = self._teacher_latent_ids
+            # _unpack_latents_with_ids zips x (batch) with x_ids (batch): broadcast
+            # the single cached id-row to z's batch size.
+            if ids.dim() == 3 and ids.shape[0] == 1 and z.dim() == 3 and z.shape[0] > 1:
+                ids = ids.expand(z.shape[0], -1, -1)
+            ctx = {**ctx, "latent_ids": ids.to(z.device)}
+            if self._teacher_spatial_hw is not None:
+                ctx.setdefault("height", self._teacher_spatial_hw[0])
+                ctx.setdefault("width", self._teacher_spatial_hw[1])
         return self._adapter_to_spatial(self.teacher_adapter, z, **ctx)
 
     def _teacher_from_spatial(self, z, **ctx):
@@ -432,6 +467,51 @@ class XOPDTrainer(BaseTrainer):
 
     def _student_from_spatial(self, z, **ctx):
         return self._adapter_from_spatial(self.adapter, z, **ctx)
+
+    def _resolve_teacher_vae_path(self) -> Optional[str]:
+        """Resolve where to load the cross-VAE teacher's VAE from.
+
+        Explicit ``teacher_vae_name_or_path`` wins. Otherwise, if the teacher repo
+        ships no ``vae/`` subfolder (FLUX.2-klein-base-9B is a transformer-only
+        release that shares the 4B VAE), auto-fall back to the klein 4B VAE. Returns
+        None when the teacher repo has its own VAE (e.g. FLUX.2-dev) — load as usual.
+        """
+        ta = self.training_args
+        if ta.teacher_vae_name_or_path:
+            return ta.teacher_vae_name_or_path
+        if (ta.teacher_model_type or "").startswith("flux2-klein"):
+            # klein-9B / klein-base teacher repos are transformer-only; use 4B VAE.
+            try:
+                from huggingface_hub import snapshot_download
+
+                snap = snapshot_download(
+                    ta.teacher_model_name_or_path, local_files_only=True
+                )
+                if os.path.isdir(os.path.join(snap, "vae")):
+                    return None  # teacher repo has its own VAE
+            except Exception:
+                pass
+            return "black-forest-labs/FLUX.2-klein-base-4B"
+        return None
+
+    def _capture_teacher_layout(self, latent_ids: torch.Tensor, hw=None) -> None:
+        """Cache the teacher's packed-latent position ids / spatial size.
+
+        FLUX.2 ``to_spatial_latent`` needs the position ids to scatter packed tokens
+        onto their (h, w) grid. They are constant for a fixed resolution (geneval),
+        so we snapshot them once (from a teacher rollout during warm-up) and reuse
+        them for every affine-transport conversion in L1.
+        """
+        if latent_ids is None:
+            return
+        ids = latent_ids.detach()
+        # Keep a single (1, seq, K) row; the converter broadcasts over the batch via
+        # the per-sample zip in _unpack_latents_with_ids (it iterates rows).
+        if ids.dim() == 3 and ids.shape[0] > 1:
+            ids = ids[:1]
+        self._teacher_latent_ids = ids.to(self.accelerator.device)
+        if hw is not None:
+            self._teacher_spatial_hw = (int(hw[0]), int(hw[1]))
 
     # ============================ Data iteration ============================
     def _make_train_iter(self):
@@ -614,6 +694,32 @@ class XOPDTrainer(BaseTrainer):
         # can be overlaid in one chart; teacher curves get a ``/teacher`` suffix.
         log_pfx = f"{self._eval_log_prefix(test_set_name)}/teacher"
 
+        # Cross-VAE: the teacher is an independent adapter (its own VAE/TE), so it
+        # rolls out directly from prompts in ITS OWN latent space — no whole-module
+        # swap (use_teacher_transformer is klein-only) and no cached teacher_* on the
+        # heterogeneous student batch. Same-arch: swap the teacher transformer into
+        # the student pipeline and route cached teacher embeddings.
+        if self._cross_vae:
+            with torch.no_grad(), self.autocast():
+                all_samples = self._run_teacher_eval_inference_batches_cross_vae(
+                    test_set_name, merged_eval, eval_seed
+                )
+                gathered_rewards = self._gather_eval_rewards()
+                gathered_tags = self._gather_eval_tags(all_samples)
+                if self.accelerator.is_main_process:
+                    self._log_eval_reward_metrics(
+                        gathered_rewards, log_pfx, all_samples, gathered_tags=gathered_tags
+                    )
+                    for key, value in gathered_rewards.items():
+                        self._teacher_baseline_scalars[f"{log_pfx}/reward_{key}_mean"] = float(
+                            np.mean(value)
+                        )
+                        self._teacher_baseline_scalars[f"{log_pfx}/reward_{key}_std"] = float(
+                            np.std(value)
+                        )
+            self.accelerator.wait_for_everyone()
+            return
+
         with torch.no_grad(), self.autocast(), self.adapter.use_teacher_transformer():
             all_samples = self._run_teacher_eval_inference_batches(
                 test_set_name, merged_eval, eval_seed
@@ -634,6 +740,48 @@ class XOPDTrainer(BaseTrainer):
                         np.std(value)
                     )
         self.accelerator.wait_for_everyone()
+
+    def _run_teacher_eval_inference_batches_cross_vae(
+        self,
+        test_set_name: str,
+        merged_eval: Any,
+        eval_seed: int,
+    ) -> List[BaseSample]:
+        """Cross-VAE teacher baseline: roll out the independent teacher adapter.
+
+        The teacher is a separate frozen adapter with its own VAE/scheduler/text
+        encoder, so it generates from the raw prompt strings in its own latent
+        space and decodes to images with its own VAE. Images are scored by the same
+        reward as the student (reward models consume decoded images, not latents),
+        giving a fair teacher reference. No ``teacher_*`` cache and no transformer
+        swap are involved.
+        """
+        all_samples: List[BaseSample] = []
+        teacher_gs = float(getattr(merged_eval, "guidance_scale", self.teacher_gs))
+        for batch in tqdm(
+            self.test_dataloaders[test_set_name],
+            desc=f"Teacher eval (cross-VAE) [{test_set_name}]",
+            disable=not self.show_progress_bar,
+        ):
+            generator = create_generator_by_prompt(batch["prompt"], eval_seed)
+            infer_kwargs = {
+                "prompt": batch["prompt"],
+                "negative_prompt": batch.get("negative_prompt"),
+                "guidance_scale": teacher_gs,
+                "num_inference_steps": getattr(
+                    merged_eval, "num_inference_steps", self.training_args.num_inference_steps
+                ),
+                "compute_log_prob": False,
+                "generator": generator,
+                "trajectory_indices": None,
+            }
+            infer_kwargs = filter_kwargs(self.teacher_adapter.inference, **infer_kwargs)
+            samples = self.teacher_adapter.inference(**infer_kwargs)
+            stitch_batch_metadata(batch, samples)
+            all_samples.extend(samples)
+            self.eval_reward_buffer.add_samples(samples)
+        return all_samples
+
 
     def _run_teacher_eval_inference_batches(
         self,
@@ -906,6 +1054,14 @@ class XOPDTrainer(BaseTrainer):
             prompt_batch = next(data_iter)
             teacher_samples = self._teacher_rollout_samples(prompt_batch)
             z0_T = torch.stack([s.all_latents[-1] for s in teacher_samples], dim=0).to(device)
+            # Snapshot the teacher packed-latent position ids once (fixed resolution)
+            # so the affine-transport converters can unpack (B,seq,C)->(B,C,H,W).
+            if self._teacher_latent_ids is None:
+                t_ids = getattr(teacher_samples[0], "latent_ids", None)
+                if t_ids is not None:
+                    self._capture_teacher_layout(
+                        t_ids if t_ids.dim() == 3 else t_ids.unsqueeze(0)
+                    )
             images = torch.stack([s.image for s in teacher_samples], dim=0).to(device)
             with torch.no_grad():
                 z0_S = self.adapter.encode_pixels(images)
@@ -952,7 +1108,13 @@ class XOPDTrainer(BaseTrainer):
 
         # ---- Learnable AdaLN: moment-match init, then a short reconstruction loop ----
         self.transport.to(device)
-        self.transport.init_from_moments(z_T_list, z_S_list)  # neutral cold start
+        # init_from_moments routes through self.t2s (which injects the CUDA teacher
+        # latent_ids) and the channel_proj buffer (now on `device`), so feed it
+        # device-resident pairs to avoid a CPU/CUDA mismatch in the unpack/einsum.
+        z_T_dev = [z.to(device) for z in z_T_list]
+        z_S_dev = [z.to(device) for z in z_S_list]
+        self.transport.init_from_moments(z_T_dev, z_S_dev)  # neutral cold start
+        del z_T_dev, z_S_dev
         opt = torch.optim.Adam(self.transport.parameters(), lr=ta.transport_lr)
         n_epochs = max(1, ta.transport_warmup_epochs)
         self.transport.train()
@@ -1277,7 +1439,7 @@ class XOPDTrainer(BaseTrainer):
         t = forward_kwargs.get("t")
         t_next = forward_kwargs.get("t_next")
 
-        def query_teacher_mean(x_T: torch.Tensor) -> torch.Tensor:
+        def query_teacher_mean(x_T: torch.Tensor, latent_ids=None) -> torch.Tensor:
             tkw = {
                 "t": t,
                 "t_next": t_next,
@@ -1289,6 +1451,15 @@ class XOPDTrainer(BaseTrainer):
                 "return_kwargs": ["next_latents_mean", "std_dev_t", "dt"],
                 **teacher_text_cond,
             }
+            # FLUX.2 teacher forward needs the packed-latent position ids. Use the
+            # ones the transport supplies (pixel bridge returns them from
+            # encode_pixels) else the cached fixed-resolution ids (affine path,
+            # whose from_spatial_latent ordering matches _prepare_latent_ids).
+            ids = latent_ids if latent_ids is not None else self._teacher_latent_ids
+            if ids is not None:
+                if ids.dim() == 3 and ids.shape[0] == 1 and x_T.dim() == 3 and x_T.shape[0] > 1:
+                    ids = ids.expand(x_T.shape[0], -1, -1)
+                tkw["latent_ids"] = ids.to(x_T.device)
             tkw = filter_kwargs(self.teacher_adapter.forward, **tkw)
             out = self.teacher_adapter.forward(**tkw)
             if out.next_latents_mean is None:
@@ -1299,6 +1470,47 @@ class XOPDTrainer(BaseTrainer):
 
         mu_S = self.transport.transition_mean_to_student(x_S, query_teacher_mean)
         return mu_S.detach()
+
+    def _build_teacher_text_cond(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Teacher text conditioning for the L1 teacher query.
+
+        Same-arch (shared VAE/TE): the teacher embeddings were precomputed offline
+        and ride on the rollout samples under ``teacher_*`` keys (the FLUX student
+        sample class carries them); read them off the stacked batch.
+
+        Cross-VAE: the student is a *different* architecture (e.g. SD3.5) whose
+        sample class carries NO ``teacher_*`` fields, so the stacked batch lacks
+        them. Instead the independent teacher adapter has its own resident text
+        encoder; encode the raw prompt strings on the fly. Constant across
+        timesteps, so this runs once per optimize batch.
+        """
+        if not self._cross_vae:
+            cond = {
+                "prompt_embeds": batch["teacher_prompt_embeds"],
+                "text_ids": batch["teacher_text_ids"],
+            }
+            if self.teacher_gs > 1.0:
+                cond["negative_prompt_embeds"] = batch["teacher_negative_prompt_embeds"]
+                cond["negative_text_ids"] = batch["teacher_negative_text_ids"]
+            return cond
+
+        # Cross-VAE: encode with the teacher adapter's own text encoder.
+        prompts = batch["prompt"]
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        enc = self.teacher_adapter.encode_prompt(
+            prompt=list(prompts),
+            guidance_scale=self.teacher_gs,
+            device=self.accelerator.device,
+        )
+        cond = {
+            "prompt_embeds": enc["prompt_embeds"],
+            "text_ids": enc["text_ids"],
+        }
+        if self.teacher_gs > 1.0 and "negative_prompt_embeds" in enc:
+            cond["negative_prompt_embeds"] = enc["negative_prompt_embeds"]
+            cond["negative_text_ids"] = enc["negative_text_ids"]
+        return cond
 
     def _precompute_d_per_timestep(
         self,
@@ -1312,19 +1524,13 @@ class XOPDTrainer(BaseTrainer):
         device = self.accelerator.device
 
         with torch.no_grad(), self.autocast():
-            # XOPD cross-model: the teacher's own text embeddings are precomputed
-            # offline and carried on the rollout samples (teacher_* fields), so the
-            # stacked batch already holds them (constant across timesteps); no
-            # teacher text encoder is resident.
-            teacher_text_cond = {
-                "prompt_embeds": batch["teacher_prompt_embeds"],
-                "text_ids": batch["teacher_text_ids"],
-            }
-            if self.teacher_gs > 1.0:
-                teacher_text_cond["negative_prompt_embeds"] = batch[
-                    "teacher_negative_prompt_embeds"
-                ]
-                teacher_text_cond["negative_text_ids"] = batch["teacher_negative_text_ids"]
+            # Teacher text conditioning. Same-arch: the teacher's own embeddings are
+            # precomputed offline and carried on the rollout samples (teacher_*
+            # fields). Cross-VAE: the SD3.5 student samples carry NO teacher_* fields
+            # (different sample class), but the independent teacher adapter has its
+            # OWN resident text encoder, so encode the teacher prompts on the fly
+            # from the raw prompt strings (constant across timesteps).
+            teacher_text_cond = self._build_teacher_text_cond(batch)
             for timestep_index in self._train_timestep_indices:
                 t = batch["timesteps"][:, timestep_index]
                 t_next = (

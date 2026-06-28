@@ -27,6 +27,7 @@ from diffusers.pipelines.flux2.pipeline_flux2 import (
     Flux2Pipeline,
     format_input,
     compute_empirical_mu,
+    retrieve_latents,
 )
 from diffusers.pipelines.flux2.system_messages import (
     SYSTEM_MESSAGE,
@@ -397,6 +398,54 @@ class Flux2Adapter(BaseAdapter):
         images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
 
         return images
+
+    # ============== Cross-VAE XOPD latent-transport primitives ==============
+    # See Flux2KleinAdapter for the rationale; the FLUX.2-dev pipeline shares the
+    # same packed-latent layout and BatchNorm-style normalization.
+    def to_spatial_latent(
+        self,
+        z: torch.Tensor,
+        latent_ids: Optional[torch.Tensor] = None,
+        **ctx,
+    ) -> torch.Tensor:
+        """Packed FLUX.2 latent ``(B, seq, C)`` -> canonical patchified ``(B, C, H, W)``."""
+        if latent_ids is None:
+            raise ValueError(
+                "Flux2Adapter.to_spatial_latent requires latent_ids (FLUX.2 latents "
+                "are packed (B, seq, C) with explicit position ids)."
+            )
+        return self.pipeline._unpack_latents_with_ids(z, latent_ids)
+
+    def from_spatial_latent(self, z_spatial: torch.Tensor, **ctx) -> torch.Tensor:
+        """Canonical patchified ``(B, C, H, W)`` -> packed FLUX.2 latent ``(B, seq, C)``."""
+        return self.pipeline._pack_latents(z_spatial)
+
+    @torch.no_grad()
+    def encode_pixels(
+        self,
+        images: torch.Tensor,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode pixel image(s) into a packed FLUX.2 latent (inverse of ``decode_latents``)."""
+        pipe = self.pipeline
+        device = device if device is not None else pipe.vae.device
+        dtype = pipe.vae.dtype
+        pixel_values = pipe.image_processor.preprocess(
+            images, height=height, width=width
+        ).to(device=device, dtype=dtype)
+        z = retrieve_latents(pipe.vae.encode(pixel_values), generator=generator, sample_mode="argmax")
+        z = pipe._patchify_latents(z)
+        bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(z.device, z.dtype)
+        bn_std = torch.sqrt(
+            pipe.vae.bn.running_var.view(1, -1, 1, 1) + pipe.vae.config.batch_norm_eps
+        ).to(z.device, z.dtype)
+        z = (z - bn_mean) / bn_std
+        latent_ids = pipe._prepare_latent_ids(z).to(device)
+        packed = pipe._pack_latents(z)
+        return packed, latent_ids
 
     # ======================== Preprocessing ========================
     def preprocess_func(

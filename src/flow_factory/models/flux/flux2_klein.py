@@ -26,7 +26,7 @@ from accelerate import Accelerator
 import torch
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 from diffusers import DiffusionPipeline
-from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline, compute_empirical_mu
+from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline, compute_empirical_mu, retrieve_latents
 import logging
 
 from ..abc import BaseAdapter
@@ -103,6 +103,18 @@ class Flux2KleinAdapter(BaseAdapter):
         # agnostic. BaseAdapter.__init__ already initialized `self._teacher_pipeline`.
 
     def load_pipeline(self) -> Flux2KleinPipeline:
+        # When vae_name_or_path is set, the model repo ships no vae/ subfolder
+        # (e.g. FLUX.2-klein-base-9B shares the 4B VAE); load the VAE separately
+        # and inject it so from_pretrained does not try to read a missing vae/.
+        if self.model_args.vae_name_or_path:
+            from diffusers import AutoencoderKLFlux2
+
+            vae = AutoencoderKLFlux2.from_pretrained(
+                self.model_args.vae_name_or_path, subfolder="vae"
+            )
+            return Flux2KleinPipeline.from_pretrained(
+                self.model_args.model_name_or_path, vae=vae, low_cpu_mem_usage=False
+            )
         return Flux2KleinPipeline.from_pretrained(
             self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
@@ -482,6 +494,88 @@ class Flux2KleinAdapter(BaseAdapter):
         images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
 
         return images
+
+    # ============== Cross-VAE XOPD latent-transport primitives ==============
+    # These let the XOPD cross-VAE trainer (trainers/xopd/transport.py) treat the
+    # FLUX.2 packed latent ``(B, seq, C)`` as a canonical spatial latent
+    # ``(B, C, H, W)`` for the affine transports, and bridge through pixels.
+    def to_spatial_latent(
+        self,
+        z: torch.Tensor,
+        latent_ids: Optional[torch.Tensor] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        **ctx,
+    ) -> torch.Tensor:
+        """Packed FLUX.2 latent ``(B, seq, C)`` -> canonical patchified ``(B, C, H, W)``.
+
+        Uses the pipeline's id-aware scatter (``_unpack_latents_with_ids``) so the
+        sequence tokens land on their (h, w) grid. ``latent_ids`` is REQUIRED
+        (FLUX.2 latents carry their position ids); the XOPD trainer threads the
+        teacher's fixed-resolution ids through ``ctx``. The returned ``C`` is the
+        patchified channel count (``vae_latent_channels * 4`` == transformer
+        ``in_channels``), which is the space the transport operates in.
+        """
+        if latent_ids is None:
+            raise ValueError(
+                "Flux2KleinAdapter.to_spatial_latent requires latent_ids (FLUX.2 "
+                "latents are packed (B, seq, C) with explicit position ids)."
+            )
+        return self.pipeline._unpack_latents_with_ids(z, latent_ids, height, width)
+
+    def from_spatial_latent(self, z_spatial: torch.Tensor, **ctx) -> torch.Tensor:
+        """Canonical patchified ``(B, C, H, W)`` -> packed FLUX.2 latent ``(B, seq, C)``.
+
+        Inverse of :meth:`to_spatial_latent` (row-major ``_pack_latents``). The
+        resulting token order matches ``_prepare_latent_ids`` (T=0, row-major
+        h then w), i.e. the ids produced for a freshly prepared latent grid.
+        """
+        return self.pipeline._pack_latents(z_spatial)
+
+    @torch.no_grad()
+    def encode_pixels(
+        self,
+        images: torch.Tensor,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode pixel image(s) into a packed FLUX.2 latent (inverse of ``decode_latents``).
+
+        Cross-VAE XOPD pixel-bridge primitive. Mirrors the pipeline's
+        ``_encode_vae_image`` (VAE encode -> patchify -> BatchNorm-style
+        normalization) then packs to ``(B, seq, C)`` and returns the matching
+        position ids, so ``decode_latents(*encode_pixels(x)) == x`` up to VAE
+        reconstruction error.
+
+        Args:
+            images: ``(B, 3, H, W)`` float tensor in ``[0, 1]`` (the
+                ``output_type="pt"`` convention of ``decode_latents``), or PIL.
+            height/width: optional resize; default keeps the input resolution.
+
+        Returns:
+            ``(packed_latents (B, seq, C), latent_ids (B, seq, 4))``.
+        """
+        pipe = self.pipeline
+        device = device if device is not None else pipe.vae.device
+        dtype = pipe.vae.dtype
+        # Normalize to a (B,3,H,W) float tensor in [-1, 1] (VAE input convention).
+        pixel_values = pipe.image_processor.preprocess(
+            images, height=height, width=width
+        ).to(device=device, dtype=dtype)
+        # VAE encode -> patchify (B, 4C, H/2, W/2) -> BatchNorm normalize. Same as
+        # _encode_vae_image, but applied to the full (B,3,H,W) batch directly.
+        z = retrieve_latents(pipe.vae.encode(pixel_values), generator=generator, sample_mode="argmax")
+        z = pipe._patchify_latents(z)
+        bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(z.device, z.dtype)
+        bn_std = torch.sqrt(
+            pipe.vae.bn.running_var.view(1, -1, 1, 1) + pipe.vae.config.batch_norm_eps
+        ).to(z.device, z.dtype)
+        z = (z - bn_mean) / bn_std  # (B, C, H, W) patchified, normalized
+        latent_ids = pipe._prepare_latent_ids(z).to(device)  # (B, seq, 4)
+        packed = pipe._pack_latents(z)  # (B, seq, C)
+        return packed, latent_ids
 
     # ======================== Inference ========================
     # Since Flux.2 does not support ragged batches of condition images, we implement a single-sample inference method.

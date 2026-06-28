@@ -30,9 +30,59 @@ def parse_args():
     return parser.parse_known_args()
 
 
+def _enable_offline_local_files_only():
+    """When HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE is set, force diffusers/transformers
+    ``from_pretrained`` to default ``local_files_only=True``.
+
+    Why: diffusers' sharded-checkpoint loader (`_get_checkpoint_shard_files`) issues
+    a network ``model_info`` call for repo-id paths whenever ``local_files_only`` is
+    falsy, and HF offline mode turns that into a hard ``OfflineModeIsEnabled`` error
+    instead of reading the already-cached ``*.index.json``. On worker nodes without
+    huggingface.co reachability this aborts the run even though every shard is cached.
+    Coercing ``local_files_only=True`` at the offline boundary takes the local fast
+    path. No-op when not in offline mode.
+    """
+    if os.environ.get("HF_HUB_OFFLINE", "0") not in ("1", "true", "True") and \
+       os.environ.get("TRANSFORMERS_OFFLINE", "0") not in ("1", "true", "True"):
+        return
+    import functools
+
+    def _patch(cls):
+        if cls is None or not hasattr(cls, "from_pretrained"):
+            return
+        orig = cls.from_pretrained.__func__ if hasattr(cls.from_pretrained, "__func__") else cls.from_pretrained
+
+        @classmethod
+        @functools.wraps(orig)
+        def _wrapped(c, *a, **kw):
+            kw.setdefault("local_files_only", True)
+            return orig(c, *a, **kw)
+
+        try:
+            cls.from_pretrained = _wrapped
+        except (AttributeError, TypeError):
+            pass
+
+    try:
+        from diffusers import DiffusionPipeline, ModelMixin
+        from diffusers.models.modeling_utils import ModelMixin as _MM
+        for c in {DiffusionPipeline, ModelMixin, _MM}:
+            _patch(c)
+    except Exception:
+        pass
+    try:
+        from transformers import PreTrainedModel
+        _patch(PreTrainedModel)
+    except Exception:
+        pass
+
+
 def main():
     args, unknown = parse_args()
-    
+
+    # Honor HF offline mode for cached multi-node loads (see helper docstring).
+    _enable_offline_local_files_only()
+
     # Load configuration
     config = Arguments.load_from_yaml(args.config)
     

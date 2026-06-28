@@ -252,18 +252,38 @@ class PixelBridgeTransport(VAETransport):
             kw["latent_ids"] = ctx["student_latent_ids"]
         return self.student.decode_latents(z_S, output_type="pt", **kw)
 
+    @staticmethod
+    def _split_encode(enc):
+        """Normalize an ``encode_pixels`` return into ``(latent, latent_ids|None)``.
+
+        SD3.5 returns a bare BCHW latent; FLUX.2 returns ``(packed_latent,
+        latent_ids)``. This lets the bridge work across both adapter conventions.
+        """
+        if isinstance(enc, tuple):
+            return enc[0], enc[1]
+        return enc, None
+
     def transport_sample(self, z_T: torch.Tensor, **ctx) -> torch.Tensor:
         img = self._decode_teacher(z_T, ctx)
-        return self.student.encode_pixels(img)
+        z_S, _ = self._split_encode(self.student.encode_pixels(img))
+        return z_S
 
     def transition_mean_to_student(self, x_S, query_teacher_mean, **ctx):
         # student state -> pixels -> teacher latent (the "inverse")
         img_S = self._decode_student(x_S, ctx)
-        x_T = self.teacher.encode_pixels(img_S)
-        mu_T = query_teacher_mean(x_T)
-        # teacher mean -> pixels -> student latent
+        x_T, x_T_ids = self._split_encode(self.teacher.encode_pixels(img_S))
+        # The teacher forward needs the packed-latent ids (FLUX.2); pass them through.
+        mu_T = (
+            query_teacher_mean(x_T, latent_ids=x_T_ids)
+            if x_T_ids is not None
+            else query_teacher_mean(x_T)
+        )
+        # teacher mean -> pixels -> student latent. decode_latents needs the same ids.
+        if x_T_ids is not None:
+            ctx = {**ctx, "teacher_latent_ids": x_T_ids}
         img_mu = self._decode_teacher(mu_T, ctx)
-        return self.student.encode_pixels(img_mu)
+        z_S, _ = self._split_encode(self.student.encode_pixels(img_mu))
+        return z_S
 
 
 class LinearTransport(VAETransport):

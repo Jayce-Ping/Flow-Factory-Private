@@ -2,12 +2,13 @@
 # Single run runs L0 velocity-regression warmup (teacher-generated data) then
 # switches to L1 on-policy transition matching at epoch == l0_warmup_epochs.
 #
-# SDE + REINFORCE variant (auto-generated mirror of the ode_pathwise sibling):
-#   dynamics_type=Flow-SDE, noise_level=0.7, reinforce_coef=1.0. The stochastic
-#   transition gives a non-degenerate per-step log_prob, so the REINFORCE
-#   trajectory term R_bar * log p_theta(x_{k+1}|x_k) actually contributes
-#   (under ODE it is a no-op and XOPDTrainer raises). num_sde_steps/sde_steps=null
-#   -> every inference step except the last is a training step.
+# SDE PATHWISE-ONLY CONTROL (reinforce_coef=0.0). This is the A/B control for the
+# REINFORCE ablation: identical to flux2_klein_9b_to_4b_l1.yaml (Flow-SDE,
+# noise_level=0.7, the SAME stochastic transition) EXCEPT reinforce_coef=0.0, so
+# the REINFORCE trajectory term R_bar * log p_theta(x_{k+1}|x_k) is switched off
+# and only the pathwise per-step Gaussian-KL D_k drives training. Pairing it with
+# the reinforce=1.0 sibling isolates the contribution of the REINFORCE term under
+# an identical SDE rollout. Pure L1 (l0_warmup_epochs=0), L1-only, max_epochs=100.
 
 # ===== Environment =====
 launcher: "accelerate"                    # Launcher. Options: accelerate
@@ -47,7 +48,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_9b_to_4b_sde_reinforce"  # Pure L1 (l0_warmup_epochs=0) + Flow-SDE + REINFORCE (reinforce_coef=1.0)
+  run_name: "flux2klein_9b_to_4b_sde_reinforce0"  # SDE pathwise-only control: l0_warmup_epochs=0 (pure L1) + Flow-SDE (noise_level=0.7) with REINFORCE OFF (reinforce_coef=0.0)
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"                      # Checkpoint / log directory
@@ -79,7 +80,7 @@ train:
 
   # --- L1: on-policy transition matching ---
   pathwise_coef: 1.0                      # Coefficient on per-step Gaussian KL D_k (mean matching); >= 0
-  reinforce_coef: 1.0                     # REINFORCE trajectory-term coefficient (ACTIVE; requires SDE scheduler below). Score-function trajectory gradient weighted by R_bar.
+  reinforce_coef: 0.0                     # REINFORCE OFF: this is the SDE pathwise-only control. Same Flow-SDE transition as the reinforce=1.0 sibling; only D_k drives training. Pairing the two isolates the REINFORCE term's effect.
   reinforce_horizon: null                 # Future steps aggregated into R_bar; null = all j > k
   reinforce_future_reduction: "mean"      # R_bar aggregation. Options: sum, mean
   normalize_d_k: false                    # true: divide D_k by 2*sigma_bar^2; false: plain MSE

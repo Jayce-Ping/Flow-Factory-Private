@@ -42,7 +42,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_9b_to_sd35_l1_whitening"
+  run_name: "flux2klein_9b_to_sd35_l1_adaln"
   project: "Flow-Factory-XOPD-CrossVAE"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -62,8 +62,10 @@ train:
   assume_shared_vae_text_encoder: false    # Cross-VAE: teacher VAE differs; transport bridges the spaces
 
   # --- VAE latent-space transport (cross-VAE) ---
-  vae_transport: "whitening"               # L1 transport (M7 diagonal AdaLN affine: moment-matched, invertible, neutral=identity; robust default). Options: whitening, linear (M2 full affine), pixel (M1 lossy baseline), mlp (placeholder)
-  transport_warmup_batches: 64             # Linear: paired-latent batches to fit A,b before training (ignored for pixel)
+  vae_transport: "adaln"                   # Learnable diagonal AdaLN affine: moment-match init + short latent-recon warm-up (gradient), then FROZEN for L1. Transport scan sibling.
+  transport_warmup_batches: 64             # paired-latent batches for the adaln warm-up gradient loop
+  transport_lr: 1.0e-3                     # adaln warm-up Adam LR
+  transport_warmup_epochs: 50              # adaln warm-up passes over the paired latents, then frozen
 
   # --- Dual classifier-free guidance ---
   teacher_guidance_scale: 1.0

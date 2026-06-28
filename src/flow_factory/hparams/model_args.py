@@ -41,6 +41,18 @@ class ModelArguments(ArgABC):
         metadata={"help": "Path to pre-trained model or model identifier from huggingface.co/models"},
     )
 
+    vae_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional separate HF repo id / local path to load the VAE from "
+                "(subfolder 'vae'), used when the main model repo ships no vae/ "
+                "subfolder (e.g. FLUX.2-klein-base-9B shares the 4B VAE). None "
+                "(default) loads the VAE from model_name_or_path as usual."
+            )
+        },
+    )
+
     finetune_type : Literal['full', 'lora'] = field(
         default='full',
         metadata={"help": "Fine-tuning type. Options are ['full', 'lora']"}

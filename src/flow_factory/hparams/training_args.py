@@ -2124,6 +2124,20 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    teacher_vae_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Cross-VAE only: HF repo id / local path to source the TEACHER's VAE "
+                "from, when the teacher_model_name_or_path repo ships no `vae` "
+                "subfolder (e.g. FLUX.2-klein-base-9B is a transformer-only release "
+                "that shares the 4B VAE). None (default) => auto: if the teacher is a "
+                "FLUX.2-klein teacher whose repo lacks a vae/, fall back to "
+                "'black-forest-labs/FLUX.2-klein-base-4B'. Ignored when the teacher "
+                "repo already has its own VAE (e.g. FLUX.2-dev)."
+            )
+        },
+    )
     vae_transport: Literal["identity", "pixel", "linear", "whitening", "adaln", "mlp"] = field(
         default="identity",
         metadata={
