@@ -43,7 +43,7 @@ model:
 # ===== Logging =====
 log:
   run_name: "flux2klein_9b_to_sd35_l1_pixel"
-  project: "Flow-Factory-XOPD-CrossVAE"
+  project: "Flow-Factory-XOPD"            # Unified with same-VAE Task-1 runs for direct comparison
   logging_backend: "wandb"
   save_dir: "saves/"
   save_freq: 0
