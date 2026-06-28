@@ -127,6 +127,33 @@ class BaseTrainer(ABC):
                 )
                 logger.info(" ".join(parts))
 
+    def log_warmup_data(self, data: Dict[str, Any], step: int, step_key: str = "warmup/step"):
+        """Log warm-up-phase data against a separate x-axis (``step_key``).
+
+        Keeps warm-up curves (e.g. transport reconstruction loss + comparison
+        images) on their own ``warmup_step`` axis so they don't collide with the
+        global training ``step``. Console summary still prints scalars.
+        """
+        if self.logger is not None:
+            self.logger.log_data_on_axis(data, step=step, step_key=step_key)
+        if self.accelerator.is_local_main_process:
+            metrics = {
+                k: v
+                for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items())
+                if v is not None
+            }
+            if metrics:
+                parts = [f"[Warmup {step:04d}]"]
+                parts.extend(
+                    (
+                        f"{k}={int(v)}"
+                        if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+                        else f"{k}={v:.4f}"
+                    )
+                    for k, v in metrics.items()
+                )
+                logger.info(" ".join(parts))
+
     def _init_logging_backend(self):
         """Initialize logging backend if specified."""
         if self.accelerator.is_main_process:

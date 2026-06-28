@@ -1070,6 +1070,36 @@ class XOPDTrainer(BaseTrainer):
             img_list.append(images.float().cpu())
         return z_T_list, z_S_list, img_list
 
+    def _warmup_comparison_image(self, z_T_dev, z_S_dev, n: int = 4):
+        """Build a 2-row comparison PIL image for warm-up visualization.
+
+        Top row    = student-space TARGET latent decoded (``decode_latents(z_S)``),
+                     i.e. the pixel-bridge ground truth in student latent space.
+        Bottom row = teacher latent carried through the transport then decoded
+                     (``decode_latents(T(z_T))``), i.e. what the transport produces.
+        A good transport makes the two rows match. Returns a single stacked PIL.
+        """
+        from PIL import Image as _PILImage
+
+        try:
+            with torch.no_grad():
+                z_S = z_S_dev[:n]
+                z_Thad = self.transport.transport_sample(z_T_dev[:n])  # student-space
+                top = self.adapter.decode_latents(z_S.to(self.accelerator.device), output_type="pil")
+                bot = self.adapter.decode_latents(z_Thad.to(self.accelerator.device), output_type="pil")
+            cols = min(len(top), len(bot), n)
+            if cols == 0:
+                return None
+            w, h = top[0].size
+            grid = _PILImage.new("RGB", (cols * w, 2 * h), "white")
+            for i in range(cols):
+                grid.paste(top[i].resize((w, h)), (i * w, 0))
+                grid.paste(bot[i].resize((w, h)), (i * w, h))
+            return grid
+        except Exception as e:  # viz must never break training
+            logger.warning(f"warm-up comparison image failed: {e}")
+            return None
+
     def _warmup_transport(self) -> None:
         """Warm-up the transport before training, then freeze (cold start).
 
@@ -1104,6 +1134,25 @@ class XOPDTrainer(BaseTrainer):
                 f"Transport ({ta.vae_transport}) fitted (closed-form): "
                 f"A {tuple(self.transport.A.shape)}, b {tuple(self.transport.b.shape)}; frozen."
             )
+            # Visualization: the fit is one-shot (no iterations), so sweep the
+            # collected pair batches and log the per-batch reconstruction error
+            # ||T(z_T) - z_S||^2 against a warm-up x-axis, plus a periodic 2-row
+            # comparison image (top = student target decode, bottom = transported
+            # teacher decode). Main process only (transport is identical post-fit).
+            if self.accelerator.is_main_process and self.logger is not None:
+                with torch.no_grad():
+                    for wstep, (z0_T_cpu, z0_S_cpu) in enumerate(zip(z_T_list, z_S_list)):
+                        z0_T = z0_T_cpu.to(device)
+                        z0_S = z0_S_cpu.to(device)
+                        pred = self.transport.transport_sample(z0_T)
+                        recon = float((pred.float() - z0_S.float()).pow(2).mean().detach())
+                        data = {"warmup/transport_recon_mse": recon}
+                        if wstep % 8 == 0 or wstep == len(z_T_list) - 1:
+                            img = self._warmup_comparison_image([z0_T], [z0_S], n=z0_T.shape[0])
+                            if img is not None:
+                                data["warmup/target_vs_transported"] = img
+                        self.log_warmup_data(data, step=wstep)
+            self.accelerator.wait_for_everyone()
             return
 
         # ---- Learnable AdaLN: moment-match init, then a short reconstruction loop ----
@@ -1136,6 +1185,17 @@ class XOPDTrainer(BaseTrainer):
                 recon += float(loss.detach())
             recon /= max(1, len(z_T_list))
             logger.info(f"  AdaLN warm-up epoch {ep}: recon_mse={recon:.6f}")
+            # Log the per-epoch reconstruction loss + a periodic comparison image
+            # on the warm-up x-axis (main process only).
+            if self.accelerator.is_main_process and self.logger is not None:
+                data = {"warmup/transport_recon_mse": recon}
+                if ep % 5 == 0 or ep == n_epochs - 1:
+                    z0_T = z_T_list[0].to(device)
+                    z0_S = z_S_list[0].to(device)
+                    img = self._warmup_comparison_image([z0_T], [z0_S], n=z0_T.shape[0])
+                    if img is not None:
+                        data["warmup/target_vs_transported"] = img
+                self.log_warmup_data(data, step=ep)
         # Freeze: no transport gradients during L1 (avoids the degenerate D_k path).
         self.transport.eval()
         for p in self.transport.parameters():

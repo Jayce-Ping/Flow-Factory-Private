@@ -109,3 +109,15 @@ class Logger(ABC):
     @abstractmethod
     def _log_impl(self, data: Dict, step: int):
         pass
+
+    def log_data_on_axis(self, data: Dict[str, Any], step: int, step_key: str):
+        """Log ``data`` against a CUSTOM x-axis ``step_key`` (e.g. 'warmup_step').
+
+        Same IR conversion as :meth:`log_data`, but the scalar/image values are
+        plotted against ``data[step_key] = step`` instead of the global training
+        ``step``. Backends that cannot express a custom x-axis fall back to a
+        plain :meth:`log_data` (so nothing is lost). Default: fall back.
+        """
+        merged = dict(data)
+        merged[step_key] = step
+        self.log_data(merged, step=step)

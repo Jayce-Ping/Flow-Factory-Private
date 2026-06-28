@@ -16,7 +16,7 @@
 from typing import Any, Dict, Optional
 import wandb
 from .abc import Logger
-from .formatting import LogImage, LogVideo, LogTable
+from .formatting import LogImage, LogVideo, LogTable, LogFormatter
 
 
 class WandbLogger(Logger):
@@ -27,6 +27,7 @@ class WandbLogger(Logger):
             config=self.config.to_dict()
         )
         self.platform = wandb
+        self._defined_axes = set()
 
     def _convert_to_platform(
         self, 
@@ -56,3 +57,39 @@ class WandbLogger(Logger):
 
     def _log_impl(self, data: Dict, step: int):
         self.platform.log(data, step=step)
+
+    def log_data_on_axis(self, data: Dict, step: int, step_key: str):
+        """Log against a custom x-axis ``step_key`` via wandb.define_metric.
+
+        Metrics under the same namespace prefix as ``step_key`` (e.g. all
+        ``warmup/*`` when step_key is ``warmup/step``) are bound to ``step_key``
+        as their x-axis, decoupling them from the global training ``step``.
+        Logged WITHOUT the global ``step=`` so wandb uses the custom axis.
+        """
+        # Define the custom axis + bind sibling metrics to it (once).
+        ns = step_key.rsplit("/", 1)[0] if "/" in step_key else None
+        if step_key not in self._defined_axes:
+            try:
+                self.platform.define_metric(step_key)
+                pattern = f"{ns}/*" if ns else "*"
+                self.platform.define_metric(pattern, step_metric=step_key)
+            except Exception:
+                pass
+            self._defined_axes.add(step_key)
+
+        # IR conversion (images/tables) identical to log_data, but log on the
+        # custom axis (no global step=).
+        formatted = LogFormatter.format_dict(data)
+        final = {}
+        for k, v in formatted.items():
+            conv = self._recursive_convert(v)
+            if isinstance(conv, dict):
+                final.update(conv)
+            else:
+                final[k] = conv
+        final[step_key] = step
+        if final:
+            self.platform.log(final)
+        if len(self._pending_cleanup) >= self.clean_up_freq:
+            self._cleanup_temp_files(self._pending_cleanup.pop(0))
+        self._pending_cleanup.append(formatted)
