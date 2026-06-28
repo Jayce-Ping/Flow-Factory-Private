@@ -63,7 +63,7 @@ train:
 
   # --- VAE latent-space transport (cross-VAE) ---
   vae_transport: "whitening"               # L1 transport (M7 diagonal AdaLN affine: moment-matched, invertible, neutral=identity; robust default). Options: whitening, linear (M2 full affine), pixel (M1 lossy baseline), mlp (placeholder)
-  transport_warmup_batches: 64             # Linear: paired-latent batches to fit A,b before training (ignored for pixel)
+  transport_warmup_batches: 480            # paired-latent batches collected for transport warm-up (whitening/linear closed-form fit, adaln gradient loop); pixel ignores. Raised 64->480 for a better-conditioned fit.
 
   # --- Dual classifier-free guidance ---
   teacher_guidance_scale: 1.0
