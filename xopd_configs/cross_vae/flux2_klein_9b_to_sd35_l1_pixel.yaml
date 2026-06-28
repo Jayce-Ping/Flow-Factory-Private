@@ -26,7 +26,7 @@ data:
   dataloader_num_workers: 16
   force_reprocess: false
   cache_dir: "~/.cache/flow_factory/datasets"
-  max_dataset_size: null
+  max_dataset_size: 2000                  # Cap prompt pool: caps the (large ~34MB/prompt) teacher-embed cache to ~68GB (disk-bound); 2000 >> 64 unique/epoch keeps diversity.
   sampler_type: "auto"
 
 # ===== Model (student = SD3.5-medium, the small model being trained) =====
