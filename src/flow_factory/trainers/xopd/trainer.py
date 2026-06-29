@@ -1254,7 +1254,10 @@ class XOPDTrainer(BaseTrainer):
 
         Returns a list of ``LogImage`` (logged as a wandb gallery under one key);
         ``max_pairs`` caps how many pairs are emitted. A good transport makes the two
-        rows of each tile match.
+        rows of each tile match. Only CLEAN pairs (``sigma`` ~ 0) are emitted: noisy-
+        latent pairs decode to garbage (both rows pure noise) and are skipped, so the
+        gallery stays interpretable. This affects ONLY the visualization; data
+        collection and the transport fit are unchanged (still cover all noise levels).
         """
         from PIL import Image as _PILImage
         from ...logger.formatting import LogImage
@@ -1266,8 +1269,15 @@ class XOPDTrainer(BaseTrainer):
             if sigma_list is None:
                 sigma_list = [None] * len(z_T_list)
             tiles = []
+            # Only CLEAN pairs (sigma ~ 0) are visualized: a noisy-latent pair decodes to
+            # meaningless garbage (BOTH the target and transported rows are pure noise),
+            # so it pollutes the gallery without conveying any transport quality. sigma is
+            # None for the legacy clean-only collection -> always kept.
+            clean_eps = 1e-3
             with torch.no_grad():
                 for bi, (z_T, z_S, s_b) in enumerate(zip(z_T_list, z_S_list, sigma_list)):
+                    if s_b is not None and float(s_b) > clean_eps:
+                        continue
                     z_S_b = z_S.to(dev)
                     z_T_b = z_T.to(dev)
                     # transport at this pair's noise level (adaln uses sigma; affine ignores)

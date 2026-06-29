@@ -62,8 +62,10 @@ train:
   assume_shared_vae_text_encoder: false    # Cross-VAE: teacher VAE differs; transport bridges the spaces
 
   # --- VAE latent-space transport (cross-VAE) ---
-  vae_transport: "linear"                  # M2 full channel affine (closed-form least-squares A,b). Transport scan sibling of the whitening (M7 diagonal) config.
-  transport_warmup_batches: 480            # paired-latent batches collected for transport warm-up (whitening/linear closed-form fit, adaln gradient loop); pixel ignores. Raised 64->480 for a better-conditioned fit.
+  vae_transport: "linear"                  # M2 full channel affine (closed-form least-squares A,b) fit in LATENT space then FROZEN; applied decode-free at L1 (valid at ALL noise levels), affine transition-mean pushforward is exact (Prop. 3).
+  transport_warmup_batches: 4              # PER-EPOCH teacher rollouts (online schedule); trajectory mode pairs ALL ~28 steps each -> ~112 pairs/epoch covering all noise levels
+  transport_warmup_trajectory: true        # pair EVERY denoising step (all noise levels), matching L1's use on noisy student states
+  transport_warmup_epochs: 20              # online epochs; closed-form linear accumulates normal equations across epochs and re-solves on ALL data -> converges fast (few-param channel affine); 20*4=80 rollouts is well-conditioned
 
   # --- Dual classifier-free guidance ---
   teacher_guidance_scale: 1.0
