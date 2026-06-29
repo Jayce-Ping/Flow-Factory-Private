@@ -304,6 +304,20 @@ class XOPDTrainer(BaseTrainer):
             f"transport={ta.vae_transport!r}."
         )
         self.teacher_adapter = load_model(teacher_config, self.accelerator)
+        # One-time note: the adaLN transport conditions on the scheduler-agnostic
+        # noise fraction sigma=t/num_train_timesteps, so a teacher/student timestep-base
+        # mismatch is absorbed (warm-up and L1 both express the noise level as sigma).
+        if ta.vae_transport == "adaln":
+            t_sched = getattr(self.teacher_adapter, "scheduler", None)
+            s_sched = getattr(self.adapter, "scheduler", None)
+            t_N = getattr(t_sched, "num_train_timesteps", None) if t_sched is not None else None
+            s_N = getattr(s_sched, "num_train_timesteps", None) if s_sched is not None else None
+            if t_N is not None and s_N is not None and t_N != s_N:
+                logger.info(
+                    f"Cross-VAE adaLN transport: teacher num_train_timesteps={t_N} != "
+                    f"student={s_N}; conditioning on sigma=t/num_train_timesteps "
+                    "normalizes this difference."
+                )
         # Freeze + eval + on-device. The teacher is NOT accelerator.prepare()d.
         for name in self.teacher_adapter._resolve_component_names():
             comp = self.teacher_adapter.get_component(name)
@@ -430,6 +444,27 @@ class XOPDTrainer(BaseTrainer):
             f"Could not infer latent channels for {type(adapter).__name__}; "
             "AdaLN transport needs teacher/student channel counts."
         )
+
+    @staticmethod
+    def _noise_fraction(adapter, t):
+        """Map a scheduler timestep to the scheduler-AGNOSTIC noise fraction sigma in [0,1].
+
+        Flow-matching convention ``sigma = t / num_train_timesteps`` (see
+        ``common.py``: ``x_t = (1-sigma) x0 + sigma eps``). ``num_train_timesteps`` is
+        read from the adapter's scheduler (or its config), defaulting to 1000.
+        Expressing BOTH the warm-up (teacher trajectory) and L1 (student state) noise
+        levels as ``sigma`` decouples the adaLN modulation from each scheduler's
+        timestep scaling/shift, so a teacher/student mismatch can no longer skew it.
+        Returns a tensor when ``t`` is a tensor, else a float; both clamped to [0,1].
+        """
+        sched = getattr(adapter, "scheduler", None)
+        N = getattr(sched, "num_train_timesteps", None) if sched is not None else None
+        if N is None and sched is not None and hasattr(sched, "config"):
+            N = getattr(sched.config, "num_train_timesteps", None)
+        N = float(N) if N else 1000.0
+        if torch.is_tensor(t):
+            return (t.float() / N).clamp(0.0, 1.0)
+        return float(min(max(float(t) / N, 0.0), 1.0))
 
     @staticmethod
     def _adapter_to_spatial(adapter, z, **ctx):
@@ -1099,15 +1134,16 @@ class XOPDTrainer(BaseTrainer):
         clean latent ``z0`` (legacy). CPU-resident lists to bound VRAM; each list
         entry is one (B, ...) pair tensor (one per (batch, timestep) in trajectory mode).
 
-        Returns ``(z_T_list, z_S_list, t_list, img_list)`` where ``t_list[i]`` is the
-        scalar timestep (noise level, on the shared ``[0, 1000]`` flow-matching axis)
-        of the ``i``-th pair — used to condition the adaLN-Zero modulation.
+        Returns ``(z_T_list, z_S_list, sigma_list, img_list)`` where ``sigma_list[i]``
+        is the scheduler-agnostic NOISE FRACTION ``sigma = t / num_train_timesteps in
+        [0, 1]`` of the ``i``-th pair (teacher trajectory) — used to condition the
+        adaLN-Zero modulation consistently with the L1 student noise level.
         """
         ta = self.training_args
         device = self.accelerator.device
         use_traj = getattr(ta, "transport_warmup_trajectory", False)
         data_iter = self._make_train_iter()
-        z_T_list, z_S_list, t_list, img_list = [], [], [], []
+        z_T_list, z_S_list, sigma_list, img_list = [], [], [], []
         for _ in tqdm(
             range(ta.transport_warmup_batches),
             desc="Transport warm-up (paired latents)",
@@ -1132,7 +1168,7 @@ class XOPDTrainer(BaseTrainer):
                     z0_S, _ = self._split_student_encode(self.adapter.encode_pixels(images))
                 z_T_list.append(z0_T.float().cpu())
                 z_S_list.append(z0_S.float().cpu())
-                t_list.append(0.0)  # clean latent -> timestep 0 (lowest noise level)
+                sigma_list.append(0.0)  # clean latent -> sigma 0 (lowest noise level)
                 img_list.append(images.float().cpu())
                 continue
 
@@ -1169,11 +1205,13 @@ class XOPDTrainer(BaseTrainer):
                     if (ts_vals is not None and step_idx < T_len)
                     else 0.0
                 )
+                # Convert the teacher timestep to the scheduler-agnostic sigma in [0,1].
+                sigma_val = self._noise_fraction(self.teacher_adapter, t_val)
                 z_T_list.append(z_t_T.float().cpu())
                 z_S_list.append(z_t_S.float().cpu())
-                t_list.append(t_val)
+                sigma_list.append(sigma_val)
                 # images not retained in trajectory mode (downstream uses only pairs).
-        return z_T_list, z_S_list, t_list, img_list
+        return z_T_list, z_S_list, sigma_list, img_list
 
     @staticmethod
     def _split_student_encode(enc):
@@ -1187,7 +1225,7 @@ class XOPDTrainer(BaseTrainer):
         return enc, None
 
     def _warmup_comparison_images(
-        self, z_T_list, z_S_list, t_list=None, max_pairs: Optional[int] = 64
+        self, z_T_list, z_S_list, sigma_list=None, max_pairs: Optional[int] = 64
     ):
         """Build a LIST of per-pair 2-row comparison images for warm-up viz.
 
@@ -1210,15 +1248,15 @@ class XOPDTrainer(BaseTrainer):
             dev = self.accelerator.device
             if not isinstance(z_T_list, (list, tuple)):
                 z_T_list, z_S_list = [z_T_list], [z_S_list]
-            if t_list is None:
-                t_list = [None] * len(z_T_list)
+            if sigma_list is None:
+                sigma_list = [None] * len(z_T_list)
             tiles = []
             with torch.no_grad():
-                for bi, (z_T, z_S, t_b) in enumerate(zip(z_T_list, z_S_list, t_list)):
+                for bi, (z_T, z_S, s_b) in enumerate(zip(z_T_list, z_S_list, sigma_list)):
                     z_S_b = z_S.to(dev)
                     z_T_b = z_T.to(dev)
-                    # transport at this pair's noise level (adaln uses t; affine ignores)
-                    z_Thad = self.transport.transport_sample(z_T_b, t=t_b)  # -> student-space
+                    # transport at this pair's noise level (adaln uses sigma; affine ignores)
+                    z_Thad = self.transport.transport_sample(z_T_b, sigma=s_b)  # -> student-space
                     top = self.adapter.decode_latents(z_S_b, output_type="pil")
                     bot = self.adapter.decode_latents(z_Thad, output_type="pil")
                     top = top if isinstance(top, (list, tuple)) else [top]
@@ -1249,6 +1287,11 @@ class XOPDTrainer(BaseTrainer):
           epochs and re-solve on ALL data seen so far (DPO-style online iteration);
         - learnable (adaln): one Adam step (grad-accumulated over the batch).
 
+        adaln two-phase (``transport_base_warmup_epochs > 0``): the first K epochs
+        update ONLY the closed-form base affine, then the base is frozen and the
+        remaining epochs train ONLY the adaLN modulation MLP against that stable
+        target (avoids chasing a moving base). K=0 keeps the legacy joint update.
+
         Decoupling: the transport uses its OWN optimizer / pure-stat accumulation,
         never ``accelerator.accumulate``, so it does not interact with the XOPD L1
         gradient-accumulation (GAS) loop. After warm-up the transport is frozen and
@@ -1258,24 +1301,46 @@ class XOPDTrainer(BaseTrainer):
         device = self.accelerator.device
         n_epochs = max(1, ta.transport_warmup_epochs)
         is_adaln = isinstance(self.transport, AdaLNTransport)
+        # Two-phase schedule (adaln only): the first `base_epochs` epochs update ONLY
+        # the closed-form base affine; the rest freeze the base and train ONLY the
+        # adaLN modulation MLP against that stable target. 0 -> legacy joint update.
+        base_epochs = int(getattr(ta, "transport_base_warmup_epochs", 0)) if is_adaln else 0
         if is_adaln:
             self.transport.to(device)
             self.transport.set_online_lr(ta.transport_lr)
+            if base_epochs >= n_epochs:
+                logger.warning(
+                    f"transport_base_warmup_epochs ({base_epochs}) >= "
+                    f"transport_warmup_epochs ({n_epochs}): the adaLN modulation MLP "
+                    "will not be trained; the transport degrades to the closed-form "
+                    "base affine (equivalent to 'linear')."
+                )
         logger.info(
             f"Transport ({ta.vae_transport}) ONLINE warm-up: {n_epochs} epoch(s), "
             f"{ta.transport_warmup_batches} freshly-rolled-out batch(es)/epoch "
             f"({'adaln grad step' if is_adaln else 'closed-form on accumulated stats'} "
             "per epoch), then frozen."
+            + (
+                f" Base/MLP split: first {base_epochs} epoch(s) base-only, then "
+                "MLP-only on a frozen base."
+                if base_epochs > 0
+                else ""
+            )
         )
         for ep in range(n_epochs):
             # 1. Fresh rollout for THIS epoch (full denoising trajectory per batch).
-            z_T_list, z_S_list, t_list, _img = self._collect_warmup_pairs()
+            z_T_list, z_S_list, sigma_list, _img = self._collect_warmup_pairs()
             z_T_dev = [z.to(device) for z in z_T_list]
             z_S_dev = [z.to(device) for z in z_S_list]
             # 2. One transport update on this epoch's fresh data. adaln consumes the
-            #    per-pair timesteps to condition its modulation; closed-form transports
-            #    ignore the extra kwarg.
-            recon = self.transport.update_online(z_T_dev, z_S_dev, t_list=t_list)
+            #    per-pair noise fractions (sigma) to condition its modulation; closed-
+            #    form transports ignore the extra kwargs. Two-phase (adaln): base-only
+            #    for the first base_epochs, then modulation-only on the frozen base.
+            update_kwargs = {"sigma_list": sigma_list}
+            if base_epochs > 0:
+                update_kwargs["update_base"] = ep < base_epochs
+                update_kwargs["update_mod"] = ep >= base_epochs
+            recon = self.transport.update_online(z_T_dev, z_S_dev, **update_kwargs)
             logger.info(f"  transport warm-up epoch {ep}: recon_mse={recon:.6f}")
             # 3. Log loss + per-pair comparison images (each pair = one 2-row tile,
             #    top=student target / bottom=transported teacher) as a gallery on the
@@ -1283,7 +1348,7 @@ class XOPDTrainer(BaseTrainer):
             if self.accelerator.is_main_process and self.logger is not None:
                 data = {"warmup/transport_recon_mse": float(recon)}
                 imgs = self._warmup_comparison_images(
-                    z_T_dev, z_S_dev, t_list=t_list, max_pairs=64
+                    z_T_dev, z_S_dev, sigma_list=sigma_list, max_pairs=64
                 )
                 if imgs:
                     data["warmup/target_vs_transported"] = imgs
@@ -1634,11 +1699,13 @@ class XOPDTrainer(BaseTrainer):
                 )
             return out.next_latents_mean.detach()
 
-        # Pass the student's current denoising timestep so a timestep-conditioned
-        # transport (adaln) modulates at the matching noise level; affine transports
-        # ignore the kwarg. For any fixed t the adaln map is still affine, so this
-        # transition-mean pushforward stays exact (Prop. 3).
-        mu_S = self.transport.transition_mean_to_student(x_S, query_teacher_mean, t=t)
+        # Pass the student's current noise level as the scheduler-agnostic fraction
+        # sigma=t/num_train_timesteps so a sigma-conditioned transport (adaln) modulates
+        # at the matching level (consistent with warm-up); affine transports ignore the
+        # kwarg. For any fixed sigma the adaln map is still affine, so this transition-
+        # mean pushforward stays exact (Prop. 3).
+        sigma = self._noise_fraction(self.adapter, t)
+        mu_S = self.transport.transition_mean_to_student(x_S, query_teacher_mean, sigma=sigma)
         return mu_S.detach()
 
     def _build_teacher_text_cond(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:

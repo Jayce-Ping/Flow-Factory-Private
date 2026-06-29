@@ -2199,6 +2199,21 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    transport_base_warmup_epochs: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "adaln-only two-phase warm-up split. If > 0, the first K warm-up "
+                "epochs update ONLY the closed-form base affine (A_base, b_base); the "
+                "remaining (transport_warmup_epochs - K) epochs FREEZE the base and "
+                "train ONLY the adaLN-Zero timestep-modulation MLP against that stable "
+                "target (avoids the MLP chasing a base that is still moving). 0 "
+                "(default) keeps the legacy joint update (base re-solve + one MLP step "
+                "every epoch). Must satisfy 0 <= K <= transport_warmup_epochs. Ignored "
+                "by closed-form transports (linear/whitening) which have no MLP."
+            )
+        },
+    )
     transport_warmup_trajectory: bool = field(
         default=True,
         metadata={
@@ -2387,6 +2402,13 @@ class XOPDTrainingArguments(TrainingArguments):
                     f"vae_transport={self.vae_transport!r} requires "
                     "transport_warmup_batches > 0 to fit/warm-up the transport; "
                     f"got {self.transport_warmup_batches}."
+                )
+            if not (0 <= self.transport_base_warmup_epochs <= self.transport_warmup_epochs):
+                raise ValueError(
+                    "transport_base_warmup_epochs must satisfy "
+                    "0 <= transport_base_warmup_epochs <= transport_warmup_epochs; got "
+                    f"transport_base_warmup_epochs={self.transport_base_warmup_epochs!r}, "
+                    f"transport_warmup_epochs={self.transport_warmup_epochs!r}."
                 )
         else:
             if self.vae_transport != "identity":

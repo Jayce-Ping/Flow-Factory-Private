@@ -333,6 +333,9 @@ class LinearTransport(VAETransport):
         self.ridge = ridge
         self.A: Optional[torch.Tensor] = None   # (C_S, C_T)
         self.b: Optional[torch.Tensor] = None   # (C_S,)
+        # Cache of pinv(A); invalidated whenever A changes (B: avoid recomputing the
+        # inverse every L1 step once the affine is frozen).
+        self._A_pinv: Optional[torch.Tensor] = None  # (C_T, C_S)
         self._student_grid: Optional[Tuple[int, int]] = None  # (H_S, W_S)
         self._teacher_grid: Optional[Tuple[int, int]] = None  # (H_T, W_T)
         # Online warm-up: running normal-equation accumulators across epochs, so the
@@ -358,6 +361,7 @@ class LinearTransport(VAETransport):
         b = state.get("b")
         self.A = None if A is None else A.clone()
         self.b = None if b is None else b.clone()
+        self._A_pinv = None  # A changed -> invalidate cached inverse
         self._student_grid = state.get("student_grid")
         self._teacher_grid = state.get("teacher_grid")
 
@@ -377,6 +381,7 @@ class LinearTransport(VAETransport):
         A, b = fit_channel_affine_lstsq(T_rs, S_spatial, ridge=self.ridge)
         self.A = A.to(T_spatial.device)
         self.b = b.to(T_spatial.device)
+        self._A_pinv = None  # A changed -> invalidate cached inverse
 
     def update_online(self, z_T_list, z_S_list, **ctx) -> float:
         """Accumulate normal-equation statistics from a fresh batch, then re-solve.
@@ -416,6 +421,7 @@ class LinearTransport(VAETransport):
         W = torch.linalg.solve(self._neq_G + reg, self._neq_XtY)        # (C_in+1, C_out)
         self.A = W[:-1, :].transpose(0, 1).contiguous().float().to(T_spatial.device)
         self.b = W[-1, :].contiguous().float().to(T_spatial.device)
+        self._A_pinv = None  # A changed -> invalidate cached inverse
         # Recon MSE on this batch under the updated transport (for logging).
         with torch.no_grad():
             pred = channel_affine(T_rs, self.A, self.b)
@@ -448,7 +454,10 @@ class LinearTransport(VAETransport):
         # Inverse: student state -> teacher native state (affine^-1 + inverse resample).
         S_spatial = self.s2s(x_S)
         # A^+ (x - b): map channels S->T, then resample student grid -> teacher grid.
-        A_pinv = torch.linalg.pinv(self.A.double()).float()  # (C_T, C_S)
+        # pinv(A) is cached since A is frozen after warm-up (recomputed on change).
+        if self._A_pinv is None:
+            self._A_pinv = torch.linalg.pinv(self.A.double()).float()  # (C_T, C_S)
+        A_pinv = self._A_pinv
         b_proj = self.b.view(1, -1, 1, 1)
         T_rs = torch.einsum("tc,bchw->bthw", A_pinv.to(S_spatial.dtype), S_spatial - b_proj)
         T_spatial = resample_spatial(T_rs, self._teacher_grid)
@@ -506,6 +515,7 @@ class WhiteningTransport(LinearTransport):
         A, b = moment_matching_affine(T_rs, S_spatial, eps=self.min_std)
         self.A = A.to(T_spatial.device)
         self.b = b.to(T_spatial.device)
+        self._A_pinv = None  # A changed -> invalidate cached inverse
 
     def update_online(self, z_T_list, z_S_list, **ctx) -> float:
         """Accumulate per-channel moments from fresh data, re-solve diagonal affine.
@@ -549,6 +559,7 @@ class WhiteningTransport(LinearTransport):
         bvec = torch.zeros(C_out, dtype=torch.float64, device=T_rs.device)
         bvec[:C] = mu_out - scale * mu_in
         self.A = A.float(); self.b = bvec.float()
+        self._A_pinv = None  # A changed -> invalidate cached inverse
         with torch.no_grad():
             pred = channel_affine(T_rs, self.A, self.b)
             recon = float((pred.float() - S_spatial.float()).pow(2).mean())
@@ -660,6 +671,9 @@ class AdaLNTransport(VAETransport, nn.Module):
         # Online warm-up: lazily-created Adam optimizer over the MLP (persists).
         self._online_opt = None
         self._online_lr = 1.0e-3
+        # Cache of pinv(A_base); invalidated whenever A_base changes (B: avoid
+        # recomputing the inverse every L1 step once the base is frozen).
+        self._A_base_pinv: Optional[torch.Tensor] = None
 
     @property
     def is_fitted(self) -> bool:
@@ -670,25 +684,35 @@ class AdaLNTransport(VAETransport, nn.Module):
 
     # ----- timestep modulation -------------------------------------------------
     def _modulation(
-        self, t: Optional[torch.Tensor], ref: torch.Tensor
+        self, sigma: Optional[torch.Tensor], ref: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(gamma, shift)`` each shaped ``(B, C_S, 1, 1)`` for broadcasting.
 
-        ``t`` is a scalar / ``(B,)`` timestep in ``[0, 1000]`` (the shared
-        flow-matching axis). When ``None`` the modulation is neutral
-        (``gamma=1, shift=0``) so ``T == A_base z + b_base``.
+        ``sigma`` is a scalar / ``(B,)`` flow-matching NOISE FRACTION in ``[0, 1]``
+        (``sigma = t / num_train_timesteps``; ``z_t = (1-sigma) z0 + sigma eps``).
+        This is the scheduler-AGNOSTIC condition: warm-up (teacher trajectory) and
+        L1 (student state) both express the noise level as ``sigma``, so a differing
+        ``num_train_timesteps`` / shift between teacher and student schedulers can no
+        longer skew the modulation. ``sigma`` is clamped to ``[0, 1]`` and rescaled
+        to the ``[0, 1000]`` base before the sinusoidal embedding (keeps the
+        embedding's frequency range identical to the standard timestep convention).
+        When ``None`` the modulation is neutral (``gamma=1, shift=0``) so
+        ``T == A_base z + b_base``.
         """
         B = ref.shape[0]
-        if t is None:
+        if sigma is None:
             g = torch.ones(B, self.C_S, 1, 1, dtype=ref.dtype, device=ref.device)
             sh = torch.zeros(B, self.C_S, 1, 1, dtype=ref.dtype, device=ref.device)
             return g, sh
-        if not torch.is_tensor(t):
-            t = torch.tensor([t], device=ref.device)
-        t = t.reshape(-1).to(ref.device).float()
-        if t.numel() == 1 and B > 1:
-            t = t.expand(B)
-        temb = self.time_proj(t).to(self.mod_mlp[0].weight.dtype)  # (B, d_t)
+        if not torch.is_tensor(sigma):
+            sigma = torch.tensor([sigma], device=ref.device)
+        sigma = sigma.reshape(-1).to(ref.device).float().clamp(0.0, 1.0)
+        if sigma.numel() == 1 and B > 1:
+            sigma = sigma.expand(B)
+        # Rescale the [0,1] noise fraction to the [0,1000] base the sinusoidal
+        # Timesteps embedding is designed for (numerically identical to feeding the
+        # raw timestep for a 1000-step scheduler, but now scheduler-agnostic).
+        temb = self.time_proj(sigma * 1000.0).to(self.mod_mlp[0].weight.dtype)  # (B, d_t)
         s, sh = self.mod_mlp(temb).chunk(2, dim=-1)                 # (B, C_S) each
         gamma = torch.exp(s).to(ref.dtype).view(-1, self.C_S, 1, 1)
         shift = sh.to(ref.dtype).view(-1, self.C_S, 1, 1)
@@ -713,6 +737,7 @@ class AdaLNTransport(VAETransport, nn.Module):
         A, b = fit_channel_affine_lstsq(T_rs, S_spatial, ridge=self.ridge)
         self.A_base.data = A.to(self.A_base.device)
         self.b_base.data = b.to(self.b_base.device)
+        self._A_base_pinv = None  # A_base changed -> invalidate cached inverse
         self._fitted = True
 
     # alias so the trainer warm-up can call .fit(...) uniformly across transports
@@ -723,91 +748,127 @@ class AdaLNTransport(VAETransport, nn.Module):
         """Set the Adam LR for the online warm-up (call before the first update)."""
         self._online_lr = lr
 
-    def update_online(self, z_T_list, z_S_list, t_list=None, **ctx) -> float:
-        """One warm-up step: re-solve closed-form base + one Adam step on the MLP.
+    def update_online(
+        self,
+        z_T_list,
+        z_S_list,
+        sigma_list=None,
+        update_base: bool = True,
+        update_mod: bool = True,
+        **ctx,
+    ) -> float:
+        """One warm-up step: optionally re-solve the base and/or step the adaLN MLP.
 
         Per warm-up epoch the trainer rolls out NEW pairs (across the denoising
-        trajectory) and calls this once with the per-pair timesteps ``t_list``:
+        trajectory) and calls this once with the per-pair NOISE FRACTIONS
+        ``sigma_list`` (each ``sigma in [0, 1]``):
 
-        1. Accumulate the additive least-squares sufficient statistics for the base
-           affine ``G += Xa^T Xa``, ``XtY += Xa^T Y`` and re-solve ``A_base, b_base``
-           on ALL data seen so far (no_grad; the base is data-global and frozen
-           w.r.t. gradients).
-        2. Take ONE Adam step on the adaLN-Zero MLP, regressing the per-``t``
-           modulation that corrects the residual of the base affine at each noise
-           level (grad-accumulated over the batch).
+        1. ``update_base`` (default True): accumulate the additive least-squares
+           sufficient statistics for the base affine ``G += Xa^T Xa``,
+           ``XtY += Xa^T Y`` and re-solve ``A_base, b_base`` on ALL data seen so far
+           (no_grad; the base is data-global and frozen w.r.t. gradients). Re-solving
+           invalidates the cached ``pinv(A_base)``.
+        2. ``update_mod`` (default True): take ONE Adam step on the adaLN-Zero MLP,
+           regressing the per-``sigma`` modulation that corrects the residual of the
+           base affine at each noise level (grad-accumulated over the batch).
 
-        Uses a dedicated optimizer (NOT accelerator) so it is fully decoupled from
-        the XOPD GAS loop. Returns this-batch recon MSE (post-update) for logging.
+        The two flags let the trainer run a TWO-PHASE schedule (warm the base first,
+        then freeze it and train only the modulation against a stable target); both
+        ``True`` reproduces the legacy joint update. Uses a dedicated optimizer (NOT
+        accelerator) so it is fully decoupled from the XOPD GAS loop. Returns this-
+        batch recon MSE (post-update) for logging.
         """
+        n = max(1, len(z_T_list))
+        if sigma_list is None:
+            sigma_list = [None] * len(z_T_list)
+
         # 1) Closed-form base affine on accumulated normal equations -------------
-        with torch.no_grad():
-            T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
-            S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
-            self._teacher_grid = tuple(T_spatial.shape[-2:])
-            self._student_grid = tuple(S_spatial.shape[-2:])
-            T_rs = resample_spatial(T_spatial, self._student_grid)
-            X = T_rs.permute(0, 2, 3, 1).reshape(-1, self.C_T).double()
-            Y = S_spatial.permute(0, 2, 3, 1).reshape(-1, self.C_S).double()
-            ones = torch.ones(X.shape[0], 1, dtype=X.dtype, device=X.device)
-            Xa = torch.cat([X, ones], dim=1)
-            G_batch = Xa.transpose(0, 1) @ Xa
-            XtY_batch = Xa.transpose(0, 1) @ Y
-            if self._neq_G is None:
-                self._neq_G, self._neq_XtY = G_batch, XtY_batch
-            else:
-                self._neq_G = self._neq_G + G_batch
-                self._neq_XtY = self._neq_XtY + XtY_batch
-            reg = self.ridge * torch.eye(
-                self._neq_G.shape[0], dtype=self._neq_G.dtype, device=self._neq_G.device
-            )
-            reg[-1, -1] = 0.0
-            W = torch.linalg.solve(self._neq_G + reg, self._neq_XtY)      # (C_T+1, C_S)
-            self.A_base.data = W[:-1, :].transpose(0, 1).contiguous().float().to(self.A_base.device)
-            self.b_base.data = W[-1, :].contiguous().float().to(self.b_base.device)
-            self._fitted = True
+        if update_base:
+            with torch.no_grad():
+                T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+                S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+                self._teacher_grid = tuple(T_spatial.shape[-2:])
+                self._student_grid = tuple(S_spatial.shape[-2:])
+                T_rs = resample_spatial(T_spatial, self._student_grid)
+                X = T_rs.permute(0, 2, 3, 1).reshape(-1, self.C_T).double()
+                Y = S_spatial.permute(0, 2, 3, 1).reshape(-1, self.C_S).double()
+                ones = torch.ones(X.shape[0], 1, dtype=X.dtype, device=X.device)
+                Xa = torch.cat([X, ones], dim=1)
+                G_batch = Xa.transpose(0, 1) @ Xa
+                XtY_batch = Xa.transpose(0, 1) @ Y
+                if self._neq_G is None:
+                    self._neq_G, self._neq_XtY = G_batch, XtY_batch
+                else:
+                    self._neq_G = self._neq_G + G_batch
+                    self._neq_XtY = self._neq_XtY + XtY_batch
+                reg = self.ridge * torch.eye(
+                    self._neq_G.shape[0], dtype=self._neq_G.dtype, device=self._neq_G.device
+                )
+                reg[-1, -1] = 0.0
+                W = torch.linalg.solve(self._neq_G + reg, self._neq_XtY)      # (C_T+1, C_S)
+                self.A_base.data = W[:-1, :].transpose(0, 1).contiguous().float().to(self.A_base.device)
+                self.b_base.data = W[-1, :].contiguous().float().to(self.b_base.device)
+                self._A_base_pinv = None  # A_base changed -> invalidate cached inverse
+                self._fitted = True
 
         # 2) One Adam step on the adaLN-Zero modulation MLP ----------------------
-        if self._online_opt is None:
-            self._online_opt = torch.optim.Adam(self.mod_mlp.parameters(), lr=self._online_lr)
-        self.train()
-        self._online_opt.zero_grad()
-        n = max(1, len(z_T_list))
-        if t_list is None:
-            t_list = [None] * len(z_T_list)
-        total = 0.0
-        for z_T, z_S, t in zip(z_T_list, z_S_list, t_list):
-            pred = self.transport_sample(z_T, t=t)
-            loss = (pred.float() - z_S.float()).pow(2).mean() / n  # average -> grad accumulate
-            loss.backward()
-            total += float(loss.detach()) * n
-        self._online_opt.step()
+        if update_mod:
+            if self._online_opt is None:
+                self._online_opt = torch.optim.Adam(self.mod_mlp.parameters(), lr=self._online_lr)
+            self.train()
+            self._online_opt.zero_grad()
+            total = 0.0
+            for z_T, z_S, s in zip(z_T_list, z_S_list, sigma_list):
+                pred = self.transport_sample(z_T, sigma=s)
+                loss = (pred.float() - z_S.float()).pow(2).mean() / n  # average -> grad accumulate
+                loss.backward()
+                total += float(loss.detach()) * n
+            self._online_opt.step()
+            return total / n
+
+        # Base-only update: report a no_grad recon (current base + neutral mod) for logging.
+        with torch.no_grad():
+            total = 0.0
+            for z_T, z_S, s in zip(z_T_list, z_S_list, sigma_list):
+                pred = self.transport_sample(z_T, sigma=s)
+                total += float((pred.float() - z_S.float()).pow(2).mean())
         return total / n
 
+    def _A_base_pinv_cached(self, dtype: torch.dtype) -> torch.Tensor:
+        """Pseudo-inverse of the (frozen) base affine, computed once and cached.
+
+        ``A_base`` is frozen after warm-up, so its ``pinv`` (used every L1 step for
+        the inverse query) is computed once and reused. The cache is invalidated
+        whenever ``A_base`` changes (closed-form re-solve / load_state_dict).
+        """
+        if self._A_base_pinv is None:
+            self._A_base_pinv = torch.linalg.pinv(self.A_base.double()).float()  # (C_T, C_S)
+        return self._A_base_pinv.to(dtype)
+
     def _to_student_spatial(
-        self, T_spatial: torch.Tensor, t: Optional[torch.Tensor] = None
+        self, T_spatial: torch.Tensor, sigma: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         T_rs = (
             resample_spatial(T_spatial, self._student_grid)
             if self._student_grid is not None
             else T_spatial
         )
-        # Frozen base affine (full channel mixing), then per-t adaLN modulation.
+        # Frozen base affine (full channel mixing), then per-sigma adaLN modulation.
         base = torch.einsum("sc,bchw->bshw", self.A_base.to(T_rs.dtype), T_rs)
         base = base + self.b_base.to(T_rs.dtype).view(1, -1, 1, 1)
-        gamma, shift = self._modulation(t, base)
+        gamma, shift = self._modulation(sigma, base)
         return gamma * base + shift
 
     def _to_teacher_spatial(
-        self, S_spatial: torch.Tensor, t: Optional[torch.Tensor] = None
+        self, S_spatial: torch.Tensor, sigma: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        # Invert (analytic, fixed t): un-modulate, then un-mix channels via the
-        # pseudo-inverse of A_base (C_T x C_S; least-norm since C_S != C_T), then
-        # inverse resample. gamma>0 keeps the modulation invertible.
-        gamma, shift = self._modulation(t, S_spatial)
+        # Invert (analytic, fixed sigma): un-modulate, then un-mix channels via the
+        # (cached) pseudo-inverse of A_base (C_T x C_S; least-norm since C_S != C_T),
+        # then inverse resample. gamma>0 keeps the modulation invertible.
+        gamma, shift = self._modulation(sigma, S_spatial)
         base = (S_spatial - shift) / gamma                      # = A_base z_rs + b_base
         base = base - self.b_base.to(base.dtype).view(1, -1, 1, 1)
-        A_pinv = torch.linalg.pinv(self.A_base.double()).to(base.dtype)  # (C_T, C_S)
+        A_pinv = self._A_base_pinv_cached(base.dtype)           # (C_T, C_S)
         T_rs = torch.einsum("cs,bshw->bchw", A_pinv, base)
         return (
             resample_spatial(T_rs, self._teacher_grid)
@@ -815,16 +876,16 @@ class AdaLNTransport(VAETransport, nn.Module):
             else T_rs
         )
 
-    def transport_sample(self, z_T: torch.Tensor, t=None, **ctx) -> torch.Tensor:
-        S_spatial = self._to_student_spatial(self.t2s(z_T), t=t)
+    def transport_sample(self, z_T: torch.Tensor, sigma=None, **ctx) -> torch.Tensor:
+        S_spatial = self._to_student_spatial(self.t2s(z_T), sigma=sigma)
         return self.s_from(S_spatial)
 
-    def transition_mean_to_student(self, x_S, query_teacher_mean, t=None, **ctx):
-        # Inverse to teacher space at this t, query teacher, map mean back at same t.
-        T_spatial = self._to_teacher_spatial(self.s2s(x_S), t=t)
+    def transition_mean_to_student(self, x_S, query_teacher_mean, sigma=None, **ctx):
+        # Inverse to teacher space at this sigma, query teacher, map mean back at it.
+        T_spatial = self._to_teacher_spatial(self.s2s(x_S), sigma=sigma)
         x_T = self.t_from(T_spatial)
         mu_T = query_teacher_mean(x_T)
-        muS_spatial = self._to_student_spatial(self.t2s(mu_T), t=t)
+        muS_spatial = self._to_student_spatial(self.t2s(mu_T), sigma=sigma)
         return self.s_from(muS_spatial)
 
     def state_dict(self, *args, **kwargs) -> dict:
@@ -840,6 +901,7 @@ class AdaLNTransport(VAETransport, nn.Module):
         self._student_grid = state.pop("_student_grid", None)
         self._teacher_grid = state.pop("_teacher_grid", None)
         self._fitted = state.pop("_fitted", False)
+        self._A_base_pinv = None  # A_base may have changed -> invalidate cached inverse
         nn.Module.load_state_dict(self, state, strict=strict)
 
 

@@ -238,12 +238,12 @@ class TestAdaLNTransport(unittest.TestCase):
 
     def test_default_is_identity(self):
         # A_base=identity-selection, b_base=0, modulation zero-init (gamma=1,shift=0)
-        # -> the untrained transport is the identity, with or without a timestep.
+        # -> the untrained transport is the identity, with or without a noise level.
         t = self._make()
         z = torch.randn(2, 4, 6, 6)
         torch.testing.assert_close(t.transport_sample(z), z, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(
-            t.transport_sample(z, t=500.0), z, atol=1e-5, rtol=1e-5
+            t.transport_sample(z, sigma=0.5), z, atol=1e-5, rtol=1e-5
         )
 
     def test_zero_init_modulation_is_neutral(self):
@@ -255,9 +255,9 @@ class TestAdaLNTransport(unittest.TestCase):
         z_S = [z * 2.0 + 1.0 for z in z_T]
         t = self._make()
         t.fit(z_T, z_S)
-        with_t = t.transport_sample(z_T[0], t=750.0)
-        no_t = t.transport_sample(z_T[0], t=None)
-        torch.testing.assert_close(with_t, no_t, atol=1e-5, rtol=1e-5)
+        with_sigma = t.transport_sample(z_T[0], sigma=0.75)
+        no_sigma = t.transport_sample(z_T[0], sigma=None)
+        torch.testing.assert_close(with_sigma, no_sigma, atol=1e-5, rtol=1e-5)
 
     def test_moment_init_and_analytic_inverse(self):
         torch.manual_seed(0)
@@ -273,41 +273,86 @@ class TestAdaLNTransport(unittest.TestCase):
         torch.testing.assert_close(
             out.mean(dim=(0, 2, 3)), z_S[0].mean(dim=(0, 2, 3)), atol=1e-2, rtol=1e-2
         )
-        # analytic inverse round trip (identity teacher mean), at a fixed timestep
+        # analytic inverse round trip (identity teacher mean), at a fixed noise level
         x_S = torch.randn(2, C, 6, 6)
         rt = t.transition_mean_to_student(
-            x_S, query_teacher_mean=lambda x_T: x_T, t=300.0
+            x_S, query_teacher_mean=lambda x_T: x_T, sigma=0.3
         )
         torch.testing.assert_close(rt, x_S, atol=1e-4, rtol=1e-4)
 
     def test_gradients_flow_to_params(self):
-        # After a forward at a real timestep, gradients reach the modulation MLP.
+        # After a forward at a real noise level, gradients reach the modulation MLP.
         t = self._make()
         z = torch.randn(2, 4, 5, 5)
-        out = t.transport_sample(z, t=500.0)
+        out = t.transport_sample(z, sigma=0.5)
         out.pow(2).mean().backward()
         self.assertIsNotNone(t.mod_mlp[0].weight.grad)
         # The zero-init last layer has a defined (possibly zero at step 0) grad slot
         # once it participates in the graph.
         self.assertIsNotNone(t.mod_mlp[-1].weight.grad)
 
-    def test_timestep_conditioning_changes_modulation(self):
-        # After a few online updates the modulation should differ across timesteps
-        # (the whole point of the conditioning) — train it to need per-t correction.
+    def test_sigma_conditioning_changes_modulation(self):
+        # After a few online updates the modulation should differ across noise levels
+        # (the whole point of the conditioning) — train it to need per-sigma correction.
         torch.manual_seed(0)
         C = 4
         t = self._make()
-        # target depends on t: low-t -> scale 2, high-t -> scale 0.5 (toy per-t map).
+        # target depends on sigma: low -> scale 2, high -> scale 0.5 (toy per-sigma map).
         for _ in range(50):
             z_T = [torch.randn(8, C, 6, 6), torch.randn(8, C, 6, 6)]
             z_S = [z_T[0] * 2.0, z_T[1] * 0.5]
             t.set_online_lr(1e-2)
-            t.update_online(z_T, z_S, t_list=[50.0, 950.0])
+            t.update_online(z_T, z_S, sigma_list=[0.05, 0.95])
         probe = torch.randn(4, C, 6, 6)
-        out_lo = t.transport_sample(probe, t=50.0)
-        out_hi = t.transport_sample(probe, t=950.0)
-        # The two timesteps must produce different outputs.
+        out_lo = t.transport_sample(probe, sigma=0.05)
+        out_hi = t.transport_sample(probe, sigma=0.95)
+        # The two noise levels must produce different outputs.
         self.assertGreater((out_lo - out_hi).abs().mean().item(), 1e-3)
+
+    def test_two_phase_base_then_mod(self):
+        # Phase 1 (update_base=True, update_mod=False) fits ONLY the base; phase 2
+        # (update_base=False, update_mod=True) freezes the base and trains ONLY the MLP.
+        torch.manual_seed(0)
+        C = 4
+        t = self._make()
+        z_T = [torch.randn(8, C, 6, 6) for _ in range(2)]
+        z_S = [z * 2.0 + 1.0 for z in z_T]
+        t.set_online_lr(1e-2)
+        # Phase 1: base only -> base fitted, modulation MLP untouched (last layer zero).
+        t.update_online(z_T, z_S, sigma_list=[0.1, 0.9], update_base=True, update_mod=False)
+        self.assertTrue(t.is_fitted)
+        base_after_p1 = t.A_base.clone()
+        mlp_last_after_p1 = t.mod_mlp[-1].weight.clone()
+        torch.testing.assert_close(
+            mlp_last_after_p1, torch.zeros_like(mlp_last_after_p1)
+        )
+        # Phase 2: modulation only -> base must stay frozen, MLP must change.
+        for _ in range(10):
+            t.update_online(
+                z_T, z_S, sigma_list=[0.1, 0.9], update_base=False, update_mod=True
+            )
+        torch.testing.assert_close(t.A_base, base_after_p1, atol=0.0, rtol=0.0)
+        self.assertGreater(
+            (t.mod_mlp[-1].weight - mlp_last_after_p1).abs().max().item(), 0.0
+        )
+
+    def test_pinv_cache_invalidates_on_base_change(self):
+        # The cached pinv(A_base) is lazily built on first inverse and invalidated
+        # whenever the base is re-solved (so a stale inverse is never reused).
+        torch.manual_seed(0)
+        C = 4
+        t = self._make()
+        z_T = [torch.randn(8, C, 6, 6) for _ in range(2)]
+        z_S = [z * 2.0 + 1.0 for z in z_T]
+        t.fit(z_T, z_S)
+        self.assertIsNone(t._A_base_pinv)
+        _ = t.transition_mean_to_student(
+            torch.randn(2, C, 6, 6), query_teacher_mean=lambda x: x, sigma=0.3
+        )
+        self.assertIsNotNone(t._A_base_pinv)  # built on first inverse
+        # Re-solving the base invalidates the cache.
+        t.update_online(z_T, z_S, sigma_list=[0.1, 0.9], update_base=True, update_mod=False)
+        self.assertIsNone(t._A_base_pinv)
 
     def test_channel_mismatch(self):
         t = self._make(C_T=6, C_S=4)
@@ -380,6 +425,110 @@ class TestTransportStateDict(unittest.TestCase):
         self.assertTrue(t2.is_fitted)
         probe = torch.randn(2, 4, 6, 6)
         torch.testing.assert_close(t2.transport_sample(probe), t.transport_sample(probe))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for GPU smoke test")
+class TestTransportGPUSmoke(unittest.TestCase):
+    """GPU smoke test for the A/B/C improvements at realistic channel counts.
+
+    Uses the cross-VAE FLUX.2 (C_T=128) -> SD3.5 (C_S=16) channel sizes on a small
+    spatial grid so it runs in <1GB and a couple of seconds, validating the
+    timestep->sigma conditioning (A), the pinv cache (B) and the two-phase base/MLP
+    schedule (C) on a CUDA device without loading any model.
+    """
+
+    C_T = 128
+    C_S = 16
+    H = W = 32
+    B = 8
+
+    def setUp(self):
+        self.device = torch.device("cuda")
+        torch.manual_seed(0)
+        # A fixed "true" teacher->student channel projection so targets are learnable.
+        self.P = torch.randn(self.C_S, self.C_T, device=self.device)
+
+    def _make(self):
+        t = AdaLNTransport(
+            teacher_to_spatial=_bchw_identity,
+            teacher_from_spatial=_bchw_identity,
+            student_to_spatial=_bchw_identity,
+            student_from_spatial=_bchw_identity,
+            teacher_channels=self.C_T,
+            student_channels=self.C_S,
+        )
+        return t.to(self.device)
+
+    def _pair(self, sigma_val):
+        """A fresh (z_T, z_S) pair whose channel scale depends on the noise level."""
+        zt = torch.randn(self.B, self.C_T, self.H, self.W, device=self.device)
+        proj = torch.einsum("sc,bchw->bshw", self.P, zt)
+        scale = 2.0 if sigma_val < 0.5 else 0.5  # per-sigma correction the MLP must learn
+        return zt, proj * scale
+
+    def test_a_sigma_conditioning_and_recon_decrease(self):
+        t = self._make()
+        t.set_online_lr(1e-2)
+        recons = []
+        for _ in range(40):
+            lo, hi = self._pair(0.1), self._pair(0.9)
+            z_T = [lo[0], hi[0]]
+            z_S = [lo[1], hi[1]]
+            recons.append(t.update_online(z_T, z_S, sigma_list=[0.1, 0.9]))
+        # recon should improve as the per-sigma modulation learns the correction.
+        self.assertLess(
+            sum(recons[-5:]) / 5.0, sum(recons[:5]) / 5.0,
+            msg=f"recon did not decrease: first5={recons[:5]} last5={recons[-5:]}",
+        )
+        # the modulation must produce DIFFERENT outputs at the two noise levels.
+        probe = torch.randn(self.B, self.C_T, self.H, self.W, device=self.device)
+        out_lo = t.transport_sample(probe, sigma=0.1)
+        out_hi = t.transport_sample(probe, sigma=0.9)
+        self.assertGreater((out_lo - out_hi).abs().mean().item(), 1e-3)
+
+    def test_b_pinv_cache_hit(self):
+        t = self._make()
+        z_T = [self._pair(0.2)[0] for _ in range(2)]
+        z_S = [torch.einsum("sc,bchw->bshw", self.P, z) for z in z_T]
+        t.fit(z_T, z_S)
+        self.assertIsNone(t._A_base_pinv)
+        x_S = torch.randn(self.B, self.C_S, self.H, self.W, device=self.device)
+        out1 = t.transition_mean_to_student(x_S, query_teacher_mean=lambda x: x, sigma=0.4)
+        cached = t._A_base_pinv
+        self.assertIsNotNone(cached)  # built on first inverse
+        out2 = t.transition_mean_to_student(x_S, query_teacher_mean=lambda x: x, sigma=0.4)
+        # same cached object reused (no recompute) and identical result.
+        self.assertIs(t._A_base_pinv, cached)
+        torch.testing.assert_close(out1, out2)
+
+    def test_inverse_exact_at_fixed_sigma(self):
+        # C_S < C_T -> A_base has full row rank -> forward(inverse(x_S)) == x_S exactly
+        # (right inverse), at any fixed sigma, with identity teacher mean.
+        t = self._make()
+        z_T = [self._pair(0.3)[0] for _ in range(3)]
+        z_S = [torch.einsum("sc,bchw->bshw", self.P, z) for z in z_T]
+        t.fit(z_T, z_S)
+        x_S = torch.randn(self.B, self.C_S, self.H, self.W, device=self.device)
+        rt = t.transition_mean_to_student(x_S, query_teacher_mean=lambda x: x, sigma=0.6)
+        torch.testing.assert_close(rt, x_S, atol=1e-3, rtol=1e-3)
+
+    def test_c_two_phase_schedule(self):
+        t = self._make()
+        t.set_online_lr(1e-2)
+        z_T = [self._pair(0.1)[0], self._pair(0.9)[0]]
+        z_S = [self._pair(0.1)[1], self._pair(0.9)[1]]
+        # Phase 1: base only.
+        t.update_online(z_T, z_S, sigma_list=[0.1, 0.9], update_base=True, update_mod=False)
+        self.assertTrue(t.is_fitted)
+        base_after_p1 = t.A_base.clone()
+        mlp_last_p1 = t.mod_mlp[-1].weight.clone()
+        # Phase 2: modulation only -> base frozen, MLP changes.
+        for _ in range(10):
+            t.update_online(
+                z_T, z_S, sigma_list=[0.1, 0.9], update_base=False, update_mod=True
+            )
+        torch.testing.assert_close(t.A_base, base_after_p1, atol=0.0, rtol=0.0)
+        self.assertGreater((t.mod_mlp[-1].weight - mlp_last_p1).abs().max().item(), 0.0)
 
 
 if __name__ == "__main__":
