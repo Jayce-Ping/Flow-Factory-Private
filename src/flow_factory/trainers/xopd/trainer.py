@@ -1122,43 +1122,50 @@ class XOPDTrainer(BaseTrainer):
             img_list.append(images.float().cpu())
         return z_T_list, z_S_list, img_list
 
-    def _warmup_comparison_image(self, z_T, z_S, n: int = 4):
-        """Build a 2-row comparison PIL image for warm-up visualization.
+    def _warmup_comparison_image(self, z_T_list, z_S_list, max_cols: Optional[int] = None):
+        """Build a 2-row comparison PIL for warm-up viz over a WHOLE epoch's data.
 
-        ``z_T`` / ``z_S`` are batched TENSORS (teacher-native packed latent and the
-        paired student-space target latent, respectively).
+        ``z_T_list`` / ``z_S_list`` are LISTS of batched tensors (one per rolled-out
+        warm-up batch this epoch): teacher-native packed latents and paired
+        student-space target latents. ALL samples across ALL batches are decoded and
+        laid out as columns:
 
         Top row    = student-space TARGET latent decoded (``decode_latents(z_S)``),
                      i.e. the pixel-bridge ground truth in student latent space.
         Bottom row = teacher latent carried through the transport then decoded
                      (``decode_latents(T(z_T))``), i.e. what the transport produces.
-        A good transport makes the two rows match. Returns a single stacked PIL.
+
+        A good transport makes the two rows match. ``max_cols`` optionally caps the
+        number of columns (None = all samples). Returns a single stacked PIL.
         """
         from PIL import Image as _PILImage
 
         try:
             dev = self.accelerator.device
-            n = min(n, z_T.shape[0], z_S.shape[0])
-            if n <= 0:
-                return None
+            if not isinstance(z_T_list, (list, tuple)):
+                z_T_list, z_S_list = [z_T_list], [z_S_list]
+            top_imgs, bot_imgs = [], []
             with torch.no_grad():
-                z_S_n = z_S[:n].to(dev)
-                z_T_n = z_T[:n].to(dev)
-                z_Thad = self.transport.transport_sample(z_T_n)  # -> student-space latent
-                top = self.adapter.decode_latents(z_S_n, output_type="pil")
-                bot = self.adapter.decode_latents(z_Thad, output_type="pil")
-            if not isinstance(top, (list, tuple)):
-                top = [top]
-            if not isinstance(bot, (list, tuple)):
-                bot = [bot]
-            cols = min(len(top), len(bot), n)
+                for z_T, z_S in zip(z_T_list, z_S_list):
+                    z_S_b = z_S.to(dev)
+                    z_T_b = z_T.to(dev)
+                    z_Thad = self.transport.transport_sample(z_T_b)  # -> student-space
+                    t = self.adapter.decode_latents(z_S_b, output_type="pil")
+                    b = self.adapter.decode_latents(z_Thad, output_type="pil")
+                    top_imgs.extend(t if isinstance(t, (list, tuple)) else [t])
+                    bot_imgs.extend(b if isinstance(b, (list, tuple)) else [b])
+                    if max_cols is not None and len(top_imgs) >= max_cols:
+                        break
+            cols = min(len(top_imgs), len(bot_imgs))
+            if max_cols is not None:
+                cols = min(cols, max_cols)
             if cols == 0:
                 return None
-            w, h = top[0].size
+            w, h = top_imgs[0].size
             grid = _PILImage.new("RGB", (cols * w, 2 * h), "white")
             for i in range(cols):
-                grid.paste(top[i].resize((w, h)), (i * w, 0))
-                grid.paste(bot[i].resize((w, h)), (i * w, h))
+                grid.paste(top_imgs[i].resize((w, h)), (i * w, 0))
+                grid.paste(bot_imgs[i].resize((w, h)), (i * w, h))
             return grid
         except Exception as e:  # viz must never break training
             logger.warning(f"warm-up comparison image failed: {type(e).__name__}: {e}")
@@ -1201,15 +1208,14 @@ class XOPDTrainer(BaseTrainer):
             # 2. One transport update on this epoch's fresh data.
             recon = self.transport.update_online(z_T_dev, z_S_dev)
             logger.info(f"  transport warm-up epoch {ep}: recon_mse={recon:.6f}")
-            # 3. Log loss + periodic comparison image on the warm-up x-axis.
+            # 3. Log loss + the FULL-epoch comparison image (all rolled-out samples,
+            #    top=student target / bottom=transported teacher) on the warm-up
+            #    x-axis, EVERY epoch.
             if self.accelerator.is_main_process and self.logger is not None:
                 data = {"warmup/transport_recon_mse": float(recon)}
-                if ep % 5 == 0 or ep == n_epochs - 1:
-                    img = self._warmup_comparison_image(
-                        z_T_dev[0], z_S_dev[0], n=min(4, z_T_dev[0].shape[0])
-                    )
-                    if img is not None:
-                        data["warmup/target_vs_transported"] = img
+                img = self._warmup_comparison_image(z_T_dev, z_S_dev)
+                if img is not None:
+                    data["warmup/target_vs_transported"] = img
                 self.log_warmup_data(data, step=ep)
             del z_T_dev, z_S_dev
 
