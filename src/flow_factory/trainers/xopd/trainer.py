@@ -1167,53 +1167,51 @@ class XOPDTrainer(BaseTrainer):
             return enc[0], enc[1]
         return enc, None
 
-    def _warmup_comparison_image(self, z_T_list, z_S_list, max_cols: Optional[int] = None):
-        """Build a 2-row comparison PIL for warm-up viz over a WHOLE epoch's data.
+    def _warmup_comparison_images(self, z_T_list, z_S_list, max_pairs: Optional[int] = 64):
+        """Build a LIST of per-pair 2-row comparison images for warm-up viz.
 
         ``z_T_list`` / ``z_S_list`` are LISTS of batched tensors (one per rolled-out
-        warm-up batch this epoch): teacher-native packed latents and paired
-        student-space target latents. ALL samples across ALL batches are decoded and
-        laid out as columns:
+        warm-up batch this epoch). Each individual (sample) pair becomes its OWN small
+        2-row image (NOT one wide concatenated strip):
 
-        Top row    = student-space TARGET latent decoded (``decode_latents(z_S)``),
-                     i.e. the pixel-bridge ground truth in student latent space.
-        Bottom row = teacher latent carried through the transport then decoded
-                     (``decode_latents(T(z_T))``), i.e. what the transport produces.
+        Top    = student-space TARGET latent decoded (``decode_latents(z_S)``).
+        Bottom = teacher latent carried through the transport then decoded
+                 (``decode_latents(T(z_T))``).
 
-        A good transport makes the two rows match. ``max_cols`` optionally caps the
-        number of columns (None = all samples). Returns a single stacked PIL.
+        Returns a list of ``LogImage`` (logged as a wandb gallery under one key);
+        ``max_pairs`` caps how many pairs are emitted. A good transport makes the two
+        rows of each tile match.
         """
         from PIL import Image as _PILImage
+        from ...logger.formatting import LogImage
 
         try:
             dev = self.accelerator.device
             if not isinstance(z_T_list, (list, tuple)):
                 z_T_list, z_S_list = [z_T_list], [z_S_list]
-            top_imgs, bot_imgs = [], []
+            tiles = []
             with torch.no_grad():
-                for z_T, z_S in zip(z_T_list, z_S_list):
+                for bi, (z_T, z_S) in enumerate(zip(z_T_list, z_S_list)):
                     z_S_b = z_S.to(dev)
                     z_T_b = z_T.to(dev)
                     z_Thad = self.transport.transport_sample(z_T_b)  # -> student-space
-                    t = self.adapter.decode_latents(z_S_b, output_type="pil")
-                    b = self.adapter.decode_latents(z_Thad, output_type="pil")
-                    top_imgs.extend(t if isinstance(t, (list, tuple)) else [t])
-                    bot_imgs.extend(b if isinstance(b, (list, tuple)) else [b])
-                    if max_cols is not None and len(top_imgs) >= max_cols:
-                        break
-            cols = min(len(top_imgs), len(bot_imgs))
-            if max_cols is not None:
-                cols = min(cols, max_cols)
-            if cols == 0:
-                return None
-            w, h = top_imgs[0].size
-            grid = _PILImage.new("RGB", (cols * w, 2 * h), "white")
-            for i in range(cols):
-                grid.paste(top_imgs[i].resize((w, h)), (i * w, 0))
-                grid.paste(bot_imgs[i].resize((w, h)), (i * w, h))
-            return grid
+                    top = self.adapter.decode_latents(z_S_b, output_type="pil")
+                    bot = self.adapter.decode_latents(z_Thad, output_type="pil")
+                    top = top if isinstance(top, (list, tuple)) else [top]
+                    bot = bot if isinstance(bot, (list, tuple)) else [bot]
+                    for si in range(min(len(top), len(bot))):
+                        w, h = top[si].size
+                        tile = _PILImage.new("RGB", (w, 2 * h), "white")
+                        tile.paste(top[si], (0, 0))
+                        tile.paste(bot[si].resize((w, h)), (0, h))
+                        tiles.append(
+                            LogImage(tile, caption=f"target(top)/transported(bot) b{bi}s{si}")
+                        )
+                        if max_pairs is not None and len(tiles) >= max_pairs:
+                            return tiles
+            return tiles or None
         except Exception as e:  # viz must never break training
-            logger.warning(f"warm-up comparison image failed: {type(e).__name__}: {e}")
+            logger.warning(f"warm-up comparison images failed: {type(e).__name__}: {e}")
             return None
 
     def _warmup_transport(self) -> None:
@@ -1253,16 +1251,14 @@ class XOPDTrainer(BaseTrainer):
             # 2. One transport update on this epoch's fresh data.
             recon = self.transport.update_online(z_T_dev, z_S_dev)
             logger.info(f"  transport warm-up epoch {ep}: recon_mse={recon:.6f}")
-            # 3. Log loss + the FULL-epoch comparison image (top=student target /
-            #    bottom=transported teacher) on the warm-up x-axis, EVERY epoch. In
-            #    trajectory mode an epoch holds batches*num_steps pairs; cap the grid
-            #    width so one full trajectory's worth of columns is shown (covers all
-            #    noise levels) without producing an absurdly wide image.
+            # 3. Log loss + per-pair comparison images (each pair = one 2-row tile,
+            #    top=student target / bottom=transported teacher) as a gallery on the
+            #    warm-up x-axis, EVERY epoch. Capped at max_pairs to bound upload.
             if self.accelerator.is_main_process and self.logger is not None:
                 data = {"warmup/transport_recon_mse": float(recon)}
-                img = self._warmup_comparison_image(z_T_dev, z_S_dev, max_cols=64)
-                if img is not None:
-                    data["warmup/target_vs_transported"] = img
+                imgs = self._warmup_comparison_images(z_T_dev, z_S_dev, max_pairs=64)
+                if imgs:
+                    data["warmup/target_vs_transported"] = imgs
                 self.log_warmup_data(data, step=ep)
             del z_T_dev, z_S_dev
 
