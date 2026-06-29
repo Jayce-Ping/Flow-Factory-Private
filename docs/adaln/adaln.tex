@@ -1,0 +1,541 @@
+% !TEX program = xelatex
+% 编译方式: xelatex adaln.tex  (需要 ctex / macTeX)
+\documentclass[11pt]{ctexart}
+
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue!55!black,citecolor=teal!60!black,urlcolor=violet!70!black]{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+
+\setlist{itemsep=2pt,topsep=3pt,parsep=0pt}
+
+% --- 代码风格 ---
+\definecolor{codebg}{RGB}{246,248,250}
+\definecolor{codekw}{RGB}{166,38,164}
+\definecolor{codestr}{RGB}{3,106,167}
+\definecolor{codecom}{RGB}{110,119,129}
+\lstdefinestyle{py}{
+  language=Python, backgroundcolor=\color{codebg}, basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries, stringstyle=\color{codestr},
+  commentstyle=\color{codecom}\itshape, numbers=left, numberstyle=\tiny\color{codecom},
+  frame=single, framesep=5pt, rulecolor=\color{gray!30}, breaklines=true,
+  showstringspaces=false, columns=fullflexible, xleftmargin=14pt
+}
+
+% --- 自定义命令 ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\LN}{\mathrm{LN}}
+\newcommand{\AdaIN}{\mathrm{AdaIN}}
+\newcommand{\CIN}{\mathrm{CIN}}
+\newcommand{\FiLM}{\mathrm{FiLM}}
+\newcommand{\AdaLN}{\mathrm{AdaLN}}
+\newcommand{\modu}{\mathrm{modulate}}
+\newcommand{\cc}{\mathbf{c}}
+\newcommand{\xx}{\mathbf{x}}
+
+\theoremstyle{definition}
+\newtheorem{insight}{洞察}[section]
+\newtheorem{remark}{注}[section]
+
+\title{\bfseries 自适应归一化 AdaLN 讲义\\[2mm]
+\large 从 AdaIN / FiLM 到 DiT 的 adaLN-Zero：一种"神奇"的条件注入结构}
+\author{Bowen 的知识库 · Research Notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+AdaLN（Adaptive Layer Normalization，自适应层归一化）是当今扩散 Transformer（DiT）、
+Stable Diffusion 3 (MMDiT) 等主流生成模型注入条件（时间步、类别、文本、动作等）的默认机制。
+它"神奇"的地方在于：用一个\emph{几乎零开销}的逐通道仿射调制，就能在保持归一化稳定性的同时
+注入条件，并且其 \textbf{adaLN-Zero} 变体通过\emph{零初始化}把每个 Transformer 块初始化为
+\emph{恒等映射}，使大模型训练异常稳定、FID 显著优于交叉注意力。本讲义结合
+AdaIN~\cite{adain}、FiLM~\cite{film}、DiT~\cite{dit} 等\textbf{原始论文}，
+推导其数学形式、梳理谱系演化、剖析官方代码，并给出设计直觉与适用边界。
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==============================================================
+\section{动机：归一化层里藏着"条件"}
+%==============================================================
+
+我们先建立一个核心直觉，它是理解整条技术线的钥匙：
+
+\begin{insight}\label{ins:affine}
+归一化层（BN/IN/LN）做两件事：(1) 用统计量 $(\mu,\sigma)$ 把激活\emph{标准化}；
+(2) 用仿射参数 $(\gamma,\beta)$ 把它\emph{重新缩放平移}。
+大量研究发现：标准化\emph{去除}的是与"内容/实例"无关的整体分布信息，而仿射参数
+$(\gamma,\beta)$ 恰恰\textbf{承载了"风格 / 域 / 条件"}。
+\end{insight}
+
+这意味着：如果我们想让网络"按条件 $\cc$ 生成"，一个极其经济的做法不是改输入、加注意力，
+而是\textbf{让条件 $\cc$ 去控制归一化层的仿射参数 $(\gamma,\beta)$}。这就是从 AdaIN 到 AdaLN
+一脉相承的中心思想。
+
+\subsection{归一化回顾}
+对一个特征张量，记其在归一化维度上的均值方差为 $\mu,\sigma$。标准（带仿射的）归一化为
+\begin{equation}
+\mathrm{Norm}(\xx) = \gamma \odot \frac{\xx - \mu}{\sigma} + \beta,
+\end{equation}
+其中 $\gamma,\beta$ 是\emph{可学习且固定}的参数（训练完就不再变）。
+不同归一化的区别只在于 $\mu,\sigma$ 在\emph{哪些维度}上统计：
+\begin{itemize}
+  \item \textbf{BatchNorm}：跨 batch + 空间统计（每通道一个）。
+  \item \textbf{InstanceNorm (IN)}：每个样本、每个通道、跨空间统计。
+  \item \textbf{LayerNorm (LN)}：每个样本（每个 token）跨特征维统计——Transformer 的标配。
+\end{itemize}
+接下来的所有方法，本质都是\textbf{把固定的 $(\gamma,\beta)$ 换成"由条件动态生成的" $(\gamma,\beta)$}。
+
+%==============================================================
+\section{谱系演化：四步走到 AdaLN（结合原文）}
+%==============================================================
+
+\subsection{第一步：Conditional Instance Norm (CIN, Dumoulin 2017)}
+为了让一个网络支持多种风格，Dumoulin 等人提出 CIN：\emph{为每个风格 $s$ 学一组独立的}
+$\gamma^s,\beta^s$。AdaIN 原文~\cite{adain} 引述其公式（式 7）为
+\begin{equation}
+\CIN(\xx;s) = \gamma^{s}\left(\frac{\xx-\mu(\xx)}{\sigma(\xx)}\right) + \beta^{s}.
+\end{equation}
+局限非常明显：风格数 $S$ 固定（原文 $S=32$），\textbf{无法泛化到任意新风格}——
+因为 $(\gamma^s,\beta^s)$ 是查表得到的离散参数。
+
+\subsection{第二步：AdaIN (Huang \& Belongie, ICCV 2017)}
+AdaIN~\cite{adain} 的灵光一闪：既然 IN 的统计量本身就编码风格，那干脆
+\textbf{用风格图像 $y$ 的统计量 $(\mu(y),\sigma(y))$ 直接当作仿射参数}，连学习都不需要：
+\begin{equation}
+\label{eq:adain}
+\AdaIN(\xx,y) = \sigma(y)\left(\frac{\xx-\mu(\xx)}{\sigma(\xx)}\right) + \mu(y).
+\end{equation}
+其中 $\xx$ 是内容特征、$y$ 是风格特征，统计量跨空间位置计算。原文强调：
+\textbf{AdaIN 没有任何可学习仿射参数}，它把"换风格"变成了"把内容的通道统计对齐到风格的通道统计"。
+这是"条件 $\to$ 仿射参数"思想第一次以\emph{自适应}（adaptive，参数随输入而变）的形式出现。
+StyleGAN 即用 AdaIN 注入风格向量。
+
+\begin{insight}
+AdaIN 的贡献是把"条件"与"仿射参数"\emph{划等号}并\emph{即时计算}。但它的条件被限定为
+"另一张图的统计量"。下一步要做的，是把条件\emph{一般化}为任意信号，并把 $(\gamma,\beta)$
+改为\emph{由一个网络回归}出来。
+\end{insight}
+
+\subsection{第三步：FiLM (Perez et al., AAAI 2018)}
+FiLM~\cite{film} 把上面的思想推到最一般的形式：用一个\textbf{条件生成网络}从任意条件 $\xx_i$
+（文本、类别、问题语句……）回归出逐特征的 $\gamma_{i,c},\beta_{i,c}$，
+\begin{equation}
+\gamma_{i,c} = f_c(\xx_i),\qquad \beta_{i,c} = h_c(\xx_i),
+\end{equation}
+然后对目标网络的中间特征 $F_{i,c}$ 做逐特征仿射调制（feature-wise affine）：
+\begin{equation}
+\label{eq:film}
+\FiLM(F_{i,c}\mid \gamma_{i,c},\beta_{i,c}) = \gamma_{i,c}\, F_{i,c} + \beta_{i,c}.
+\end{equation}
+原文明确指出：\textbf{FiLM 是 Conditional Normalization 的一般化}——它不再绑定到归一化的统计量，
+$(\gamma,\beta)$ 可以是任意条件的函数。FiLM 能够\emph{放大、缩小、取反、关闭、选择性阈值化}特征，
+从而以极小的代价控制一个深层网络的计算。原文还观察到一个重要现象：
+\textbf{FiLM 自身是线性的，其表达力来自它\emph{后面}的非线性层}——单个 FiLM 层放在 CNN 早期，
+就能取得接近"4 个 FiLM 层遍布全网"的效果。
+
+\subsection{第四步：AdaLN (DiT, Peebles \& Xie, ICCV 2023)}
+DiT~\cite{dit} 把 FiLM 思路搬进 Transformer：既然 Transformer 用 LayerNorm，
+那就让条件 $\cc$（时间步嵌入 $+$ 类别/文本嵌入）去回归 LN 的仿射参数。这就是 \textbf{AdaLN}。
+具体地，先把 LayerNorm 设为\emph{无自带仿射}（\texttt{elementwise\_affine=False}），
+再用一个小 MLP 从 $\cc$ 回归出 $(\gamma,\beta)$：
+\begin{equation}
+(\gamma,\beta) = \mathrm{MLP}(\cc),\qquad
+\AdaLN(\xx,\cc) = \gamma(\cc)\odot \frac{\xx-\mu(\xx)}{\sigma(\xx)} + \beta(\cc).
+\end{equation}
+与交叉注意力相比，AdaLN \textbf{几乎不增加 Gflops}（DiT 原文：adaLN 118.6 vs cross-attn 137.6 Gflops），
+却把条件高效地广播到每个 token 的每个通道。
+
+\begin{table}[t]
+\centering\small
+\renewcommand{\arraystretch}{1.35}
+\begin{tabularx}{\textwidth}{@{}l l l X@{}}
+\toprule
+\textbf{方法} & \textbf{$(\gamma,\beta)$ 来源} & \textbf{条件类型} & \textbf{关键特征 / 局限} \\
+\midrule
+LN/IN(仿射) & 可学习\emph{固定} & 无条件 & 训练后不变 \\
+CIN        & 查表 $\gamma^s,\beta^s$ & 离散风格 $s$ & 风格数固定，不能泛化 \\
+AdaIN      & 风格图统计 $\mu(y),\sigma(y)$ & 任意风格图 & 无可学习参数；条件限于"统计量" \\
+FiLM       & 条件网络回归 $f(\cc),h(\cc)$ & \emph{任意}条件 & CN 的一般化；线性，靠后续非线性赋能 \\
+AdaLN      & MLP$(\cc)$ 回归 & 时间步/类别/文本 & 用于 Transformer LN；近零算力 \\
+adaLN-Zero & MLP$(\cc)$ + 门控 $\alpha$ & 同上 & \textbf{零初始化}$\to$块=恒等；最稳最优 \\
+\bottomrule
+\end{tabularx}
+\caption{自适应归一化谱系：本质都是"把固定 $(\gamma,\beta)$ 换成由条件生成的 $(\gamma,\beta)$"。}
+\end{table}
+
+%==============================================================
+\section{核心：adaLN-Zero 为什么"神奇"}
+%==============================================================
+
+AdaLN 已经好用，但 DiT 真正的杀手锏是 \textbf{adaLN-Zero}。它的"神奇"来自一个看似微不足道、
+实则深刻的初始化技巧。
+
+\subsection{思想来源：把残差块初始化为恒等映射}
+DiT 原文~\cite{dit} 引述了两条经验：
+\begin{itemize}
+  \item Goyal 等人发现，在监督学习里\textbf{把每个残差块最后一个 BN 的 $\gamma$ 零初始化}，
+        能加速大规模训练；
+  \item 扩散 U-Net 普遍\textbf{把每个块残差连接前的最后一个卷积零初始化}。
+\end{itemize}
+共同的原理是：让残差分支在训练开始时输出 $0$，于是 $\xx \leftarrow \xx + 0 = \xx$，
+整个块成为\textbf{恒等函数 (identity)}，给优化一个极其平稳的起点。
+
+\subsection{adaLN-Zero 的构造}
+在 AdaLN 回归 $(\gamma,\beta)$ 的基础上，adaLN-Zero \textbf{额外回归一个逐通道门控 $\alpha$}，
+作用在\emph{残差相加之前}：
+\begin{equation}
+\xx \leftarrow \xx + \alpha(\cc)\odot \mathrm{SubLayer}\big(\AdaLN(\xx,\cc)\big),
+\end{equation}
+其中 $\mathrm{SubLayer}\in\{\text{Self-Attn},\text{MLP}\}$。关键一招：
+\textbf{把\emph{每个 block 内部}那个回归 $(\gamma,\beta,\alpha)$ 的调制 MLP 的\emph{末层 Linear}
+（$\mathrm{MLP}_{\text{adaLN}}$ 的最后一层）权重和偏置全部零初始化}。
+使初始时 $\alpha=\bm 0$（同时 $\gamma$ 对应的有效缩放为 $1$、$\beta=\bm 0$），于是
+\[
+\xx \leftarrow \xx + \bm 0 \odot (\cdots) = \xx,
+\]
+该 block 在训练第 0 步即为恒等映射。
+
+\begin{remark}[这里的"最后一层"不是"最后一个 block"]
+要分清两个"最后"：被清零的是\emph{每个 block 内部}调制 MLP（$\texttt{[SiLU, Linear]}$）的
+\emph{末层 Linear}，而\emph{不是}整个网络的最后一个 DiT block。代码里
+\texttt{for block in self.blocks} 对\textbf{所有 block} 都执行了这一清零，因此
+\textbf{所有 block 在初始时都是恒等映射}，并非只有最后一块。此外 DiT 还把\emph{最终输出层}
+（\texttt{FinalLayer}）的调制 MLP 末层与最后的投影 \texttt{linear} 一起清零，
+使\textbf{整个网络在第 0 步预测的噪声恒为 $\bm 0$}——一个极其平稳的训练起点。
+\end{remark}
+
+\begin{remark}[全恒等为何不妨碍学习]
+"所有 block 恒等"只是\emph{初始化}，不影响表达能力，原因在于梯度流向。对
+$\xx\leftarrow\xx+\bm\alpha\odot S$（$S=\mathrm{SubLayer}(\cdots)$，注意/MLP 子层为\emph{正常}非零初始化，故 $S\neq\bm 0$）：
+第 0 步 $\dfrac{\partial L}{\partial\bm\alpha}=\dfrac{\partial L}{\partial\xx_{\text{out}}}\odot S\neq\bm0$，
+门控 $\bm\alpha$ 立刻被更新而离开 $0$；而子层内部权重的梯度
+$\dfrac{\partial L}{\partial\theta_S}\propto\bm\alpha\odot\dfrac{\partial S}{\partial\theta_S}$
+在 $\bm\alpha=0$ 时为 $0$、待 $\bm\alpha$ 变非零后才开始更新。于是网络\textbf{先打开"阀门"$\bm\alpha$、
+再逐步激活各残差分支}，从恒等平滑"长出"能力（ResNet zero-init / Fixup / SkipInit 思想）。
+恒等初始化的收益随\emph{深度}累积，故应对\emph{所有} block 统一施加，而非只做一部分。
+\end{remark}
+
+\subsection{完整的 DiT 块公式}
+一个 adaLN-Zero DiT 块为每个子层各回归一组 $(\text{shift},\text{scale},\text{gate})$，共 6 个向量：
+\begin{align}
+\xx &\leftarrow \xx + \bm\alpha_1\odot \mathrm{Attn}\Big(\modu\big(\LN(\xx),\,\bm\beta_1,\bm\gamma_1\big)\Big),\\
+\xx &\leftarrow \xx + \bm\alpha_2\odot \mathrm{MLP}\Big(\modu\big(\LN(\xx),\,\bm\beta_2,\bm\gamma_2\big)\Big),\\
+\text{其中}\quad
+&(\bm\beta_1,\bm\gamma_1,\bm\alpha_1,\bm\beta_2,\bm\gamma_2,\bm\alpha_2)
+= \mathrm{MLP}_{\text{adaLN}}(\cc),\\
+&\modu(\xx,\bm\beta,\bm\gamma) \triangleq \xx\odot(1+\bm\gamma) + \bm\beta. \label{eq:modulate}
+\end{align}
+
+\begin{remark}
+注意式~\eqref{eq:modulate} 用的是 $(1+\bm\gamma)$ 而非 $\bm\gamma$。这是工程上的关键细节：
+MLP 零初始化时 $\bm\gamma=\bm 0$，于是缩放因子为 $1+0=1$，即\textbf{初始恰好是标准 LayerNorm}，
+不引入任何额外缩放；条件的作用是在 $1$ 附近做\emph{增量}调制，数值更稳定。
+\end{remark}
+
+\subsection{为什么有效：原文的实证}
+DiT 原文用最高算力的 DiT-XL/2，对比四种条件注入块（in-context / cross-attention / adaLN / adaLN-Zero），
+测训练过程的 FID，结论非常干脆：
+\begin{itemize}
+  \item \textbf{adaLN-Zero 的 FID 同时低于交叉注意力与 in-context}，且\emph{最省算力}；
+  \item 在 400K 迭代时，adaLN-Zero 的 FID \textbf{几乎只有 in-context 的一半}——
+        说明\emph{条件注入方式本身关键地影响模型质量}；
+  \item \textbf{初始化也很关键}：adaLN-Zero（块初始化为恒等）\emph{显著优于}普通 adaLN。
+\end{itemize}
+正因如此，DiT 全文后续模型一律采用 adaLN-Zero；该结构也被 Stable Diffusion 3 的 MMDiT 等继承。
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  >=Stealth,
+  box/.style={draw,rounded corners,minimum height=0.85cm,align=center,font=\small},
+  norm/.style={box,fill=blue!8,minimum width=3.0cm},
+  op/.style={box,fill=teal!12,minimum width=1.9cm},
+  gate/.style={draw,circle,fill=orange!28,inner sep=0pt,minimum size=0.62cm,font=\footnotesize},
+  add/.style={draw,circle,inner sep=0pt,minimum size=0.55cm,font=\small},
+  cond/.style={box,fill=violet!10,minimum width=3.2cm},
+  ada/.style={box,fill=orange!18,minimum width=3.0cm},
+  arr/.style={->,thick},
+  mod/.style={->,densely dashed,gray}
+]
+% ---- 主残差流 (竖直, 最左) ----
+\node (in) at (0,1.0) {$\xx$ (tokens)};
+\coordinate (b1) at (0,0);
+\node[add] (add1) at (0,-1.7) {$+$};
+\coordinate (b2) at (0,-3.0);
+\node[add] (add2) at (0,-4.7) {$+$};
+\node (out) at (0,-5.6) {输出};
+\draw[arr] (in) -- (add1);
+\draw[arr] (add1) -- (add2);
+\draw[arr] (add2) -- (out);
+\fill (b1) circle (1.7pt);
+\fill (b2) circle (1.7pt);
+
+% ---- 注意力子块 (第 1 行) ----
+\node[norm] (ln1) at (3.3,0) {LN $+$ modulate\\$(\bm\gamma_1,\bm\beta_1)$};
+\node[op]   (attn) at (6.3,0) {Self-Attn};
+\node[gate] (g1) at (8.1,0) {$\bm\alpha_1$};
+\draw[arr] (b1) -- (ln1);
+\draw[arr] (ln1) -- (attn);
+\draw[arr] (attn) -- (g1);
+\draw[arr] (g1) |- (add1);
+
+% ---- MLP 子块 (第 2 行) ----
+\node[norm] (ln2) at (3.3,-3.0) {LN $+$ modulate\\$(\bm\gamma_2,\bm\beta_2)$};
+\node[op]   (mlp2) at (6.3,-3.0) {MLP};
+\node[gate] (g2) at (8.1,-3.0) {$\bm\alpha_2$};
+\draw[arr] (b2) -- (ln2);
+\draw[arr] (ln2) -- (mlp2);
+\draw[arr] (mlp2) -- (g2);
+\draw[arr] (g2) |- (add2);
+
+% ---- 条件调制 MLP (顶部) ----
+\node[cond] (c) at (3.3,2.0) {条件 $\cc$\\(timestep$+$class)};
+\node[ada]  (ada) at (7.0,2.0) {$\mathrm{MLP}_{\text{adaLN}}$\\(零初始化)};
+\draw[arr] (c) -- (ada);
+% 调制信号 (虚线): 同一 MLP 产出 (gamma,beta,alpha) 喂给两个子块
+\draw[mod] (ada) to[out=180,in=90] (ln1.north);
+\draw[mod] (ada.east) to[out=0,in=90] (g1.north);
+\draw[mod] (ada.east) to[out=0,in=0] (g2.east);
+\draw[mod] (ada) to[out=180,in=120] (ln2.north west);
+\end{tikzpicture}
+\caption{adaLN-Zero DiT 块：左侧竖直线为残差主流，输入 $\xx$ 在分叉点（实心圆）
+旁路进入"LN$+$modulate $\to$ 子层 $\to$ 门控 $\bm\alpha$"后由 $+$ 汇回主流。
+橙色 $\mathrm{MLP}_{\text{adaLN}}$ 从条件 $\cc$ 回归 6 组参数 $(\bm\gamma_i,\bm\beta_i,\bm\alpha_i)$
+（虚线）并零初始化；初始 $\bm\alpha_i=\bm 0$ 使两个子块输出为 $0$，整块成为恒等映射。}
+\end{figure}
+
+%==============================================================
+\section{代码剖析：DiT 官方实现}
+%==============================================================
+
+下面是 DiT 官方 \texttt{models.py} 的核心片段，逐行对应上面的公式。
+
+\begin{lstlisting}[style=py]
+def modulate(x, shift, scale):
+    # 注意是 (1 + scale): 零初始化时缩放=1, 等价标准 LN
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+class DiTBlock(nn.Module):
+    """带 adaLN-Zero 条件的 DiT 块"""
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **kw):
+        super().__init__()
+        # LN 关掉自带仿射, 仿射交给条件回归
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn  = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **kw)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.mlp   = Mlp(in_features=hidden_size,
+                         hidden_features=int(hidden_size*mlp_ratio),
+                         act_layer=lambda: nn.GELU(approximate="tanh"))
+        # 从条件 c 回归 6*hidden 个调制参数
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+
+    def forward(self, x, c):
+        # 切成 6 份: 注意力子层与 MLP 子层各 (shift, scale, gate)
+        (shift_msa, scale_msa, gate_msa,
+         shift_mlp, scale_mlp, gate_mlp) = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp (modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+# 初始化: 对【所有】block, 把其调制 MLP 的【末层 Linear】清零 => 每块=恒等
+for block in self.blocks:
+    nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+    nn.init.constant_(block.adaLN_modulation[-1].bias,   0)
+
+# 再把【最终输出层】也清零 => 整网第 0 步输出恒为 0
+nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias,   0)
+nn.init.constant_(self.final_layer.linear.weight, 0)
+nn.init.constant_(self.final_layer.linear.bias,   0)
+\end{lstlisting}
+
+要点对照：
+\begin{enumerate}[label=(\arabic*)]
+  \item \texttt{elementwise\_affine=False}：LN 只做标准化，仿射全部交给条件——呼应洞察~\ref{ins:affine}。
+  \item \texttt{6 * hidden\_size}：一个块两个子层 $\times$ 每子层 $(\text{shift},\text{scale},\text{gate})=6$ 组。
+  \item \texttt{modulate} 用 \texttt{(1 + scale)}：保证零初始化时等价于普通 LN。
+  \item \texttt{gate\_*}（即 $\bm\alpha$）乘在子层输出上、加回残差前：零初始化它就让块=恒等。
+  \item \texttt{constant\_(..., 0)}：把 adaLN MLP 末层清零，是 adaLN-\emph{Zero} 的"Zero"所在。
+\end{enumerate}
+
+%==============================================================
+\section{设计直觉、适用边界与对比}
+%==============================================================
+
+\subsection{为什么"调制归一化"比"直接拼接/相加"更优雅}
+\begin{itemize}
+  \item \textbf{解耦内容与条件}：LN 先把每个 token 的特征标准化（去掉与内容相关的整体尺度），
+        再由条件统一施加"风格"。条件控制的是\emph{分布}而非\emph{具体数值}，泛化更好。
+  \item \textbf{近零算力、强可扩展}：只需一个共享 MLP 回归调制参数，参数量相对骨干极小，
+        利于 scaling（DiT 的核心卖点）。
+  \item \textbf{训练稳定}：恒等初始化让深层 Transformer 从一个良态起点出发，避免早期条件噪声破坏表示。
+\end{itemize}
+
+\subsection{局限：AdaLN 是"全局/逐通道"的，不擅长空间对齐}
+\label{sec:limit}
+先用张量形状把"逐通道"讲清。设特征为 $\xx\in\R^{B\times N\times C}$（$N$ 为 token / patch 数，
+即\emph{空间位置}维），全局条件为 $\cc\in\R^{B\times C}$（每个样本一个向量，\emph{无} $N$ 维）。
+adaLN 的调制 MLP 是 $\mathrm{Linear}(C\!\to\!6C)$：
+\[
+\cc\;\xrightarrow{\ \mathrm{MLP}\ }\;\R^{B\times 6C}\;\xrightarrow{\ \text{chunk}\ }\;
+\underbrace{(\bm\gamma_1,\bm\beta_1,\bm\alpha_1,\bm\gamma_2,\bm\beta_2,\bm\alpha_2)}_{\text{每个 }\in\,\R^{B\times C}} .
+\]
+调制时把它们 \texttt{unsqueeze} 成 $\R^{B\times 1\times C}$ 再沿 $N$ \textbf{广播}：
+\[
+y_{b,i,c} = \gamma_{b,c}\cdot \widehat{x}_{b,i,c} + \beta_{b,c}\qquad(\text{右边\emph{无}位置下标 } i).
+\]
+即\textbf{同一样本内所有位置 $i$ 共享同一组 $(\gamma,\beta,\alpha)$，只在通道维 $C$ 上逐元素不同}——
+这就是"逐通道、空间共享"；输出形状与输入相同（$B\times N\times C$）。
+
+因此 $\gamma,\beta$ 只能"整体地拧每个特征通道的旋钮"、对所有 patch 一视同仁：
+\begin{itemize}
+  \item 它非常适合\textbf{时间步、类别、池化后的文本/动作向量}这类全局条件；
+  \item 但对\textbf{逐像素 / 逐位置对齐}的稠密条件（深度图、分割、相机 Plücker 图、历史帧）
+        力不从心——无法表达"左上放猫、右下放狗"这类位置相关控制；
+        这类条件应改用通道拼接、交叉注意力或 ControlNet 式零卷积旁路
+        （见配套文档《条件注入机制综述》）。
+\end{itemize}
+
+\begin{insight}
+\textbf{选型法则}：全局/低维条件 $\Rightarrow$ AdaLN(-Zero)；空间/逐位置稠密条件 $\Rightarrow$ 拼接 /
+交叉注意力 / 零卷积旁路。现代多模态 DiT（如 MMDiT）常\emph{混用}：文本走联合注意力，
+时间步走 AdaLN。
+\end{insight}
+
+\subsection{能否把 AdaLN 扩成逐位置 $\R^{B\times N\times C}$？SPADE 与 adaLN-single 的双向证据}
+既然"空间共享"是短板，一个自然的想法是：让调制 MLP 直接输出逐位置的
+$(\bm\gamma,\bm\beta,\bm\alpha)\in\R^{B\times N\times C}$ 做更细粒度的调控。文献其实从\emph{两个相反方向}
+都已给出答案。
+
+\paragraph{正向——这正是 SPADE。}
+\textbf{SPADE}（空间自适应归一化，\cite{spade}）比 DiT 更早，就把 $\gamma,\beta$ 升级为与特征图同尺寸的张量、
+逐位置调制：
+\[
+\text{out}_{n,c,y,x}=\gamma_{n,c,y,x}\,\widehat{h}_{n,c,y,x}+\beta_{n,c,y,x},
+\]
+其实现 \texttt{out = norm(x)*(1+gamma)+beta} 与 DiT 的 \texttt{modulate} 完全同形，\emph{唯一差别是
+$\gamma,\beta$ 带空间下标}。但 SPADE 成立有一个\textbf{决定性前提}：它的逐位置 $\gamma,\beta$ 是
+\emph{从一张空间条件图（分割图）用卷积算出来的}——\textbf{信息本身必须是空间的}。
+
+\paragraph{关键阻碍——全局条件 $+$ MLP 变不出逐位置信息。}
+DiT 的 $\cc$ 是全局向量 $\R^{B\times C}$、不含 $N$ 维。以全局向量为输入的函数\emph{无法凭空产生位置相关的
+输出}：要让输出带 $N$，只能再喂入带 $N$ 的东西（通常是位置编码），此时 $\gamma_i,\beta_i$ 退化为
+"位置 $i$ 的\emph{固定学习模板}、与内容无关"，不再 adaptive，且把模型与\emph{固定序列长度/分辨率}绑死。
+\textbf{要真正实现 content-adaptive 的逐位置调制，就必须引入空间条件——而那时你做的已经是
+SPADE / 交叉注意力 / ControlNet，而非 adaLN。}
+
+\paragraph{反向——PixArt-$\alpha$ 的 adaLN-single 量化了代价。}
+\cite{pixart} 发现\textbf{adaLN 的线性投影在标准 DiT 中已占 27\% 参数}（这还是最省的 $\R^{B\times C}$ 粒度）。
+它索性反着做：只在首块算一套全局 $\bar S=f(t)$、其余块共享 $+$ 各自一个可学习偏置 $E^{(i)}$（adaLN-single），
+结果\textbf{参数省 26\%、显存省 21\% 且质量不降}。这说明对全局条件，趋势是\emph{往更少粒度走}；
+若反向膨胀到 $\R^{B\times N\times C}$，代价只会相反地放大。
+
+\paragraph{naive 扩展的四条后果。}
+\begin{enumerate}[label=(\arabic*)]
+  \item \textbf{信息}：全局条件下，逐位置变化要么来自内容（须引入空间条件，坍缩为 SPADE/注意力），
+        要么仅来自位置编码（固定模板、非自适应）——单纯改输出维度并不会凭空增加可控信息。
+  \item \textbf{参数 / 算力}：调制生成器须\emph{逐 token} 产出 $\R^{B\times N\times 6C}$，
+        从"近零开销的广播"变成"对整条序列起作用的网络"，adaLN 的效率卖点尽失，长序列还显著增显存。
+  \item \textbf{归纳偏置 / 过拟合}："沿 $N$ 广播"本身是一种正则；去掉后自由度暴涨、更吃数据，
+        且与 self-attention"处理位置间交互"的职责\emph{功能重叠}，易冗余甚至不稳
+        （与 \cite{vd3d} 在时空纠缠 DiT 中的观察一致）。
+  \item \textbf{分辨率泛化}：全局粒度天然分辨率无关；逐位置量一旦绑定 $N$ 索引，换分辨率/序列长度即对不上。
+\end{enumerate}
+（训练稳定性本身不受影响——仍可零初始化恒等起步；问题全在以上四项。）
+
+\begin{insight}
+\textbf{正确路线是"按条件的对齐结构选注入机制"，而非硬把 adaLN 扩成逐位置}：
+全局条件保持逐通道 adaLN（甚至像 PixArt 那样共享精简）；空间/稠密条件交给
+SPADE（空间图 $\to$ 空间 $\gamma,\beta$）、交叉注意力（逐 token）或 ControlNet（逐像素残差）。
+\end{insight}
+
+\subsection{与交叉注意力的取舍}
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+ & \textbf{AdaLN-Zero} & \textbf{Cross-Attention} \\
+\midrule
+算力开销   & 极低（近零 Gflops）          & 较高（额外 KV 投影与注意力）\\
+条件粒度   & 全局/逐通道，空间共享        & 可逐 token 对齐，支持变长序列 \\
+适配条件   & 时间步、类别、标量/池化向量  & 文本序列、离散动作、变长结构条件 \\
+训练稳定性 & 恒等初始化，非常稳            & 取决于初始化（可配零初始化）\\
+DiT 实证   & FID 最优、最省算力           & FID 次于 adaLN-Zero \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================
+\section{小结}
+%==============================================================
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+  \item AdaLN 的思想源头是洞察~\ref{ins:affine}：\textbf{归一化的仿射参数承载条件/风格}，
+        于是"按条件生成"$=$"让条件控制 $(\gamma,\beta)$"。
+  \item 谱系：CIN（离散查表）$\to$ AdaIN（用风格统计、无参数、式~\eqref{eq:adain}）$\to$
+        FiLM（任意条件回归、CN 的一般化、式~\eqref{eq:film}）$\to$ AdaLN（搬进 Transformer LN）。
+  \item adaLN-Zero 的"神奇"$=$ 在 AdaLN 上加\textbf{逐通道门控 $\alpha$} $+$ \textbf{零初始化}，
+        把每个块初始化为\emph{恒等映射}；细节上用 $(1+\gamma)$ 保证初始等价标准 LN。
+  \item 实证：adaLN-Zero 比交叉注意力、in-context 都更优且更省算力，已成 DiT / SD3 的默认。
+  \item 边界：AdaLN 适合\emph{全局}条件；\emph{空间对齐}的稠密条件需另选注入算子。
+  \item 想做逐位置 $\R^{B\times N\times C}$ 调制就是 SPADE（须空间条件），而全局条件下硬扩只会
+        丢失效率、破坏归纳偏置与分辨率泛化；PixArt 的 adaLN-single 反向印证"全局条件宜更省粒度"。
+\end{enumerate}
+
+\bigskip
+\noindent\textbf{一句话总结}：AdaLN 把"条件注入"优雅地化归为"\emph{让条件去写归一化的仿射参数}"，
+而 adaLN-Zero 再用"\emph{零初始化的恒等起点}"换来了大模型训练的稳定与质量——
+小机制，大杠杆。
+
+%==============================================================
+\begin{thebibliography}{9}
+\bibitem{adain} X.~Huang, S.~Belongie.
+\emph{Arbitrary Style Transfer in Real-time with Adaptive Instance Normalization (AdaIN)}. ICCV 2017.
+\url{https://arxiv.org/abs/1703.06868}
+
+\bibitem{cin} V.~Dumoulin, J.~Shlens, M.~Kudlur.
+\emph{A Learned Representation For Artistic Style (Conditional Instance Normalization)}. ICLR 2017.
+\url{https://arxiv.org/abs/1610.07629}
+
+\bibitem{film} E.~Perez, F.~Strub, H.~de Vries, V.~Dumoulin, A.~Courville.
+\emph{FiLM: Visual Reasoning with a General Conditioning Layer}. AAAI 2018.
+\url{https://arxiv.org/abs/1709.07871}
+
+\bibitem{dit} W.~Peebles, S.~Xie.
+\emph{Scalable Diffusion Models with Transformers (DiT)}. ICCV 2023.
+\url{https://arxiv.org/abs/2212.09748}
+
+\bibitem{sd3} P.~Esser et al.
+\emph{Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (Stable Diffusion 3, MMDiT)}. ICML 2024.
+\url{https://arxiv.org/abs/2403.03206}
+
+\bibitem{spade} T.~Park, M.-Y.~Liu, T.-C.~Wang, J.-Y.~Zhu.
+\emph{Semantic Image Synthesis with Spatially-Adaptive Normalization (SPADE)}. CVPR 2019.
+\url{https://arxiv.org/abs/1903.07291}
+
+\bibitem{pixart} J.~Chen et al.
+\emph{PixArt-$\alpha$: Fast Training of Diffusion Transformer for Photorealistic Text-to-Image Synthesis}. ICLR 2024.
+\url{https://arxiv.org/abs/2310.00426}
+
+\bibitem{vd3d} S.~Bahmani et al.
+\emph{VD3D: Taming Large Video Diffusion Transformers for 3D Camera Control}. 2024.
+\url{https://arxiv.org/abs/2407.12781}
+\end{thebibliography}
+
+\end{document}

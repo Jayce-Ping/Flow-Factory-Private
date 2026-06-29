@@ -556,30 +556,41 @@ class WhiteningTransport(LinearTransport):
 
 
 class AdaLNTransport(VAETransport, nn.Module):
-    """Learnable full-affine + AdaLN-style modulation transport, trainable.
+    """Timestep-conditioned affine transport (true adaLN-Zero), trainable.
 
-    ``T(z) = gamma ⊙ (W z_rs) + beta`` with ALL of ``W`` (C_S x C_T full channel
-    mixing), ``gamma`` and ``beta`` learnable ``nn.Parameter`` s, optimized jointly.
-    Theory: docs/mof/xopd_vae_space_align.tex (M2 full-affine = the L1 main workhorse,
-    + M7 AdaLN modulation). This is method A: it uses ALL teacher channels (every
-    student channel is a linear combination of all C_T teacher channels) for full
-    M2-affine expressivity, while keeping AdaLN's analytic invertibility for L1.
+    ``T_t(z) = gamma(t) ⊙ (A_base z_rs + b_base) + shift(t)`` where the channel
+    affine ``(A_base in R^{C_S x C_T}, b_base)`` is a CLOSED-FORM least-squares fit
+    (frozen buffer) and ``(gamma(t), shift(t))`` are a per-timestep modulation
+    REGRESSED by a small adaLN-Zero MLP from a sinusoidal embedding of ``t``.
+    Theory: docs/adaln/adaln.tex.
 
-    Design:
-    * ``W`` (C_S x C_T) is a LEARNABLE full channel-mixing matrix (not a fixed
-      selection of the first C_S teacher channels — that earlier diagonal-only form
-      discarded C_T - C_S teacher channels and could not fit the cross-VAE map).
-      Initialized to identity-selection, closed-form least-squares warm-started in
-      :meth:`init_from_moments`, then refined by the online gradient loop.
-    * ``gamma`` is parameterized in log space (``gamma = exp(log_gamma)`` > 0) so the
-      modulation is analytically invertible; the channel mixing is inverted by the
-      pseudo-inverse of ``W`` (least-norm; C_T != C_S). Together they give L1 the
-      required (approximate) inverse without a separate inverse network.
-    * Cold start: ``init_from_moments`` fits ``W`` by least-squares then moment-matches
-      gamma/beta on the residual — a good warm start the gradient loop refines.
-    * "Do no harm" non-linear extension (zero-init residual / AdaLN-Zero) is left
-      as a documented hook (``use_residual=False`` default); enabling it makes the
-      transport non-affine and would require the M5 inverse machinery for L1.
+    Why this and not the earlier ``gamma ⊙ (W z) + beta``: with unconditional
+    scalar ``gamma``, ``diag(gamma) @ W`` collapses to a single matrix ``A`` — the
+    map is *exactly* an affine ``A z + b``, identical in expressivity to
+    :class:`LinearTransport`, whose closed-form normal equations already give the
+    GLOBAL optimum. A learnable affine can only chase (never beat) that closed
+    form, which is why the unconditional adaln descended so slowly. The doc shows
+    "learnable" only earns its cost by adding a CONDITION or a NON-LINEARITY. We
+    add the condition (``t``): the teacher's noisy state ``z_t`` and the student's
+    differ by noise level, so a SINGLE global affine is a compromise across all
+    levels — a per-``t`` affine fits each noise level. Crucially, for any FIXED
+    ``t`` the map is still affine, so XOPD's L1 transition-mean pushforward stays
+    exact and analytically invertible (no M5 cycle-inverse / JVP needed).
+
+    Design (adaLN-Zero faithful):
+    * ``A_base, b_base`` (frozen buffers): closed-form ridge least squares over all
+      paired positions seen during warm-up (accumulated normal equations). This is
+      the M2 full-affine "workhorse" base; it is NOT trained by gradients.
+    * ``mod_mlp = [Linear(d_t, d_t), SiLU, Linear(d_t, 2*C_S)]`` regresses
+      ``(s(t), shift(t))`` from a ``Timesteps`` sinusoidal embedding of ``t``. Its
+      LAST Linear is ZERO-INITIALIZED (the "Zero" in adaLN-Zero): at step 0 the
+      modulation is neutral and ``T_t(z) == A_base z + b_base`` — the closed-form
+      optimum (do-no-harm start that is >= LinearTransport from epoch 0).
+    * ``gamma(t) = exp(s(t))`` (not ``1 + s(t)``): exp(0)=1 is equally neutral at
+      zero-init AND guarantees ``gamma > 0`` so the modulation is analytically
+      invertible — an intentional deviation from doc Eq.(8) for the L1 inverse.
+    * When ``t`` is None (e.g. shared-VAE / unit probes), the modulation is the
+      neutral identity and the map is the pure base affine.
 
     Layout: like :class:`LinearTransport`, holds ``to/from_spatial`` converters so
     it accepts/returns native latents while operating in canonical ``BCHW``.
@@ -597,6 +608,8 @@ class AdaLNTransport(VAETransport, nn.Module):
         student_channels: int,
         student_grid: Optional[Tuple[int, int]] = None,
         teacher_grid: Optional[Tuple[int, int]] = None,
+        time_embed_dim: int = 256,
+        ridge: float = 1e-4,
         min_std: float = 1e-6,
     ):
         nn.Module.__init__(self)
@@ -606,73 +619,100 @@ class AdaLNTransport(VAETransport, nn.Module):
         self.s_from = student_from_spatial
         self.C_T = teacher_channels
         self.C_S = student_channels
+        self.ridge = ridge
         self.min_std = min_std
         self._student_grid = tuple(student_grid) if student_grid is not None else None
         self._teacher_grid = tuple(teacher_grid) if teacher_grid is not None else None
         self._fitted = False
 
-        # Learnable per-(student-)channel affine modulation (AdaLN: scale+shift).
-        self.log_gamma = nn.Parameter(torch.zeros(self.C_S))
-        self.beta = nn.Parameter(torch.zeros(self.C_S))
-        # LEARNABLE full teacher->student channel-mixing W (C_S x C_T): every student
-        # channel is a linear combination of ALL teacher channels (not a fixed
-        # selection of the first C_S). Initialized to the identity-selection so the
-        # untrained map matches the legacy behaviour, then closed-form warm-started
-        # (least-squares) and refined by the online gradient loop. This restores
-        # full-affine expressivity (M2) while keeping AdaLN's analytic invertibility.
+        # --- Frozen closed-form base affine (M2 workhorse), as buffers ---------
+        # A_base (C_S x C_T) maps ALL teacher channels -> student channels; fit by
+        # closed-form ridge least squares on accumulated normal equations. NOT a
+        # gradient parameter. Init to identity-selection so an unfitted transport is
+        # the (truncated) identity.
         C = min(self.C_T, self.C_S)
-        W0 = torch.zeros(self.C_S, self.C_T)
-        W0[torch.arange(C), torch.arange(C)] = 1.0
-        self.W = nn.Parameter(W0)
-        # Online warm-up: lazily-created Adam optimizer (persists across epochs).
+        A0 = torch.zeros(self.C_S, self.C_T)
+        A0[torch.arange(C), torch.arange(C)] = 1.0
+        self.register_buffer("A_base", A0)
+        self.register_buffer("b_base", torch.zeros(self.C_S))
+        # Running normal-equation accumulators (additive across warm-up epochs):
+        # G = sum Xa^T Xa (C_T+1, C_T+1); XtY = sum Xa^T Y (C_T+1, C_S).
+        self._neq_G: Optional[torch.Tensor] = None
+        self._neq_XtY: Optional[torch.Tensor] = None
+
+        # --- adaLN-Zero timestep modulation MLP (the only gradient params) ------
+        from diffusers.models.embeddings import Timesteps
+
+        self.time_embed_dim = time_embed_dim
+        self.time_proj = Timesteps(
+            num_channels=time_embed_dim, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.mod_mlp = nn.Sequential(
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, 2 * self.C_S),  # -> (s(t), shift(t))
+        )
+        # Zero-init the LAST Linear ("Zero" in adaLN-Zero): step-0 modulation is
+        # neutral -> T_t == A_base z + b_base (the closed-form optimum).
+        nn.init.zeros_(self.mod_mlp[-1].weight)
+        nn.init.zeros_(self.mod_mlp[-1].bias)
+
+        # Online warm-up: lazily-created Adam optimizer over the MLP (persists).
         self._online_opt = None
         self._online_lr = 1.0e-3
 
     @property
     def is_fitted(self) -> bool:
-        # The module is always usable (identity by default); `is_fitted` reports
-        # whether moment-matching init has run, for warm-up bookkeeping.
+        # The module is always usable (base identity by default); `is_fitted`
+        # reports whether the closed-form base affine has been fit, for warm-up
+        # bookkeeping.
         return self._fitted
 
-    def _gamma(self) -> torch.Tensor:
-        return torch.exp(self.log_gamma)
+    # ----- timestep modulation -------------------------------------------------
+    def _modulation(
+        self, t: Optional[torch.Tensor], ref: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(gamma, shift)`` each shaped ``(B, C_S, 1, 1)`` for broadcasting.
+
+        ``t`` is a scalar / ``(B,)`` timestep in ``[0, 1000]`` (the shared
+        flow-matching axis). When ``None`` the modulation is neutral
+        (``gamma=1, shift=0``) so ``T == A_base z + b_base``.
+        """
+        B = ref.shape[0]
+        if t is None:
+            g = torch.ones(B, self.C_S, 1, 1, dtype=ref.dtype, device=ref.device)
+            sh = torch.zeros(B, self.C_S, 1, 1, dtype=ref.dtype, device=ref.device)
+            return g, sh
+        if not torch.is_tensor(t):
+            t = torch.tensor([t], device=ref.device)
+        t = t.reshape(-1).to(ref.device).float()
+        if t.numel() == 1 and B > 1:
+            t = t.expand(B)
+        temb = self.time_proj(t).to(self.mod_mlp[0].weight.dtype)  # (B, d_t)
+        s, sh = self.mod_mlp(temb).chunk(2, dim=-1)                 # (B, C_S) each
+        gamma = torch.exp(s).to(ref.dtype).view(-1, self.C_S, 1, 1)
+        shift = sh.to(ref.dtype).view(-1, self.C_S, 1, 1)
+        return gamma, shift
 
     @torch.no_grad()
     def init_from_moments(
         self, z_T_list: List[torch.Tensor], z_S_list: List[torch.Tensor]
     ) -> None:
-        """Closed-form warm start: least-squares W (full channel mixing) + AdaLN moments.
+        """Closed-form fit of the base affine ``A_base, b_base`` (frozen buffers).
 
-        1. Fit the full channel-mixing ``W`` (C_S x C_T) by ridge least-squares so
-           ``W z_T_rs ~= z_S`` (uses ALL teacher channels, not a fixed selection).
-        2. Moment-match gamma/beta on the RESIDUAL after W, so the AdaLN modulation
-           starts neutral w.r.t. the already-fitted linear map. The online gradient
-           loop then refines W, gamma, beta jointly.
+        Solves ridge least squares ``A_base z_T_rs + b_base ~= z_S`` over all paired
+        positions (uses ALL teacher channels). The adaLN-Zero MLP is left at its
+        zero init, so right after this the transport equals the closed-form optimum
+        and the online loop only refines the per-``t`` modulation on top.
         """
         T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
         S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
         self._teacher_grid = tuple(T_spatial.shape[-2:])
         self._student_grid = tuple(S_spatial.shape[-2:])
         T_rs = resample_spatial(T_spatial, self._student_grid)            # (N,C_T,H,W)
-        # 1) closed-form least-squares W: solve min_W ||W X - Y||^2 over positions.
-        X = T_rs.permute(0, 2, 3, 1).reshape(-1, self.C_T).double()       # (M, C_T)
-        Y = S_spatial.permute(0, 2, 3, 1).reshape(-1, self.C_S).double()  # (M, C_S)
-        ridge = 1e-4
-        G = X.transpose(0, 1) @ X + ridge * torch.eye(
-            self.C_T, dtype=X.dtype, device=X.device
-        )
-        W = torch.linalg.solve(G, X.transpose(0, 1) @ Y).transpose(0, 1)  # (C_S, C_T)
-        self.W.data.copy_(W.float())
-        # 2) moment-match gamma/beta on the residual after W.
-        T_proj = torch.einsum("sc,bchw->bshw", self.W.to(T_rs.dtype), T_rs)
-        mu_in = T_proj.mean(dim=(0, 2, 3)).double()
-        std_in = T_proj.std(dim=(0, 2, 3)).double().clamp_min(self.min_std)
-        mu_out = S_spatial.mean(dim=(0, 2, 3)).double()
-        std_out = S_spatial.std(dim=(0, 2, 3)).double().clamp_min(self.min_std)
-        gamma = (std_out / std_in).float()
-        beta = (mu_out - gamma.double() * mu_in).float()
-        self.log_gamma.data.copy_(torch.log(gamma.clamp_min(self.min_std)))
-        self.beta.data.copy_(beta)
+        A, b = fit_channel_affine_lstsq(T_rs, S_spatial, ridge=self.ridge)
+        self.A_base.data = A.to(self.A_base.device)
+        self.b_base.data = b.to(self.b_base.device)
         self._fitted = True
 
     # alias so the trainer warm-up can call .fit(...) uniformly across transports
@@ -683,77 +723,112 @@ class AdaLNTransport(VAETransport, nn.Module):
         """Set the Adam LR for the online warm-up (call before the first update)."""
         self._online_lr = lr
 
-    def update_online(self, z_T_list, z_S_list, **ctx) -> float:
-        """One gradient step on a fresh batch (grad-accumulated over the batch).
+    def update_online(self, z_T_list, z_S_list, t_list=None, **ctx) -> float:
+        """One warm-up step: re-solve closed-form base + one Adam step on the MLP.
 
-        Per warm-up epoch the trainer rolls out NEW pairs and calls this once: we
-        accumulate the per-micro-batch reconstruction-loss gradients over the whole
-        batch, then take a single Adam step (so one transport update per epoch on
-        fresh data). The Adam state persists across epochs. Uses a dedicated
-        optimizer (NOT accelerator) so it is fully decoupled from the XOPD GAS loop.
+        Per warm-up epoch the trainer rolls out NEW pairs (across the denoising
+        trajectory) and calls this once with the per-pair timesteps ``t_list``:
 
-        On the FIRST call, sets the teacher/student spatial grids (so transport_sample
-        resamples correctly) and moment-matches the affine for a neutral cold start.
+        1. Accumulate the additive least-squares sufficient statistics for the base
+           affine ``G += Xa^T Xa``, ``XtY += Xa^T Y`` and re-solve ``A_base, b_base``
+           on ALL data seen so far (no_grad; the base is data-global and frozen
+           w.r.t. gradients).
+        2. Take ONE Adam step on the adaLN-Zero MLP, regressing the per-``t``
+           modulation that corrects the residual of the base affine at each noise
+           level (grad-accumulated over the batch).
+
+        Uses a dedicated optimizer (NOT accelerator) so it is fully decoupled from
+        the XOPD GAS loop. Returns this-batch recon MSE (post-update) for logging.
         """
-        if not self._fitted:
-            # First epoch: set grids + neutral moment-match init (no_grad), then
-            # the gradient loop below refines on this and subsequent fresh batches.
-            self.init_from_moments(z_T_list, z_S_list)
+        # 1) Closed-form base affine on accumulated normal equations -------------
+        with torch.no_grad():
+            T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+            S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+            self._teacher_grid = tuple(T_spatial.shape[-2:])
+            self._student_grid = tuple(S_spatial.shape[-2:])
+            T_rs = resample_spatial(T_spatial, self._student_grid)
+            X = T_rs.permute(0, 2, 3, 1).reshape(-1, self.C_T).double()
+            Y = S_spatial.permute(0, 2, 3, 1).reshape(-1, self.C_S).double()
+            ones = torch.ones(X.shape[0], 1, dtype=X.dtype, device=X.device)
+            Xa = torch.cat([X, ones], dim=1)
+            G_batch = Xa.transpose(0, 1) @ Xa
+            XtY_batch = Xa.transpose(0, 1) @ Y
+            if self._neq_G is None:
+                self._neq_G, self._neq_XtY = G_batch, XtY_batch
+            else:
+                self._neq_G = self._neq_G + G_batch
+                self._neq_XtY = self._neq_XtY + XtY_batch
+            reg = self.ridge * torch.eye(
+                self._neq_G.shape[0], dtype=self._neq_G.dtype, device=self._neq_G.device
+            )
+            reg[-1, -1] = 0.0
+            W = torch.linalg.solve(self._neq_G + reg, self._neq_XtY)      # (C_T+1, C_S)
+            self.A_base.data = W[:-1, :].transpose(0, 1).contiguous().float().to(self.A_base.device)
+            self.b_base.data = W[-1, :].contiguous().float().to(self.b_base.device)
+            self._fitted = True
+
+        # 2) One Adam step on the adaLN-Zero modulation MLP ----------------------
         if self._online_opt is None:
-            self._online_opt = torch.optim.Adam(self.parameters(), lr=self._online_lr)
+            self._online_opt = torch.optim.Adam(self.mod_mlp.parameters(), lr=self._online_lr)
         self.train()
         self._online_opt.zero_grad()
         n = max(1, len(z_T_list))
+        if t_list is None:
+            t_list = [None] * len(z_T_list)
         total = 0.0
-        for z_T, z_S in zip(z_T_list, z_S_list):
-            pred = self.transport_sample(z_T)
+        for z_T, z_S, t in zip(z_T_list, z_S_list, t_list):
+            pred = self.transport_sample(z_T, t=t)
             loss = (pred.float() - z_S.float()).pow(2).mean() / n  # average -> grad accumulate
             loss.backward()
             total += float(loss.detach()) * n
         self._online_opt.step()
         return total / n
 
-    def _to_student_spatial(self, T_spatial: torch.Tensor) -> torch.Tensor:
+    def _to_student_spatial(
+        self, T_spatial: torch.Tensor, t: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         T_rs = (
             resample_spatial(T_spatial, self._student_grid)
             if self._student_grid is not None
             else T_spatial
         )
-        # Full channel mixing W (uses ALL teacher channels), then AdaLN modulation.
-        T_proj = torch.einsum("sc,bchw->bshw", self.W.to(T_rs.dtype), T_rs)
-        g = self._gamma().view(1, -1, 1, 1).to(T_proj.dtype)
-        b = self.beta.view(1, -1, 1, 1).to(T_proj.dtype)
-        return g * T_proj + b
+        # Frozen base affine (full channel mixing), then per-t adaLN modulation.
+        base = torch.einsum("sc,bchw->bshw", self.A_base.to(T_rs.dtype), T_rs)
+        base = base + self.b_base.to(T_rs.dtype).view(1, -1, 1, 1)
+        gamma, shift = self._modulation(t, base)
+        return gamma * base + shift
 
-    def _to_teacher_spatial(self, S_spatial: torch.Tensor) -> torch.Tensor:
-        # Invert: un-modulate (analytic), then un-mix channels via pseudo-inverse of W
-        # (C_T x C_S; W is non-square C_S x C_T so the inverse is a least-norm pinv),
-        # then inverse resample. gamma>0 keeps the modulation analytically invertible.
-        g = self._gamma().view(1, -1, 1, 1).to(S_spatial.dtype)
-        b = self.beta.view(1, -1, 1, 1).to(S_spatial.dtype)
-        S_demod = (S_spatial - b) / g
-        W_pinv = torch.linalg.pinv(self.W.double()).to(S_demod.dtype)  # (C_T, C_S)
-        T_rs = torch.einsum("cs,bshw->bchw", W_pinv, S_demod)
+    def _to_teacher_spatial(
+        self, S_spatial: torch.Tensor, t: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # Invert (analytic, fixed t): un-modulate, then un-mix channels via the
+        # pseudo-inverse of A_base (C_T x C_S; least-norm since C_S != C_T), then
+        # inverse resample. gamma>0 keeps the modulation invertible.
+        gamma, shift = self._modulation(t, S_spatial)
+        base = (S_spatial - shift) / gamma                      # = A_base z_rs + b_base
+        base = base - self.b_base.to(base.dtype).view(1, -1, 1, 1)
+        A_pinv = torch.linalg.pinv(self.A_base.double()).to(base.dtype)  # (C_T, C_S)
+        T_rs = torch.einsum("cs,bshw->bchw", A_pinv, base)
         return (
             resample_spatial(T_rs, self._teacher_grid)
             if self._teacher_grid is not None
             else T_rs
         )
 
-    def transport_sample(self, z_T: torch.Tensor, **ctx) -> torch.Tensor:
-        S_spatial = self._to_student_spatial(self.t2s(z_T))
+    def transport_sample(self, z_T: torch.Tensor, t=None, **ctx) -> torch.Tensor:
+        S_spatial = self._to_student_spatial(self.t2s(z_T), t=t)
         return self.s_from(S_spatial)
 
-    def transition_mean_to_student(self, x_S, query_teacher_mean, **ctx):
-        # Inverse to teacher space (gradient flows through gamma/beta), query, map back.
-        T_spatial = self._to_teacher_spatial(self.s2s(x_S))
+    def transition_mean_to_student(self, x_S, query_teacher_mean, t=None, **ctx):
+        # Inverse to teacher space at this t, query teacher, map mean back at same t.
+        T_spatial = self._to_teacher_spatial(self.s2s(x_S), t=t)
         x_T = self.t_from(T_spatial)
         mu_T = query_teacher_mean(x_T)
-        muS_spatial = self._to_student_spatial(self.t2s(mu_T))
+        muS_spatial = self._to_student_spatial(self.t2s(mu_T), t=t)
         return self.s_from(muS_spatial)
 
     def state_dict(self, *args, **kwargs) -> dict:
-        # nn.Module params + the non-parameter grid/fitted bookkeeping.
+        # nn.Module params/buffers + the non-parameter grid/fitted bookkeeping.
         sd = dict(nn.Module.state_dict(self, *args, **kwargs))
         sd["_student_grid"] = self._student_grid
         sd["_teacher_grid"] = self._teacher_grid
@@ -776,9 +851,9 @@ class MLPTransport(VAETransport):
     M2-nonlinear / M5 cycle-consistent). Deliberately unimplemented for now.
 
     Note: the "do no harm" non-linear init is a zero-init residual on top of the
-    diagonal moment-matching baseline (AdaLN-Zero style, see AdaLNTransport's
-    use_residual hook and the theory doc) — NOT an identity-initialized
-    non-linear map.
+    closed-form affine baseline (AdaLN-Zero style; cf. :class:`AdaLNTransport`,
+    which zero-inits its timestep-modulation MLP on top of a frozen closed-form
+    base affine) — NOT an identity-initialized non-linear map.
     """
 
     requires_warmup = True

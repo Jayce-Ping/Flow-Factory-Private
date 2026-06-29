@@ -219,15 +219,45 @@ class TestAdaLNTransport(unittest.TestCase):
 
         t = self._make()
         self.assertIsInstance(t, nn.Module)
+        # Only the adaLN-Zero modulation MLP is a gradient parameter; the base
+        # affine (A_base, b_base) is a frozen closed-form buffer.
         names = {n for n, _ in t.named_parameters()}
-        self.assertEqual(names, {"log_gamma", "beta", "W"})
+        self.assertEqual(
+            names,
+            {
+                "mod_mlp.0.weight",
+                "mod_mlp.0.bias",
+                "mod_mlp.2.weight",
+                "mod_mlp.2.bias",
+            },
+        )
+        buf_names = {n for n, _ in t.named_buffers()}
+        self.assertIn("A_base", buf_names)
+        self.assertIn("b_base", buf_names)
         self.assertTrue(t.requires_warmup)
 
     def test_default_is_identity(self):
-        # log_gamma=0, beta=0 -> identity before any init.
+        # A_base=identity-selection, b_base=0, modulation zero-init (gamma=1,shift=0)
+        # -> the untrained transport is the identity, with or without a timestep.
         t = self._make()
         z = torch.randn(2, 4, 6, 6)
         torch.testing.assert_close(t.transport_sample(z), z, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            t.transport_sample(z, t=500.0), z, atol=1e-5, rtol=1e-5
+        )
+
+    def test_zero_init_modulation_is_neutral(self):
+        # adaLN-Zero: zero-init last Linear -> modulation neutral at any t, so the
+        # transport equals the closed-form base affine right after fit (do-no-harm).
+        torch.manual_seed(0)
+        C = 4
+        z_T = [torch.randn(8, C, 6, 6) for _ in range(3)]
+        z_S = [z * 2.0 + 1.0 for z in z_T]
+        t = self._make()
+        t.fit(z_T, z_S)
+        with_t = t.transport_sample(z_T[0], t=750.0)
+        no_t = t.transport_sample(z_T[0], t=None)
+        torch.testing.assert_close(with_t, no_t, atol=1e-5, rtol=1e-5)
 
     def test_moment_init_and_analytic_inverse(self):
         torch.manual_seed(0)
@@ -243,18 +273,41 @@ class TestAdaLNTransport(unittest.TestCase):
         torch.testing.assert_close(
             out.mean(dim=(0, 2, 3)), z_S[0].mean(dim=(0, 2, 3)), atol=1e-2, rtol=1e-2
         )
-        # analytic inverse round trip (identity teacher mean)
+        # analytic inverse round trip (identity teacher mean), at a fixed timestep
         x_S = torch.randn(2, C, 6, 6)
-        rt = t.transition_mean_to_student(x_S, query_teacher_mean=lambda x_T: x_T)
+        rt = t.transition_mean_to_student(
+            x_S, query_teacher_mean=lambda x_T: x_T, t=300.0
+        )
         torch.testing.assert_close(rt, x_S, atol=1e-4, rtol=1e-4)
 
     def test_gradients_flow_to_params(self):
+        # After a forward at a real timestep, gradients reach the modulation MLP.
         t = self._make()
         z = torch.randn(2, 4, 5, 5)
-        out = t.transport_sample(z)
+        out = t.transport_sample(z, t=500.0)
         out.pow(2).mean().backward()
-        self.assertIsNotNone(t.log_gamma.grad)
-        self.assertIsNotNone(t.beta.grad)
+        self.assertIsNotNone(t.mod_mlp[0].weight.grad)
+        # The zero-init last layer has a defined (possibly zero at step 0) grad slot
+        # once it participates in the graph.
+        self.assertIsNotNone(t.mod_mlp[-1].weight.grad)
+
+    def test_timestep_conditioning_changes_modulation(self):
+        # After a few online updates the modulation should differ across timesteps
+        # (the whole point of the conditioning) — train it to need per-t correction.
+        torch.manual_seed(0)
+        C = 4
+        t = self._make()
+        # target depends on t: low-t -> scale 2, high-t -> scale 0.5 (toy per-t map).
+        for _ in range(50):
+            z_T = [torch.randn(8, C, 6, 6), torch.randn(8, C, 6, 6)]
+            z_S = [z_T[0] * 2.0, z_T[1] * 0.5]
+            t.set_online_lr(1e-2)
+            t.update_online(z_T, z_S, t_list=[50.0, 950.0])
+        probe = torch.randn(4, C, 6, 6)
+        out_lo = t.transport_sample(probe, t=50.0)
+        out_hi = t.transport_sample(probe, t=950.0)
+        # The two timesteps must produce different outputs.
+        self.assertGreater((out_lo - out_hi).abs().mean().item(), 1e-3)
 
     def test_channel_mismatch(self):
         t = self._make(C_T=6, C_S=4)

@@ -1098,12 +1098,16 @@ class XOPDTrainer(BaseTrainer):
         levels (matching L1's use on noisy student states). False: only the final
         clean latent ``z0`` (legacy). CPU-resident lists to bound VRAM; each list
         entry is one (B, ...) pair tensor (one per (batch, timestep) in trajectory mode).
+
+        Returns ``(z_T_list, z_S_list, t_list, img_list)`` where ``t_list[i]`` is the
+        scalar timestep (noise level, on the shared ``[0, 1000]`` flow-matching axis)
+        of the ``i``-th pair — used to condition the adaLN-Zero modulation.
         """
         ta = self.training_args
         device = self.accelerator.device
         use_traj = getattr(ta, "transport_warmup_trajectory", False)
         data_iter = self._make_train_iter()
-        z_T_list, z_S_list, img_list = [], [], []
+        z_T_list, z_S_list, t_list, img_list = [], [], [], []
         for _ in tqdm(
             range(ta.transport_warmup_batches),
             desc="Transport warm-up (paired latents)",
@@ -1128,13 +1132,20 @@ class XOPDTrainer(BaseTrainer):
                     z0_S, _ = self._split_student_encode(self.adapter.encode_pixels(images))
                 z_T_list.append(z0_T.float().cpu())
                 z_S_list.append(z0_S.float().cpu())
+                t_list.append(0.0)  # clean latent -> timestep 0 (lowest noise level)
                 img_list.append(images.float().cpu())
                 continue
 
             # Trajectory mode: pair every denoising step. all_latents is
             # (num_steps, seq, C); decode each step in teacher space -> image ->
-            # student encode_pixels. One (B,...) pair per timestep.
+            # student encode_pixels. One (B,...) pair per timestep. The per-step
+            # timestep value (the noise level of THAT latent, on the shared [0,1000]
+            # flow-matching axis) conditions the adaLN-Zero modulation; map each
+            # collected position to its scheduler timestep via latent_index_map.
             num_steps = teacher_samples[0].all_latents.shape[0]
+            ts_vals = getattr(teacher_samples[0], "timesteps", None)
+            idx_map = getattr(teacher_samples[0], "latent_index_map", None)
+            T_len = int(ts_vals.shape[0]) if ts_vals is not None else num_steps
             # Match the teacher VAE dtype for decode (rollout latents may be fp16
             # while the VAE/bias is bf16 -> dtype-mismatch error otherwise).
             vae_dtype = self.teacher_adapter.pipeline.vae.dtype
@@ -1151,10 +1162,18 @@ class XOPDTrainer(BaseTrainer):
                         imgs_t = torch.stack(imgs_t, dim=0)
                     imgs_t = imgs_t.to(device)
                     z_t_S, _ = self._split_student_encode(self.adapter.encode_pixels(imgs_t))
+                # noise level of all_latents[t]: timesteps[step_idx] if pre-clean else 0.
+                step_idx = int(idx_map[t]) if idx_map is not None else t
+                t_val = (
+                    float(ts_vals[step_idx])
+                    if (ts_vals is not None and step_idx < T_len)
+                    else 0.0
+                )
                 z_T_list.append(z_t_T.float().cpu())
                 z_S_list.append(z_t_S.float().cpu())
+                t_list.append(t_val)
                 # images not retained in trajectory mode (downstream uses only pairs).
-        return z_T_list, z_S_list, img_list
+        return z_T_list, z_S_list, t_list, img_list
 
     @staticmethod
     def _split_student_encode(enc):
@@ -1167,7 +1186,9 @@ class XOPDTrainer(BaseTrainer):
             return enc[0], enc[1]
         return enc, None
 
-    def _warmup_comparison_images(self, z_T_list, z_S_list, max_pairs: Optional[int] = 64):
+    def _warmup_comparison_images(
+        self, z_T_list, z_S_list, t_list=None, max_pairs: Optional[int] = 64
+    ):
         """Build a LIST of per-pair 2-row comparison images for warm-up viz.
 
         ``z_T_list`` / ``z_S_list`` are LISTS of batched tensors (one per rolled-out
@@ -1189,12 +1210,15 @@ class XOPDTrainer(BaseTrainer):
             dev = self.accelerator.device
             if not isinstance(z_T_list, (list, tuple)):
                 z_T_list, z_S_list = [z_T_list], [z_S_list]
+            if t_list is None:
+                t_list = [None] * len(z_T_list)
             tiles = []
             with torch.no_grad():
-                for bi, (z_T, z_S) in enumerate(zip(z_T_list, z_S_list)):
+                for bi, (z_T, z_S, t_b) in enumerate(zip(z_T_list, z_S_list, t_list)):
                     z_S_b = z_S.to(dev)
                     z_T_b = z_T.to(dev)
-                    z_Thad = self.transport.transport_sample(z_T_b)  # -> student-space
+                    # transport at this pair's noise level (adaln uses t; affine ignores)
+                    z_Thad = self.transport.transport_sample(z_T_b, t=t_b)  # -> student-space
                     top = self.adapter.decode_latents(z_S_b, output_type="pil")
                     bot = self.adapter.decode_latents(z_Thad, output_type="pil")
                     top = top if isinstance(top, (list, tuple)) else [top]
@@ -1245,18 +1269,22 @@ class XOPDTrainer(BaseTrainer):
         )
         for ep in range(n_epochs):
             # 1. Fresh rollout for THIS epoch (full denoising trajectory per batch).
-            z_T_list, z_S_list, _img = self._collect_warmup_pairs()
+            z_T_list, z_S_list, t_list, _img = self._collect_warmup_pairs()
             z_T_dev = [z.to(device) for z in z_T_list]
             z_S_dev = [z.to(device) for z in z_S_list]
-            # 2. One transport update on this epoch's fresh data.
-            recon = self.transport.update_online(z_T_dev, z_S_dev)
+            # 2. One transport update on this epoch's fresh data. adaln consumes the
+            #    per-pair timesteps to condition its modulation; closed-form transports
+            #    ignore the extra kwarg.
+            recon = self.transport.update_online(z_T_dev, z_S_dev, t_list=t_list)
             logger.info(f"  transport warm-up epoch {ep}: recon_mse={recon:.6f}")
             # 3. Log loss + per-pair comparison images (each pair = one 2-row tile,
             #    top=student target / bottom=transported teacher) as a gallery on the
             #    warm-up x-axis, EVERY epoch. Capped at max_pairs to bound upload.
             if self.accelerator.is_main_process and self.logger is not None:
                 data = {"warmup/transport_recon_mse": float(recon)}
-                imgs = self._warmup_comparison_images(z_T_dev, z_S_dev, max_pairs=64)
+                imgs = self._warmup_comparison_images(
+                    z_T_dev, z_S_dev, t_list=t_list, max_pairs=64
+                )
                 if imgs:
                     data["warmup/target_vs_transported"] = imgs
                 self.log_warmup_data(data, step=ep)
@@ -1267,8 +1295,12 @@ class XOPDTrainer(BaseTrainer):
             import torch.distributed as dist
 
             if is_adaln:
+                # adaln has BOTH gradient params (modulation MLP) and frozen buffers
+                # (A_base, b_base from the closed-form fit) — broadcast both.
                 for p in self.transport.parameters():
                     dist.broadcast(p.data, src=0)
+                for buf in self.transport.buffers():
+                    dist.broadcast(buf.data, src=0)
             else:
                 A = self.transport.A.to(device)
                 b = self.transport.b.to(device)
@@ -1602,7 +1634,11 @@ class XOPDTrainer(BaseTrainer):
                 )
             return out.next_latents_mean.detach()
 
-        mu_S = self.transport.transition_mean_to_student(x_S, query_teacher_mean)
+        # Pass the student's current denoising timestep so a timestep-conditioned
+        # transport (adaln) modulates at the matching noise level; affine transports
+        # ignore the kwarg. For any fixed t the adaln map is still affine, so this
+        # transition-mean pushforward stays exact (Prop. 3).
+        mu_S = self.transport.transition_mean_to_student(x_S, query_teacher_mean, t=t)
         return mu_S.detach()
 
     def _build_teacher_text_cond(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
