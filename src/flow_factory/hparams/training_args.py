@@ -2162,11 +2162,16 @@ class XOPDTrainingArguments(TrainingArguments):
         default=64,
         metadata={
             "help": (
-                "Number of teacher-rollout batches used to warm up the transport "
-                "(paired (z_T, z_S) latents via the pixel bridge). Closed-form "
-                "('linear'/'whitening') fit once; 'adaln' trains a gradient loop on "
-                "these batches. Ignored for 'identity'/'pixel'. Must be > 0 for "
-                "'linear'/'whitening'/'adaln'."
+                "Transport warm-up DATA SIZE: number of teacher-rollout batches of "
+                "paired (z_T, z_S) latents (z_S via the pixel bridge) collected to fit "
+                "the cross-VAE transport. This knob has the SAME meaning for every "
+                "transport (it sizes the fitting set); what differs is only HOW the "
+                "fit consumes the data: 'whitening'/'linear' solve a CLOSED-FORM fit "
+                "in one pass over these batches (moment-matching / least-squares -> the "
+                "global optimum, so transport_warmup_epochs is implicitly 1 and extra "
+                "passes cannot improve it), while 'adaln' runs a GRADIENT loop over them "
+                "for transport_warmup_epochs passes. Ignored for 'identity'/'pixel' "
+                "(no fit). Must be > 0 for 'linear'/'whitening'/'adaln'."
             )
         },
     )
@@ -2175,7 +2180,8 @@ class XOPDTrainingArguments(TrainingArguments):
         metadata={
             "help": (
                 "Adam learning rate for the LEARNABLE 'adaln' transport warm-up "
-                "(latent-reconstruction objective). Ignored for other transports."
+                "(latent-reconstruction objective). Ignored for other transports "
+                "(closed-form fits have no learning rate)."
             )
         },
     )
@@ -2183,9 +2189,14 @@ class XOPDTrainingArguments(TrainingArguments):
         default=50,
         metadata={
             "help": (
-                "Number of passes over the collected warm-up batches when training "
-                "the 'adaln' transport. Ignored for closed-form/non-learnable "
-                "transports. After warm-up the transport is frozen for L1."
+                "Transport warm-up GRADIENT PASSES: number of optimization passes over "
+                "the transport_warmup_batches collected pairs. Pairs with "
+                "transport_warmup_batches as (epochs x batches), exactly like a normal "
+                "training schedule. Only meaningful for the LEARNABLE 'adaln' transport "
+                "(iterative gradient fit); the closed-form 'whitening'/'linear' fits are "
+                "single-pass by construction (their optimum is reached in one pass, so "
+                "this value is effectively 1 and is ignored), and 'identity'/'pixel' do "
+                "no fit. After warm-up the transport is frozen for L1."
             )
         },
     )

@@ -62,12 +62,17 @@ Key knobs (pathwise only, `reinforce_coef=0`, ODE):
   **Flip among `whitening` / `linear` / `adaln` / `pixel` to compare L1 transport
   baselines.** All non-pixel transports are **frozen during L1** (student-only
   update); L0 always uses the pixel bridge regardless of this knob.
-- `transport_warmup_batches`: paired-latent batches collected for warm-up
-  (closed-form fit for `whitening`/`linear`; gradient loop for `adaln`); ignored
-  for `pixel`/`identity`.
-- `transport_lr` / `transport_warmup_epochs`: Adam LR and number of passes for the
-  `adaln` warm-up reconstruction loop (ignored otherwise). The fitted/trained
-  transport is persisted to `transport.pt` in checkpoints (resume skips re-warm-up).
+- `transport_warmup_batches` — warm-up **data size**: paired `(z_T, z_S)` latent
+  batches collected to fit the transport. Same meaning for all transports; only
+  *how* the fit consumes them differs: `whitening`/`linear` solve a **closed-form**
+  fit in one pass (the optimum — extra passes can't help), `adaln` runs a
+  **gradient** loop. Ignored for `pixel`/`identity`.
+- `transport_lr` / `transport_warmup_epochs` — warm-up **gradient passes** (and Adam
+  LR) over those batches: `(epochs × batches)`, like a normal training schedule.
+  Only meaningful for the learnable `adaln` transport; the closed-form
+  `whitening`/`linear` fits are single-pass by construction (epochs effectively 1,
+  ignored), and `pixel`/`identity` do no fit. The fitted/trained transport is
+  persisted to `transport.pt` in checkpoints (resume skips re-warm-up).
 
 > **Status:** the transport layer (pixel / linear / whitening / learnable adaln +
 > placeholders), `encode_pixels`, `predict_velocity`, the teacher text-encoder
