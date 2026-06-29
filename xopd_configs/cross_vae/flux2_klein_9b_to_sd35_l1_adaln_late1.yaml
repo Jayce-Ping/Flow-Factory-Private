@@ -63,10 +63,10 @@ train:
 
   # --- VAE latent-space transport (cross-VAE) ---
   vae_transport: "adaln"                   # Learnable diagonal AdaLN affine: moment-match init + online latent-recon warm-up (gradient), then FROZEN for L1.
-  transport_warmup_batches: 2              # PER-EPOCH teacher rollouts; trajectory mode pairs ALL ~50 steps each -> ~100 pairs/epoch covering all noise levels
+  transport_warmup_batches: 4              # PER-EPOCH teacher rollouts (doubled 2->4); trajectory mode pairs ALL ~50 steps each -> ~200 pairs/epoch covering all noise levels
   transport_warmup_trajectory: true        # pair EVERY denoising step (all noise levels), not just the final clean latent
   transport_lr: 1.0e-3                     # adaln online warm-up Adam LR
-  transport_warmup_epochs: 100             # online warm-up epochs: each re-rolls fresh pairs + 1 adaln Adam step, avoids overfitting a fixed set
+  transport_warmup_epochs: 500             # online warm-up epochs (raised 100->500; 100 was not enough to converge); each re-rolls fresh pairs + 1 adaln Adam step
 
   # --- Dual classifier-free guidance ---
   teacher_guidance_scale: 1.0
