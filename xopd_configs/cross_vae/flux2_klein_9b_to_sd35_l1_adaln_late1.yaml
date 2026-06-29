@@ -62,10 +62,11 @@ train:
   assume_shared_vae_text_encoder: false    # Cross-VAE: teacher VAE differs; transport bridges the spaces
 
   # --- VAE latent-space transport (cross-VAE) ---
-  vae_transport: "adaln"                   # Learnable diagonal AdaLN affine: moment-match init + short latent-recon warm-up (gradient), then FROZEN for L1. Transport scan sibling.
-  transport_warmup_batches: 8              # PER-EPOCH fresh rollouts for the online transport warm-up (each is a full teacher trajectory; kept small since total = epochs * this)
+  vae_transport: "adaln"                   # Learnable diagonal AdaLN affine: moment-match init + online latent-recon warm-up (gradient), then FROZEN for L1.
+  transport_warmup_batches: 2              # PER-EPOCH teacher rollouts; trajectory mode pairs ALL ~50 steps each -> ~100 pairs/epoch covering all noise levels
+  transport_warmup_trajectory: true        # pair EVERY denoising step (all noise levels), not just the final clean latent
   transport_lr: 1.0e-3                     # adaln online warm-up Adam LR
-  transport_warmup_epochs: 100             # online warm-up epochs: each re-rolls 8 fresh pairs + 1 adaln Adam step (~800 total rollouts), avoids overfitting a fixed set
+  transport_warmup_epochs: 100             # online warm-up epochs: each re-rolls fresh pairs + 1 adaln Adam step, avoids overfitting a fixed set
 
   # --- Dual classifier-free guidance ---
   teacher_guidance_scale: 1.0

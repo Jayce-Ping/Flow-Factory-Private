@@ -1089,13 +1089,19 @@ class XOPDTrainer(BaseTrainer):
         """Roll out ``transport_warmup_batches`` FRESH paired (z_T, z_S) latents.
 
         Called ONCE PER WARM-UP EPOCH (online schedule), so transport_warmup_batches
-        is the per-epoch data size. Teacher native clean latent ``z0_T`` from a
-        teacher rollout (full denoising trajectory); student latent
-        ``z0_S = encode_pixels(teacher image)`` via the pixel bridge. Also returns
-        the teacher images. CPU-resident lists to bound VRAM.
+        is the per-epoch rollout count. For each teacher rollout we pair teacher
+        native latents with student-space latents via the pixel bridge
+        (``z_S = encode_pixels(decode(z_T))``).
+
+        ``transport_warmup_trajectory`` (default True): pair EVERY denoising step's
+        latent ``z_t^T`` (decode -> student encode), so the transport sees all noise
+        levels (matching L1's use on noisy student states). False: only the final
+        clean latent ``z0`` (legacy). CPU-resident lists to bound VRAM; each list
+        entry is one (B, ...) pair tensor (one per (batch, timestep) in trajectory mode).
         """
         ta = self.training_args
         device = self.accelerator.device
+        use_traj = getattr(ta, "transport_warmup_trajectory", False)
         data_iter = self._make_train_iter()
         z_T_list, z_S_list, img_list = [], [], []
         for _ in tqdm(
@@ -1105,7 +1111,6 @@ class XOPDTrainer(BaseTrainer):
         ):
             prompt_batch = next(data_iter)
             teacher_samples = self._teacher_rollout_samples(prompt_batch)
-            z0_T = torch.stack([s.all_latents[-1] for s in teacher_samples], dim=0).to(device)
             # Snapshot the teacher packed-latent position ids once (fixed resolution)
             # so the affine-transport converters can unpack (B,seq,C)->(B,C,H,W).
             if self._teacher_latent_ids is None:
@@ -1114,13 +1119,50 @@ class XOPDTrainer(BaseTrainer):
                     self._capture_teacher_layout(
                         t_ids if t_ids.dim() == 3 else t_ids.unsqueeze(0)
                     )
-            images = torch.stack([s.image for s in teacher_samples], dim=0).to(device)
-            with torch.no_grad():
-                z0_S = self.adapter.encode_pixels(images)
-            z_T_list.append(z0_T.float().cpu())
-            z_S_list.append(z0_S.float().cpu())
-            img_list.append(images.float().cpu())
+
+            if not use_traj:
+                # Legacy: final clean latent only. z0_S from the teacher's final image.
+                z0_T = torch.stack([s.all_latents[-1] for s in teacher_samples], dim=0).to(device)
+                images = torch.stack([s.image for s in teacher_samples], dim=0).to(device)
+                with torch.no_grad():
+                    z0_S, _ = self._split_student_encode(self.adapter.encode_pixels(images))
+                z_T_list.append(z0_T.float().cpu())
+                z_S_list.append(z0_S.float().cpu())
+                img_list.append(images.float().cpu())
+                continue
+
+            # Trajectory mode: pair every denoising step. all_latents is
+            # (num_steps, seq, C); decode each step in teacher space -> image ->
+            # student encode_pixels. One (B,...) pair per timestep.
+            num_steps = teacher_samples[0].all_latents.shape[0]
+            for t in range(num_steps):
+                z_t_T = torch.stack([s.all_latents[t] for s in teacher_samples], dim=0).to(device)
+                t_ids = torch.stack(
+                    [s.latent_ids for s in teacher_samples], dim=0
+                ).to(device)
+                with torch.no_grad():
+                    imgs_t = self.teacher_adapter.decode_latents(
+                        z_t_T, latent_ids=t_ids, output_type="pt"
+                    )
+                    if isinstance(imgs_t, list):
+                        imgs_t = torch.stack(imgs_t, dim=0)
+                    imgs_t = imgs_t.to(device)
+                    z_t_S, _ = self._split_student_encode(self.adapter.encode_pixels(imgs_t))
+                z_T_list.append(z_t_T.float().cpu())
+                z_S_list.append(z_t_S.float().cpu())
+                # images not retained in trajectory mode (downstream uses only pairs).
         return z_T_list, z_S_list, img_list
+
+    @staticmethod
+    def _split_student_encode(enc):
+        """Normalize a student ``encode_pixels`` return to a bare latent tensor.
+
+        SD3.5 returns a tensor; FLUX.2 returns ``(packed, ids)``. The student here is
+        always BCHW (SD3.5) but stay robust.
+        """
+        if isinstance(enc, tuple):
+            return enc[0], enc[1]
+        return enc, None
 
     def _warmup_comparison_image(self, z_T_list, z_S_list, max_cols: Optional[int] = None):
         """Build a 2-row comparison PIL for warm-up viz over a WHOLE epoch's data.
@@ -1208,12 +1250,14 @@ class XOPDTrainer(BaseTrainer):
             # 2. One transport update on this epoch's fresh data.
             recon = self.transport.update_online(z_T_dev, z_S_dev)
             logger.info(f"  transport warm-up epoch {ep}: recon_mse={recon:.6f}")
-            # 3. Log loss + the FULL-epoch comparison image (all rolled-out samples,
-            #    top=student target / bottom=transported teacher) on the warm-up
-            #    x-axis, EVERY epoch.
+            # 3. Log loss + the FULL-epoch comparison image (top=student target /
+            #    bottom=transported teacher) on the warm-up x-axis, EVERY epoch. In
+            #    trajectory mode an epoch holds batches*num_steps pairs; cap the grid
+            #    width so one full trajectory's worth of columns is shown (covers all
+            #    noise levels) without producing an absurdly wide image.
             if self.accelerator.is_main_process and self.logger is not None:
                 data = {"warmup/transport_recon_mse": float(recon)}
-                img = self._warmup_comparison_image(z_T_dev, z_S_dev)
+                img = self._warmup_comparison_image(z_T_dev, z_S_dev, max_cols=64)
                 if img is not None:
                     data["warmup/target_vs_transported"] = img
                 self.log_warmup_data(data, step=ep)

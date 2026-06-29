@@ -2199,6 +2199,19 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    transport_warmup_trajectory: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True (default), the transport warm-up pairs cover the ENTIRE teacher "
+                "denoising trajectory: every step's teacher latent z_t^T is decoded to an "
+                "image and re-encoded into the student space (z_t^S = encode_pixels(decode("
+                "z_t^T))), so the transport is trained on latents at ALL noise levels "
+                "(matching how L1 applies it to noisy student states at every step). If "
+                "False, only the final clean latent z0 is paired (legacy clean-only)."
+            )
+        },
+    )
 
     # ---- Dual classifier-free guidance ----
     teacher_guidance_scale: float = field(
