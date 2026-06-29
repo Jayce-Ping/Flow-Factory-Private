@@ -2138,7 +2138,9 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    vae_transport: Literal["identity", "pixel", "linear", "whitening", "adaln", "mlp"] = field(
+    vae_transport: Literal[
+        "identity", "pixel", "linear", "whitening", "adaln", "conv", "conv_linear", "mlp"
+    ] = field(
         default="identity",
         metadata={
             "help": (
@@ -2152,7 +2154,13 @@ class XOPDTrainingArguments(TrainingArguments):
                 "'adaln': LEARNABLE diagonal AdaLN affine — moment-match init then a "
                 "short latent-reconstruction warm-up (gradient), then FROZEN for L1 "
                 "(training it on D_k would be degenerate since mu_teacher is cached/"
-                "detached). 'mlp': non-linear placeholder (NotImplementedError). All "
+                "detached). 'conv' (== 'conv_linear'): STRICTLY-LINEAR convolutional "
+                "transport — a learned PixelShuffle upsample + conv residual on the "
+                "frozen closed-form base affine (do-no-harm), plus a paired linear "
+                "inverse net; adds a spatial receptive field the per-pixel affine/adaln "
+                "lack (recovers detail when the teacher grid is coarser) while keeping "
+                "the L1 pushforward exact. 'mlp': non-linear placeholder "
+                "(NotImplementedError). All "
                 "non-pixel transports are frozen during L1; L0 always uses the pixel "
                 "bridge. This selects the L1 transition-mean transport."
             )
@@ -2178,9 +2186,24 @@ class XOPDTrainingArguments(TrainingArguments):
         default=1.0e-3,
         metadata={
             "help": (
-                "Adam learning rate for the LEARNABLE 'adaln' transport online warm-up "
-                "(latent-reconstruction objective). Ignored for other transports "
-                "(closed-form fits have no learning rate)."
+                "Adam learning rate for the LEARNABLE 'adaln'/'conv' transport online "
+                "warm-up (latent-reconstruction objective). Ignored for closed-form "
+                "transports (linear/whitening have no learning rate)."
+            )
+        },
+    )
+    transport_inner_steps: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Optimizer steps the LEARNABLE 'adaln'/'conv' transport takes per warm-up "
+                "EPOCH on that epoch's freshly-rolled POOLED pairs. The teacher rollout is "
+                "the expensive part, so reusing its pairs for many cheap gradient steps "
+                "decouples optimizer convergence from rollout cost — 1 step/epoch converges "
+                "glacially (the residual/MLP needs hundreds of steps from its zero-init), so "
+                "the warm-up recon looks flat. Fresh pairs each epoch prevent overfitting "
+                "the pool. Ignored by closed-form transports (linear/whitening). Default 1 "
+                "(legacy 1-step-per-epoch)."
             )
         },
     )
@@ -2203,14 +2226,15 @@ class XOPDTrainingArguments(TrainingArguments):
         default=0,
         metadata={
             "help": (
-                "adaln-only two-phase warm-up split. If > 0, the first K warm-up "
-                "epochs update ONLY the closed-form base affine (A_base, b_base); the "
-                "remaining (transport_warmup_epochs - K) epochs FREEZE the base and "
-                "train ONLY the adaLN-Zero timestep-modulation MLP against that stable "
-                "target (avoids the MLP chasing a base that is still moving). 0 "
-                "(default) keeps the legacy joint update (base re-solve + one MLP step "
-                "every epoch). Must satisfy 0 <= K <= transport_warmup_epochs. Ignored "
-                "by closed-form transports (linear/whitening) which have no MLP."
+                "Two-phase warm-up split for gradient transports ('adaln'/'conv'). If "
+                "> 0, the first K warm-up epochs update ONLY the closed-form base affine "
+                "(A_base, b_base); the remaining (transport_warmup_epochs - K) epochs "
+                "FREEZE the base and train ONLY the learnable part (adaLN-Zero MLP / conv "
+                "residual nets) against that stable target (avoids it chasing a base "
+                "that is still moving). 0 (default) keeps the legacy joint update (base "
+                "re-solve + one gradient step every epoch). Must satisfy "
+                "0 <= K <= transport_warmup_epochs. Ignored by closed-form transports "
+                "(linear/whitening) which have no learnable part."
             )
         },
     )
@@ -2397,7 +2421,9 @@ class XOPDTrainingArguments(TrainingArguments):
                     "vae_transport (one of {'pixel', 'linear', 'mlp'}); got "
                     "vae_transport='identity'."
                 )
-            if self.vae_transport in ("linear", "whitening", "adaln") and self.transport_warmup_batches <= 0:
+            if self.vae_transport in (
+                "linear", "whitening", "adaln", "conv", "conv_linear"
+            ) and self.transport_warmup_batches <= 0:
                 raise ValueError(
                     f"vae_transport={self.vae_transport!r} requires "
                     "transport_warmup_batches > 0 to fit/warm-up the transport; "

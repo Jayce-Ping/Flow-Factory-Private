@@ -77,7 +77,7 @@ from .common import (
     validate_l1_one_step_per_epoch,
     validate_source_ratio,
 )
-from .transport import AdaLNTransport, build_transport
+from .transport import AdaLNTransport, ConvTransport, build_transport
 
 logger = setup_logger(__name__)
 
@@ -360,6 +360,21 @@ class XOPDTrainer(BaseTrainer):
                 teacher_channels=self._adapter_latent_channels(self.teacher_adapter),
                 student_channels=self._adapter_latent_channels(self.adapter),
             )
+        elif ta.vae_transport in ("conv", "conv_linear"):
+            # STRICTLY-LINEAR conv transport: a learned (PixelShuffle) upsample + conv
+            # residual on top of the frozen closed-form base affine (do-no-harm), plus
+            # a paired linear inverse net. Adds a spatial receptive field the per-pixel
+            # affine/adaln lack, while keeping the L1 pushforward exact (still linear).
+            # Trained ONLY during warm-up (forward+inverse+cycle recon), then frozen.
+            self.transport = build_transport(
+                "conv",
+                teacher_to_spatial=self._teacher_to_spatial,
+                teacher_from_spatial=self._teacher_from_spatial,
+                student_to_spatial=self._student_to_spatial,
+                student_from_spatial=self._student_from_spatial,
+                teacher_channels=self._adapter_latent_channels(self.teacher_adapter),
+                student_channels=self._adapter_latent_channels(self.adapter),
+            )
         else:  # "mlp" -> placeholder (raises in build_transport/constructor)
             self.transport = build_transport(ta.vae_transport)
 
@@ -404,7 +419,7 @@ class XOPDTrainer(BaseTrainer):
                         f"config {self.training_args.vae_transport!r}; loading anyway."
                     )
                 self.transport.load_state_dict(blob["state"])
-                if isinstance(self.transport, AdaLNTransport):
+                if isinstance(self.transport, torch.nn.Module):
                     self.transport.to(self.accelerator.device)
                 logger.info(f"Loaded cross-VAE transport state from {transport_path}.")
             else:
@@ -1300,25 +1315,31 @@ class XOPDTrainer(BaseTrainer):
         ta = self.training_args
         device = self.accelerator.device
         n_epochs = max(1, ta.transport_warmup_epochs)
+        # Gradient-trained transports (adaln modulation MLP / conv residual nets) are
+        # nn.Modules with a dedicated online optimizer; closed-form ones (linear/
+        # whitening) are not. The nn.Module path also gets the two-phase schedule and
+        # the param+buffer broadcast for cross-rank determinism.
+        is_nn = isinstance(self.transport, torch.nn.Module)
         is_adaln = isinstance(self.transport, AdaLNTransport)
-        # Two-phase schedule (adaln only): the first `base_epochs` epochs update ONLY
-        # the closed-form base affine; the rest freeze the base and train ONLY the
-        # adaLN modulation MLP against that stable target. 0 -> legacy joint update.
-        base_epochs = int(getattr(ta, "transport_base_warmup_epochs", 0)) if is_adaln else 0
-        if is_adaln:
+        # Two-phase schedule (gradient transports): the first `base_epochs` epochs
+        # update ONLY the closed-form base affine; the rest freeze the base and train
+        # ONLY the learnable part (adaLN MLP / conv residual) against that stable
+        # target. 0 -> legacy joint update.
+        base_epochs = int(getattr(ta, "transport_base_warmup_epochs", 0)) if is_nn else 0
+        if is_nn:
             self.transport.to(device)
             self.transport.set_online_lr(ta.transport_lr)
             if base_epochs >= n_epochs:
                 logger.warning(
                     f"transport_base_warmup_epochs ({base_epochs}) >= "
-                    f"transport_warmup_epochs ({n_epochs}): the adaLN modulation MLP "
-                    "will not be trained; the transport degrades to the closed-form "
-                    "base affine (equivalent to 'linear')."
+                    f"transport_warmup_epochs ({n_epochs}): the learnable part will "
+                    "not be trained; the transport degrades to the closed-form base "
+                    "affine (equivalent to 'linear')."
                 )
         logger.info(
             f"Transport ({ta.vae_transport}) ONLINE warm-up: {n_epochs} epoch(s), "
             f"{ta.transport_warmup_batches} freshly-rolled-out batch(es)/epoch "
-            f"({'adaln grad step' if is_adaln else 'closed-form on accumulated stats'} "
+            f"({'gradient step' if is_nn else 'closed-form on accumulated stats'} "
             "per epoch), then frozen."
             + (
                 f" Base/MLP split: first {base_epochs} epoch(s) base-only, then "
@@ -1340,6 +1361,11 @@ class XOPDTrainer(BaseTrainer):
             if base_epochs > 0:
                 update_kwargs["update_base"] = ep < base_epochs
                 update_kwargs["update_mod"] = ep >= base_epochs
+            if is_nn:
+                # Gradient transports: many optimizer steps per epoch on the (expensive)
+                # rolled-out pairs, so the learnable part actually converges (1/epoch is
+                # far too slow). Closed-form transports ignore this.
+                update_kwargs["inner_steps"] = int(getattr(ta, "transport_inner_steps", 1))
             recon = self.transport.update_online(z_T_dev, z_S_dev, **update_kwargs)
             logger.info(f"  transport warm-up epoch {ep}: recon_mse={recon:.6f}")
             # 3. Log loss + per-pair comparison images (each pair = one 2-row tile,
@@ -1359,9 +1385,10 @@ class XOPDTrainer(BaseTrainer):
         if self.accelerator.num_processes > 1:
             import torch.distributed as dist
 
-            if is_adaln:
-                # adaln has BOTH gradient params (modulation MLP) and frozen buffers
-                # (A_base, b_base from the closed-form fit) — broadcast both.
+            if is_nn:
+                # nn.Module transports (adaln MLP / conv residual nets) have BOTH
+                # gradient params and frozen buffers (A_base, b_base from the closed-
+                # form fit) — broadcast both so all ranks share rank-0's transport.
                 for p in self.transport.parameters():
                     dist.broadcast(p.data, src=0)
                 for buf in self.transport.buffers():
@@ -1372,7 +1399,7 @@ class XOPDTrainer(BaseTrainer):
                 dist.broadcast(A, src=0)
                 dist.broadcast(b, src=0)
                 self.transport.A, self.transport.b = A, b
-        if is_adaln:
+        if is_nn:
             self.transport.eval()
             for p in self.transport.parameters():
                 p.requires_grad_(False)

@@ -20,6 +20,7 @@ import torch
 
 from flow_factory.trainers.xopd.transport import (
     AdaLNTransport,
+    ConvTransport,
     IdentityTransport,
     LinearTransport,
     MLPTransport,
@@ -359,6 +360,205 @@ class TestAdaLNTransport(unittest.TestCase):
         z_T = torch.randn(2, 6, 5, 5)
         out = t.transport_sample(z_T)
         self.assertEqual(tuple(out.shape), (2, 4, 5, 5))
+
+
+class TestConvTransport(unittest.TestCase):
+    """Strictly-linear conv transport: do-no-harm init, affine pushforward, recon."""
+
+    def _make(self, C_T=8, C_S=4, hidden=16, n_layers=2):
+        return ConvTransport(
+            teacher_to_spatial=_bchw_identity,
+            teacher_from_spatial=_bchw_identity,
+            student_to_spatial=_bchw_identity,
+            student_from_spatial=_bchw_identity,
+            teacher_channels=C_T,
+            student_channels=C_S,
+            hidden_channels=hidden,
+            n_layers=n_layers,
+        )
+
+    @staticmethod
+    def _true_upsample_net(C_T, C_S, f, seed=0):
+        """A fixed LINEAR conv->PixelShuffle map (channels carry the sub-pixel detail).
+
+        This is exactly the regime the per-pixel affine cannot fit (bilinear upsample
+        + per-position channel mix) but a linear conv residual CAN.
+        """
+        import torch.nn as nn
+
+        g = torch.Generator().manual_seed(seed)
+        net = nn.Sequential(nn.Conv2d(C_T, C_S * f * f, 3, padding=1), nn.PixelShuffle(f))
+        for p in net.parameters():
+            p.data = torch.randn(p.shape, generator=g)
+            p.requires_grad_(False)
+        return net
+
+    def test_is_nn_module_with_residual_params(self):
+        import torch.nn as nn
+
+        t = self._make()
+        self.assertIsInstance(t, nn.Module)
+        self.assertTrue(t.requires_warmup)
+        # Residual nets are lazily built on fit; before that there are no params.
+        self.assertEqual(len(list(t.parameters())), 0)
+        z_T = [torch.randn(6, 8, 4, 4) for _ in range(2)]
+        z_S = [torch.randn(6, 4, 8, 8) for _ in range(2)]  # 2x upscale
+        t.fit(z_T, z_S)
+        names = {n for n, _ in t.named_parameters()}
+        self.assertTrue(any(n.startswith("_fwd") for n in names))
+        self.assertTrue(any(n.startswith("_inv") for n in names))
+        buf_names = {n for n, _ in t.named_buffers()}
+        self.assertIn("A_base", buf_names)
+        self.assertIn("b_base", buf_names)
+        self.assertEqual(t._upscale, 2)
+
+    def test_do_no_harm_init_equals_base_affine(self):
+        # Zero-init residual -> right after fit the transport == the closed-form base
+        # affine (bilinear resample + channel affine), i.e. >= LinearTransport.
+        torch.manual_seed(0)
+        C_T, C_S, f = 8, 4, 2
+        z_T = [torch.randn(6, C_T, 4, 4) for _ in range(3)]
+        z_S = [torch.randn(6, C_S, 4 * f, 4 * f) for _ in range(3)]
+        t = self._make(C_T=C_T, C_S=C_S)
+        t.fit(z_T, z_S)
+        probe = torch.randn(2, C_T, 4, 4)
+        out = t.transport_sample(probe)
+        base = channel_affine(
+            resample_spatial(probe, t._student_grid), t.A_base, t.b_base
+        )
+        torch.testing.assert_close(out, base, atol=1e-5, rtol=1e-5)
+
+    def test_linearity_affine_pushforward(self):
+        # Even after training the residual, T is AFFINE: it preserves affine combos,
+        # so E[T(z)] = T(E[z]) and the L1 transition-mean pushforward stays exact.
+        torch.manual_seed(0)
+        C_T, C_S, f = 8, 4, 2
+        true_net = self._true_upsample_net(C_T, C_S, f)
+        t = self._make(C_T=C_T, C_S=C_S)
+        t.set_online_lr(1e-2)
+        for _ in range(30):
+            z_T = [torch.randn(6, C_T, 4, 4) for _ in range(2)]
+            z_S = [true_net(z).detach() for z in z_T]
+            t.update_online(z_T, z_S)
+        z1 = torch.randn(2, C_T, 4, 4)
+        z2 = torch.randn(2, C_T, 4, 4)
+        a = 0.3
+        lhs = t.transport_sample(a * z1 + (1 - a) * z2)
+        rhs = a * t.transport_sample(z1) + (1 - a) * t.transport_sample(z2)
+        torch.testing.assert_close(lhs, rhs, atol=1e-4, rtol=1e-4)
+
+    def test_warmup_recon_beats_affine_floor(self):
+        # On a channel->sub-pixel target (what the affine CANNOT fit), training the
+        # linear conv residual drops the recon far below the base-affine floor.
+        torch.manual_seed(0)
+        C_T, C_S, f = 8, 4, 2
+        true_net = self._true_upsample_net(C_T, C_S, f)
+        t = self._make(C_T=C_T, C_S=C_S, hidden=32, n_layers=2)
+        t.set_online_lr(1e-2)
+        # Fixed eval batch.
+        z_T_eval = torch.randn(8, C_T, 4, 4)
+        z_S_eval = true_net(z_T_eval).detach()
+
+        def recon():
+            with torch.no_grad():
+                return float(
+                    (t.transport_sample(z_T_eval) - z_S_eval).pow(2).mean()
+                )
+
+        # Phase 1: base only -> the affine floor.
+        z_T = [torch.randn(6, C_T, 4, 4) for _ in range(2)]
+        z_S = [true_net(z).detach() for z in z_T]
+        t.update_online(z_T, z_S, update_base=True, update_mod=False)
+        base_floor = recon()
+        # Phase 2: train the residual on frozen base.
+        for _ in range(200):
+            z_T = [torch.randn(6, C_T, 4, 4) for _ in range(2)]
+            z_S = [true_net(z).detach() for z in z_T]
+            t.update_online(z_T, z_S, update_base=False, update_mod=True)
+        final = recon()
+        self.assertLess(final, 0.3 * base_floor)
+
+    def test_inverse_recon_improves(self):
+        # The paired inverse net is directly trained to map z_S -> z_T; training drops
+        # its recon below the analytic base inverse (pinv(A_base) + bilinear downsample).
+        torch.manual_seed(0)
+        C_T, C_S, f = 8, 4, 2
+        true_net = self._true_upsample_net(C_T, C_S, f)
+        t = self._make(C_T=C_T, C_S=C_S, hidden=32, n_layers=2)
+        t.set_online_lr(1e-2)
+        # Fixed eval pair (teacher z_T and its true student image z_S).
+        z_T_eval = torch.randn(8, C_T, 4, 4)
+        z_S_eval = true_net(z_T_eval).detach()
+
+        def inv_err():
+            with torch.no_grad():
+                return float(
+                    (t._inverse_spatial(z_S_eval) - z_T_eval).pow(2).mean()
+                )
+
+        t.update_online(
+            [torch.randn(6, C_T, 4, 4)],
+            [true_net(torch.randn(6, C_T, 4, 4)).detach()],
+            update_base=True,
+            update_mod=False,
+        )
+        before = inv_err()
+        for _ in range(200):
+            z_T = [torch.randn(6, C_T, 4, 4) for _ in range(2)]
+            z_S = [true_net(z).detach() for z in z_T]
+            t.update_online(z_T, z_S, update_base=False, update_mod=True)
+        after = inv_err()
+        self.assertLess(after, before)
+
+    def test_requires_update_base_before_mod(self):
+        # update_mod before the residual nets exist (no base/grids yet) must raise.
+        t = self._make()
+        with self.assertRaises(RuntimeError):
+            t.update_online(
+                [torch.randn(2, 8, 4, 4)],
+                [torch.randn(2, 4, 8, 8)],
+                update_base=False,
+                update_mod=True,
+            )
+
+    def test_non_integer_upscale_raises(self):
+        # Teacher 3x3 -> student 4x4 is not an integer upscale -> fail fast.
+        t = self._make()
+        with self.assertRaises(ValueError):
+            t.fit([torch.randn(2, 8, 3, 3)], [torch.randn(2, 4, 4, 4)])
+
+    def test_state_dict_roundtrip(self):
+        torch.manual_seed(0)
+        C_T, C_S, f = 8, 4, 2
+        true_net = self._true_upsample_net(C_T, C_S, f)
+        t = self._make(C_T=C_T, C_S=C_S)
+        t.set_online_lr(1e-2)
+        for _ in range(10):
+            z_T = [torch.randn(6, C_T, 4, 4) for _ in range(2)]
+            z_S = [true_net(z).detach() for z in z_T]
+            t.update_online(z_T, z_S)
+        sd = t.state_dict()
+        self.assertIn("_student_grid", sd)
+        self.assertIn("_upscale", sd)
+        t2 = self._make(C_T=C_T, C_S=C_S)
+        t2.load_state_dict(sd)
+        self.assertTrue(t2.is_fitted)
+        probe = torch.randn(2, C_T, 4, 4)
+        torch.testing.assert_close(t2.transport_sample(probe), t.transport_sample(probe))
+
+    def test_build_via_factory(self):
+        for name in ("conv", "conv_linear"):
+            t = build_transport(
+                name,
+                teacher_to_spatial=_bchw_identity,
+                teacher_from_spatial=_bchw_identity,
+                student_to_spatial=_bchw_identity,
+                student_from_spatial=_bchw_identity,
+                teacher_channels=8,
+                student_channels=4,
+            )
+            self.assertIsInstance(t, ConvTransport)
+            self.assertTrue(t.requires_warmup)
 
 
 class TestMLPTransportPlaceholder(unittest.TestCase):

@@ -755,6 +755,7 @@ class AdaLNTransport(VAETransport, nn.Module):
         sigma_list=None,
         update_base: bool = True,
         update_mod: bool = True,
+        inner_steps: int = 1,
         **ctx,
     ) -> float:
         """One warm-up step: optionally re-solve the base and/or step the adaLN MLP.
@@ -811,20 +812,28 @@ class AdaLNTransport(VAETransport, nn.Module):
                 self._A_base_pinv = None  # A_base changed -> invalidate cached inverse
                 self._fitted = True
 
-        # 2) One Adam step on the adaLN-Zero modulation MLP ----------------------
+        # 2) inner_steps Adam steps on the adaLN-Zero modulation MLP -------------
+        # The teacher rollout is the expensive part, so reuse this epoch's pairs for
+        # many cheap MLP steps (1 step/epoch converges glacially). Report the HELD-OUT
+        # recon measured BEFORE the steps (honest generalization signal).
         if update_mod:
             if self._online_opt is None:
                 self._online_opt = torch.optim.Adam(self.mod_mlp.parameters(), lr=self._online_lr)
+            with torch.no_grad():
+                pre = 0.0
+                for z_T, z_S, s in zip(z_T_list, z_S_list, sigma_list):
+                    pred = self.transport_sample(z_T, sigma=s)
+                    pre += float((pred.float() - z_S.float()).pow(2).mean())
+                pre_recon = pre / n
             self.train()
-            self._online_opt.zero_grad()
-            total = 0.0
-            for z_T, z_S, s in zip(z_T_list, z_S_list, sigma_list):
-                pred = self.transport_sample(z_T, sigma=s)
-                loss = (pred.float() - z_S.float()).pow(2).mean() / n  # average -> grad accumulate
-                loss.backward()
-                total += float(loss.detach()) * n
-            self._online_opt.step()
-            return total / n
+            for _ in range(max(1, int(inner_steps))):
+                self._online_opt.zero_grad()
+                for z_T, z_S, s in zip(z_T_list, z_S_list, sigma_list):
+                    pred = self.transport_sample(z_T, sigma=s)
+                    loss = (pred.float() - z_S.float()).pow(2).mean() / n  # average -> grad accumulate
+                    loss.backward()
+                self._online_opt.step()
+            return pre_recon
 
         # Base-only update: report a no_grad recon (current base + neutral mod) for logging.
         with torch.no_grad():
@@ -905,6 +914,337 @@ class AdaLNTransport(VAETransport, nn.Module):
         nn.Module.load_state_dict(self, state, strict=strict)
 
 
+class ConvTransport(VAETransport, nn.Module):
+    """M2-conv: a STRICTLY-LINEAR convolutional transport (learned upsample + conv).
+
+    Motivation. :class:`LinearTransport` / :class:`AdaLNTransport` are per-position
+    channel affines applied *after a bilinear resample*. When the teacher latent grid
+    is COARSER than the student's (FLUX.2 ``32x32x128`` -> SD3.5 ``64x64x16``) that
+    bilinear upsample is a hard blur floor, and the adaLN per-channel modulation is
+    spatially uniform so it cannot add any spatial detail. Empirically the recon MSE
+    plateaus (~0.10) and the transported image is blurry. The teacher's 128 channels
+    are a 2x2 patchify of its 32-channel VAE latent, i.e. the sub-pixel detail lives
+    in the channels; a *learned* upsample (PixelShuffle) plus multi-tap convs give a
+    spatial receptive field that recovers it.
+
+    Linearity (why this still fits XOPD). Every component is linear/affine:
+
+        T(z) = base(z) + residual(z)
+        base(z)     = channel_affine(resample_bilinear(z, student_grid), A_base, b_base)
+        residual(z) = Conv2d* -> PixelShuffle   (NO activation / normalization)
+
+    so ``T(z) = L z + c`` with ``L`` linear and ``c`` constant. Hence the L1
+    transition-mean pushforward stays EXACT (``E[T(z)] = T(E[z])``) — the property the
+    non-linear M2-nonlinear/M5 transports give up. The added capacity over the affine
+    is purely the spatial receptive field + learned (vs bilinear) upsampling.
+
+    do-no-harm init (adaLN-Zero style). ``A_base, b_base`` are the frozen closed-form
+    least-squares affine (the M2 workhorse, == :class:`LinearTransport`); the residual
+    net's LAST conv is ZERO-INITIALIZED, so at warm-up start ``T == base`` (>= linear
+    from epoch 0) and the residual can only improve on it.
+
+    Inverse (the L1 teacher query ``x_S -> Z_T``). A PAIRED linear inverse net
+    ``T_inv(z') = base_inv(z') + residual_inv(z')`` with ``base_inv`` the cached
+    ``pinv(A_base)`` + bilinear downsample (the current analytic inverse) and a
+    zero-init learned residual. Forward + inverse are trained jointly with forward
+    recon + inverse recon + cycle consistency (the "two mutually-inverse networks").
+    """
+
+    requires_warmup = True
+
+    def __init__(
+        self,
+        teacher_to_spatial: Callable,
+        teacher_from_spatial: Callable,
+        student_to_spatial: Callable,
+        student_from_spatial: Callable,
+        teacher_channels: int,
+        student_channels: int,
+        student_grid: Optional[Tuple[int, int]] = None,
+        teacher_grid: Optional[Tuple[int, int]] = None,
+        hidden_channels: int = 64,
+        n_layers: int = 2,
+        kernel_size: int = 3,
+        inverse_coef: float = 1.0,
+        cycle_coef: float = 1.0,
+        ridge: float = 1e-4,
+    ):
+        nn.Module.__init__(self)
+        self.t2s = teacher_to_spatial
+        self.t_from = teacher_from_spatial
+        self.s2s = student_to_spatial
+        self.s_from = student_from_spatial
+        self.C_T = int(teacher_channels)
+        self.C_S = int(student_channels)
+        if hidden_channels <= 0 or n_layers <= 0 or kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(
+                "ConvTransport needs hidden_channels>0, n_layers>0, odd kernel_size>0; "
+                f"got hidden_channels={hidden_channels}, n_layers={n_layers}, "
+                f"kernel_size={kernel_size}."
+            )
+        self.hidden = int(hidden_channels)
+        self.n_layers = int(n_layers)
+        self.k = int(kernel_size)
+        self.inverse_coef = float(inverse_coef)
+        self.cycle_coef = float(cycle_coef)
+        self.ridge = float(ridge)
+        self._student_grid = tuple(student_grid) if student_grid is not None else None
+        self._teacher_grid = tuple(teacher_grid) if teacher_grid is not None else None
+        self._fitted = False
+
+        # --- Frozen closed-form base affine (M2 workhorse), as buffers ----------
+        C = min(self.C_T, self.C_S)
+        A0 = torch.zeros(self.C_S, self.C_T)
+        A0[torch.arange(C), torch.arange(C)] = 1.0
+        self.register_buffer("A_base", A0)
+        self.register_buffer("b_base", torch.zeros(self.C_S))
+        self._neq_G: Optional[torch.Tensor] = None
+        self._neq_XtY: Optional[torch.Tensor] = None
+        self._A_base_pinv: Optional[torch.Tensor] = None
+
+        # --- Learned LINEAR residual nets (lazily built once grids are known) ----
+        self._upscale: Optional[int] = None
+        self._fwd: Optional[nn.Module] = None  # (B,C_T,H_T,W_T) -> (B,C_S,H_S,W_S)
+        self._inv: Optional[nn.Module] = None  # (B,C_S,H_S,W_S) -> (B,C_T,H_T,W_T)
+        self._online_opt = None
+        self._online_lr = 1.0e-3
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._fitted
+
+    # ----- lazy residual-net construction (needs the upscale factor) -----------
+    def _make_forward_net(self, f: int) -> nn.Module:
+        """Linear teacher->student residual: convs then PixelShuffle upsample by ``f``."""
+        k, p = self.k, self.k // 2
+        layers: List[nn.Module] = [nn.Conv2d(self.C_T, self.hidden, k, padding=p)]
+        for _ in range(self.n_layers - 1):
+            layers.append(nn.Conv2d(self.hidden, self.hidden, k, padding=p))
+        last = nn.Conv2d(self.hidden, self.C_S * f * f, k, padding=p)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)  # do-no-harm: residual starts at 0
+        layers.append(last)
+        layers.append(nn.PixelShuffle(f))
+        return nn.Sequential(*layers)
+
+    def _make_inverse_net(self, f: int) -> nn.Module:
+        """Linear student->teacher residual: PixelUnshuffle downsample then convs."""
+        k, p = self.k, self.k // 2
+        layers: List[nn.Module] = [
+            nn.PixelUnshuffle(f),
+            nn.Conv2d(self.C_S * f * f, self.hidden, k, padding=p),
+        ]
+        for _ in range(self.n_layers - 1):
+            layers.append(nn.Conv2d(self.hidden, self.hidden, k, padding=p))
+        last = nn.Conv2d(self.hidden, self.C_T, k, padding=p)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)  # do-no-harm
+        layers.append(last)
+        return nn.Sequential(*layers)
+
+    def _build_residual_nets(self, device, dtype) -> None:
+        if self._fwd is not None:
+            return
+        if self._student_grid is None or self._teacher_grid is None:
+            raise RuntimeError(
+                "ConvTransport._build_residual_nets called before spatial grids are "
+                "known (run a warm-up update or init_from_moments first)."
+            )
+        Hs, Ws = self._student_grid
+        Ht, Wt = self._teacher_grid
+        if Ht <= 0 or Wt <= 0 or Hs % Ht != 0 or Ws % Wt != 0:
+            raise ValueError(
+                "ConvTransport requires an INTEGER spatial upscale teacher->student; "
+                f"got teacher_grid={self._teacher_grid} -> student_grid={self._student_grid}."
+            )
+        fh, fw = Hs // Ht, Ws // Wt
+        if fh != fw:
+            raise ValueError(
+                f"ConvTransport requires an isotropic upscale; got fh={fh}, fw={fw} "
+                f"(teacher_grid={self._teacher_grid}, student_grid={self._student_grid})."
+            )
+        self._upscale = int(fh)
+        self._fwd = self._make_forward_net(self._upscale).to(device=device, dtype=dtype)
+        self._inv = self._make_inverse_net(self._upscale).to(device=device, dtype=dtype)
+
+    def _A_base_pinv_cached(self, dtype: torch.dtype) -> torch.Tensor:
+        if self._A_base_pinv is None:
+            self._A_base_pinv = torch.linalg.pinv(self.A_base.double()).float()  # (C_T, C_S)
+        return self._A_base_pinv.to(dtype)
+
+    # ----- core linear maps (canonical BCHW) -----------------------------------
+    def _forward_spatial(self, T_spatial: torch.Tensor) -> torch.Tensor:
+        base_rs = resample_spatial(T_spatial, self._student_grid)
+        base = torch.einsum("sc,bchw->bshw", self.A_base.to(T_spatial.dtype), base_rs)
+        base = base + self.b_base.to(T_spatial.dtype).view(1, -1, 1, 1)
+        if self._fwd is None:
+            return base
+        return base + self._fwd(T_spatial.to(self._fwd[0].weight.dtype)).to(base.dtype)
+
+    def _inverse_spatial(self, S_spatial: torch.Tensor) -> torch.Tensor:
+        A_pinv = self._A_base_pinv_cached(S_spatial.dtype)  # (C_T, C_S)
+        base = S_spatial - self.b_base.to(S_spatial.dtype).view(1, -1, 1, 1)
+        base = torch.einsum("cs,bshw->bchw", A_pinv, base)
+        base = resample_spatial(base, self._teacher_grid)
+        if self._inv is None:
+            return base
+        inv_w = self._inv[1].weight  # first Conv2d after PixelUnshuffle
+        return base + self._inv(S_spatial.to(inv_w.dtype)).to(base.dtype)
+
+    def transport_sample(self, z_T: torch.Tensor, sigma=None, **ctx) -> torch.Tensor:
+        # Linear transport: ignores `sigma` (no timestep condition by design).
+        return self.s_from(self._forward_spatial(self.t2s(z_T)))
+
+    def transition_mean_to_student(self, x_S, query_teacher_mean, sigma=None, **ctx):
+        T_spatial = self._inverse_spatial(self.s2s(x_S))
+        x_T = self.t_from(T_spatial)
+        mu_T = query_teacher_mean(x_T)
+        muS_spatial = self._forward_spatial(self.t2s(mu_T))  # forward = EXACT linear pushforward
+        return self.s_from(muS_spatial)
+
+    # ----- warm-up -------------------------------------------------------------
+    @torch.no_grad()
+    def _resolve_base(self, z_T_list, z_S_list) -> None:
+        """Accumulate normal equations and re-solve the closed-form base affine."""
+        T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+        S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+        self._teacher_grid = tuple(T_spatial.shape[-2:])
+        self._student_grid = tuple(S_spatial.shape[-2:])
+        T_rs = resample_spatial(T_spatial, self._student_grid)
+        X = T_rs.permute(0, 2, 3, 1).reshape(-1, self.C_T).double()
+        Y = S_spatial.permute(0, 2, 3, 1).reshape(-1, self.C_S).double()
+        ones = torch.ones(X.shape[0], 1, dtype=X.dtype, device=X.device)
+        Xa = torch.cat([X, ones], dim=1)
+        G_batch = Xa.transpose(0, 1) @ Xa
+        XtY_batch = Xa.transpose(0, 1) @ Y
+        if self._neq_G is None:
+            self._neq_G, self._neq_XtY = G_batch, XtY_batch
+        else:
+            self._neq_G = self._neq_G + G_batch
+            self._neq_XtY = self._neq_XtY + XtY_batch
+        reg = self.ridge * torch.eye(
+            self._neq_G.shape[0], dtype=self._neq_G.dtype, device=self._neq_G.device
+        )
+        reg[-1, -1] = 0.0
+        W = torch.linalg.solve(self._neq_G + reg, self._neq_XtY)  # (C_T+1, C_S)
+        self.A_base.data = W[:-1, :].transpose(0, 1).contiguous().float().to(self.A_base.device)
+        self.b_base.data = W[-1, :].contiguous().float().to(self.b_base.device)
+        self._A_base_pinv = None  # A_base changed -> invalidate cached inverse
+        self._fitted = True
+        self._build_residual_nets(T_spatial.device, torch.float32)
+
+    @torch.no_grad()
+    def init_from_moments(self, z_T_list, z_S_list) -> None:
+        """Closed-form base affine fit + lazy residual-net construction (do-no-harm)."""
+        self._resolve_base(z_T_list, z_S_list)
+
+    def fit(self, z_T_list, z_S_list, **ctx) -> None:
+        self.init_from_moments(z_T_list, z_S_list)
+
+    def set_online_lr(self, lr: float) -> None:
+        self._online_lr = float(lr)
+
+    def update_online(
+        self,
+        z_T_list,
+        z_S_list,
+        sigma_list=None,
+        update_base: bool = True,
+        update_mod: bool = True,
+        inner_steps: int = 1,
+        **ctx,
+    ) -> float:
+        """One warm-up EPOCH: optionally re-solve the base and/or step the residual nets.
+
+        ``sigma_list`` is accepted for interface parity but IGNORED (the conv transport
+        is unconditional/linear). The two flags let the trainer run a TWO-PHASE
+        schedule (warm the closed-form base first, then train the linear residual nets
+        against a frozen base).
+
+        ``inner_steps``: the teacher rollout that produced these pairs is the expensive
+        part, so we POOL the epoch's pairs into one batch and take ``inner_steps`` Adam
+        steps on it (1 step/epoch converges glacially; the residual needs hundreds of
+        steps). Fresh pairs each epoch keep it from overfitting the pool. Returns the
+        HELD-OUT forward-recon MSE measured on this epoch's fresh pool BEFORE the steps
+        (an honest generalization signal for logging), not the post-fit value.
+        """
+        if update_base:
+            self._resolve_base(z_T_list, z_S_list)
+
+        if update_mod:
+            if self._fwd is None or self._inv is None:
+                raise RuntimeError(
+                    "ConvTransport.update_online(update_mod=True) before the residual "
+                    "nets exist; call with update_base=True (or fit()) first so the "
+                    "spatial grids and nets are built."
+                )
+            if self._online_opt is None:
+                params = list(self._fwd.parameters()) + list(self._inv.parameters())
+                self._online_opt = torch.optim.Adam(params, lr=self._online_lr)
+            # Pool this epoch's freshly-rolled pairs into one batch.
+            T_all = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+            S_all = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+            # Honest held-out recon: BEFORE any step, using the residual learned so far.
+            with torch.no_grad():
+                pre_recon = float(
+                    (self._forward_spatial(T_all).float() - S_all.float()).pow(2).mean()
+                )
+            self.train()
+            for _ in range(max(1, int(inner_steps))):
+                self._online_opt.zero_grad()
+                S_pred = self._forward_spatial(T_all)        # forward recon
+                T_pred = self._inverse_spatial(S_all)        # inverse recon
+                T_cyc = self._inverse_spatial(S_pred)        # cycle T->S->T
+                S_cyc = self._forward_spatial(T_pred)        # cycle S->T->S
+                loss_fwd = (S_pred.float() - S_all.float()).pow(2).mean()
+                loss_inv = (T_pred.float() - T_all.float()).pow(2).mean()
+                loss_cyc = (
+                    (T_cyc.float() - T_all.float()).pow(2).mean()
+                    + (S_cyc.float() - S_all.float()).pow(2).mean()
+                )
+                loss = (
+                    loss_fwd
+                    + self.inverse_coef * loss_inv
+                    + self.cycle_coef * loss_cyc
+                )
+                loss.backward()
+                self._online_opt.step()
+            return pre_recon
+
+        # base-only epoch: report a no_grad forward recon for logging.
+        with torch.no_grad():
+            n = max(1, len(z_T_list))
+            total = 0.0
+            for z_T, z_S in zip(z_T_list, z_S_list):
+                S_pred = self._forward_spatial(self.t2s(z_T))
+                total += float((S_pred.float() - self.s2s(z_S).float()).pow(2).mean())
+        return total / n
+
+    def state_dict(self, *args, **kwargs) -> dict:
+        sd = dict(nn.Module.state_dict(self, *args, **kwargs))
+        sd["_student_grid"] = self._student_grid
+        sd["_teacher_grid"] = self._teacher_grid
+        sd["_upscale"] = self._upscale
+        sd["_fitted"] = self._fitted
+        return sd
+
+    def load_state_dict(self, state: dict, strict: bool = True) -> None:
+        state = dict(state)
+        self._student_grid = state.pop("_student_grid", None)
+        self._teacher_grid = state.pop("_teacher_grid", None)
+        self._upscale = state.pop("_upscale", None)
+        self._fitted = state.pop("_fitted", False)
+        self._A_base_pinv = None
+        # Build the residual nets (so their params exist) before loading them.
+        if (
+            self._fwd is None
+            and self._student_grid is not None
+            and self._teacher_grid is not None
+        ):
+            self._build_residual_nets(self.A_base.device, self.A_base.dtype)
+        nn.Module.load_state_dict(self, state, strict=strict)
+
+
 class MLPTransport(VAETransport):
     """Placeholder for a future non-linear transport (and its inverse).
 
@@ -949,9 +1289,11 @@ def build_transport(transport_type: str, **kwargs) -> VAETransport:
         return WhiteningTransport(**kwargs)
     if t == "adaln":
         return AdaLNTransport(**kwargs)
+    if t in ("conv", "conv_linear"):
+        return ConvTransport(**kwargs)
     if t == "mlp":
         return MLPTransport(**kwargs)
     raise ValueError(
-        f"Unknown vae_transport type {transport_type!r}; "
-        "expected one of {'identity', 'pixel', 'linear', 'whitening', 'adaln', 'mlp'}."
+        f"Unknown vae_transport type {transport_type!r}; expected one of "
+        "{'identity', 'pixel', 'linear', 'whitening', 'adaln', 'conv', 'mlp'}."
     )
