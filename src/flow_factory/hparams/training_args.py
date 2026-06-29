@@ -2287,6 +2287,37 @@ class XOPDTrainingArguments(TrainingArguments):
         metadata={"help": "KL anchor coefficient against the base model; 0 disables."},
     )
 
+    # ---- L1 training-timestep selection (parallel to scheduler sde_steps/num_sde_steps) ----
+    xopd_train_steps: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "L1-ONLY: candidate k_idx indices INTO the base per-rollout training-step "
+                "list (the same list that ODE=range(num_inference_steps) / SDE="
+                "scheduler.train_timesteps produce; 0-based). When set, L1 on-policy "
+                "distillation (teacher forward + pathwise D_k MSE; and under SDE the "
+                "SDE/REINFORCE steps) is restricted to these positions; the student still "
+                "rolls out the FULL trajectory. Parallel to scheduler.sde_steps. "
+                "null (default) => all base steps. Combine with num_xopd_steps to randomly "
+                "subsample these per epoch."
+            )
+        },
+    )
+    num_xopd_steps: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "L1-ONLY: how many steps to RANDOMLY pick per epoch from the candidate "
+                "pool (xopd_train_steps, or the full base list if xopd_train_steps is "
+                "null) for L1 distillation. Re-drawn each epoch (deterministic via "
+                "epoch+seed), exactly like scheduler.num_sde_steps draws from sde_steps. "
+                "null or >= pool size => use the whole pool (no subsampling). The "
+                "auto-GAS multiplier and num_train_timesteps become this fixed count, so "
+                "the one-optimizer-step-per-epoch invariant holds."
+            )
+        },
+    )
+
     # ---- Multi-source training data (optional) ----
     source_ratio: Optional[Dict[str, float]] = field(
         default=None,
@@ -2393,6 +2424,33 @@ class XOPDTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"Invalid kl_type for XOPD: {self.kl_type!r}; expected 'x-based' or 'v-based'."
             )
+        # L1 training-timestep selection (xopd_train_steps / num_xopd_steps).
+        if self.xopd_train_steps is not None:
+            if len(self.xopd_train_steps) == 0:
+                raise ValueError(
+                    "`xopd_train_steps` must be a non-empty list of k_idx indices, or null "
+                    "for all steps."
+                )
+            if any((not isinstance(i, int)) or i < 0 for i in self.xopd_train_steps):
+                raise ValueError(
+                    f"`xopd_train_steps` must be non-negative ints, got {self.xopd_train_steps!r}."
+                )
+            if len(set(self.xopd_train_steps)) != len(self.xopd_train_steps):
+                raise ValueError(
+                    f"`xopd_train_steps` must be unique, got {self.xopd_train_steps!r}."
+                )
+        if self.num_xopd_steps is not None:
+            if self.num_xopd_steps < 1:
+                raise ValueError(
+                    f"`num_xopd_steps` must be >= 1 (or null), got {self.num_xopd_steps!r}."
+                )
+            if self.xopd_train_steps is not None and self.num_xopd_steps > len(
+                self.xopd_train_steps
+            ):
+                raise ValueError(
+                    f"`num_xopd_steps`={self.num_xopd_steps} cannot exceed the candidate pool "
+                    f"len(xopd_train_steps)={len(self.xopd_train_steps)}."
+                )
         # Student guidance drives sampling and the gradient-bearing forward; sync
         # it into the base `guidance_scale` field consumed by adapter.inference.
         self.guidance_scale = self.student_guidance_scale
@@ -2400,6 +2458,19 @@ class XOPDTrainingArguments(TrainingArguments):
     def get_num_train_timesteps(self, args: Any) -> int:
         # L1 enters accelerator.accumulate() once per training timestep (like OPD),
         # so GAS is multiplied by T. L0 manages its own accumulation separately.
+        #
+        # xopd_train_steps / num_xopd_steps restrict L1 to a (possibly randomly
+        # subsampled) subset of the base steps. The GAS multiplier must be the FIXED
+        # subset size so one-optimizer-step-per-epoch holds across epochs (mirrors how
+        # num_sde_steps is a fixed count even though the SDE steps are re-drawn each
+        # epoch). Precedence: num_xopd_steps > len(xopd_train_steps) > base count.
+        if self.num_xopd_steps is not None and self.num_xopd_steps > 0:
+            pool = len(self.xopd_train_steps) if self.xopd_train_steps else None
+            if pool is not None:
+                return min(self.num_xopd_steps, pool)
+            return self.num_xopd_steps
+        if self.xopd_train_steps:
+            return len(self.xopd_train_steps)
         if args.scheduler_args.dynamics_type == "ODE":
             return self.num_inference_steps
         return args.scheduler_args.num_sde_steps

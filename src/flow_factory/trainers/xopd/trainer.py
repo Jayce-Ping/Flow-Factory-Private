@@ -172,8 +172,11 @@ class XOPDTrainer(BaseTrainer):
         #     auto-rounded up if not, and L0 then runs l0_inner_steps // T steps/epoch.
         # `T` actually iterated per micro-batch; matches the GAS multiplier
         # (get_num_train_timesteps) unless num_sde_steps > len(sde_steps), in which
-        # case the validation below trips with a clear message.
-        self.num_train_timesteps = len(self._train_timestep_indices)
+        # case the validation below trips with a clear message. With
+        # xopd_train_steps/num_xopd_steps the per-epoch subset is random but its SIZE
+        # is FIXED, so use get_num_train_timesteps (the canonical fixed count) rather
+        # than len() of one (possibly random) draw, keeping GAS consistent across epochs.
+        self.num_train_timesteps = ta.get_num_train_timesteps(self.config)
         validate_l1_one_step_per_epoch(
             num_batches_per_epoch=ta.num_batches_per_epoch,
             num_train_timesteps=self.num_train_timesteps,
@@ -572,11 +575,59 @@ class XOPDTrainer(BaseTrainer):
 
     # =============================== Properties ===============================
     @property
-    def _train_timestep_indices(self):
-        """Training timestep indices: all steps for ODE, scheduler-selected for SDE."""
+    def _base_train_timestep_indices(self):
+        """Base per-rollout training-step indices BEFORE xopd_train_steps selection.
+
+        All steps for ODE, scheduler-selected (post-SDE) for SDE. This is the pool
+        that ``xopd_train_steps`` indexes into.
+        """
         if self._is_ode:
             return list(range(self.training_args.num_inference_steps))
-        return self.adapter.scheduler.train_timesteps
+        ts = self.adapter.scheduler.train_timesteps
+        return ts.tolist() if hasattr(ts, "tolist") else list(ts)
+
+    @property
+    def _train_timestep_indices(self):
+        """L1 training-timestep indices (subset of the base list).
+
+        ``xopd_train_steps`` (config) selects k_idx positions of the base list; with
+        ``num_xopd_steps`` a fixed-size random subset is drawn PER EPOCH (deterministic
+        via epoch+seed, parallel to scheduler.current_sde_steps). The selection is
+        CACHED per epoch so every consumer in one epoch (sample / D_k pre-pass /
+        optimize) sees the SAME steps; the subset SIZE is fixed (= num_xopd_steps or
+        len(xopd_train_steps)) so GAS / one-step-per-epoch stays consistent. null/null
+        => the full base list (legacy behavior).
+        """
+        ta = self.training_args
+        base = self._base_train_timestep_indices
+
+        # Candidate pool = xopd_train_steps positions into base, else the whole base.
+        if ta.xopd_train_steps:
+            if any(i >= len(base) for i in ta.xopd_train_steps):
+                raise ValueError(
+                    f"xopd_train_steps={ta.xopd_train_steps} has an index >= the number of "
+                    f"base training steps ({len(base)} for "
+                    f"{'ODE' if self._is_ode else 'SDE'}). Indices are 0-based positions "
+                    "into the per-rollout training-step list."
+                )
+            pool = [base[i] for i in ta.xopd_train_steps]
+        else:
+            pool = list(base)
+
+        # No random subsampling -> use the whole pool.
+        if ta.num_xopd_steps is None or ta.num_xopd_steps >= len(pool):
+            return pool
+
+        # Per-epoch deterministic random subset (cached so all consumers agree).
+        epoch = getattr(self, "epoch", 0)
+        if getattr(self, "_xopd_tts_cache_epoch", None) != epoch:
+            g = torch.Generator().manual_seed(int(epoch) + int(ta.seed))
+            sel = torch.randperm(len(pool), generator=g)[: ta.num_xopd_steps]
+            sel = sorted(sel.tolist())  # ascending trajectory order
+            self._xopd_tts_cache = [pool[i] for i in sel]
+            self._xopd_tts_cache_epoch = epoch
+        return self._xopd_tts_cache
+
 
     @property
     def enable_kl_loss(self) -> bool:
