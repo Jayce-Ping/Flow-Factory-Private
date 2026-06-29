@@ -668,7 +668,14 @@ class AdaLNTransport(VAETransport, nn.Module):
         batch, then take a single Adam step (so one transport update per epoch on
         fresh data). The Adam state persists across epochs. Uses a dedicated
         optimizer (NOT accelerator) so it is fully decoupled from the XOPD GAS loop.
+
+        On the FIRST call, sets the teacher/student spatial grids (so transport_sample
+        resamples correctly) and moment-matches the affine for a neutral cold start.
         """
+        if not self._fitted:
+            # First epoch: set grids + neutral moment-match init (no_grad), then
+            # the gradient loop below refines on this and subsequent fresh batches.
+            self.init_from_moments(z_T_list, z_S_list)
         if self._online_opt is None:
             self._online_opt = torch.optim.Adam(self.parameters(), lr=self._online_lr)
         self.train()
