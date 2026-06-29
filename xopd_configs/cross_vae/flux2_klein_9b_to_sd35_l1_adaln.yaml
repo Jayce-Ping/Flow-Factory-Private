@@ -65,7 +65,7 @@ train:
   vae_transport: "adaln"                   # Learnable diagonal AdaLN affine: moment-match init + short latent-recon warm-up (gradient), then FROZEN for L1. Transport scan sibling.
   transport_warmup_batches: 480            # paired-latent batches collected for transport warm-up (whitening/linear closed-form fit, adaln gradient loop); pixel ignores. Raised 64->480 for a better-conditioned fit.
   transport_lr: 1.0e-3                     # adaln warm-up Adam LR
-  transport_warmup_epochs: 30              # adaln warm-up gradient passes over the 480 collected batches, then frozen
+  transport_warmup_epochs: 100             # adaln transport warm-up gradient passes over the 480 collected pairs, then frozen (raised 30->100 for better transport cold-start)
 
   # --- Dual classifier-free guidance ---
   teacher_guidance_scale: 1.0

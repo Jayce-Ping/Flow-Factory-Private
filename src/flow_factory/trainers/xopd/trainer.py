@@ -1070,8 +1070,11 @@ class XOPDTrainer(BaseTrainer):
             img_list.append(images.float().cpu())
         return z_T_list, z_S_list, img_list
 
-    def _warmup_comparison_image(self, z_T_dev, z_S_dev, n: int = 4):
+    def _warmup_comparison_image(self, z_T, z_S, n: int = 4):
         """Build a 2-row comparison PIL image for warm-up visualization.
+
+        ``z_T`` / ``z_S`` are batched TENSORS (teacher-native packed latent and the
+        paired student-space target latent, respectively).
 
         Top row    = student-space TARGET latent decoded (``decode_latents(z_S)``),
                      i.e. the pixel-bridge ground truth in student latent space.
@@ -1082,11 +1085,20 @@ class XOPDTrainer(BaseTrainer):
         from PIL import Image as _PILImage
 
         try:
+            dev = self.accelerator.device
+            n = min(n, z_T.shape[0], z_S.shape[0])
+            if n <= 0:
+                return None
             with torch.no_grad():
-                z_S = z_S_dev[:n]
-                z_Thad = self.transport.transport_sample(z_T_dev[:n])  # student-space
-                top = self.adapter.decode_latents(z_S.to(self.accelerator.device), output_type="pil")
-                bot = self.adapter.decode_latents(z_Thad.to(self.accelerator.device), output_type="pil")
+                z_S_n = z_S[:n].to(dev)
+                z_T_n = z_T[:n].to(dev)
+                z_Thad = self.transport.transport_sample(z_T_n)  # -> student-space latent
+                top = self.adapter.decode_latents(z_S_n, output_type="pil")
+                bot = self.adapter.decode_latents(z_Thad, output_type="pil")
+            if not isinstance(top, (list, tuple)):
+                top = [top]
+            if not isinstance(bot, (list, tuple)):
+                bot = [bot]
             cols = min(len(top), len(bot), n)
             if cols == 0:
                 return None
@@ -1097,7 +1109,7 @@ class XOPDTrainer(BaseTrainer):
                 grid.paste(bot[i].resize((w, h)), (i * w, h))
             return grid
         except Exception as e:  # viz must never break training
-            logger.warning(f"warm-up comparison image failed: {e}")
+            logger.warning(f"warm-up comparison image failed: {type(e).__name__}: {e}")
             return None
 
     def _warmup_transport(self) -> None:
@@ -1148,7 +1160,7 @@ class XOPDTrainer(BaseTrainer):
                         recon = float((pred.float() - z0_S.float()).pow(2).mean().detach())
                         data = {"warmup/transport_recon_mse": recon}
                         if wstep % 8 == 0 or wstep == len(z_T_list) - 1:
-                            img = self._warmup_comparison_image([z0_T], [z0_S], n=z0_T.shape[0])
+                            img = self._warmup_comparison_image(z0_T, z0_S, n=min(4, z0_T.shape[0]))
                             if img is not None:
                                 data["warmup/target_vs_transported"] = img
                         self.log_warmup_data(data, step=wstep)
@@ -1192,7 +1204,7 @@ class XOPDTrainer(BaseTrainer):
                 if ep % 5 == 0 or ep == n_epochs - 1:
                     z0_T = z_T_list[0].to(device)
                     z0_S = z_S_list[0].to(device)
-                    img = self._warmup_comparison_image([z0_T], [z0_S], n=z0_T.shape[0])
+                    img = self._warmup_comparison_image(z0_T, z0_S, n=min(4, z0_T.shape[0]))
                     if img is not None:
                         data["warmup/target_vs_transported"] = img
                 self.log_warmup_data(data, step=ep)
