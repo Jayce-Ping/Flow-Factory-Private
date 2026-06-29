@@ -220,7 +220,7 @@ class TestAdaLNTransport(unittest.TestCase):
         t = self._make()
         self.assertIsInstance(t, nn.Module)
         names = {n for n, _ in t.named_parameters()}
-        self.assertEqual(names, {"log_gamma", "beta"})
+        self.assertEqual(names, {"log_gamma", "beta", "W"})
         self.assertTrue(t.requires_warmup)
 
     def test_default_is_identity(self):

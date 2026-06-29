@@ -556,25 +556,27 @@ class WhiteningTransport(LinearTransport):
 
 
 class AdaLNTransport(VAETransport, nn.Module):
-    """Learnable AdaLN-style affine transport (per-channel scale + shift), trainable.
+    """Learnable full-affine + AdaLN-style modulation transport, trainable.
 
-    The trainable counterpart of :class:`WhiteningTransport`: the per-channel
-    ``gamma, beta`` are ``nn.Parameter`` s optimized jointly with the student
-    (a SECOND trainable module, DDP/DeepSpeed-prepared by the trainer). Theory:
-    docs/mof/xopd_vae_space_align.tex (M7 / "传输的初始化与 AdaLN…").
+    ``T(z) = gamma ⊙ (W z_rs) + beta`` with ALL of ``W`` (C_S x C_T full channel
+    mixing), ``gamma`` and ``beta`` learnable ``nn.Parameter`` s, optimized jointly.
+    Theory: docs/mof/xopd_vae_space_align.tex (M2 full-affine = the L1 main workhorse,
+    + M7 AdaLN modulation). This is method A: it uses ALL teacher channels (every
+    student channel is a linear combination of all C_T teacher channels) for full
+    M2-affine expressivity, while keeping AdaLN's analytic invertibility for L1.
 
     Design:
-    * ``gamma`` is parameterized in log space (``gamma = exp(log_gamma)``) so it
-      stays strictly positive and the map is **always analytically invertible**
-      (``z = (z' - beta) / gamma``) — no pseudo-inverse, no separate inverse net.
-    * Initialized by **moment matching** (the neutral init: identity when the two
-      spaces coincide); call :meth:`init_from_moments` during warm-up. Without it,
-      defaults to identity (log_gamma=0, beta=0).
-    * Channel-count mismatch (``C_T != C_S``) is handled by a fixed (non-learned)
-      ``channel_proj`` selection matrix mapping the first ``min(C_T,C_S)`` teacher
-      channels to student channels; the learnable affine then acts in student
-      channels. (A full learnable ``C_S x C_T`` mixing is the M2 non-diagonal
-      extension; kept diagonal here for invertibility + stability.)
+    * ``W`` (C_S x C_T) is a LEARNABLE full channel-mixing matrix (not a fixed
+      selection of the first C_S teacher channels — that earlier diagonal-only form
+      discarded C_T - C_S teacher channels and could not fit the cross-VAE map).
+      Initialized to identity-selection, closed-form least-squares warm-started in
+      :meth:`init_from_moments`, then refined by the online gradient loop.
+    * ``gamma`` is parameterized in log space (``gamma = exp(log_gamma)`` > 0) so the
+      modulation is analytically invertible; the channel mixing is inverted by the
+      pseudo-inverse of ``W`` (least-norm; C_T != C_S). Together they give L1 the
+      required (approximate) inverse without a separate inverse network.
+    * Cold start: ``init_from_moments`` fits ``W`` by least-squares then moment-matches
+      gamma/beta on the residual — a good warm start the gradient loop refines.
     * "Do no harm" non-linear extension (zero-init residual / AdaLN-Zero) is left
       as a documented hook (``use_residual=False`` default); enabling it makes the
       transport non-affine and would require the M5 inverse machinery for L1.
@@ -609,14 +611,19 @@ class AdaLNTransport(VAETransport, nn.Module):
         self._teacher_grid = tuple(teacher_grid) if teacher_grid is not None else None
         self._fitted = False
 
-        # Learnable per-(student-)channel affine in log/linear space.
+        # Learnable per-(student-)channel affine modulation (AdaLN: scale+shift).
         self.log_gamma = nn.Parameter(torch.zeros(self.C_S))
         self.beta = nn.Parameter(torch.zeros(self.C_S))
-        # Fixed teacher->student channel selection (non-learned), C_S x C_T.
+        # LEARNABLE full teacher->student channel-mixing W (C_S x C_T): every student
+        # channel is a linear combination of ALL teacher channels (not a fixed
+        # selection of the first C_S). Initialized to the identity-selection so the
+        # untrained map matches the legacy behaviour, then closed-form warm-started
+        # (least-squares) and refined by the online gradient loop. This restores
+        # full-affine expressivity (M2) while keeping AdaLN's analytic invertibility.
         C = min(self.C_T, self.C_S)
-        proj = torch.zeros(self.C_S, self.C_T)
-        proj[torch.arange(C), torch.arange(C)] = 1.0
-        self.register_buffer("channel_proj", proj)
+        W0 = torch.zeros(self.C_S, self.C_T)
+        W0[torch.arange(C), torch.arange(C)] = 1.0
+        self.W = nn.Parameter(W0)
         # Online warm-up: lazily-created Adam optimizer (persists across epochs).
         self._online_opt = None
         self._online_lr = 1.0e-3
@@ -634,14 +641,30 @@ class AdaLNTransport(VAETransport, nn.Module):
     def init_from_moments(
         self, z_T_list: List[torch.Tensor], z_S_list: List[torch.Tensor]
     ) -> None:
-        """Initialize gamma/beta by per-channel moment matching (warm-up cold start)."""
+        """Closed-form warm start: least-squares W (full channel mixing) + AdaLN moments.
+
+        1. Fit the full channel-mixing ``W`` (C_S x C_T) by ridge least-squares so
+           ``W z_T_rs ~= z_S`` (uses ALL teacher channels, not a fixed selection).
+        2. Moment-match gamma/beta on the RESIDUAL after W, so the AdaLN modulation
+           starts neutral w.r.t. the already-fitted linear map. The online gradient
+           loop then refines W, gamma, beta jointly.
+        """
         T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
         S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
         self._teacher_grid = tuple(T_spatial.shape[-2:])
         self._student_grid = tuple(S_spatial.shape[-2:])
-        T_rs = resample_spatial(T_spatial, self._student_grid)
-        # project teacher channels -> student channels, then match moments
-        T_proj = torch.einsum("sc,bchw->bshw", self.channel_proj.to(T_rs.dtype), T_rs)
+        T_rs = resample_spatial(T_spatial, self._student_grid)            # (N,C_T,H,W)
+        # 1) closed-form least-squares W: solve min_W ||W X - Y||^2 over positions.
+        X = T_rs.permute(0, 2, 3, 1).reshape(-1, self.C_T).double()       # (M, C_T)
+        Y = S_spatial.permute(0, 2, 3, 1).reshape(-1, self.C_S).double()  # (M, C_S)
+        ridge = 1e-4
+        G = X.transpose(0, 1) @ X + ridge * torch.eye(
+            self.C_T, dtype=X.dtype, device=X.device
+        )
+        W = torch.linalg.solve(G, X.transpose(0, 1) @ Y).transpose(0, 1)  # (C_S, C_T)
+        self.W.data.copy_(W.float())
+        # 2) moment-match gamma/beta on the residual after W.
+        T_proj = torch.einsum("sc,bchw->bshw", self.W.to(T_rs.dtype), T_rs)
         mu_in = T_proj.mean(dim=(0, 2, 3)).double()
         std_in = T_proj.std(dim=(0, 2, 3)).double().clamp_min(self.min_std)
         mu_out = S_spatial.mean(dim=(0, 2, 3)).double()
@@ -696,17 +719,21 @@ class AdaLNTransport(VAETransport, nn.Module):
             if self._student_grid is not None
             else T_spatial
         )
-        T_proj = torch.einsum("sc,bchw->bshw", self.channel_proj.to(T_rs.dtype), T_rs)
+        # Full channel mixing W (uses ALL teacher channels), then AdaLN modulation.
+        T_proj = torch.einsum("sc,bchw->bshw", self.W.to(T_rs.dtype), T_rs)
         g = self._gamma().view(1, -1, 1, 1).to(T_proj.dtype)
         b = self.beta.view(1, -1, 1, 1).to(T_proj.dtype)
         return g * T_proj + b
 
     def _to_teacher_spatial(self, S_spatial: torch.Tensor) -> torch.Tensor:
-        # invert affine (analytic), un-project channels, inverse resample
+        # Invert: un-modulate (analytic), then un-mix channels via pseudo-inverse of W
+        # (C_T x C_S; W is non-square C_S x C_T so the inverse is a least-norm pinv),
+        # then inverse resample. gamma>0 keeps the modulation analytically invertible.
         g = self._gamma().view(1, -1, 1, 1).to(S_spatial.dtype)
         b = self.beta.view(1, -1, 1, 1).to(S_spatial.dtype)
-        T_proj = (S_spatial - b) / g
-        T_rs = torch.einsum("cs,bshw->bchw", self.channel_proj.t().to(T_proj.dtype), T_proj)
+        S_demod = (S_spatial - b) / g
+        W_pinv = torch.linalg.pinv(self.W.double()).to(S_demod.dtype)  # (C_T, C_S)
+        T_rs = torch.einsum("cs,bshw->bchw", W_pinv, S_demod)
         return (
             resample_spatial(T_rs, self._teacher_grid)
             if self._teacher_grid is not None
