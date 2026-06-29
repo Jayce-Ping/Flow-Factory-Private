@@ -53,7 +53,7 @@ log:
 train:
   trainer_type: "xopd"
   eval_teacher_at_start: false           # Lightened short-term protocol: skip the (slow) epoch-0 teacher baseline eval.
-  max_epochs: 100                          # Short-term transport-scan horizon (100 on-policy L1 optimizer steps)
+  max_epochs: 101                          # Short-term transport-scan horizon (101 on-policy L1 optimizer steps; +1 so the final eval at a multiple of eval_freq fires)
 
   # --- Cross-VAE teacher (independent adapter) ---
   teacher_model_type: "flux2-klein"        # Different architecture than the SD3.5 student -> cross-VAE path
@@ -132,7 +132,7 @@ eval:
   per_device_batch_size: 1
   num_inference_steps: 28
   guidance_scale: 1.0
-  eval_freq: 50
+  eval_freq: 20
   seed: 42
   test_sets:
     - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}

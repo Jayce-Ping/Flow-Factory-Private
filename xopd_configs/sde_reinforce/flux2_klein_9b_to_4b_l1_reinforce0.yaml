@@ -59,7 +59,7 @@ log:
 train:
   trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
   eval_teacher_at_start: false           # Lightened short-term protocol: skip the (slow) epoch-0 teacher baseline eval.
-  max_epochs: 100                         # Short-term ablation horizon (100 on-policy L1 optimizer steps)
+  max_epochs: 101                         # Short-term ablation horizon (101 on-policy L1 optimizer steps; +1 so the final eval at a multiple of eval_freq fires)
 
   # --- Cross-model teacher ---
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"  # Teacher path; only its transformer is loaded, VAE/TE reused from student
@@ -131,7 +131,7 @@ eval:
   per_device_batch_size: 1                # Eval batch size
   num_inference_steps: 28                 # Eval steps
   guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
-  eval_freq: 50                           # Eval every N epochs (0 disables)
+  eval_freq: 20                           # Eval every N epochs (0 disables)
   seed: 42                                # Eval seed
   test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
                                           # eval_reward_names selects which reward (from the `rewards` list below) runs per set;
