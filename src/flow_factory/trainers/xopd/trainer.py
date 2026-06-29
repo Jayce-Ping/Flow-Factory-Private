@@ -1135,14 +1135,17 @@ class XOPDTrainer(BaseTrainer):
             # (num_steps, seq, C); decode each step in teacher space -> image ->
             # student encode_pixels. One (B,...) pair per timestep.
             num_steps = teacher_samples[0].all_latents.shape[0]
+            # Match the teacher VAE dtype for decode (rollout latents may be fp16
+            # while the VAE/bias is bf16 -> dtype-mismatch error otherwise).
+            vae_dtype = self.teacher_adapter.pipeline.vae.dtype
             for t in range(num_steps):
                 z_t_T = torch.stack([s.all_latents[t] for s in teacher_samples], dim=0).to(device)
                 t_ids = torch.stack(
                     [s.latent_ids for s in teacher_samples], dim=0
                 ).to(device)
-                with torch.no_grad():
+                with torch.no_grad(), self.autocast():
                     imgs_t = self.teacher_adapter.decode_latents(
-                        z_t_T, latent_ids=t_ids, output_type="pt"
+                        z_t_T.to(vae_dtype), latent_ids=t_ids, output_type="pt"
                     )
                     if isinstance(imgs_t, list):
                         imgs_t = torch.stack(imgs_t, dim=0)
