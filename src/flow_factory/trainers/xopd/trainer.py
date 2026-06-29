@@ -1086,12 +1086,13 @@ class XOPDTrainer(BaseTrainer):
         return torch.stack([s.image for s in teacher_samples], dim=0)
 
     def _collect_warmup_pairs(self):
-        """Collect paired (teacher native latent, student latent) for warm-up.
+        """Roll out ``transport_warmup_batches`` FRESH paired (z_T, z_S) latents.
 
-        Teacher native clean latent ``z0_T`` from a teacher rollout; student latent
+        Called ONCE PER WARM-UP EPOCH (online schedule), so transport_warmup_batches
+        is the per-epoch data size. Teacher native clean latent ``z0_T`` from a
+        teacher rollout (full denoising trajectory); student latent
         ``z0_S = encode_pixels(teacher image)`` via the pixel bridge. Also returns
-        the teacher images so a gradient warm-up can recompute the reconstruction
-        target. CPU-resident lists to bound VRAM.
+        the teacher images. CPU-resident lists to bound VRAM.
         """
         ta = self.training_args
         device = self.accelerator.device
@@ -1164,112 +1165,73 @@ class XOPDTrainer(BaseTrainer):
             return None
 
     def _warmup_transport(self) -> None:
-        """Warm-up the transport before training, then freeze (cold start).
+        """Warm-up the transport ONLINE, then freeze (before L1).
 
-        Dispatches on transport type:
-        - closed-form (``linear`` / ``whitening``): least-squares / moment-matching
-          ``fit`` on paired latents (no gradient), broadcast to all ranks.
-        - learnable (``adaln``): a short gradient loop on the latent reconstruction
-          objective ``||T(z_T) - z_S||^2`` (z_S = pixel-bridge target), since
-          training the transport on the distillation D_k would be degenerate
-          (mu_teacher is detached/cached in L1, so D_k gradient would collapse the
-          teacher target onto the student). After warm-up the transport is FROZEN,
-          so L1 trains the student only — keeping a fair comparison with the
-          non-learnable transports.
+        Online schedule (avoids overfitting the transport to a fixed pair set):
+        each of ``transport_warmup_epochs`` epochs rolls out FRESH paired latents
+        (``transport_warmup_batches`` teacher rollouts across the full denoising
+        trajectory), then performs ONE transport update on that fresh batch:
+        - closed-form (linear/whitening): accumulate sufficient statistics across
+          epochs and re-solve on ALL data seen so far (DPO-style online iteration);
+        - learnable (adaln): one Adam step (grad-accumulated over the batch).
+
+        Decoupling: the transport uses its OWN optimizer / pure-stat accumulation,
+        never ``accelerator.accumulate``, so it does not interact with the XOPD L1
+        gradient-accumulation (GAS) loop. After warm-up the transport is frozen and
+        broadcast from rank 0 for cross-rank determinism.
         """
         ta = self.training_args
         device = self.accelerator.device
-        z_T_list, z_S_list, _img_list = self._collect_warmup_pairs()
+        n_epochs = max(1, ta.transport_warmup_epochs)
+        is_adaln = isinstance(self.transport, AdaLNTransport)
+        if is_adaln:
+            self.transport.to(device)
+            self.transport.set_online_lr(ta.transport_lr)
+        logger.info(
+            f"Transport ({ta.vae_transport}) ONLINE warm-up: {n_epochs} epoch(s), "
+            f"{ta.transport_warmup_batches} freshly-rolled-out batch(es)/epoch "
+            f"({'adaln grad step' if is_adaln else 'closed-form on accumulated stats'} "
+            "per epoch), then frozen."
+        )
+        for ep in range(n_epochs):
+            # 1. Fresh rollout for THIS epoch (full denoising trajectory per batch).
+            z_T_list, z_S_list, _img = self._collect_warmup_pairs()
+            z_T_dev = [z.to(device) for z in z_T_list]
+            z_S_dev = [z.to(device) for z in z_S_list]
+            # 2. One transport update on this epoch's fresh data.
+            recon = self.transport.update_online(z_T_dev, z_S_dev)
+            logger.info(f"  transport warm-up epoch {ep}: recon_mse={recon:.6f}")
+            # 3. Log loss + periodic comparison image on the warm-up x-axis.
+            if self.accelerator.is_main_process and self.logger is not None:
+                data = {"warmup/transport_recon_mse": float(recon)}
+                if ep % 5 == 0 or ep == n_epochs - 1:
+                    img = self._warmup_comparison_image(
+                        z_T_dev[0], z_S_dev[0], n=min(4, z_T_dev[0].shape[0])
+                    )
+                    if img is not None:
+                        data["warmup/target_vs_transported"] = img
+                self.log_warmup_data(data, step=ep)
+            del z_T_dev, z_S_dev
 
-        if not isinstance(self.transport, AdaLNTransport):
-            # Closed-form fit (linear / whitening). Fit on all ranks (identical
-            # data is rank-local here, so broadcast A,b from rank 0 for determinism).
-            self.transport.fit(z_T_list, z_S_list)
-            if self.accelerator.num_processes > 1:
-                import torch.distributed as dist
+        # Freeze + broadcast from rank 0 for cross-rank determinism.
+        if self.accelerator.num_processes > 1:
+            import torch.distributed as dist
 
+            if is_adaln:
+                for p in self.transport.parameters():
+                    dist.broadcast(p.data, src=0)
+            else:
                 A = self.transport.A.to(device)
                 b = self.transport.b.to(device)
                 dist.broadcast(A, src=0)
                 dist.broadcast(b, src=0)
                 self.transport.A, self.transport.b = A, b
-            logger.info(
-                f"Transport ({ta.vae_transport}) fitted (closed-form): "
-                f"A {tuple(self.transport.A.shape)}, b {tuple(self.transport.b.shape)}; frozen."
-            )
-            # Visualization: the fit is one-shot (no iterations), so sweep the
-            # collected pair batches and log the per-batch reconstruction error
-            # ||T(z_T) - z_S||^2 against a warm-up x-axis, plus a periodic 2-row
-            # comparison image (top = student target decode, bottom = transported
-            # teacher decode). Main process only (transport is identical post-fit).
-            if self.accelerator.is_main_process and self.logger is not None:
-                with torch.no_grad():
-                    for wstep, (z0_T_cpu, z0_S_cpu) in enumerate(zip(z_T_list, z_S_list)):
-                        z0_T = z0_T_cpu.to(device)
-                        z0_S = z0_S_cpu.to(device)
-                        pred = self.transport.transport_sample(z0_T)
-                        recon = float((pred.float() - z0_S.float()).pow(2).mean().detach())
-                        data = {"warmup/transport_recon_mse": recon}
-                        if wstep % 8 == 0 or wstep == len(z_T_list) - 1:
-                            img = self._warmup_comparison_image(z0_T, z0_S, n=min(4, z0_T.shape[0]))
-                            if img is not None:
-                                data["warmup/target_vs_transported"] = img
-                        self.log_warmup_data(data, step=wstep)
-            self.accelerator.wait_for_everyone()
-            return
-
-        # ---- Learnable AdaLN: moment-match init, then a short reconstruction loop ----
-        self.transport.to(device)
-        # init_from_moments routes through self.t2s (which injects the CUDA teacher
-        # latent_ids) and the channel_proj buffer (now on `device`), so feed it
-        # device-resident pairs to avoid a CPU/CUDA mismatch in the unpack/einsum.
-        z_T_dev = [z.to(device) for z in z_T_list]
-        z_S_dev = [z.to(device) for z in z_S_list]
-        self.transport.init_from_moments(z_T_dev, z_S_dev)  # neutral cold start
-        del z_T_dev, z_S_dev
-        opt = torch.optim.Adam(self.transport.parameters(), lr=ta.transport_lr)
-        n_epochs = max(1, ta.transport_warmup_epochs)
-        self.transport.train()
-        logger.info(
-            f"AdaLN transport warm-up: {n_epochs} epoch(s) of latent-reconstruction "
-            f"training over {len(z_T_list)} batches (lr={ta.transport_lr}), then frozen."
-        )
-        for ep in range(n_epochs):
-            recon = 0.0
-            for z0_T_cpu, z0_S_cpu in zip(z_T_list, z_S_list):
-                z0_T = z0_T_cpu.to(device)
-                z0_S = z0_S_cpu.to(device)
-                opt.zero_grad()
-                # ||T(z_T) - z_S||^2 in student latent space (z_S = pixel-bridge target).
-                pred = self.transport.transport_sample(z0_T)
-                loss = (pred.float() - z0_S.float()).pow(2).mean()
-                loss.backward()
-                opt.step()
-                recon += float(loss.detach())
-            recon /= max(1, len(z_T_list))
-            logger.info(f"  AdaLN warm-up epoch {ep}: recon_mse={recon:.6f}")
-            # Log the per-epoch reconstruction loss + a periodic comparison image
-            # on the warm-up x-axis (main process only).
-            if self.accelerator.is_main_process and self.logger is not None:
-                data = {"warmup/transport_recon_mse": recon}
-                if ep % 5 == 0 or ep == n_epochs - 1:
-                    z0_T = z_T_list[0].to(device)
-                    z0_S = z_S_list[0].to(device)
-                    img = self._warmup_comparison_image(z0_T, z0_S, n=min(4, z0_T.shape[0]))
-                    if img is not None:
-                        data["warmup/target_vs_transported"] = img
-                self.log_warmup_data(data, step=ep)
-        # Freeze: no transport gradients during L1 (avoids the degenerate D_k path).
-        self.transport.eval()
-        for p in self.transport.parameters():
-            p.requires_grad_(False)
-        if self.accelerator.num_processes > 1:
-            import torch.distributed as dist
-
+        if is_adaln:
+            self.transport.eval()
             for p in self.transport.parameters():
-                dist.broadcast(p.data, src=0)
-        self.transport._fitted = True
-        logger.info("AdaLN transport warm-up complete; frozen for L1.")
+                p.requires_grad_(False)
+            self.transport._fitted = True
+        logger.info(f"Transport ({ta.vae_transport}) warm-up complete; frozen for L1.")
 
     def _l0_epoch_cross_vae(self) -> None:
         """Cross-VAE L0: pixel-bridge sample transport + analytic FM regression.

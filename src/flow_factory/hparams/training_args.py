@@ -2162,16 +2162,15 @@ class XOPDTrainingArguments(TrainingArguments):
         default=64,
         metadata={
             "help": (
-                "Transport warm-up DATA SIZE: number of teacher-rollout batches of "
-                "paired (z_T, z_S) latents (z_S via the pixel bridge) collected to fit "
-                "the cross-VAE transport. This knob has the SAME meaning for every "
-                "transport (it sizes the fitting set); what differs is only HOW the "
-                "fit consumes the data: 'whitening'/'linear' solve a CLOSED-FORM fit "
-                "in one pass over these batches (moment-matching / least-squares -> the "
-                "global optimum, so transport_warmup_epochs is implicitly 1 and extra "
-                "passes cannot improve it), while 'adaln' runs a GRADIENT loop over them "
-                "for transport_warmup_epochs passes. Ignored for 'identity'/'pixel' "
-                "(no fit). Must be > 0 for 'linear'/'whitening'/'adaln'."
+                "Transport warm-up PER-EPOCH DATA SIZE: number of teacher-rollout "
+                "batches of FRESH paired (z_T, z_S) latents (z_S via the pixel bridge) "
+                "rolled out EACH warm-up epoch. The transport is warmed up ONLINE: "
+                "every epoch re-rolls this many batches and updates on that fresh data "
+                "(avoids overfitting to a fixed pair set). Same meaning for all "
+                "transports. NOTE: total rollouts = transport_warmup_epochs * this, and "
+                "each batch is a full teacher denoising trajectory (expensive), so keep "
+                "this small (e.g. 4-16). Ignored for 'identity'/'pixel'. Must be > 0 for "
+                "'linear'/'whitening'/'adaln'."
             )
         },
     )
@@ -2179,7 +2178,7 @@ class XOPDTrainingArguments(TrainingArguments):
         default=1.0e-3,
         metadata={
             "help": (
-                "Adam learning rate for the LEARNABLE 'adaln' transport warm-up "
+                "Adam learning rate for the LEARNABLE 'adaln' transport online warm-up "
                 "(latent-reconstruction objective). Ignored for other transports "
                 "(closed-form fits have no learning rate)."
             )
@@ -2189,14 +2188,14 @@ class XOPDTrainingArguments(TrainingArguments):
         default=50,
         metadata={
             "help": (
-                "Transport warm-up GRADIENT PASSES: number of optimization passes over "
-                "the transport_warmup_batches collected pairs. Pairs with "
-                "transport_warmup_batches as (epochs x batches), exactly like a normal "
-                "training schedule. Only meaningful for the LEARNABLE 'adaln' transport "
-                "(iterative gradient fit); the closed-form 'whitening'/'linear' fits are "
-                "single-pass by construction (their optimum is reached in one pass, so "
-                "this value is effectively 1 and is ignored), and 'identity'/'pixel' do "
-                "no fit. After warm-up the transport is frozen for L1."
+                "Transport warm-up EPOCHS: number of ONLINE update epochs. Each epoch "
+                "re-rolls transport_warmup_batches fresh pairs and performs ONE transport "
+                "update on them: 'adaln' takes one Adam step (grad-accumulated over the "
+                "batch); the closed-form 'whitening'/'linear' accumulate sufficient "
+                "statistics across epochs and re-solve on ALL data seen so far (DPO-style "
+                "online iteration on growing fresh data -> less overfitting than a single "
+                "closed-form fit on a fixed set). 'identity'/'pixel' do no warm-up. After "
+                "warm-up the transport is frozen for L1."
             )
         },
     )

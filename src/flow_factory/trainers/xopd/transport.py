@@ -198,6 +198,21 @@ class VAETransport(ABC):
         """Warm-up fit. No-op unless ``requires_warmup``."""
         return None
 
+    def update_online(self, z_T_list, z_S_list, **kwargs) -> float:
+        """One ONLINE warm-up step on a freshly-rolled-out batch of paired latents.
+
+        Called once per warm-up epoch with NEW data (the trainer re-rolls out
+        ``transport_warmup_batches`` pairs each epoch to avoid overfitting the
+        transport to a fixed set). Returns the (scalar) reconstruction MSE on this
+        batch for logging. Default: no-op (identity/pixel need no warm-up).
+
+        Subclasses:
+          * closed-form (linear/whitening): accumulate sufficient statistics across
+            epochs and re-solve the closed-form fit on ALL data seen so far;
+          * learnable (adaln): a gradient step (grad-accumulated over the batch).
+        """
+        return 0.0
+
     def state_dict(self) -> dict:
         """Serializable transport state (fitted params + grids). Default: empty."""
         return {}
@@ -320,6 +335,11 @@ class LinearTransport(VAETransport):
         self.b: Optional[torch.Tensor] = None   # (C_S,)
         self._student_grid: Optional[Tuple[int, int]] = None  # (H_S, W_S)
         self._teacher_grid: Optional[Tuple[int, int]] = None  # (H_T, W_T)
+        # Online warm-up: running normal-equation accumulators across epochs, so the
+        # closed-form fit uses ALL data seen so far (each epoch re-rolls new data).
+        # G = sum Xa^T Xa  (C_T+1, C_T+1);  XtY = sum Xa^T Y  (C_T+1, C_S).
+        self._neq_G: Optional[torch.Tensor] = None
+        self._neq_XtY: Optional[torch.Tensor] = None
 
     @property
     def is_fitted(self) -> bool:
@@ -357,6 +377,50 @@ class LinearTransport(VAETransport):
         A, b = fit_channel_affine_lstsq(T_rs, S_spatial, ridge=self.ridge)
         self.A = A.to(T_spatial.device)
         self.b = b.to(T_spatial.device)
+
+    def update_online(self, z_T_list, z_S_list, **ctx) -> float:
+        """Accumulate normal-equation statistics from a fresh batch, then re-solve.
+
+        Each warm-up epoch supplies NEW rolled-out pairs. We accumulate the additive
+        least-squares sufficient statistics ``G += Xa^T Xa`` and ``XtY += Xa^T Y``
+        (Xa = [resample(z_T)->BCHW positions, 1]) into running totals, then solve the
+        ridge normal equations on ALL data seen so far. This is the closed-form
+        analogue of online/DPO-style iteration: more (fresh) data each epoch ->
+        better-conditioned global optimum, no overfitting to one fixed set.
+        Returns the reconstruction MSE on THIS batch (pre-update transport if fitted,
+        else post-solve) for logging.
+        """
+        T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+        S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+        self._teacher_grid = tuple(T_spatial.shape[-2:])
+        self._student_grid = tuple(S_spatial.shape[-2:])
+        T_rs = resample_spatial(T_spatial, self._student_grid)          # (N,C_T,H_S,W_S)
+        C_in = T_rs.shape[1]
+        C_out = S_spatial.shape[1]
+        X = T_rs.permute(0, 2, 3, 1).reshape(-1, C_in).double()
+        Y = S_spatial.permute(0, 2, 3, 1).reshape(-1, C_out).double()
+        ones = torch.ones(X.shape[0], 1, dtype=X.dtype, device=X.device)
+        Xa = torch.cat([X, ones], dim=1)                                # (M, C_in+1)
+        G_batch = Xa.transpose(0, 1) @ Xa
+        XtY_batch = Xa.transpose(0, 1) @ Y
+        if self._neq_G is None:
+            self._neq_G = G_batch
+            self._neq_XtY = XtY_batch
+        else:
+            self._neq_G = self._neq_G + G_batch
+            self._neq_XtY = self._neq_XtY + XtY_batch
+        reg = self.ridge * torch.eye(
+            self._neq_G.shape[0], dtype=self._neq_G.dtype, device=self._neq_G.device
+        )
+        reg[-1, -1] = 0.0
+        W = torch.linalg.solve(self._neq_G + reg, self._neq_XtY)        # (C_in+1, C_out)
+        self.A = W[:-1, :].transpose(0, 1).contiguous().float().to(T_spatial.device)
+        self.b = W[-1, :].contiguous().float().to(T_spatial.device)
+        # Recon MSE on this batch under the updated transport (for logging).
+        with torch.no_grad():
+            pred = channel_affine(T_rs, self.A, self.b)
+            recon = float((pred.float() - S_spatial.float()).pow(2).mean())
+        return recon
 
     def _check_fitted(self):
         if not self.is_fitted:
@@ -424,6 +488,13 @@ class WhiteningTransport(LinearTransport):
     def __init__(self, *args, min_std: float = 1e-6, **kwargs):
         super().__init__(*args, **kwargs)
         self.min_std = min_std
+        # Online warm-up: running per-channel moment accumulators (additive across
+        # epochs) -> diagonal moment-matching on ALL data seen so far.
+        self._mom_n = 0.0
+        self._mom_sx = None   # sum_x over teacher(proj) channels (C,)
+        self._mom_sxx = None  # sum_x^2
+        self._mom_sy = None   # sum_y over student channels (C_out,)
+        self._mom_syy = None
 
     def fit(self, z_T_list: List[torch.Tensor], z_S_list: List[torch.Tensor], **ctx) -> None:
         """Diagonal moment-matching fit (per-channel mean/std alignment)."""
@@ -435,6 +506,53 @@ class WhiteningTransport(LinearTransport):
         A, b = moment_matching_affine(T_rs, S_spatial, eps=self.min_std)
         self.A = A.to(T_spatial.device)
         self.b = b.to(T_spatial.device)
+
+    def update_online(self, z_T_list, z_S_list, **ctx) -> float:
+        """Accumulate per-channel moments from fresh data, re-solve diagonal affine.
+
+        Diagonal moment matching needs only running per-channel sums (Σx, Σx², Σy,
+        Σy², N), all additive -> the closed-form scale/shift on ALL data seen so far.
+        Returns this-batch recon MSE for logging.
+        """
+        T_spatial = torch.cat([self.t2s(z) for z in z_T_list], dim=0)
+        S_spatial = torch.cat([self.s2s(z) for z in z_S_list], dim=0)
+        self._teacher_grid = tuple(T_spatial.shape[-2:])
+        self._student_grid = tuple(S_spatial.shape[-2:])
+        T_rs = resample_spatial(T_spatial, self._student_grid)          # (N,C_T,H_S,W_S)
+        C_in = T_rs.shape[1]
+        C_out = S_spatial.shape[1]
+        C = min(C_in, C_out)
+        # Per-channel sums over the N*H*W positions (fp64).
+        Xc = T_rs[:, :C].permute(1, 0, 2, 3).reshape(C, -1).double()    # (C, M)
+        Yc = S_spatial[:, :C].permute(1, 0, 2, 3).reshape(C, -1).double()
+        m = Xc.shape[1]
+        sx = Xc.sum(1); sxx = (Xc * Xc).sum(1)
+        sy = Yc.sum(1); syy = (Yc * Yc).sum(1)
+        if self._mom_sx is None:
+            self._mom_sx, self._mom_sxx = sx, sxx
+            self._mom_sy, self._mom_syy = sy, syy
+            self._mom_n = float(m)
+        else:
+            self._mom_sx = self._mom_sx + sx; self._mom_sxx = self._mom_sxx + sxx
+            self._mom_sy = self._mom_sy + sy; self._mom_syy = self._mom_syy + syy
+            self._mom_n = self._mom_n + m
+        n = self._mom_n
+        mu_in = self._mom_sx / n
+        var_in = (self._mom_sxx / n - mu_in ** 2).clamp_min(self.min_std ** 2)
+        std_in = var_in.sqrt().clamp_min(self.min_std)
+        mu_out = self._mom_sy / n
+        var_out = (self._mom_syy / n - mu_out ** 2).clamp_min(self.min_std ** 2)
+        std_out = var_out.sqrt().clamp_min(self.min_std)
+        scale = (std_out / std_in)                                      # (C,)
+        A = torch.zeros(C_out, C_in, dtype=torch.float64, device=T_rs.device)
+        A[torch.arange(C), torch.arange(C)] = scale
+        bvec = torch.zeros(C_out, dtype=torch.float64, device=T_rs.device)
+        bvec[:C] = mu_out - scale * mu_in
+        self.A = A.float(); self.b = bvec.float()
+        with torch.no_grad():
+            pred = channel_affine(T_rs, self.A, self.b)
+            recon = float((pred.float() - S_spatial.float()).pow(2).mean())
+        return recon
 
 
 class AdaLNTransport(VAETransport, nn.Module):
@@ -499,6 +617,9 @@ class AdaLNTransport(VAETransport, nn.Module):
         proj = torch.zeros(self.C_S, self.C_T)
         proj[torch.arange(C), torch.arange(C)] = 1.0
         self.register_buffer("channel_proj", proj)
+        # Online warm-up: lazily-created Adam optimizer (persists across epochs).
+        self._online_opt = None
+        self._online_lr = 1.0e-3
 
     @property
     def is_fitted(self) -> bool:
@@ -534,6 +655,33 @@ class AdaLNTransport(VAETransport, nn.Module):
     # alias so the trainer warm-up can call .fit(...) uniformly across transports
     def fit(self, z_T_list, z_S_list, **ctx) -> None:
         self.init_from_moments(z_T_list, z_S_list)
+
+    def set_online_lr(self, lr: float) -> None:
+        """Set the Adam LR for the online warm-up (call before the first update)."""
+        self._online_lr = lr
+
+    def update_online(self, z_T_list, z_S_list, **ctx) -> float:
+        """One gradient step on a fresh batch (grad-accumulated over the batch).
+
+        Per warm-up epoch the trainer rolls out NEW pairs and calls this once: we
+        accumulate the per-micro-batch reconstruction-loss gradients over the whole
+        batch, then take a single Adam step (so one transport update per epoch on
+        fresh data). The Adam state persists across epochs. Uses a dedicated
+        optimizer (NOT accelerator) so it is fully decoupled from the XOPD GAS loop.
+        """
+        if self._online_opt is None:
+            self._online_opt = torch.optim.Adam(self.parameters(), lr=self._online_lr)
+        self.train()
+        self._online_opt.zero_grad()
+        n = max(1, len(z_T_list))
+        total = 0.0
+        for z_T, z_S in zip(z_T_list, z_S_list):
+            pred = self.transport_sample(z_T)
+            loss = (pred.float() - z_S.float()).pow(2).mean() / n  # average -> grad accumulate
+            loss.backward()
+            total += float(loss.detach()) * n
+        self._online_opt.step()
+        return total / n
 
     def _to_student_spatial(self, T_spatial: torch.Tensor) -> torch.Tensor:
         T_rs = (
