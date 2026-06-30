@@ -1,0 +1,243 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\Xspace}{\mathcal{X}}
+\newcommand{\Za}{\mathcal{Z}_{A}}
+\newcommand{\Zb}{\mathcal{Z}_{B}}
+\newcommand{\Enc}{\mathcal{E}}
+\newcommand{\Dec}{\mathcal{D}}
+\newcommand{\Tmap}{\mathsf{T}}
+\newcommand{\Tinv}{\mathsf{T}^{-1}}
+\newcommand{\push}{\#}
+\newcommand{\Jac}{\mathbf{J}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{problem}{Problem}
+\newtheorem{remark}{Remark}
+
+\title{\textbf{跨隐空间速度场传输与 On-Policy 蒸馏}\\[0.3em]
+\large 问题的理论形式化 \\[0.3em]
+\large Cross-Latent Velocity-Field Transport for On-Policy Distillation}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文只做一件事：用尽量 general 的形式化语言，把"在两个异构隐空间上的扩散
+/ 流匹配模型之间做 on-policy 蒸馏"这一需求陈述为一个明确的数学问题。我们
+设有两个分别在各自隐空间中去噪并生成图像的模型，目标是学习一个隐空间之间
+的双向映射 $(\Tmap,\Tinv)$，使得一个模型的 velocity field 可以被
+\emph{推前 / 拉回} (pushforward / pullback) 到另一个隐空间，从而让 on-policy
+蒸馏的监督信号在类型与语义上都合法。本文\textbf{不涉及任何具体解法、构造或
+算法比较}，只给出问题的设定、需要满足的性质，以及最终的形式化问题陈述。
+\end{abstract}
+
+\section{设定 (Setup)}
+\label{sec:setup}
+
+\paragraph{两个生成模型。}
+设有一个共享的像素（图像）空间 $\Xspace\subseteq\R^{D}$，以及两个分别由各自
+变分自编码器 (VAE) 诱导的隐空间
+\[
+\Za\subseteq\R^{d_A},\qquad \Zb\subseteq\R^{d_B},
+\]
+配备编码器 / 解码器对 $(\Enc_A,\Dec_A)$ 与 $(\Enc_B,\Dec_B)$，其中
+$\Enc_\bullet:\Xspace\to\mathcal{Z}_\bullet$，$\Dec_\bullet:\mathcal{Z}_\bullet\to\Xspace$。
+一般情形下两个隐空间是\emph{异构}的：
+\[
+d_A\neq d_B,\quad \Za\not\cong\Zb,\quad \Enc_A\neq\Enc_B,
+\]
+即通道数、空间下采样率、以及逐通道统计量都可能不同。
+
+\paragraph{两个流 / 扩散过程。}
+在每个隐空间上各有一个（流匹配 / 扩散）生成模型，由一个时间相关的
+velocity field 刻画：
+\[
+v_A:\Za\times[0,1]\to\R^{d_A},
+\qquad
+v_B:\Zb\times[0,1]\to\R^{d_B}.
+\]
+它们各自定义了一条 probability-flow ODE，把噪声端 $t=1$ 的先验输运到数据端
+$t=0$ 的隐变量边际：
+\begin{equation}
+\dot z_A(t) = v_A\big(z_A(t),t\big),
+\qquad
+\dot z_B(t) = v_B\big(z_B(t),t\big).
+\label{eq:pf-ode}
+\end{equation}
+对应的隐变量边际记为 $p_A(\cdot,t)$ 与 $p_B(\cdot,t)$；干净端 $t=0$ 的边际
+分别为 $p_A^{0}=\Enc_A\push\, p_{\mathrm{data}}$ 与 $p_B^{0}=\Enc_B\push\, p_{\mathrm{data}}$。
+解码后两者生成的是同一像素分布 $p_{\mathrm{data}}$。
+
+\paragraph{蒸馏方向。}
+固定其中一个模型为 \emph{teacher}（记为 $A$，velocity $v_A$ 冻结），另一个为
+\emph{student}（记为 $B$，velocity $v_B=v_\theta$，参数 $\theta$ 可训练）。蒸馏的
+目标是用 teacher 在 $\Za$ 中的生成知识监督 student 在 $\Zb$ 中的生成过程。
+
+\section{隐空间传输映射 (Latent Transport Map)}
+\label{sec:transport}
+
+由于 $v_A$ 与 $v_B$ 定义在\emph{不同}的隐空间上，teacher 的任何信号（干净
+样本、velocity、转移分布）都活在 $\Za$ 中，而 student 的 rollout、loss、梯度
+都活在 $\Zb$ 中。要把监督信号搬运过去，需要一个隐空间之间的双向映射。
+
+\begin{definition}[隐空间传输映射]
+\label{def:transport}
+一个隐空间传输映射是一对函数
+\[
+\Tmap:\Za\to\Zb,\qquad \Tinv:\Zb\to\Za,
+\]
+满足互逆关系 $\Tinv\circ\Tmap=\mathrm{id}_{\Za}$ 与 $\Tmap\circ\Tinv=\mathrm{id}_{\Zb}$
+（在异构维度 $d_A\neq d_B$ 时，互逆性只能在公共子空间 / 值域上要求，定义为
+广义逆）。
+\end{definition}
+
+\begin{definition}[语义一致性 / 像素锚定]
+\label{def:consistency}
+称 $\Tmap$ 是\emph{像素一致}的，若它保持解码后的图像语义：对 teacher 隐变量
+$z\in\Za$，
+\begin{equation}
+\Dec_B\big(\Tmap(z)\big)\;\approx\;\Dec_A(z),
+\qquad \forall z\in\Za.
+\label{eq:pixel-consistency}
+\end{equation}
+即 $z$ 与 $\Tmap(z)$ "代表同一张图"。这是传输具备语义正确性的判据。
+\end{definition}
+
+\begin{definition}[传输一致性误差]
+\label{def:delta}
+定义传输在像素空间的往返重建误差
+\begin{equation}
+\delta_{\Tmap}
+\;=\;
+\E_{z\sim p_A}\,\norm{\Dec_B\big(\Tmap(z)\big)-\Dec_A(z)},
+\label{eq:delta}
+\end{equation}
+其中 $p_A$ 是 teacher 在相关时刻的隐变量分布。$\delta_{\Tmap}=0$ 即严格满足
+像素一致 \eqref{eq:pixel-consistency}。$\delta_{\Tmap}$ 是衡量传输有损性的标量。
+\end{definition}
+
+\section{速度场的推前与拉回 (Pushforward / Pullback)}
+\label{sec:pushforward}
+
+蒸馏不仅要搬运干净样本，更要搬运\emph{整个 velocity field}，使 teacher 在
+$\Za$ 中的概率流经 $\Tmap$ 之后，与 student 在 $\Zb$ 中看到的动力学一致。
+
+\begin{problem}[velocity field 的传输]
+\label{prob:pf-existence}
+寻找 $(\Tmap,\Tinv)$，使得 teacher 的 probability-flow ODE
+\eqref{eq:pf-ode} 在映射 $z_B(t)=\Tmap\big(z_A(t)\big)$ 下被忠实输运。
+\end{problem}
+
+形式上，若 $\Tmap$ 为 $C^1$ 微分同胚，Jacobian 记为
+$\Jac_{\Tmap}(z)=\partial\Tmap/\partial z$，则由链式法则
+$\dot z_B=\Jac_{\Tmap}(z_A)\,\dot z_A$，得到\emph{推前 velocity field}
+\begin{equation}
+(\Tmap\push v_A)(z_B,t)
+\;=\;
+\Jac_{\Tmap}\!\big(\Tinv(z_B)\big)\;
+v_A\!\big(\Tinv(z_B),t\big),
+\qquad z_B\in\Zb.
+\label{eq:pushforward}
+\end{equation}
+对称地，把 student 空间中的状态拉回 teacher 空间需要逆映射 $\Tinv$（pullback）。
+式 \eqref{eq:pushforward} 显式地表明，要把 teacher 的"意见"评估在 student
+访问到的状态上，必须同时具备：
+\begin{enumerate}[leftmargin=2em,itemsep=2pt]
+  \item \textbf{可逆性}：能取 $\Tinv(z_B)$，以便在 student 状态 $z_B$ 处查询
+        teacher；
+  \item \textbf{可微性}：Jacobian $\Jac_{\Tmap}$ 存在且可计算，以便把 teacher
+        velocity 正确变换到 $\Zb$。
+\end{enumerate}
+
+\section{On-Policy 蒸馏的形式化需求}
+\label{sec:onpolicy}
+
+On-policy 蒸馏的本质特征是：监督信号必须在 \emph{student 自己 rollout 出来的
+状态分布} 上评估，而非在 teacher 预先采样的状态上评估。
+
+\paragraph{student 的 on-policy 状态。}
+student 用自身 velocity $v_\theta$ rollout 一条轨迹 $\{z_B(t)\}_{t}\subset\Zb$，
+诱导一个被访问状态的分布 $\rho_\theta$（依赖当前参数 $\theta$，故是 on-policy 的）。
+
+\paragraph{监督信号。}
+对每个被访问状态 $z_B\sim\rho_\theta$，蒸馏要求 teacher 在该点给出"应当如何
+去噪"的意见。但 teacher 的 velocity $v_A$ 只定义在 $\Za$ 上，因此其在 $\Zb$ 中
+的合法取值正是\eqref{eq:pushforward}的推前场 $(\Tmap\push v_A)(z_B,t)$，它依赖
+$\Tinv$（把 $z_B$ 拉回 $\Za$ 查询 teacher）与 $\Jac_{\Tmap}$（把结果变换回 $\Zb$）。
+
+\paragraph{蒸馏目标（general 形式）。}
+on-policy 蒸馏最小化 student velocity 与传输后 teacher velocity 在 student
+访问分布上的偏差：
+\begin{equation}
+\min_{\theta}\;
+\E_{t}\,\E_{z_B\sim\rho_\theta}\;
+\Big[\,w(t)\,
+\mathcal{M}\!\Big(v_\theta(z_B,t),\;(\Tmap\push v_A)(z_B,t)\Big)\Big],
+\label{eq:distill-objective}
+\end{equation}
+其中 $w(t)$ 为时间权重，$\mathcal{M}(\cdot,\cdot)$ 是一个差异度量（例如二次
+回归差，或由动力学诱导的转移分布散度），其具体形式不在本文范围内。该目标
+良定义的前提，正是 $(\Tmap\push v_A)$ 在 $\rho_\theta$ 的支撑上可被求值——即
+$\Tinv$ 与 $\Jac_{\Tmap}$ 存在且可计算。
+
+\section{形式化问题陈述}
+\label{sec:problem-statement}
+
+综合 \S\ref{sec:setup}--\S\ref{sec:onpolicy}，跨隐空间 on-policy 蒸馏归结为以下
+传输映射设计问题。
+
+\begin{problem}[跨隐空间传输设计]
+\label{prob:main}
+给定两个异构隐空间 $\Za,\Zb$、对应的解码器 $\Dec_A,\Dec_B$、teacher velocity
+$v_A$ 与 student velocity $v_\theta$，寻找一对映射 $(\Tmap,\Tinv)$，
+$\Tmap:\Za\to\Zb$、$\Tinv:\Zb\to\Za$，使得：
+\begin{enumerate}[leftmargin=2.4em,label=\textup{(P\arabic*)},itemsep=3pt]
+  \item \textbf{语义一致 (semantic consistency)}：$\Tmap$ 像素一致，即传输
+        一致性误差 $\delta_{\Tmap}$（Def.~\ref{def:delta}）尽可能小，
+        $\Dec_B(\Tmap(z))\approx\Dec_A(z)$；
+  \item \textbf{可逆 (invertibility)}：$\Tinv$ 满足 Def.~\ref{def:transport}
+        的互逆关系，使 student 状态可被拉回 $\Za$ 查询 teacher；
+  \item \textbf{可推前 (differentiable pushforward)}：$\Tmap$ 可微且 Jacobian
+        $\Jac_{\Tmap}$ 可得，从而推前 velocity field
+        \eqref{eq:pushforward} $(\Tmap\push v_A)$ 在 student 访问的状态上可
+        求值。
+\end{enumerate}
+满足 (P1)--(P3) 时，on-policy 蒸馏目标 \eqref{eq:distill-objective} 的监督信号在
+类型上合法、在语义上正确，蒸馏问题随之良定义。
+\end{problem}
+
+\begin{remark}[需求的层次性]
+\label{rem:layering}
+不同强度的蒸馏对 $(\Tmap,\Tinv)$ 的要求不同：仅在干净样本 $z_A^{0}$ 上做
+\emph{样本传输} $z_B^{0}=\Tmap(z_A^{0})$ 只需要 (P1)；而在 student on-policy
+轨迹上做 \emph{velocity field 传输} 则额外需要 (P2)--(P3)。这两个层次构成了
+问题 \ref{prob:main} 的两种强度版本。
+\end{remark}
+
+\begin{remark}[范围声明]
+本文只给出问题的形式化（设定、所需性质、问题陈述），不讨论 $(\Tmap,\Tinv)$
+的任何具体构造、参数化、初始化或求解算法，也不对候选解法做比较与取舍。
+\end{remark}
+
+\end{document}
