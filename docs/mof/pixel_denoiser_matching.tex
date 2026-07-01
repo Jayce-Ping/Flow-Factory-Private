@@ -1,0 +1,252 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\Xspace}{\mathcal{X}}
+\newcommand{\Za}{\mathcal{Z}_{A}}
+\newcommand{\Zb}{\mathcal{Z}_{B}}
+\newcommand{\Enc}{\mathcal{E}}
+\newcommand{\Dec}{\mathcal{D}}
+\newcommand{\den}{\mathrm{den}}
+\newcommand{\Jac}{\mathbf{J}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newtheorem{observation}{Observation}
+
+\title{\textbf{Pixel-Space One-Step Denoiser Matching for Cross-VAE On-Policy Distillation}\\[0.3em]
+\large Working Analysis (Draft)}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This working note formalizes a concrete cross-VAE distillation scheme: the student rolls out a
+clean latent, decodes it to an image; that image is re-encoded by \emph{each} model's own VAE,
+re-noised to a common level $t$, denoised in \emph{one step} by that model, and decoded back to
+pixels; the pixel-space discrepancy between the teacher's and the student's reconstructions is the
+training signal. We show this is a symmetric, fully pixel-anchored instance of the ``shared-space''
+route (companion note \texttt{avoid\_inverse\_transport\_analysis.tex}, Route~B): it needs
+\emph{no} latent transport map $\mathsf{T}$ or its inverse. We characterize what it distills
+(one-step $x_0$-prediction matching across noise levels $\Leftrightarrow$ velocity/score matching
+$\Leftrightarrow$ probability-flow matching, transported through the decoders), its gradient
+structure (only adjoints/VJPs of forward maps), its behavior across $t$, and its irreducible
+reconstruction floor. We also contrast it with DMD.
+\end{abstract}
+
+\section{Setup}
+\label{sec:setup}
+
+Two frozen VAEs give encoders/decoders $(\Enc_A,\Dec_A)$ on teacher latent space
+$\Za\subseteq\R^{d_A}$ and $(\Enc_B,\Dec_B)$ on student latent space $\Zb\subseteq\R^{d_B}$, over a
+shared pixel space $\Xspace$. The teacher velocity $v_A$ (frozen) and the student velocity
+$v_\theta$ each induce a \emph{one-step clean-sample estimator} (denoiser). With a noising schedule
+$z^t=\alpha_t z^0+\sigma_t\varepsilon$ ($\alpha_0=1,\sigma_0=0$, $\varepsilon\sim\N(0,I)$), the
+denoiser of a model with velocity $v$ is the affine image of its velocity,
+\begin{equation}
+\den(z^t,t)\;\coloneqq\;\widehat{z^0}(z^t,t)
+\;=\;\text{(schedule-dependent affine map of } v(z^t,t)\text{)},
+\label{eq:den-def}
+\end{equation}
+i.e.\ the model's ``one step to clean'' prediction. Write $\den_A$ for the teacher and
+$\den_\theta$ for the student. We assume $d_A\ge d_B$, but the scheme below does not use this.
+
+\section{The Scheme}
+\label{sec:scheme}
+
+\begin{definition}[Pixel-space one-step denoiser matching]
+\label{def:scheme}
+Let the student roll out a clean latent $z_B^{0}\sim\rho_\theta$ and decode it to an image
+\begin{equation}
+x\;\coloneqq\;\Dec_B\big(z_B^{0}\big)\ \in\ \Xspace \qquad(\text{on-policy image}).
+\label{eq:img}
+\end{equation}
+For a noise level $t$ and independent draws $\varepsilon_A\in\R^{d_A},\ \varepsilon_B\in\R^{d_B}$,
+define the two \emph{decode-of-one-step-denoise} branches
+\begin{align}
+\text{teacher:}\quad
+y_A(x,t,\varepsilon_A)&\;\coloneqq\;\Dec_A\!\Big(\den_A\big(\alpha_t\,\Enc_A(x)+\sigma_t\varepsilon_A,\ t\big)\Big),
+\label{eq:yA}\\
+\text{student:}\quad
+y_B(x,t,\varepsilon_B)&\;\coloneqq\;\Dec_B\!\Big(\den_\theta\big(\alpha_t\,\Enc_B(x)+\sigma_t\varepsilon_B,\ t\big)\Big).
+\label{eq:yB}
+\end{align}
+The training objective is the pixel-space discrepancy
+\begin{equation}
+L(\theta)\;=\;\E_{x\sim\rho_\theta}\ \E_{t\sim p(t)}\ \E_{\varepsilon_A,\varepsilon_B}\Big[\,w(t)\,
+\norm{\ \sg\!\big[y_A(x,t,\varepsilon_A)\big]-y_B(x,t,\varepsilon_B)\ }^2\Big],
+\label{eq:loss}
+\end{equation}
+with a time weight $w(t)$ and a stop-gradient $\sg[\cdot]$ on the teacher target.
+\end{definition}
+
+\begin{observation}[No transport map is needed; pixels are the shared anchor]
+\label{obs:no-transport}
+Both branches only ever apply \emph{forward} maps within a single latent space
+($\Enc_\bullet$, $\den_\bullet$, $\Dec_\bullet$), and meet in the shared pixel space $\Xspace$.
+The two latent spaces are never put into correspondence: there is no $\mathsf{T}:\Za\to\Zb$ and,
+in particular, no underdetermined inverse $\mathsf{T}^{-1}:\Zb\to\Za$. The cross-VAE mismatch is
+dissolved by comparing \emph{behavior in pixel space} rather than \emph{coordinates in latent
+space}. This is the symmetric, both-sides-decoded form of Route~B of the companion note.
+\end{observation}
+
+\section{What the Objective Distills}
+\label{sec:what}
+
+\begin{proposition}[Denoiser family $\Leftrightarrow$ velocity $\Leftrightarrow$ flow]
+\label{prop:equiv}
+For a fixed schedule, the one-step denoiser family $\{\den(\cdot,t)\}_{t\in(0,1)}$ is in bijection
+with the velocity family $\{v(\cdot,t)\}_{t\in(0,1)}$ via the affine relation \eqref{eq:den-def};
+the velocity family determines the probability-flow ODE and hence the model's clean marginal
+$p^{0}$. Consequently, matching one-step $x_0$-predictions \emph{at all $t$} (within a common
+space) is equivalent to matching velocities/scores, i.e.\ to matching the generated distribution.
+\end{proposition}
+
+\begin{remark}[The pixel version = velocity matching transported through the decoders]
+\label{rem:transport-through-decoder}
+Objective \eqref{eq:loss} compares $\Dec_A(\den_A(\cdot))$ against $\Dec_B(\den_\theta(\cdot))$.
+Were the decoders invertible and identical, this would reduce (by Prop.~\ref{prop:equiv}) to exact
+latent denoiser/velocity matching. In general it is velocity matching \emph{conjugated by the
+decoders}: the comparison is transported to pixels by the \emph{forward} maps $\Dec_A,\Dec_B$
+instead of by a latent transport map. This is precisely why the ill-posed vector-field pushforward
+(and its section/inverse) is avoided---see companion note, Prop.~``projectability''.
+\end{remark}
+
+\begin{proposition}[Fixed point]
+\label{prop:fixed-point}
+Suppose $\Dec_B$ is injective on the relevant support and $w(t)>0$. If $L(\theta)$ attains its
+$\theta$-dependent minimum with $y_B\equiv y_A$ (in expectation over $\varepsilon$) for all
+$x\in\mathrm{supp}(\rho_\theta)$ and all $t$, then $\den_\theta$ reproduces the pixel-conjugated
+teacher denoiser on that support, hence (Prop.~\ref{prop:equiv}) the student's probability flow
+matches the teacher's \emph{as observed through} $\Dec_B$. As $\rho_\theta$ then covers the
+teacher's image manifold, the match is self-reinforcing---the standard on-policy fixed point.
+\end{proposition}
+
+\section{Gradient Structure and Stop-Gradient Design}
+\label{sec:grad}
+
+The student parameter $\theta$ enters \eqref{eq:loss} through (i) the on-policy image $x$
+(produced by the rollout $v_\theta$) and (ii) the student branch $y_B$ (the denoiser being
+trained). The teacher branch $y_A$ depends on $\theta$ only through $x$.
+
+\begin{remark}[Recommended gradient paths]
+\label{rem:paths}
+Treat $x$ as a \emph{sampled on-policy state} (detach it) and stop-gradient the teacher target;
+then the gradient flows only through the student branch,
+\begin{equation}
+\nabla_\theta L
+= \E\Big[-2\,w(t)\,\big(\sg[y_A]-y_B\big)^{\!\top}\,
+\Jac_{\Dec_B}\,\Jac_{\den_\theta}\,\partial_\theta\den_\theta\Big],
+\label{eq:grad}
+\end{equation}
+which uses only \emph{adjoints} (vector--Jacobian products) of the forward maps $\Dec_B$ and
+$\den_\theta$; no map is inverted. Crucially, the rollout policy and the denoiser are the
+\emph{same} network $v_\theta$, so regressing the denoiser on on-policy states \eqref{eq:grad}
+\emph{also} improves the rollout---this is the on-policy distillation mechanism. Propagating
+additionally through $x$ (the rollout) is possible but expensive and can create a trivial
+fixed point (the student may prefer images on which the two VAEs happen to agree); detaching $x$
+avoids this.
+\end{remark}
+
+\section{Behavior Across Noise Levels and the Reconstruction Floor}
+\label{sec:t-behavior}
+
+\begin{remark}[Limiting behavior in $t$]
+\label{rem:t-limits}
+At $t\to0$: $\den_\bullet\to\mathrm{id}$, so $y_A\to\Dec_A\Enc_A(x)$ and $y_B\to\Dec_B\Enc_B(x)$;
+the loss tends to the VAE round-trip discrepancy, largely $\theta$-independent and
+\emph{uninformative}. At $t\to1$: the branches compare the two models' \emph{generative priors}
+(one-step guesses from near-noise); the distillation signal is strongest but has the highest
+variance. A weight $w(t)$ emphasizing mid-to-high $t$ is therefore natural.
+\end{remark}
+
+\begin{proposition}[Irreducible floor from VAE mismatch]
+\label{prop:floor}
+Even a student whose implied clean distribution equals the teacher's incurs a nonzero loss,
+because $y_A$ and $y_B$ pass through \emph{different} decoders. Define the reconstruction floor
+\begin{equation}
+\delta_{\mathrm{rec}}\;\coloneqq\;\E_{x\sim\rho_\theta}\ \norm{\Dec_A\Enc_A(x)-\Dec_B\Enc_B(x)},
+\label{eq:floor}
+\end{equation}
+the pixel gap between the two VAEs' reconstructions of the same image. Then \eqref{eq:loss} is
+bounded below by a $\delta_{\mathrm{rec}}$-type term (exactly $\delta_{\mathrm{rec}}^2$ in the
+$t\to0$ limit) and should be interpreted \emph{modulo} this floor; e.g.\ one may subtract the
+student's own reconstruction baseline to debias.
+\end{proposition}
+
+\section{Relationship to DMD, and to the Companion Routes}
+\label{sec:relations}
+
+\begin{remark}[DMD comparison]
+\label{rem:dmd}
+Like DMD/VSD, the states probed are \emph{noised outputs of the student generator} (here: noised
+re-encodings of $x\sim\rho_\theta$), so the scheme is on-policy w.r.t.\ the student's \emph{output}
+distribution (not its trajectory states). Unlike DMD, the signal is a \emph{direct pixel-space
+regression} between decoded one-step denoisings \eqref{eq:loss}, back-propagated through the
+student denoiser; it needs \emph{no} auxiliary online ``fake-score'' network and does not form the
+$(\,\text{real score}-\text{fake score}\,)$ gradient. It is thus closer to a denoiser/$x_0$-matching
+distillation than to variational score distillation, at the cost of back-propagating through
+$\Dec_B$ each step.
+\end{remark}
+
+\begin{remark}[Placement among the routes]
+\label{rem:placement}
+This scheme is Route~B (pixel adjoint) made symmetric and swept over $t$: both sides do
+encode$\to$noise$\to$one-step$\to$decode, and the target uses only the \emph{frozen}
+$\Enc_A,\Dec_A$ (never a learned low$\to$high map). It preserves the student as a
+velocity/denoiser network $v_\theta$ (a multi-step flow), in contrast to Route~A (DMD), which
+naturally yields a few-step generator.
+\end{remark}
+
+\section{Assumptions and Limitations}
+\label{sec:limits}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Metric.} The pixel-space $\ell_2$ metric, pulled back through $\Dec_B$, induces a
+        non-Euclidean effective metric on $\Zb$ (weighted by $\Jac_{\Dec_B}^{\!\top}\Jac_{\Dec_B}$);
+        perceptual/latent structure is only implicitly respected.
+  \item \textbf{Floor.} $\delta_{\mathrm{rec}}$ \eqref{eq:floor} sets a noise floor; small-$t$ terms
+        are dominated by it and should be down-weighted or debiased (Prop.~\ref{prop:floor}).
+  \item \textbf{Variance.} $\varepsilon_A,\varepsilon_B$ are independent (dimensions differ), adding
+        variance; averaging over several draws, or using expected (denoiser) forms, reduces it.
+  \item \textbf{Cost.} Each step needs a teacher forward plus $\Enc_A,\Dec_A$ for the target and a
+        differentiable pass through $\Enc_B,\den_\theta,\Dec_B$ for the student branch.
+  \item \textbf{On-policy notion.} On-policy is w.r.t.\ the student \emph{output} distribution
+        (noised), not the multi-step \emph{trajectory} states of XOPD's L1.
+  \item \textbf{One-step coarseness.} At high $t$ the one-step $x_0$-prediction is a coarse
+        estimate for both models; the signal is meaningful only when integrated across $t$
+        (Prop.~\ref{prop:equiv}).
+\end{itemize}
+
+\section{Summary}
+\label{sec:summary}
+
+The scheme distills the teacher's denoiser (equivalently its velocity/flow) into the student by
+comparing \emph{decoded one-step denoisings in pixel space}, on the student's own on-policy image
+distribution, across noise levels. Its defining virtue is that pixel space serves as the shared
+anchor, so it requires \emph{no} latent transport map and \emph{no} underdetermined
+student$\to$teacher inverse; its gradient uses only adjoints of forward maps. Its principal
+caveats are the VAE-mismatch floor $\delta_{\mathrm{rec}}$, the pixel-metric bias, and the per-step
+decode cost. It keeps the student a multi-step flow model (unlike DMD) and needs no auxiliary
+score network (unlike VSD).
+
+\end{document}
