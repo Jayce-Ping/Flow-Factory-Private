@@ -13,10 +13,13 @@
 # limitations under the License.
 
 # src/flow_factory/logger/wandb.py
+import logging
 from typing import Any, Dict, Optional
 import wandb
 from .abc import Logger
 from .formatting import LogImage, LogVideo, LogTable, LogFormatter
+
+_log = logging.getLogger(__name__)
 
 
 class WandbLogger(Logger):
@@ -28,6 +31,26 @@ class WandbLogger(Logger):
         )
         self.platform = wandb
         self._defined_axes = set()
+        # Two INDEPENDENT x-axes so the cold-start and L1 phases never collide:
+        #   * training/eval metrics -> ``step`` (= trainer.step)
+        #   * cold-start metrics    -> ``cold-start/step`` (also (re)bound in
+        #     `log_data_on_axis`)
+        # We bind SPECIFIC namespaces (not "*") so cold-start rows are never stamped with
+        # a training ``step`` value (which previously made wandb's global x-axis pile all
+        # cold-start points at step=0). Combined with STEPLESS logging in `_log_impl`
+        # (no `step=`), wandb's internal `_step` just auto-increments monotonically, so no
+        # early eval/train point is ever dropped (the bug where cold-start logs advanced
+        # `_step` past the early explicit-step eval logs, dropping them).
+        try:
+            wandb.define_metric("step")
+            wandb.define_metric("cold-start/step")
+            for _pat in ("train/*", "eval/*", "eval_samples", "train_samples", "reward/*"):
+                wandb.define_metric(_pat, step_metric="step")
+            wandb.define_metric("cold-start/*", step_metric="cold-start/step")
+        except Exception as e:
+            # define_metric is best-effort chart config (idempotent); a failure only affects
+            # the wandb x-axis, never training. Surface it instead of silently swallowing.
+            _log.warning("wandb.define_metric setup failed (x-axis may be off): %s", e)
 
     def _convert_to_platform(
         self, 
@@ -56,7 +79,13 @@ class WandbLogger(Logger):
         return value
 
     def _log_impl(self, data: Dict, step: int):
-        self.platform.log(data, step=step)
+        # Log STEPLESS against the training ``step`` axis (bound in `_init_platform`).
+        # wandb's internal `_step` then auto-increments monotonically per call and never
+        # rejects a log for a non-monotonic explicit step -- so early eval/train points
+        # are no longer dropped after the cold-start logs advanced `_step`.
+        payload = dict(data)
+        payload["step"] = step
+        self.platform.log(payload)
 
     def log_data_on_axis(self, data: Dict, step: int, step_key: str):
         """Log against a custom x-axis ``step_key`` via wandb.define_metric.
@@ -73,8 +102,8 @@ class WandbLogger(Logger):
                 self.platform.define_metric(step_key)
                 pattern = f"{ns}/*" if ns else "*"
                 self.platform.define_metric(pattern, step_metric=step_key)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.warning("wandb.define_metric(%s) failed: %s", step_key, e)
             self._defined_axes.add(step_key)
 
         # IR conversion (images/tables) identical to log_data, but log on the

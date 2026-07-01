@@ -1,0 +1,165 @@
+# Cross-VAE XOPD: FLUX.2-klein-base-9B (teacher) -> SD3.5-medium (student)
+# LOW-NOISE + LATE variant (user-directed 2026-07-01):
+#   * cold-start Q on CLEAN + LOW-noise latents only (sigma ~ U(0, 0.3)), so the transport
+#     is trained in the same low-noise band it will be used in.
+#   * L1 XOPD ONLY on the LATE (low-sigma) timesteps [20..27] (sigma ~ [0.04, 0.29] for the
+#     28-step schedule), matching the cold-start noise interval (DanceOPD-style).
+#   * cold-start epochs = 6 (2x the main config's 3).
+# Rationale: the clean-trained transport failed on high-sigma latents; keep BOTH the transport
+# training AND the XOPD steps inside the low-noise region where the transport is accurate.
+# Uses the displacement transport + scaled/BN-space noising fixes.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (prompts only) =====
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/geneval"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 2000
+  sampler_type: "auto"
+
+# ===== Model (student = SD3.5-medium) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_9b_to_sd35_l1_hsct_lonoise_late"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+# ===== Training (XOPD cross-VAE) =====
+train:
+  trainer_type: "xopd"
+  eval_teacher_at_start: false
+  max_epochs: 201
+
+  # --- Cross-VAE teacher (independent adapter; 9B teacher shares the 4B VAE) ---
+  teacher_model_type: "flux2-klein"
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: false
+
+  # --- M8 HSCT transport ---
+  vae_transport: "hsct"
+  hsct_q_arch: "conv"
+  hsct_q_inject: "deepstack"
+  hsct_hidden_blocks: [5, 11, 17, 23]
+  hsct_h_proj: 256
+  hsct_q_hidden: 256
+  hsct_q_depth: 4
+  # cold-start: CLEAN + LOW-noise (sigma ~ U(0, 0.3)); 6 epochs (2x the main 3).
+  hsct_coldstart_source: "offline_corpus"
+  hsct_coldstart_corpus: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/vae_align_corpus_big"
+  hsct_coldstart_epochs: 6
+  hsct_coldstart_bs: 4
+  hsct_coldstart_inner_steps: 1
+  hsct_coldstart_max_images: 0
+  hsct_coldstart_sigma: 0.0
+  hsct_coldstart_noisy: true
+  hsct_coldstart_sigma_max: 0.3       # low-noise band, matched to the late window [20..27]
+  hsct_coldstart_lr: 1.0e-4
+  transport_warmup_batches: 1
+
+  # --- Dual classifier-free guidance ---
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  # --- L0 disabled (pure L1) ---
+  l0_warmup_epochs: 0
+
+  # --- L1: on-policy transition matching (pathwise only) ---
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  # --- L1 timestep selection: LATE / low-sigma window only (sigma ~ [0.04, 0.29]) ---
+  xopd_train_steps: [20, 21, 22, 23, 24, 25, 26, 27]
+  num_xopd_steps: 1
+
+  # --- Sampling / batch: 128 unique samples / grad step ---
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 128
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  # --- Optimizer ---
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # --- EMA ---
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # --- Memory / misc ---
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (geneval + pickscore at gs 1.0 and 4.5) =====
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  num_inference_steps: 28
+  guidance_scale: 1.0
+  eval_freq: 25
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval, split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: geneval_gs45,  dataset_dir: dataset/geneval, split: test, guidance_scale: 4.5, eval_reward_names: [geneval, pick_score]}
+
+# ===== Rewards =====
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false

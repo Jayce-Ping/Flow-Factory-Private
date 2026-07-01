@@ -1,0 +1,165 @@
+# Cross-VAE XOPD: FLUX.2-klein-base-9B (teacher) -> SD3.5-medium (student)
+# M8 HSCT transport: linear P (raw teacher->student, exact L1 pushforward) + deepstack
+# inverse Q conditioned on SD3.5 transformer hidden states h_S (the d_S<d_T deficit fix).
+# Cold-start: train P (closed-form) + Q (gradient) on the offline corpus (raw z_S,z_T,h_S),
+# logging loss + inverse-recon to wandb, then FREEZE for L1. Pure L1 (no L0 warmup), ODE.
+#
+# This variant trains L1 on the FULL trajectory (a few random steps/epoch). If it
+# collapses to noise (clean-trained transport failing on noisy latents), switch to
+# flux2_klein_9b_to_sd35_l1_hsct_late.yaml (DanceOPD late-timestep only).
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (prompts only) =====
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/geneval"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 2000
+  sampler_type: "auto"
+
+# ===== Model (student = SD3.5-medium) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_9b_to_sd35_l1_hsct_noisy"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+# ===== Training (XOPD cross-VAE) =====
+train:
+  trainer_type: "xopd"
+  eval_teacher_at_start: false
+  max_epochs: 201
+
+  # --- Cross-VAE teacher (independent adapter; 9B teacher shares the 4B VAE) ---
+  teacher_model_type: "flux2-klein"
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: false
+
+  # --- M8 HSCT transport ---
+  vae_transport: "hsct"
+  hsct_q_arch: "conv"                 # Phase-2 winner (update after ablation: conv|unet|dit)
+  hsct_q_inject: "deepstack"
+  hsct_hidden_blocks: [5, 11, 17, 23] # spread low->high SD3.5 blocks (DeepStack)
+  hsct_h_proj: 256
+  hsct_q_hidden: 256
+  hsct_q_depth: 4
+  # cold-start: read offline corpus (shared disk) -> (raw z_S,z_T,h_S) -> train P+Q
+  hsct_coldstart_source: "offline_corpus"
+  hsct_coldstart_corpus: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/vae_align_corpus_big"
+  hsct_coldstart_epochs: 5            # offline scaling inflection ~3 passes
+  hsct_coldstart_bs: 4
+  hsct_coldstart_inner_steps: 1
+  hsct_coldstart_max_images: 0        # 0 = all
+  hsct_coldstart_sigma: 0.0
+  hsct_coldstart_noisy: true
+  hsct_coldstart_sigma_max: 1.0           # clean (per offline); raise to train noisy if needed
+  hsct_coldstart_lr: 1.0e-4
+  # the warmup_* knobs below are unused by hsct (kept for arg-validation parity)
+  transport_warmup_batches: 1
+
+  # --- Dual classifier-free guidance ---
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  # --- L0 disabled (pure L1) ---
+  l0_warmup_epochs: 0
+
+  # --- L1: on-policy transition matching (pathwise only) ---
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  # --- L1 timestep selection: FULL trajectory, sample 4 random steps/epoch ---
+  xopd_train_steps: null              # null => all 28 steps eligible
+  num_xopd_steps: 4
+
+  # --- Sampling / batch: 128 unique samples / grad step (pdbs=4 x 32 gpu) ---
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1            # -> 2/1 if OOM (auto GAS collects 128)
+  group_size: 1
+  unique_sample_num_per_epoch: 128
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  # --- Optimizer ---
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # --- EMA ---
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # --- Memory / misc ---
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (geneval + pickscore at gs 1.0 and 4.5) =====
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  num_inference_steps: 28
+  guidance_scale: 1.0
+  eval_freq: 25
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval, split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: geneval_gs45,  dataset_dir: dataset/geneval, split: test, guidance_scale: 4.5, eval_reward_names: [geneval, pick_score]}
+
+# ===== Rewards =====
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false

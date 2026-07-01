@@ -2139,7 +2139,8 @@ class XOPDTrainingArguments(TrainingArguments):
         },
     )
     vae_transport: Literal[
-        "identity", "pixel", "linear", "whitening", "adaln", "conv", "conv_linear", "mlp"
+        "identity", "pixel", "linear", "whitening", "adaln",
+        "conv", "conv_linear", "m5", "conv_nl", "nonlinear", "aligned", "hsct", "mlp"
     ] = field(
         default="identity",
         metadata={
@@ -2159,8 +2160,11 @@ class XOPDTrainingArguments(TrainingArguments):
                 "frozen closed-form base affine (do-no-harm), plus a paired linear "
                 "inverse net; adds a spatial receptive field the per-pixel affine/adaln "
                 "lack (recovers detail when the teacher grid is coarser) while keeping "
-                "the L1 pushforward exact. 'mlp': non-linear placeholder "
-                "(NotImplementedError). All "
+                "the L1 pushforward exact. 'm5' (== 'conv_nl'/'nonlinear'): the SAME "
+                "scaffolding as 'conv' but with NON-LINEAR residual nets + a learned "
+                "(non-analytic) inverse — higher clean fidelity at the cost of an only-"
+                "APPROXIMATE L1 pushforward (the doc's M5 cycle-consistent transport). "
+                "'mlp': non-linear placeholder (NotImplementedError). All "
                 "non-pixel transports are frozen during L1; L0 always uses the pixel "
                 "bridge. This selects the L1 transition-mean transport."
             )
@@ -2247,9 +2251,106 @@ class XOPDTrainingArguments(TrainingArguments):
                 "image and re-encoded into the student space (z_t^S = encode_pixels(decode("
                 "z_t^T))), so the transport is trained on latents at ALL noise levels "
                 "(matching how L1 applies it to noisy student states at every step). If "
-                "False, only the final clean latent z0 is paired (legacy clean-only)."
+                "False, only the final clean latent z0 is paired (legacy clean-only). "
+                "NOTE: with transport_clean_fit_only=True (default) the noisy pairs are "
+                "DROPPED from the fit anyway, so prefer False here to skip the wasted "
+                "per-step decode/encode."
             )
         },
+    )
+    transport_teacher_unshuffle: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Cross-VAE only. If True, the teacher latent is PixelShuffle(2)-"
+                "un-patchified BEFORE the transport: FLUX.2's packed transformer input "
+                "(128ch @ 32x32 = a 2x2 patchify of the 32ch VAE latent) becomes 32ch @ "
+                "64x64. This (a) spatially ALIGNS the teacher latent with the SD3.5 "
+                "student grid (64x64) so the transport needs NO bilinear up-sample (which "
+                "is wrong on a patchified latent — adjacent patch-channels are sub-pixel "
+                "detail, not smooth), and (b) cuts the channel ratio 128:16 -> 32:16, so "
+                "the student->teacher inverse (needed for the L1 teacher query) is far "
+                "less under-determined (2:1 vs 8:1). A paired PixelUnshuffle(2) in the "
+                "from_spatial converter makes the round-trip exact (the teacher query is "
+                "still on the true packed latent). Default False (legacy patchified "
+                "transport)."
+            )
+        },
+    )
+    transport_clean_fit_only: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True (default), FIT the transport on CLEAN (sigma~0) pairs ONLY, "
+                "dropping any noisy-step pairs from the warm-up update. RATIONALE: the "
+                "noisy-step student target is built by the pixel bridge "
+                "(z_t^S = encode(decode(z_t^T))), but the VAE decode is only valid on "
+                "CLEAN latents -> a decoded NOISY teacher latent is garbage, so those "
+                "pairs corrupt the fit. By Prop.(affine pushforward) a linear/conv "
+                "transport fit on clean pairs already transports EVERY noise level "
+                "correctly (linearity commutes with the FM interpolation), so the noisy "
+                "pairs are not just useless but harmful. Set False only to reproduce the "
+                "legacy all-noise-level fit. Ignored by identity/pixel (no warm-up)."
+            )
+        },
+    )
+
+    # ---- M8 HSCT (hidden-state-conditioned transport) ----
+    hsct_q_arch: Literal["conv", "unet", "dit"] = field(
+        default="conv",
+        metadata={"help": "HSCT inverse-Q backbone (Phase-2 winner): conv|unet|dit."},
+    )
+    hsct_q_inject: Literal["concat", "wsum", "deepstack"] = field(
+        default="deepstack",
+        metadata={"help": "How multi-layer student hidden states enter Q (deepstack=per-layer residual)."},
+    )
+    hsct_hidden_blocks: List[int] = field(
+        default_factory=lambda: [5, 11, 17, 23],
+        metadata={"help": "SD3.5 transformer blocks (0..23) tapped for h_S (DeepStack)."},
+    )
+    hsct_h_proj: int = field(default=256, metadata={"help": "HSCT hidden projection dim."})
+    hsct_q_hidden: int = field(default=256, metadata={"help": "HSCT conv-Q hidden width."})
+    hsct_q_depth: int = field(default=4, metadata={"help": "HSCT Q depth (conv stages / dit blocks)."})
+    hsct_coldstart_source: Literal["offline_corpus", "online_gen"] = field(
+        default="offline_corpus",
+        metadata={"help": "Cold-start data: read offline corpus from disk, or teacher-generate online."},
+    )
+    hsct_coldstart_corpus: str = field(
+        default="/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/vae_align_corpus_big",
+        metadata={"help": "Offline corpus dir (rank_*/*.png) for HSCT cold-start (offline_corpus mode)."},
+    )
+    hsct_coldstart_epochs: int = field(
+        default=3, metadata={"help": "HSCT cold-start passes over the cold-start data."},
+    )
+    hsct_coldstart_bs: int = field(
+        default=4, metadata={"help": "HSCT cold-start per-device batch size (images)."},
+    )
+    hsct_coldstart_inner_steps: int = field(
+        default=1, metadata={"help": "Q optimizer steps per cold-start batch."},
+    )
+    hsct_coldstart_max_images: int = field(
+        default=0, metadata={"help": "Cap unique cold-start images (0=all). For data-scaling/budget."},
+    )
+    hsct_coldstart_sigma: float = field(
+        default=0.0,
+        metadata={"help": "Noise fraction for cold-start h_S/z_S (0=clean, per offline; raise to train noisy)."},
+    )
+    hsct_coldstart_noisy: bool = field(
+        default=False,
+        metadata={"help": "Cold-start Q on NOISY latents: per-sample sigma~U(0,sigma_max), independent "
+                  "FM noise on Q input (noisy z_S) AND target (noisy z_T), h_S at the noisy state. "
+                  "Fixes the clean->noisy generalization collapse in L1."},
+    )
+    hsct_coldstart_sigma_max: float = field(
+        default=1.0,
+        metadata={"help": "Upper bound of the per-sample noise fraction when hsct_coldstart_noisy=True."},
+    )
+    hsct_coldstart_gs: List[float] = field(
+        default_factory=lambda: [1.0, 4.0],
+        metadata={"help": "Guidance scales mixed for online_gen cold-start image collection."},
+    )
+    hsct_coldstart_lr: float = field(
+        default=1.0e-4, metadata={"help": "HSCT cold-start Q learning rate."},
     )
 
     # ---- Dual classifier-free guidance ----
@@ -2418,11 +2519,12 @@ class XOPDTrainingArguments(TrainingArguments):
                 raise ValueError(
                     "Cross-VAE XOPD (teacher_model_type set: "
                     f"{self.teacher_model_type!r}) requires a non-identity "
-                    "vae_transport (one of {'pixel', 'linear', 'mlp'}); got "
-                    "vae_transport='identity'."
+                    "vae_transport (e.g. 'hsct', 'linear', 'conv', 'm5', 'adaln', "
+                    "'whitening', 'pixel'); got vae_transport='identity'."
                 )
             if self.vae_transport in (
-                "linear", "whitening", "adaln", "conv", "conv_linear"
+                "linear", "whitening", "adaln", "conv", "conv_linear",
+                "m5", "conv_nl", "nonlinear"
             ) and self.transport_warmup_batches <= 0:
                 raise ValueError(
                     f"vae_transport={self.vae_transport!r} requires "

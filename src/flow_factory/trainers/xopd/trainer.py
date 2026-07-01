@@ -77,7 +77,7 @@ from .common import (
     validate_l1_one_step_per_epoch,
     validate_source_ratio,
 )
-from .transport import AdaLNTransport, ConvTransport, build_transport
+from .transport import AdaLNTransport, build_transport
 
 logger = setup_logger(__name__)
 
@@ -329,6 +329,9 @@ class XOPDTrainer(BaseTrainer):
         # Build the transport. Adapter latent-layout converters (native <-> BCHW)
         # let an affine transport accept/return native latents; identity for an
         # already-BCHW adapter (SD3.5), unpack/pack for FLUX.2.
+        self._is_hsct = ta.vae_transport == "hsct"
+        self._hsct_hidden: Dict[int, torch.Tensor] = {}
+        self._hsct_capture = False
         if ta.vae_transport == "pixel":
             self.transport = build_transport(
                 "pixel",
@@ -360,20 +363,56 @@ class XOPDTrainer(BaseTrainer):
                 teacher_channels=self._adapter_latent_channels(self.teacher_adapter),
                 student_channels=self._adapter_latent_channels(self.adapter),
             )
-        elif ta.vae_transport in ("conv", "conv_linear"):
-            # STRICTLY-LINEAR conv transport: a learned (PixelShuffle) upsample + conv
-            # residual on top of the frozen closed-form base affine (do-no-harm), plus
-            # a paired linear inverse net. Adds a spatial receptive field the per-pixel
-            # affine/adaln lack, while keeping the L1 pushforward exact (still linear).
-            # Trained ONLY during warm-up (forward+inverse+cycle recon), then frozen.
+        elif ta.vae_transport in ("conv", "conv_linear", "m5", "conv_nl", "nonlinear"):
+            # conv (== conv_linear): STRICTLY-LINEAR conv transport — a learned
+            # (PixelShuffle) upsample + conv residual on top of the frozen closed-form
+            # base affine (do-no-harm), plus a paired linear inverse net. Adds a spatial
+            # receptive field the per-pixel affine/adaln lack, while keeping the L1
+            # pushforward EXACT (still linear).
+            # m5 (== conv_nl/nonlinear): the SAME scaffolding but NON-LINEAR residual
+            # nets (activations) + a learned (non-analytic) inverse — higher clean
+            # fidelity at the cost of an only-APPROXIMATE L1 pushforward (the doc's M5
+            # cycle-consistent two-network transport). Both are trained ONLY during
+            # warm-up (forward+inverse+cycle recon), then frozen for L1.
             self.transport = build_transport(
-                "conv",
+                ta.vae_transport,
                 teacher_to_spatial=self._teacher_to_spatial,
                 teacher_from_spatial=self._teacher_from_spatial,
                 student_to_spatial=self._student_to_spatial,
                 student_from_spatial=self._student_from_spatial,
                 teacher_channels=self._adapter_latent_channels(self.teacher_adapter),
                 student_channels=self._adapter_latent_channels(self.adapter),
+            )
+        elif ta.vae_transport == "hsct":
+            # M8: hidden-state-conditioned transport. Linear P (raw teacher->student,
+            # closed-form, exact pushforward) + deepstack Q (raw student + SD3.5 hidden
+            # h_S -> raw teacher). Operates on RAW VAE latents; HSCT converts the SCALED
+            # rollout latent <-> raw and the teacher raw <-> packed internally.
+            s_vae_cfg = self.adapter.pipeline.vae.config
+            t_vae_cfg = self.teacher_adapter.pipeline.vae.config
+            self.transport = build_transport(
+                "hsct",
+                teacher_adapter=self.teacher_adapter,
+                student_to_spatial=self._student_to_spatial,
+                student_from_spatial=self._student_from_spatial,
+                c_T=int(t_vae_cfg.latent_channels),
+                c_S=int(s_vae_cfg.latent_channels),
+                student_scaling=float(s_vae_cfg.scaling_factor),
+                student_shift=float(getattr(s_vae_cfg, "shift_factor", 0.0) or 0.0),
+                h_proj=ta.hsct_h_proj,
+                q_arch=ta.hsct_q_arch,
+                q_inject=ta.hsct_q_inject,
+                q_hidden=ta.hsct_q_hidden,
+                q_depth=ta.hsct_q_depth,
+                n_blocks=len(ta.hsct_hidden_blocks),
+            )
+            self._register_hsct_hooks()
+        elif ta.vae_transport == "aligned":
+            # M3 Stage-2 needs teacher_adapter + checkpoint_path, which this trainer does not
+            # construct. Fail fast with an actionable message instead of a cryptic ctor error.
+            raise NotImplementedError(
+                "vae_transport='aligned' is not wired in the XOPD trainer (needs "
+                "teacher_adapter + checkpoint_path). Use 'hsct', or wire AlignedTransport here."
             )
         else:  # "mlp" -> placeholder (raises in build_transport/constructor)
             self.transport = build_transport(ta.vae_transport)
@@ -510,9 +549,18 @@ class XOPDTrainer(BaseTrainer):
             if self._teacher_spatial_hw is not None:
                 ctx.setdefault("height", self._teacher_spatial_hw[0])
                 ctx.setdefault("width", self._teacher_spatial_hw[1])
-        return self._adapter_to_spatial(self.teacher_adapter, z, **ctx)
+        sp = self._adapter_to_spatial(self.teacher_adapter, z, **ctx)
+        if getattr(self.training_args, "transport_teacher_unshuffle", False):
+            # 128ch@32x32 (2x2 patchify of the 32ch VAE latent) -> 32ch@64x64. Lossless
+            # reshape: aligns the teacher latent to the student 64x64 grid (no bilinear)
+            # and cuts the channel ratio 128:16 -> 32:16. Paired with PixelUnshuffle(2) in
+            # _teacher_from_spatial so t_from(t2s(x)) == x (the teacher query stays exact).
+            sp = torch.nn.functional.pixel_shuffle(sp, 2)
+        return sp
 
     def _teacher_from_spatial(self, z, **ctx):
+        if getattr(self.training_args, "transport_teacher_unshuffle", False):
+            z = torch.nn.functional.pixel_unshuffle(z, 2)
         return self._adapter_from_spatial(self.teacher_adapter, z, **ctx)
 
     def _student_to_spatial(self, z, **ctx):
@@ -520,6 +568,55 @@ class XOPDTrainer(BaseTrainer):
 
     def _student_from_spatial(self, z, **ctx):
         return self._adapter_from_spatial(self.adapter, z, **ctx)
+
+    # ----- M8 HSCT: student-transformer hidden-state capture --------------------
+    def _register_hsct_hooks(self) -> None:
+        """Register forward hooks on the student transformer blocks to capture h_S.
+
+        The SD3 JointTransformerBlock returns ``(encoder_hidden_states, hidden_states)``;
+        we grab the image stream ``[1]``. Capture is gated by ``self._hsct_capture`` so
+        only the L1 pre-pass / cold-start forwards pay the (tiny) cost; sampling/eval
+        forwards skip it. Hooks live on the underlying block modules so they survive
+        accelerate/deepspeed wrapping.
+        """
+        transformer = getattr(self.adapter.pipeline, "transformer", None)
+        if transformer is None or not hasattr(transformer, "transformer_blocks"):
+            raise RuntimeError(
+                "HSCT needs self.adapter.pipeline.transformer.transformer_blocks to hook "
+                f"hidden states; got {type(self.adapter).__name__}."
+            )
+        blocks = transformer.transformer_blocks
+        for b in self.training_args.hsct_hidden_blocks:
+            if not (0 <= b < len(blocks)):
+                raise ValueError(f"hsct_hidden_blocks entry {b} out of range [0,{len(blocks)})")
+
+            def _mk(bi):
+                def _hook(_m, _i, out):
+                    if self._hsct_capture:
+                        self._hsct_hidden[bi] = out[1] if isinstance(out, (tuple, list)) else out
+                return _hook
+
+            blocks[b].register_forward_hook(_mk(b))
+
+    def _hsct_h_list(self, latent_bs: int) -> List[torch.Tensor]:
+        """Reshape captured per-block hidden ``(B|2B, N, D)`` -> list of ``(B, D, s, s)``.
+
+        Under CFG the transformer runs on ``cat[uncond, cond]`` (2B); take the cond
+        half so h_S matches the (positive-prompt) conditioning the inverse needs.
+        """
+        out = []
+        for b in self.training_args.hsct_hidden_blocks:
+            if b not in self._hsct_hidden:
+                raise RuntimeError(f"HSCT hidden for block {b} not captured; was _hsct_capture set?")
+            h = self._hsct_hidden[b]
+            if h.shape[0] == 2 * latent_bs:
+                h = h[latent_bs:]
+            B, N, D = h.shape
+            s = int(round(N ** 0.5))
+            if s * s != N:
+                raise ValueError(f"non-square token count N={N} at block {b}")
+            out.append(h.reshape(B, s, s, D).permute(0, 3, 1, 2).contiguous())
+        return out
 
     def _resolve_teacher_vae_path(self) -> Optional[str]:
         """Resolve where to load the cross-VAE teacher's VAE from.
@@ -703,7 +800,10 @@ class XOPDTrainer(BaseTrainer):
             and getattr(self.transport, "requires_warmup", False)
             and not getattr(self.transport, "is_fitted", True)
         ):
-            self._warmup_transport()
+            if self._is_hsct:
+                self._coldstart_hsct()  # M8: train linear-P + deepstack-Q on corpus h_S
+            else:
+                self._warmup_transport()
 
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
@@ -1358,9 +1458,33 @@ class XOPDTrainer(BaseTrainer):
                 else ""
             )
         )
+        clean_fit_only = bool(getattr(ta, "transport_clean_fit_only", True))
         for ep in range(n_epochs):
             # 1. Fresh rollout for THIS epoch (full denoising trajectory per batch).
             z_T_list, z_S_list, sigma_list, _img = self._collect_warmup_pairs()
+            # Clean-only fit (default): the NOISY-step student target is built by the
+            # pixel bridge (decode a NOISY teacher latent -> garbage; the VAE is only
+            # valid on clean latents), so fitting on those pairs corrupts the transport.
+            # By Prop.(affine pushforward) a linear/conv transport fit on CLEAN pairs
+            # already transports EVERY noise level correctly, so we drop the noisy pairs
+            # from the fit. (M5/non-linear is also clean-fit here; its noisy behaviour is
+            # an accepted approximation.) sigma is None for the legacy clean-only path.
+            if clean_fit_only:
+                clean_eps = 1e-3
+                keep = [
+                    i for i, s in enumerate(sigma_list)
+                    if s is None or float(s) <= clean_eps
+                ]
+                if not keep:
+                    raise RuntimeError(
+                        "transport_clean_fit_only=True but warm-up epoch produced NO "
+                        f"clean (sigma<={clean_eps}) pairs out of {len(sigma_list)}; "
+                        "set transport_warmup_trajectory=False (clean endpoint only) or "
+                        "check the teacher rollout."
+                    )
+                z_T_list = [z_T_list[i] for i in keep]
+                z_S_list = [z_S_list[i] for i in keep]
+                sigma_list = [sigma_list[i] for i in keep]
             z_T_dev = [z.to(device) for z in z_T_list]
             z_S_dev = [z.to(device) for z in z_S_list]
             # 2. One transport update on this epoch's fresh data. adaln consumes the
@@ -1415,6 +1539,304 @@ class XOPDTrainer(BaseTrainer):
                 p.requires_grad_(False)
             self.transport._fitted = True
         logger.info(f"Transport ({ta.vae_transport}) warm-up complete; frozen for L1.")
+
+    # ===================== M8: HSCT cold-start ==============================
+    def _coldstart_hsct(self) -> None:
+        """Cold-start the HSCT transport: fit linear P + grad-train deepstack Q on
+        (raw z_S, raw z_T, student hidden h_S) triples, logging loss + recon to wandb,
+        then freeze for L1.
+
+        Data source (ta.hsct_coldstart_source):
+          * 'offline_corpus': read images + prompts from a corpus ``index.jsonl`` on
+            the shared disk (fast; matches the offline alignment study).
+          * 'online_gen': teacher-generate images on the fly at mixed guidance scales
+            (on-distribution but slower).
+        DDP: a DistributedSampler shards the data; the transport all-reduces P stats and
+        Q grads so every rank ends identical (then rank-0 broadcast as insurance).
+        """
+        import json as _json
+
+        import torchvision.transforms as _TT
+        from PIL import Image as _Image, ImageFile as _ImageFile
+        from torch.utils.data import DataLoader as _DL, Dataset as _DS
+        from torch.utils.data.distributed import DistributedSampler as _DSamp
+
+        _ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate partial-write corpus PNGs
+
+        ta = self.training_args
+        acc = self.accelerator
+        device = acc.device
+        s_vae = self.adapter.pipeline.vae
+        t_vae = self.teacher_adapter.pipeline.vae
+        s_scale = float(s_vae.config.scaling_factor)
+        s_shift = float(getattr(s_vae.config, "shift_factor", 0.0) or 0.0)
+        sigma = float(ta.hsct_coldstart_sigma)
+
+        self.transport.to(device)
+        self.transport.set_online_lr(ta.hsct_coldstart_lr)
+
+        # ---- dataset: (image[-1,1], prompt) -----------------------------------
+        class _Corpus(_DS):
+            def __init__(self, entries, res):
+                self.entries = entries
+                self.tf = _TT.Compose([_TT.Resize(res), _TT.CenterCrop(res), _TT.ToTensor()])
+
+            def __len__(self):
+                return len(self.entries)
+
+            def __getitem__(self, i):
+                # skip truncated/corrupt PNGs (partial gen writes) -> next valid entry
+                n = len(self.entries)
+                for off in range(n):
+                    e = self.entries[(i + off) % n]
+                    try:
+                        img = _Image.open(e["path"]).convert("RGB")
+                        return self.tf(img) * 2.0 - 1.0, e["prompt"]
+                    except (OSError, ValueError):
+                        continue
+                raise RuntimeError("HSCT cold-start corpus: no decodable image found")
+
+        if ta.hsct_coldstart_source != "offline_corpus":
+            raise NotImplementedError(
+                "online_gen cold-start not wired in this build; use "
+                "hsct_coldstart_source='offline_corpus' (generate the corpus offline)."
+            )
+        index_path = os.path.join(ta.hsct_coldstart_corpus, "index.jsonl")
+        if not os.path.isfile(index_path):
+            raise FileNotFoundError(
+                f"HSCT cold-start needs {index_path} (lines {{'path','prompt'}}); "
+                "build it from the corpus first (scripts/vae_align/build_corpus_index.py)."
+            )
+        with open(index_path) as f:
+            entries = [_json.loads(line) for line in f if line.strip()]
+        if ta.hsct_coldstart_max_images > 0:
+            entries = entries[: ta.hsct_coldstart_max_images]
+        ds = _Corpus(entries, ta.resolution)
+        sampler = (
+            _DSamp(ds, num_replicas=acc.num_processes, rank=acc.process_index, shuffle=True, drop_last=True)
+            if acc.num_processes > 1 else None
+        )
+        dl = _DL(
+            ds, batch_size=ta.hsct_coldstart_bs, sampler=sampler,
+            shuffle=(sampler is None), num_workers=8, drop_last=True, pin_memory=True,
+        )
+        if acc.is_main_process:
+            _noise_desc = (
+                f"noisy sigma~U(0,{ta.hsct_coldstart_sigma_max})"
+                if ta.hsct_coldstart_noisy else f"clean sigma={sigma}"
+            )
+            logger.info(
+                f"HSCT cold-start: {len(ds)} imgs, source={ta.hsct_coldstart_source}, "
+                f"arch={ta.hsct_q_arch}/{ta.hsct_q_inject}, blocks={ta.hsct_hidden_blocks}, "
+                f"{_noise_desc}, epochs={ta.hsct_coldstart_epochs}, bs={ta.hsct_coldstart_bs}."
+            )
+
+        transformer = self.adapter.pipeline.transformer
+        # encode_prompt needs the (possibly CPU-offloaded) student text encoders on
+        # device; onload for the cold-start, restore after (L1 uses precomputed embeds).
+        _te_saved = []
+        for _n in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            _te = getattr(self.adapter.pipeline, _n, None)
+            if _te is not None and hasattr(_te, "parameters"):
+                try:
+                    _dev0 = next(_te.parameters()).device
+                except StopIteration:
+                    continue
+                _te_saved.append((_te, _dev0))
+                _te.to(device)
+
+        # ---- FIXED viz set (rank0): encode a constant set of images ONCE so the recon
+        # gallery shows the SAME images at every viz step (=> can eyeball Q improving over
+        # cold-start), decoupled from the training batch size. Half are shown clean-target,
+        # half noised-target (spanning sigma) inside `_hsct_recon_images`. ----
+        _VIZ_N = 32
+        viz_pack = None
+        if acc.is_main_process and self.logger is not None:
+            v_n = min(_VIZ_N, len(ds))
+            with torch.no_grad(), self.autocast():
+                v_imgs = torch.stack([ds[i][0] for i in range(v_n)]).to(device)
+                v_prompts = [ds[i][1] for i in range(v_n)]
+                v_rawS = s_vae.encode(v_imgs.to(s_vae.dtype)).latent_dist.mode().float()
+                v_rawT = t_vae.encode(v_imgs.to(t_vae.dtype)).latent_dist.mode().float()
+                v_pe, _, v_pool, _ = self.adapter.pipeline.encode_prompt(
+                    prompt=v_prompts, prompt_2=v_prompts, prompt_3=v_prompts,
+                    device=device, do_classifier_free_guidance=False,
+                )
+            viz_pack = (v_rawS, v_rawT, v_imgs, v_pe, v_pool)
+        cs_step = 0
+        for ep in range(ta.hsct_coldstart_epochs):
+            if sampler is not None:
+                sampler.set_epoch(ep)
+            for imgs, prompts in dl:
+                imgs = imgs.to(device)
+                with torch.no_grad(), self.autocast():
+                    raw_S = s_vae.encode(imgs.to(s_vae.dtype)).latent_dist.mode().float()
+                    raw_T = t_vae.encode(imgs.to(t_vae.dtype)).latent_dist.mode().float()
+                    enc = self.adapter.pipeline.encode_prompt(
+                        prompt=list(prompts), prompt_2=list(prompts), prompt_3=list(prompts),
+                        device=device, do_classifier_free_guidance=False,
+                    )
+                    prompt_embeds, _, pooled, _ = enc
+                    B = imgs.shape[0]
+                    # NOISY-domain cold-start: per-sample sigma; add INDEPENDENT flow-matching
+                    # noise to the Q input (noisy z_S) AND the target (noisy z_T); h_S at the
+                    # noisy state. Trains Q to map noisy_student -> noisy_teacher at matched
+                    # sigma so it does not produce garbage on the L1 rollout's noisy latents.
+                    # CRITICAL: noise in the SCALED (flow-matching) latent space -- exactly what
+                    # the L1 rollout produces -- then convert back to raw for Q/P (which operate
+                    # on raw latents). Noising raw latents directly is WRONG: the teacher raw
+                    # latent has large magnitude (FLUX scale~0.36 => std~2.8) so unit noise is
+                    # far too weak, and the effective sigma no longer matches L1.
+                    if ta.hsct_coldstart_noisy:
+                        sig = torch.rand(B, 1, 1, 1, device=device) * ta.hsct_coldstart_sigma_max
+                        # FM-noise student (scaled space) + teacher (BN-packed space) to match
+                        # the L1 rollout; single source of truth lives on the transport.
+                        q_in_S, z_tf = self.transport.noise_student_scaled(raw_S, sig)
+                        q_tgt_T = self.transport.noise_teacher_raw(raw_T, sig)
+                        ts = (sig.reshape(B) * 1000.0).to(transformer.dtype)
+                    else:
+                        sig = float(sigma)
+                        q_in_S, q_tgt_T = raw_S, raw_T
+                        zS = (raw_S - s_shift) * s_scale
+                        if sig > 0.0:
+                            zS_n = (1.0 - sig) * zS + sig * torch.randn_like(zS)
+                            q_in_S = zS_n / s_scale + s_shift
+                        else:
+                            zS_n = zS
+                        z_tf = zS_n  # transformer input = (noisy) SCALED student latent
+                        ts = torch.full((B,), sig * 1000.0, device=device, dtype=transformer.dtype)
+                    self._hsct_hidden = {}
+                    self._hsct_capture = True
+                    transformer(
+                        hidden_states=z_tf.to(transformer.dtype), timestep=ts,
+                        encoder_hidden_states=prompt_embeds.to(transformer.dtype),
+                        pooled_projections=pooled.to(transformer.dtype), return_dict=False,
+                    )
+                    self._hsct_capture = False
+                    h_list = self._hsct_h_list(B)
+                # P fits the CLEAN linear map (raw_T<-raw_S, exact pushforward); Q learns the
+                # (noisy) inverse. So pass clean raw for P, noisy q_in/q_tgt for Q.
+                q_mse, p_mse = self.transport.coldstart_step(
+                    q_tgt_T, q_in_S, h_list, raw_T_clean=raw_T, raw_S_clean=raw_S,
+                    inner_steps=ta.hsct_coldstart_inner_steps,
+                    distributed=acc.num_processes > 1,
+                )
+                cs_step += 1
+                if acc.is_main_process and cs_step % 20 == 0:
+                    logger.info(
+                        f"  HSCT cold-start ep{ep} step{cs_step} q_lat_mse={q_mse:.5f} p_lat_mse={p_mse:.5f}"
+                    )
+                    if self.logger is not None:
+                        # Cold-start metrics on their OWN x-axis "cold-start/step"
+                        # (separate from the L1 training "step" axis).
+                        data = {"cold-start/hsct_q_lat_mse": q_mse, "cold-start/hsct_p_lat_mse": p_mse}
+                        if cs_step % 200 == 0 and viz_pack is not None:
+                            _vS, _vT, _vI, _vpe, _vpool = viz_pack
+                            data["cold-start/hsct_inverse_recon"] = self._hsct_recon_images(
+                                _vS, _vT, _vI, _vpe, _vpool, max_n=32
+                            )
+                        self.log_warmup_data(data, step=cs_step, step_key="cold-start/step")
+
+        # restore text encoders to their original device (free GPU for L1)
+        for _te, _dev0 in _te_saved:
+            _te.to(_dev0)
+
+        # broadcast rank0 (insurance) + freeze
+        if acc.num_processes > 1:
+            import torch.distributed as dist
+            for p in self.transport.parameters():
+                dist.broadcast(p.data, src=0)
+            for buf in self.transport.buffers():
+                dist.broadcast(buf.data, src=0)
+        self.transport.eval()
+        for p in self.transport.parameters():
+            p.requires_grad_(False)
+        self.transport._fitted = True
+        if acc.is_main_process:
+            logger.info("HSCT cold-start complete; transport frozen for L1.")
+
+    def _hsct_recon_images(self, raw_S, raw_T, imgs, prompt_embeds, pooled,
+                           max_n=16, noisy_sigma=0.6):
+        """wandb gallery of per-sample tiles. Each tile stacks 3 rows:
+          row0 = original image (constant anchor)
+          row1 = teacher-decode(Q(z_S, h_S))   -- the transport reconstruction
+          row2 = teacher-decode(z_T target)    -- the reference the transport aims at
+        The FIRST half of the tiles are CLEAN (z_S clean, z_T target = clean raw_T); the
+        SECOND half are NOISY: z_S is noised at ``noisy_sigma`` (with h_S taken from the
+        student transformer at that noise level) AND the z_T target is noised at the SAME
+        sigma. I.e. "half clean-latent-as-target, half noised-latent-as-target", so we can
+        eyeball how the transport behaves against BOTH clean and noised teacher targets
+        (the noisy latents it will actually see during L1). Returns LogImage."""
+        from PIL import Image as _Image
+        from ...logger.formatting import LogImage
+
+        transformer = self.adapter.pipeline.transformer
+        t_vae = self.teacher_adapter.pipeline.vae
+        n = min(max_n, imgs.shape[0])
+        n_noisy = n // 2
+        n_clean = n - n_noisy
+        # clean tiles at sigma=0; noisy tiles SPAN (0, noisy_sigma] so the gallery shows the
+        # degradation-vs-noise curve (answers "to what noise level does Q still hold up").
+        noisy_levels = (
+            torch.linspace(noisy_sigma / n_noisy, noisy_sigma, n_noisy, device=raw_S.device)
+            if n_noisy > 0 else torch.empty(0, device=raw_S.device)
+        )
+        sig = torch.cat(
+            [torch.zeros(n_clean, device=raw_S.device), noisy_levels]
+        ).view(-1, 1, 1, 1)
+        with torch.no_grad(), self.autocast():
+            # FM-noise student in scaled space to match the L1 rollout (transport helper).
+            q_in, z_tf = self.transport.noise_student_scaled(raw_S[:n], sig)
+            ts = (sig.reshape(n) * 1000.0).to(transformer.dtype)
+            self._hsct_hidden = {}
+            self._hsct_capture = True
+            transformer(
+                hidden_states=z_tf.to(transformer.dtype), timestep=ts,
+                encoder_hidden_states=prompt_embeds[:n].to(transformer.dtype),
+                pooled_projections=pooled[:n].to(transformer.dtype), return_dict=False,
+            )
+            self._hsct_capture = False
+            h_list = self._hsct_h_list(n)
+            qd = self.transport.Q.base.weight.dtype
+            zq = self.transport.Q(q_in.to(qd), [h.to(qd) for h in h_list])
+            # chunked teacher decode: a single decode of all tiles can OOM at large n.
+            def _dec(z):
+                outs = [t_vae.decode(z[j:j + 4].to(t_vae.dtype)).sample
+                        for j in range(0, z.shape[0], 4)]
+                return torch.cat(outs, 0)
+            x_inv = _dec(zq)
+            # z_T TARGET: clean for clean tiles, BN-packed-space noised for noisy tiles ->
+            # "half clean-latent-as-target, half noised-latent-as-target".
+            tgt_T = self.transport.noise_teacher_raw(raw_T[:n], sig)
+            x_gt = _dec(tgt_T)
+
+        def to_pil(t):
+            a = ((t.float().clamp(-1, 1) + 1) / 2 * 255).round().byte().cpu().permute(1, 2, 0).numpy()
+            return _Image.fromarray(a)
+
+        from PIL import ImageDraw as _ImageDraw
+        out = []
+        for i in range(n):
+            rows = [to_pil(imgs[i]), to_pil(x_inv[i]), to_pil(x_gt[i])]
+            w, h = rows[0].size
+            tile = _Image.new("RGB", (w, 3 * h), "white")
+            for r, im in enumerate(rows):
+                tile.paste(im.resize((w, h)), (0, r * h))
+            is_clean = float(sig[i]) == 0.0
+            # burned-in per-row labels: row0 is the (always clean) ORIGINAL image, row1 is
+            # Q's reconstruction, row2 is the z_T TARGET (clean or noised). Makes it obvious
+            # that the clean top row is the source, not the target.
+            tgt_lab = "z_T target: clean" if is_clean else f"z_T target: noised s={float(sig[i]):.2f}"
+            row_labels = ["original (source)", "Q-recon", tgt_lab]
+            draw = _ImageDraw.Draw(tile)
+            for r, lab in enumerate(row_labels):
+                y = r * h + 2
+                draw.rectangle([0, y, 9 + 6 * len(lab), y + 15], fill=(0, 0, 0))
+                draw.text((3, y + 3), lab, fill=(255, 255, 0))
+            out.append(
+                LogImage(tile, caption=f"s{i} [{'clean' if is_clean else f'noised s={float(sig[i]):.2f}'}]")
+            )
+        return out
 
     def _l0_epoch_cross_vae(self) -> None:
         """Cross-VAE L0: pixel-bridge sample transport + analytic FM regression.
@@ -1647,10 +2069,17 @@ class XOPDTrainer(BaseTrainer):
         self,
         forward_kwargs: Dict[str, Any],
         teacher_text_cond: Optional[Dict[str, torch.Tensor]] = None,
+        student_hidden: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Route the L1 teacher transition mean to the same-arch or cross-VAE path."""
+        """Route the L1 teacher transition mean to the same-arch or cross-VAE path.
+
+        ``student_hidden`` (HSCT only) carries the student transformer hidden states
+        captured at this state for the hidden-state-conditioned inverse transport.
+        """
         if self._cross_vae:
-            return self._teacher_next_latents_mean_cross_vae(forward_kwargs, teacher_text_cond)
+            return self._teacher_next_latents_mean_cross_vae(
+                forward_kwargs, teacher_text_cond, student_hidden=student_hidden
+            )
         return self._teacher_next_latents_mean(forward_kwargs, teacher_text_cond)
 
     def _teacher_next_latents_mean(
@@ -1691,6 +2120,7 @@ class XOPDTrainer(BaseTrainer):
         self,
         forward_kwargs: Dict[str, Any],
         teacher_text_cond: Dict[str, torch.Tensor],
+        student_hidden: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Cross-VAE teacher transition mean, mapped into the student space.
 
@@ -1704,6 +2134,14 @@ class XOPDTrainer(BaseTrainer):
         bridge it decodes/encodes through pixels (lossy, slow). All under no_grad.
         """
         x_S = forward_kwargs["latents"]
+        # TIMESTEP/SIGMA ALIGNMENT (verified force-aligned): t/t_next are the STUDENT's
+        # rollout timesteps. They are passed straight to the teacher, and because we always
+        # provide `t_next`, `FlowMatchEulerDiscreteSDEScheduler.step` takes the
+        # `sigma = t/1000`, `sigma_prev = t_next/1000` branch (it does NOT index the teacher's
+        # own shifted `self.sigmas`). So the teacher steps at EXACTLY the student's sigma, and
+        # its transformer sees `t/1000` = the student's noise fraction. The teacher's dynamic
+        # shift (compute_empirical_mu) is only used in its standalone rollout, never here.
+        # => no student->teacher sigma mismatch in the L1 target.
         t = forward_kwargs.get("t")
         t_next = forward_kwargs.get("t_next")
 
@@ -1742,7 +2180,12 @@ class XOPDTrainer(BaseTrainer):
         # kwarg. For any fixed sigma the adaln map is still affine, so this transition-
         # mean pushforward stays exact (Prop. 3).
         sigma = self._noise_fraction(self.adapter, t)
-        mu_S = self.transport.transition_mean_to_student(x_S, query_teacher_mean, sigma=sigma)
+        transport_ctx = {}
+        if student_hidden is not None:
+            transport_ctx["student_hidden"] = student_hidden
+        mu_S = self.transport.transition_mean_to_student(
+            x_S, query_teacher_mean, sigma=sigma, **transport_ctx
+        )
         return mu_S.detach()
 
     def _build_teacher_text_cond(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -1826,15 +2269,23 @@ class XOPDTrainer(BaseTrainer):
                     guidance_scale=self.student_gs,
                 )
 
+                # HSCT: capture the student transformer hidden states from THIS forward
+                # (free; same call site) to condition the inverse transport.
+                self._hsct_capture = self._is_hsct
                 student_out = self.adapter.forward(**forward_kwargs)
+                self._hsct_capture = False
                 if student_out.next_latents_mean is None:
                     raise RuntimeError(
                         "Student forward did not return `next_latents_mean` during "
                         f"pre-pass; requested return_kwargs={_TEACHER_RETURN_KWARGS!r}."
                     )
 
+                student_hidden = (
+                    self._hsct_h_list(forward_kwargs["latents"].shape[0])
+                    if self._is_hsct else None
+                )
                 mu_teacher = self._teacher_mean_dispatch(
-                    forward_kwargs, teacher_text_cond
+                    forward_kwargs, teacher_text_cond, student_hidden=student_hidden
                 )
 
                 d_k = compute_per_step_kl(

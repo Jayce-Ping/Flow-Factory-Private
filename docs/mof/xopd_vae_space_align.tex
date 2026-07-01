@@ -687,6 +687,136 @@ $\delta_{\mathrm{px}}$（M1 桥接的像素往返误差）与矩匹配线性传�
 （隐空间可互通但非线性关联），则线性 M2 不足，升级到非线性 M2 / M5。
 
 %% ============================================================
+\section{M3 深入：维度缺口、L1 逆映射瓶颈与 VAE 对齐（选定实现方向）}
+\label{sec:m3-deep}
+%% ============================================================
+
+§\ref{sec:methods} 把 M3 的动机表述为"把 $\delta_{\Tmap}$ 推到 VAE 训练阶段"。本节把它
+落实为\emph{精确的对齐目标、可逆性条件与 L1 无偏性证明}，动机来自一个比"$\delta_{\Tmap}$
+过大"更\textbf{结构化}的失败模式：当 $d_S<d_T$ 时，L1 所需的\emph{逆映射}本质欠定，\textbf{冻结的
+M2/M5 传输无论前向保真度多高都会在 on-policy L1 上崩溃}。这是 FLUX.2-klein$\to$SD3.5 实测的根因。
+
+\subsection{先导：same-VAE 传输收敛到 identity，残差为 $\delta_{\mathrm{VAE}}$}
+
+\begin{proposition}[same-VAE 拟合收敛到近恒等]
+\label{prop:samevae-identity}
+设 teacher 与 student 共享 VAE $(\Enc,\Dec)$，warm-up 配对取像素桥
+$z_S=\Enc(\Dec(z_T))=z_T+r(z_T)$，$r$ 为 VAE 隐变量\emph{往返残差}。将其分解为最优线性部分加
+非线性余项 $r(z)=Rz+c+e(z)$（$\E[e]=0$，$e\perp\{z,1\}$）。则最小二乘 LinearTransport 收敛到
+\[
+A^\star=I+R,\qquad b^\star=c,\qquad
+\delta_{\mathrm{VAE}}^2:=\min_{A,b}\E\lVert Az_T+b-z_S\rVert^2=\E\lVert e(z)\rVert^2 .
+\]
+理想无损 VAE（$r\equiv0$）退化为 $A^\star=I,b^\star=0,\delta_{\mathrm{VAE}}=0$。对角白化/矩匹配在
+同分布两端给 $\gamma{=}1,\beta{=}0$，亦为恒等（Rem.~\ref{rem:mm-is-identity}）。
+\end{proposition}
+\begin{proof}
+$z_S=z_T+Rz_T+c+e$。最小二乘投影到 $\{Az+b\}$：线性可解释部分 $z_T+Rz_T+c=(I+R)z_T+c$ 被精确
+拟合，正交余项 $e$ 进入残差。
+\end{proof}
+
+\begin{remark}[$\delta_{\mathrm{VAE}}$ 是跨 VAE recon 的隐含楼层 $\Rightarrow$ M3 必须动 VAE]
+\label{rem:vae-floor}
+跨 VAE 的 $z_S=\Enc_S(\Dec_T(z_T))$ 经 $\Dec_T,\Enc_S$ 两次有损往返，故经验残差
+\[
+\delta_{\Tmap}^2 \;\approx\; \underbrace{\delta_{\mathrm{VAE},T}^2+\delta_{\mathrm{VAE},S}^2}_{\text{两 VAE 各自往返}}+\underbrace{\delta_{\mathrm{align}}^2}_{\text{跨空间线性失配}} .
+\]
+即便把传输对齐到 $\Tmap=\mathrm{Id}$，recon 也降不到 $\delta_{\mathrm{VAE}}$ 以下，\emph{除非同时微调
+decoder}。这是 M3（动 VAE）相对 M2（仅学 $\Tmap$）不可替代的根本原因，也解释了实测中冷启动重建
+即便 MSE$\approx$0.1 仍\emph{目视模糊/带噪}。
+\end{remark}
+
+\subsection{L1 逆映射瓶颈：为何 $d_S<d_T$ 时冻结传输必崩}
+
+\begin{proposition}[欠定逆映射的 off-manifold 偏置]
+\label{prop:inverse-deficit}
+设 M2 仿射传输 $\Tmap(z)=Az+b$，$A\in\R^{d_S\times d_T}$ 行满秩，$d_S<d_T$。L1 在 student 状态
+$x_S$ 上查询 teacher 需 $x_T=\Tmap^{+}(x_S)=A^{+}(x_S-b)$（最小范数逆）。则：
+\begin{enumerate}[leftmargin=1.6em,label=(\alph*)]
+\item $\Tmap^{+}$ 把整个 $\Zs$ 映入仿射子空间 $\mathcal{U}=\mathrm{row}(A)+A^{+}(-b)$，$\dim\mathcal{U}=d_S$；
+\item teacher 速度场 $\vT$ 只在其训练支撑（数据流形 $\mathcal{M}_T\subset\Zt$，含各噪声层）附近
+有意义；当 $\dim\mathcal{M}_T>d_S$ 时，\emph{任何} $A$ 都无法令 $\mathcal{U}\supset\mathcal{M}_T$，
+故 $x_T=\Tmap^{+}(x_S)$ 系统性偏离 $\mathcal{M}_T$；
+\item 记 off-manifold 偏置 $\epsilon_{\mathrm{off}}(x_S)=\lVert \vT(\Tmap^{+}x_S)-\vT(\Pi_{\mathcal{M}_T}\Tmap^{+}x_S)\rVert$，
+则推前到 $\Zs$ 的 L1 靶子误差 $\ge \sigma_{\min}(A)\,\E[\epsilon_{\mathrm{off}}]$，\textbf{对任意冻结
+$(A,b)$ 不可消除}（信息缺口）。on-policy 下该误差每步把 student 拉偏，漂移 $\propto$ LR$\times$偏置
+$\Rightarrow$ 崩溃。
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(a) 行满秩右伪逆 $A^{+}=A^\top(AA^\top)^{-1}$，$\mathrm{im}(A^{+})=\mathrm{row}(A)$。(b) $\dim\mathcal{M}_T$
+由 teacher VAE 决定，与 $\mathcal{U}$ 无对齐约束；$d_S$ 维子空间无法包含更高维流形。(c) 链式
+$\Tmap_\push\vT(x_S)=A\,\vT(\Tmap^{+}x_S)$，与"真值"$A\,\vT(\Pi_{\mathcal{M}_T}\Tmap^{+}x_S)$ 之差经
+$A$ 放大，下界用 $A$ 的最小奇异值。\end{proof}
+
+\begin{remark}[经验验证]
+\label{rem:collapse-empirical}
+FLUX.2-klein$\to$SD3.5（$d_T{=}32{\times}32{\times}128{=}131072$、$d_S{=}64{\times}64{\times}16{=}65536$，
+$d_T{=}2d_S$）实测：冻结 M2 线性 / conv（严格线性）/ M5（非线性+学习逆）在\emph{纯 L1} 上\textbf{无论
+学习率都崩溃}（geneval gs1 $0.326\!\to\!{<}0.01$，崩溃速率 $\propto$ LR：1e-4@20ep、1e-5@100ep）；把
+逆映射欠定从 $8{:}1$（$128{\to}16$）经 PixelShuffle 还原降到 $2{:}1$（$32{\to}16$）\emph{仍崩}；
+KL-to-base 锚定\emph{也}挡不住（on-policy 锚定随漂移移动）。\textbf{对照}：same-VAE（identity 传输、
+真 target、同超参）仅温和下降不崩（$0.379\!\to\!0.29$@40ep）。三者共同坐实 Prop.~\ref{prop:inverse-deficit}：
+崩溃源于跨 VAE 逆映射的 off-manifold 偏置，而非 L1 方法本身。\textbf{结论}：纯冻结传输（任何通道结构 /
+LR / 正则）救不了 $d_S<d_T$；必须用 M3 动 VAE。
+\end{remark}
+
+\subsection{M3 对齐目标与可逆性条件}
+
+M3 同时消除 Rem.~\ref{rem:vae-floor} 的 $\delta_{\mathrm{VAE}}$ 楼层与 Prop.~\ref{prop:inverse-deficit}
+的逆映射偏置。teacher VAE $(\Enc_T,\Dec_T)$ 冻结，微调 student VAE $(\Enc_S',\Dec_S')$（全量或 LoRA/
+adapter），取线性 $P:\Zt\to\Zs$、$Q:\Zs\to\Zt$。要求：
+
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{前向保真（编码对齐）}：$\Enc_S'(x)\approx P\,\Enc_T(x)$ 且 $\Dec_S'(P\,\Enc_T(x))\approx x$
+——两空间\emph{线性可互换}，$\Tmap{=}P$ 高保真且保 Prop.~\ref{prop:affine} 的 L1 干净性。
+\item \textbf{逆向 on-manifold（关键，解 Prop.~\ref{prop:inverse-deficit}）}：
+$\Dec_T(Q(z_S))\approx\Dec_S'(z_S)$——恢复的 teacher 隐变量\emph{解码出同一张图}，
+强制 $Q(z_S)\in\mathcal{M}_T$。只有 on-manifold 的 teacher 隐变量才解码成合法图像，故 decoder 一致性
+是把逆映射钉在流形上的\emph{充分}监督（相对 M5 仅用 latent-cycle 的本质增强）。
+\item \textbf{维度/流形条件}：要么 $d_S'{=}d_T$（取 $P$ 正交、$Q{=}P^\top$ 精确可逆）；要么 teacher
+流形固有维数 $\le d_S'$（则 $P$ 在 $\mathcal{M}_T$ 上可逆、$Q$ 落在流形内）。前者最稳，代价是改 student
+latent 通道数（牵动 transformer I/O）；后者保持 SD3.5 的 16 通道，靠 (ii) 把 $Q$ 训到流形上。
+\end{enumerate}
+
+\begin{proposition}[M3 对齐后 L1 无偏]
+\label{prop:m3-unbiased}
+若对齐达成 (i) $\Tmap{=}P$ 线性、(ii) $\Dec_T(Q(x_S))=\Dec_S(x_S)$ 误差 $\le\eta$（逆映射 on-manifold），
+则 cross-VAE L1 转移均值传输 $\mu_S=P\,\mu_T(Q(x_S))$ 相对 same-VAE 基准的偏差
+$\le \mathrm{Lip}(\vT)\,\eta+\delta_{\mathrm{align}}$，\textbf{与 $d_S<d_T$ 无关}（off-manifold 项消失）。
+即 M3 把 Prop.~\ref{prop:inverse-deficit} 的\emph{不可约信息缺口}替换为\emph{可训练压低}的对齐残差 $\eta$。
+\end{proposition}
+\begin{proof}
+(ii) $\Rightarrow Q(x_S)\in\mathcal{M}_T$（解码一致 $\Rightarrow$ 在 teacher 支撑内），故 $\vT(Q(x_S))$ 有意义，
+$\epsilon_{\mathrm{off}}\le\mathrm{Lip}(\vT)\,\eta$；(i) $\Rightarrow$ 推前为常 Jacobian $P$（Prop.~\ref{prop:affine}），
+无逐点 Jacobian 误差。两者相加。\end{proof}
+
+\subsection{M3 训练目标（CV-VAE + 逆映射 decoder 一致性）}
+在共享图像集 $\{x\}$ 上联合训练 $(\Enc_S',\Dec_S',P,Q)$（teacher VAE 冻结）：
+\begin{align}
+\loss_{\mathrm{AE}}  &= \lVert \Dec_S'(\Enc_S'(x))-x\rVert^2 + \mathrm{LPIPS} + \beta_{\mathrm{KL}}\KL, \label{eq:m3-ae}\\
+\loss_{\mathrm{fwd}} &= \lVert \Dec_S'(P\,\Enc_T(x))-x\rVert^2 + \lambda_\ell\lVert \Enc_S'(x)-P\,\Enc_T(x)\rVert^2, \label{eq:m3-fwd}\\
+\loss_{\mathrm{inv}} &= \lVert \Dec_T(Q\,\Enc_S'(x))-x\rVert^2 \quad(\text{逆映射 on-manifold，新增项}), \label{eq:m3-inv}\\
+\loss_{\mathrm{cyc}} &= \lVert QP\,\Enc_T(x)-\Enc_T(x)\rVert^2 + \lVert PQ\,\Enc_S'(x)-\Enc_S'(x)\rVert^2, \label{eq:m3-cyc}\\
+\loss &= \loss_{\mathrm{AE}} + \lambda_1\loss_{\mathrm{fwd}} + \lambda_2\loss_{\mathrm{inv}} + \lambda_3\loss_{\mathrm{cyc}} . \label{eq:m3-total}
+\end{align}
+$\loss_{\mathrm{AE}}$ 保 student 采样质量不退化；$\loss_{\mathrm{fwd}}$ 给前向高保真线性 $P$
+（替代 §\ref{sec:methods} M2 训出来的低保真 $A$）；$\loss_{\mathrm{inv}}$（teacher decoder 一致）是相对
+CV-VAE \eqref{eq:cvvae} 的\emph{新增}项，专门解 Prop.~\ref{prop:inverse-deficit} 的逆映射偏置；
+$P,Q$ 取线性以保 L1 干净（Prop.~\ref{prop:affine}）。当 $d_S'<d_T$ 时 $\loss_{\mathrm{inv}}$ 仍能把 $Q$
+训到流形上（流形固有维数 $\le d_S'$ 时无损）；若要彻底消除缺口则取 $d_S'{=}d_T$、$P$ 正交。
+
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=M3 落地建议（两档）]
+\textbf{档 A（轻，推荐先试）}：冻结 $\Enc_S$、$\Enc_T$、$\Dec_T$；只对 student \textbf{$\Dec_S$ 加 LoRA}
++ 学线性 $P,Q$，跑 \eqref{eq:m3-fwd}--\eqref{eq:m3-cyc}（省去重训 $\Enc_S$，$\loss_{\mathrm{AE}}$ 退化为
+正则）。即 §\ref{sec:methods} M6 + 逆映射一致性，最小侵入、不动 student transformer。
+\textbf{档 B（重，彻底）}：student VAE latent 升到 $d_S'{=}d_T$（32 通道），全量微调 $\Enc_S',\Dec_S'$
++ 适配 transformer I/O，$P$ 取正交 $\Rightarrow$ 逆映射精确、$\eta\to0$。
+先用 §\ref{sec:impl} 的 $\delta$ 体检（量 $\delta_{\mathrm{VAE}}$、$\delta_{\mathrm{align}}$、teacher 流形固有维数）
+决定是否需要档 B。
+\end{tcolorbox}
+
+%% ============================================================
 \section{结论}
 %% ============================================================
 
@@ -703,6 +833,13 @@ latent 服从高斯——事实上扩散 VAE 的隐变量\emph{边际是非高�
 比较；"线性够不够"由 $\delta_{\mathrm{linear}}$ 实测判定，而非高斯定理。
 \item 工程上：M1(L0)+M2 线性(L1)+M4 矩匹配初始化 是最小可行且理论自洽的首选；M3/M5/M6
 作为 $\delta$ 过大时的升级项。
+\item \textbf{$d_S<d_T$ 的结构性瓶颈（实测主因，§\ref{sec:m3-deep}）}：当 student latent 维数小于
+teacher 时，L1 on-policy 所需的逆映射本质欠定，把 student 状态映到 teacher 空间时\emph{系统性偏离
+teacher 数据流形}（Prop.~\ref{prop:inverse-deficit}），导致 teacher 给出有害 target、student 漂移崩溃。
+这\emph{不是} $\delta_{\Tmap}$ 大小问题，任何冻结传输（线性/conv/M5、任何 LR、KL 锚定）都救不了，
+same-VAE 对照不崩可佐证。唯一出路是 \textbf{M3 动 VAE}：用 \eqref{eq:m3-inv} 的 teacher-decoder 一致性
+把逆映射钉到流形上（Prop.~\ref{prop:m3-unbiased} 证明此时 L1 无偏，与 $d_S<d_T$ 无关），必要时把
+student latent 升到 $d_S{=}d_T$ 彻底消除缺口。
 \end{itemize}
 
 \end{document}

@@ -1245,6 +1245,188 @@ class ConvTransport(VAETransport, nn.Module):
         nn.Module.load_state_dict(self, state, strict=strict)
 
 
+class M5Transport(ConvTransport):
+    """M5: cycle-consistent NON-LINEAR conv transport with a learned inverse.
+
+    Same scaffolding as :class:`ConvTransport` (frozen closed-form affine base +
+    zero-init residual nets + a PAIRED learned inverse + forward/inverse/cycle
+    warm-up), but the residual nets are NON-LINEAR (an activation between convs).
+    This deliberately trades the strictly-linear conv's EXACT L1 pushforward
+    (Prop. affine) for higher fidelity on the *clean* correspondence
+    ``z0_T <-> z0_S``, which is genuinely non-linear (``z0_S = E_S(D_T(z0_T))``).
+
+    Caveats (the accepted M5 trade-off, see docs/mof/xopd_vae_space_align.tex M5):
+    * The non-linearity breaks the flow-matching path structure, so on NOISY
+      latents the map is only APPROXIMATE — fine for ODE/pathwise L1 on the lower-
+      noise steps, NOT for SDE+REINFORCE (noise enters the log-prob).
+    * A non-linear forward has no analytic inverse, so the L1 teacher query relies
+      ENTIRELY on the learned inverse net (trained jointly via inverse-recon +
+      cycle-consistency — the doc's "two mutually-inverse networks").
+
+    do-no-harm: the residual's last conv is still zero-init, so warm-up starts
+    EXACTLY at the closed-form affine base (>= LinearTransport from epoch 0) and the
+    non-linear residual can only improve the clean recon. The only change vs
+    :class:`ConvTransport` is the inserted activations.
+    """
+
+    _ACTS = {"silu": nn.SiLU, "gelu": nn.GELU, "relu": nn.ReLU, "tanh": nn.Tanh}
+
+    def __init__(self, *args, activation: str = "silu", **kwargs):
+        # Set before super().__init__ so the (lazy) net builders can read it later.
+        self._act_name = str(activation).lower()
+        if self._act_name not in self._ACTS:
+            raise ValueError(
+                f"M5Transport activation must be one of {sorted(self._ACTS)}; "
+                f"got {activation!r}."
+            )
+        super().__init__(*args, **kwargs)
+
+    def _act(self) -> nn.Module:
+        return self._ACTS[self._act_name]()
+
+    def _make_forward_net(self, f: int) -> nn.Module:
+        """NON-LINEAR teacher->student residual: convs+activation then PixelShuffle."""
+        k, p = self.k, self.k // 2
+        layers: List[nn.Module] = [nn.Conv2d(self.C_T, self.hidden, k, padding=p), self._act()]
+        for _ in range(self.n_layers - 1):
+            layers += [nn.Conv2d(self.hidden, self.hidden, k, padding=p), self._act()]
+        last = nn.Conv2d(self.hidden, self.C_S * f * f, k, padding=p)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)  # do-no-harm: residual starts at 0
+        layers += [last, nn.PixelShuffle(f)]
+        return nn.Sequential(*layers)
+
+    def _make_inverse_net(self, f: int) -> nn.Module:
+        """NON-LINEAR student->teacher residual: PixelUnshuffle then convs+activation."""
+        k, p = self.k, self.k // 2
+        layers: List[nn.Module] = [
+            nn.PixelUnshuffle(f),
+            nn.Conv2d(self.C_S * f * f, self.hidden, k, padding=p),
+            self._act(),
+        ]
+        for _ in range(self.n_layers - 1):
+            layers += [nn.Conv2d(self.hidden, self.hidden, k, padding=p), self._act()]
+        last = nn.Conv2d(self.hidden, self.C_T, k, padding=p)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)  # do-no-harm
+        layers += [last]
+        return nn.Sequential(*layers)
+
+
+class _AlignQNet(nn.Module):
+    """Q: student(C_S) -> teacher-raw(C_T). Linear base + zero-init conv residual.
+
+    MUST match ``scripts/vae_align/train_align.py:NonlinearInverse`` so the Stage-1
+    checkpoint loads. (Duplicated here to keep ``transport.py`` import-free of the
+    training script.)
+    """
+
+    def __init__(self, c_in, c_out, hidden=128, n_layers=3, k=3):
+        super().__init__()
+        self.base = nn.Conv2d(c_in, c_out, 1)
+        p = k // 2
+        layers = [nn.Conv2d(c_in, hidden, k, padding=p), nn.SiLU()]
+        for _ in range(max(0, n_layers - 2)):
+            layers += [nn.Conv2d(hidden, hidden, k, padding=p), nn.SiLU()]
+        last = nn.Conv2d(hidden, c_out, k, padding=p)
+        layers += [last]
+        self.res = nn.Sequential(*layers)
+
+    def forward(self, z):
+        return self.base(z) + self.res(z)
+
+
+class AlignedTransport(VAETransport, nn.Module):
+    """M3 (variant A): use a Stage-1 *aligned* VAE pair as the L1 transport.
+
+    Loads the Stage-1 alignment (``scripts/vae_align/train_align.py``) artifacts:
+      * ``P`` (LINEAR 1x1, FLUX raw 32ch -> SD3.5 16ch): forward map. Linear keeps
+        the L1 transition-mean pushforward EXACT (Prop. affine).
+      * ``Q`` (NON-LINEAR, SD3.5 16ch -> FLUX raw 32ch): the L1 teacher-query
+        inverse, trained with teacher-decoder consistency so ``Q(z_S)`` lands on
+        the FLUX manifold (the fix for the d_S<d_T collapse, Prop. inverse-deficit).
+      * (the fine-tuned student decoder is loaded into the student adapter at eval,
+        outside this class.)
+
+    P/Q operate on the RAW VAE latents (32ch / 16ch @ 64x64). The teacher's L1
+    state is a PACKED transformer latent (B, seq, 128) that is a 2x2 patchify +
+    BatchNorm of the raw 32ch latent, so this class bridges with the teacher
+    adapter's LOSSLESS ops:
+        packed --to_spatial--> (128,32,32 BN) --un-BN--> --_unpatchify--> raw(32,64,64)
+        raw(32,64,64) --_patchify--> --BN--> (128,32,32) --from_spatial--> packed
+
+    STATUS: Stage-2 wiring. The forward/inverse math is implemented; end-to-end L1
+    "no-collapse" validation happens after Stage-1 alignment converges (needs the
+    checkpoint). Frozen for L1 (no warm-up).
+    """
+
+    requires_warmup = False
+
+    def __init__(
+        self,
+        teacher_adapter,
+        student_to_spatial: Callable,
+        student_from_spatial: Callable,
+        checkpoint_path: str,
+        q_hidden: int = 128,
+        q_layers: int = 3,
+    ):
+        nn.Module.__init__(self)
+        self.teacher = teacher_adapter
+        self.s2s = student_to_spatial
+        self.s_from = student_from_spatial
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        # infer channels from the saved P (Conv2d weight: (C_S, C_T, 1, 1))
+        pw = ckpt["P"]["weight"]
+        self.C_S, self.C_T = int(pw.shape[0]), int(pw.shape[1])
+        self.P = nn.Conv2d(self.C_T, self.C_S, 1)
+        self.P.load_state_dict(ckpt["P"])
+        self.Q = _AlignQNet(self.C_S, self.C_T, q_hidden, q_layers)
+        self.Q.load_state_dict(ckpt["Q"])
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+
+    # ----- FLUX packed (B,seq,128) <-> raw VAE latent (B,32,64,64) (lossless) -----
+    def _bn(self):
+        vae = self.teacher.pipeline.vae
+        mean = vae.bn.running_mean.view(1, -1, 1, 1)
+        std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps)
+        return mean, std
+
+    def _packed_to_raw(self, z_packed, latent_ids):
+        sp = self.teacher.to_spatial_latent(z_packed, latent_ids=latent_ids)  # (B,128,32,32) BN
+        mean, std = self._bn()
+        sp = sp * std.to(sp) + mean.to(sp)                                     # un-BN
+        return self.teacher.pipeline._unpatchify_latents(sp)                   # (B,32,64,64) raw
+
+    def _raw_to_packed(self, raw):
+        sp = self.teacher.pipeline._patchify_latents(raw)                      # (B,128,32,32)
+        mean, std = self._bn()
+        sp = (sp - mean.to(sp)) / std.to(sp)                                   # BN
+        return self.teacher.from_spatial_latent(sp)                           # (B,seq,128)
+
+    def _forward_map(self, raw_T):  # raw 32ch -> student 16ch (BCHW)
+        return self.P(raw_T.to(self.P.weight.dtype)).to(raw_T.dtype)
+
+    # ----- VAETransport API -----------------------------------------------------
+    def transport_sample(self, z_T, sigma=None, **ctx):
+        ids = ctx.get("teacher_latent_ids") or ctx.get("latent_ids")
+        raw_T = self._packed_to_raw(z_T, ids)
+        return self.s_from(self._forward_map(raw_T))
+
+    def transition_mean_to_student(self, x_S, query_teacher_mean, sigma=None, **ctx):
+        # inverse: student state -> raw teacher (Q, on-manifold) -> packed -> teacher
+        z_S = self.s2s(x_S)
+        raw_T_pred = self.Q(z_S.to(self.Q.base.weight.dtype)).to(z_S.dtype)
+        x_T = self._raw_to_packed(raw_T_pred)
+        mu_T = query_teacher_mean(x_T)
+        # forward: teacher mean (packed) -> raw -> P -> student
+        ids = ctx.get("teacher_latent_ids") or ctx.get("latent_ids")
+        raw_muT = self._packed_to_raw(mu_T, ids)
+        return self.s_from(self._forward_map(raw_muT))
+
+
 class MLPTransport(VAETransport):
     """Placeholder for a future non-linear transport (and its inverse).
 
@@ -1277,7 +1459,8 @@ class MLPTransport(VAETransport):
 
 
 def build_transport(transport_type: str, **kwargs) -> VAETransport:
-    """Factory: ``transport_type`` in {identity, pixel, linear, whitening, adaln, mlp}."""
+    """Factory: ``transport_type`` in
+    {identity, pixel, linear, whitening, adaln, conv, m5, aligned, hsct, mlp}."""
     t = (transport_type or "identity").lower()
     if t == "identity":
         return IdentityTransport()
@@ -1291,9 +1474,23 @@ def build_transport(transport_type: str, **kwargs) -> VAETransport:
         return AdaLNTransport(**kwargs)
     if t in ("conv", "conv_linear"):
         return ConvTransport(**kwargs)
+    if t in ("m5", "conv_nl", "nonlinear"):
+        return M5Transport(**kwargs)
+    if t == "aligned":
+        # M3 Stage-2: load Stage-1 aligned P/Q. Requires teacher_adapter +
+        # checkpoint_path; the trainer constructs it (see trainer __init__ wiring).
+        return AlignedTransport(**kwargs)
+    if t == "hsct":
+        # M8: hidden-state-conditioned transport (linear P + deepstack Q on student
+        # transformer hidden states). Lazy import avoids a circular dependency
+        # (hsct_transport imports VAETransport from this module).
+        from .hsct_transport import HSCTTransport
+
+        return HSCTTransport(**kwargs)
     if t == "mlp":
         return MLPTransport(**kwargs)
     raise ValueError(
         f"Unknown vae_transport type {transport_type!r}; expected one of "
-        "{'identity', 'pixel', 'linear', 'whitening', 'adaln', 'conv', 'mlp'}."
+        "{'identity', 'pixel', 'linear', 'whitening', 'adaln', 'conv', 'm5', 'aligned', "
+        "'hsct', 'mlp'}."
     )
