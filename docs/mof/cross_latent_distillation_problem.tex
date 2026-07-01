@@ -1,8 +1,5 @@
 \documentclass[11pt,a4paper]{article}
 \usepackage{fontspec}
-\usepackage{xeCJK}
-\setCJKmainfont{STSong}
-\setCJKsansfont{STHeiti}
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{mathtools}
 \usepackage{bm}
@@ -33,162 +30,306 @@
 \newtheorem{problem}{Problem}
 \newtheorem{remark}{Remark}
 
-\title{\textbf{跨隐空间速度场传输与 On-Policy 蒸馏}\\[0.3em]
-\large 问题的理论形式化 \\[0.3em]
-\large Cross-Latent Velocity-Field Transport for On-Policy Distillation}
+\title{\textbf{Cross-Latent Velocity-Field Transport for On-Policy Distillation}\\[0.3em]
+\large A Problem Formalization}
 \author{Flow Factory}
 \date{}
 
 \begin{document}
 \maketitle
 
-\begin{abstract}
-本文只做一件事：用尽量 general 的形式化语言，把"在两个异构隐空间上的扩散
-/ 流匹配模型之间做 on-policy 蒸馏"这一需求陈述为一个明确的数学问题。我们
-设有两个分别在各自隐空间中去噪并生成图像的模型，目标是学习一个隐空间之间
-的双向映射 $(\Tmap,\Tinv)$，使得一个模型的 velocity field 可以被
-\emph{推前 / 拉回} (pushforward / pullback) 到另一个隐空间，从而让 on-policy
-蒸馏的监督信号在类型与语义上都合法。本文\textbf{不涉及任何具体解法、构造或
-算法比较}，只给出问题的设定、需要满足的性质，以及最终的形式化问题陈述。
-\end{abstract}
-
-\section{设定 (Setup)}
+\section{Problem Setup}
 \label{sec:setup}
 
-\paragraph{两个生成模型。}
-设有一个共享的像素（图像）空间 $\Xspace\subseteq\R^{D}$，以及两个分别由各自
-变分自编码器 (VAE) 诱导的隐空间
+\textbf{Two flow-matching generative models.}
+Let $\Xspace\subseteq\R^{D}$ be a shared pixel (image) space, and let there be two
+latent spaces induced by their respective variational autoencoders (VAEs),
 \[
 \Za\subseteq\R^{d_A},\qquad \Zb\subseteq\R^{d_B},
 \]
-配备编码器 / 解码器对 $(\Enc_A,\Dec_A)$ 与 $(\Enc_B,\Dec_B)$，其中
-$\Enc_\bullet:\Xspace\to\mathcal{Z}_\bullet$，$\Dec_\bullet:\mathcal{Z}_\bullet\to\Xspace$。
-一般情形下两个隐空间是\emph{异构}的：
+equipped with encoder/decoder pairs $(\Enc_A,\Dec_A)$ and $(\Enc_B,\Dec_B)$, where
+$\Enc_\bullet:\Xspace\to\mathcal{Z}_\bullet$ and $\Dec_\bullet:\mathcal{Z}_\bullet\to\Xspace$.
+In general the two latent spaces are \emph{heterogeneous}:
 \[
 d_A\neq d_B,\quad \Za\not\cong\Zb,\quad \Enc_A\neq\Enc_B,
 \]
-即通道数、空间下采样率、以及逐通道统计量都可能不同。
+i.e.\ the channel counts, spatial downsampling rates, and per-channel statistics may all differ.
 
-\paragraph{两个流 / 扩散过程。}
-在每个隐空间上各有一个（流匹配 / 扩散）生成模型，由一个时间相关的
-velocity field 刻画：
+On each latent space there is a (flow-matching / diffusion) generative model described by a
+time-dependent velocity field:
 \[
 v_A:\Za\times[0,1]\to\R^{d_A},
 \qquad
 v_B:\Zb\times[0,1]\to\R^{d_B}.
 \]
-它们各自定义了一条 probability-flow ODE，把噪声端 $t=1$ 的先验输运到数据端
-$t=0$ 的隐变量边际：
+Each defines a probability-flow ODE that transports the prior at the noise end $t=1$ to the
+latent marginal at the data end $t=0$:
 \begin{equation}
 \dot z_A(t) = v_A\big(z_A(t),t\big),
 \qquad
 \dot z_B(t) = v_B\big(z_B(t),t\big).
 \label{eq:pf-ode}
 \end{equation}
-对应的隐变量边际记为 $p_A(\cdot,t)$ 与 $p_B(\cdot,t)$；干净端 $t=0$ 的边际
-分别为 $p_A^{0}=\Enc_A\push\, p_{\mathrm{data}}$ 与 $p_B^{0}=\Enc_B\push\, p_{\mathrm{data}}$。
-解码后两者生成的是同一像素分布 $p_{\mathrm{data}}$。
+Denote the corresponding latent marginals by $p_A(\cdot,t)$ and $p_B(\cdot,t)$; the clean-end
+($t=0$) marginals are $p_A^{0}=\Enc_A\push\, p_{\mathrm{data}}$ and
+$p_B^{0}=\Enc_B\push\, p_{\mathrm{data}}$. After decoding, both generate the same pixel
+distribution $p_{\mathrm{data}}$.
 
-\paragraph{蒸馏方向。}
-固定其中一个模型为 \emph{teacher}（记为 $A$，velocity $v_A$ 冻结），另一个为
-\emph{student}（记为 $B$，velocity $v_B=v_\theta$，参数 $\theta$ 可训练）。蒸馏的
-目标是用 teacher 在 $\Za$ 中的生成知识监督 student 在 $\Zb$ 中的生成过程。
+\textbf{Distillation direction.}
+Fix one model as the \emph{teacher} (denoted $A$, with frozen velocity $v_A$) and the other as
+the \emph{student} (denoted $B$, with trainable velocity $v_B=v_\theta$, parameters $\theta$).
+The goal of distillation is to use the teacher's generative knowledge in $\Za$ to supervise the
+student's generative process in $\Zb$.
 
-\section{隐空间传输映射 (Latent Transport Map)}
+\section{Latent Transport Map}
 \label{sec:transport}
 
-由于 $v_A$ 与 $v_B$ 定义在\emph{不同}的隐空间上，teacher 的任何信号（干净
-样本、velocity、转移分布）都活在 $\Za$ 中，而 student 的 rollout、loss、梯度
-都活在 $\Zb$ 中。要把监督信号搬运过去，需要一个隐空间之间的双向映射。
+Because $v_A$ and $v_B$ are defined on \emph{different} latent spaces, every teacher signal
+(clean samples, velocities, transition distributions) lives in $\Za$, whereas the student's
+rollout, loss, and gradients all live in $\Zb$. Moving the supervision signal across requires a
+bidirectional map between the latent spaces.
 
-\begin{definition}[隐空间传输映射]
+\begin{definition}[Latent transport map]
 \label{def:transport}
-一个隐空间传输映射是一对函数
+A latent transport map is a pair of functions
 \[
 \Tmap:\Za\to\Zb,\qquad \Tinv:\Zb\to\Za,
 \]
-满足互逆关系 $\Tinv\circ\Tmap=\mathrm{id}_{\Za}$ 与 $\Tmap\circ\Tinv=\mathrm{id}_{\Zb}$
-（在异构维度 $d_A\neq d_B$ 时，互逆性只能在公共子空间 / 值域上要求，定义为
-广义逆）。
+satisfying the mutual-inverse relations $\Tinv\circ\Tmap=\mathrm{id}_{\Za}$ and
+$\Tmap\circ\Tinv=\mathrm{id}_{\Zb}$ (when the dimensions differ, $d_A\neq d_B$, invertibility
+can only be required on a common subspace / range, i.e.\ as a generalized inverse).
 \end{definition}
 
-\begin{definition}[语义一致性 / 像素锚定]
+\begin{definition}[Semantic consistency / pixel anchoring]
 \label{def:consistency}
-称 $\Tmap$ 是\emph{像素一致}的，若它保持解码后的图像语义：对 teacher 隐变量
-$z\in\Za$，
+We call $\Tmap$ \emph{pixel-consistent} if it preserves the decoded image semantics: for a
+teacher latent $z\in\Za$,
 \begin{equation}
 \Dec_B\big(\Tmap(z)\big)\;\approx\;\Dec_A(z),
 \qquad \forall z\in\Za.
 \label{eq:pixel-consistency}
 \end{equation}
-即 $z$ 与 $\Tmap(z)$ "代表同一张图"。这是传输具备语义正确性的判据。
+That is, $z$ and $\Tmap(z)$ ``represent the same image''. This is the semantic-correctness
+criterion for any reasonable transport.
 \end{definition}
 
-\begin{definition}[传输一致性误差]
+\begin{definition}[Transport consistency error]
 \label{def:delta}
-定义传输在像素空间的往返重建误差
+Define the round-trip pixel-space reconstruction error of the transport,
 \begin{equation}
 \delta_{\Tmap}
-\;=\;
+\;\coloneqq\;
 \E_{z\sim p_A}\,\norm{\Dec_B\big(\Tmap(z)\big)-\Dec_A(z)},
 \label{eq:delta}
 \end{equation}
-其中 $p_A$ 是 teacher 在相关时刻的隐变量分布。$\delta_{\Tmap}=0$ 即严格满足
-像素一致 \eqref{eq:pixel-consistency}。$\delta_{\Tmap}$ 是衡量传输有损性的标量。
+where $p_A$ is the teacher's latent distribution at the relevant time. $\delta_{\Tmap}=0$ means
+exact pixel consistency \eqref{eq:pixel-consistency}. $\delta_{\Tmap}$ is the scalar that
+quantifies the lossiness of a transport.
 \end{definition}
 
-\section{速度场的推前与拉回 (Pushforward / Pullback)}
+\section{Pushforward and Pullback of the Velocity Field}
 \label{sec:pushforward}
 
-蒸馏不仅要搬运干净样本，更要搬运\emph{整个 velocity field}，使 teacher 在
-$\Za$ 中的概率流经 $\Tmap$ 之后，与 student 在 $\Zb$ 中看到的动力学一致。
+Distillation must transport not only clean samples but the \emph{entire velocity field}, so that
+the teacher's probability flow in $\Za$, after being pushed through $\Tmap$, agrees with the
+dynamics the student sees in $\Zb$.
 
-\begin{problem}[velocity field 的传输]
+\begin{problem}[Transport of the velocity field]
 \label{prob:pf-existence}
-寻找 $(\Tmap,\Tinv)$，使得 teacher 的 probability-flow ODE
-\eqref{eq:pf-ode} 在映射 $z_B(t)=\Tmap\big(z_A(t)\big)$ 下被忠实输运。
+Find $(\Tmap,\Tinv)$ such that the teacher's probability-flow ODE \eqref{eq:pf-ode} is
+faithfully transported under the map $z_B(t)=\Tmap\big(z_A(t)\big)$.
 \end{problem}
 
-形式上，若 $\Tmap$ 为 $C^1$ 微分同胚，Jacobian 记为
-$\Jac_{\Tmap}(z)=\partial\Tmap/\partial z$，则由链式法则
-$\dot z_B=\Jac_{\Tmap}(z_A)\,\dot z_A$，得到\emph{推前 velocity field}
+Formally, if $\Tmap$ is a $C^1$ diffeomorphism with Jacobian
+$\Jac_{\Tmap}(z)\coloneqq\partial\Tmap/\partial z$, the chain rule gives
+$\dot z_B=\Jac_{\Tmap}(z_A)\,\dot z_A$. Motivated by this, we \emph{define} the
+\emph{pushforward velocity field} (the transported field expressed in $z_B$ coordinates) by
 \begin{equation}
 (\Tmap\push v_A)(z_B,t)
-\;=\;
+\;\coloneqq\;
 \Jac_{\Tmap}\!\big(\Tinv(z_B)\big)\;
 v_A\!\big(\Tinv(z_B),t\big),
 \qquad z_B\in\Zb.
 \label{eq:pushforward}
 \end{equation}
-对称地，把 student 空间中的状态拉回 teacher 空间需要逆映射 $\Tinv$（pullback）。
-式 \eqref{eq:pushforward} 显式地表明，要把 teacher 的"意见"评估在 student
-访问到的状态上，必须同时具备：
+The chain-rule identity above is the derivation that justifies this as the correct definition.
+Symmetrically, mapping a state in the student space back into the teacher space requires the
+inverse $\Tinv$ (pullback). Equation \eqref{eq:pushforward} makes explicit that, to evaluate the
+teacher's ``opinion'' at a state visited by the student, one must simultaneously have:
 \begin{enumerate}[leftmargin=2em,itemsep=2pt]
-  \item \textbf{可逆性}：能取 $\Tinv(z_B)$，以便在 student 状态 $z_B$ 处查询
-        teacher；
-  \item \textbf{可微性}：Jacobian $\Jac_{\Tmap}$ 存在且可计算，以便把 teacher
-        velocity 正确变换到 $\Zb$。
+  \item \textbf{Invertibility}: access to $\Tinv(z_B)$, so the teacher can be queried at the
+        student state $z_B$;
+  \item \textbf{Differentiability}: the Jacobian $\Jac_{\Tmap}$ exists and is computable, so the
+        teacher velocity can be correctly mapped into $\Zb$.
 \end{enumerate}
 
-\section{On-Policy 蒸馏的形式化需求}
+\section{Dimension Mismatch and Conditional Pullback}
+\label{sec:cond-pullback}
+
+\textbf{Dimension (mis)match in practice.}
+Empirically, the teacher's VAE has \emph{at least} as many channels as the student's VAE, i.e.
+\[
+d_A \ge d_B ,
+\]
+and strictly more in the common case. Two regimes arise:
+\begin{itemize}[leftmargin=1.6em,itemsep=2pt]
+  \item \emph{Strict mismatch} ($d_A>d_B$): the forward transport $\Tmap:\Za\to\Zb$ is a
+        \emph{dimensionality reduction} (many-to-one), while the pullback $\Tinv:\Zb\to\Za$ is a
+        \emph{dimensional expansion}; recovering a high-dimensional vector from a lower-dimensional
+        one is \emph{underdetermined}, so the student $\to$ teacher transport is
+        \textbf{necessarily lossy}.
+  \item \emph{Equal dimension} ($d_A=d_B$): the dimension count alone no longer forces loss; if
+        $\Tmap$ is full-rank (invertible) the single-valued pullback is exact, and the
+        constructions below degenerate gracefully to the plain inverse of \S\ref{sec:transport}
+        (made precise in Rem.~\ref{rem:equal-dim}).
+\end{itemize}
+This section treats the general case $d_A\ge d_B$, makes the strict-mismatch lossiness precise, and
+formalizes the operation of ``conditioning on the student DiT's hidden states''.
+
+\begin{definition}[Fiber and ideal pullback]
+\label{def:fiber}
+For $z_B\in\Zb$, the \emph{fiber} (preimage) of the forward transport is
+\[
+\mathcal{F}(z_B)\;\coloneqq\;\Tmap^{-1}(z_B)\;=\;\{\,z\in\Za:\ \Tmap(z)=z_B\,\}.
+\]
+When $\Tmap$ is a full-rank submersion, a generic fiber is a $(d_A-d_B)$-dimensional submanifold of
+$\Za$ (an affine subspace when $\Tmap$ is affine); it has \emph{positive} dimension exactly when
+$d_A>d_B$, and collapses to a \emph{single point} when $d_A=d_B$. Any \emph{single-valued} pullback
+$\Tinv:\Zb\to\Za$ must select a \emph{unique} representative on each fiber, thereby discarding the
+in-fiber coordinate---a vacuous choice when the fiber is a point ($d_A=d_B$), and a genuinely lossy
+one when it is positive-dimensional ($d_A>d_B$). Moreover, let the teacher latent that is
+pixel-consistent
+(Def.~\ref{def:consistency}) with $z_B$ be the \emph{ideal pullback}
+\begin{equation}
+\bar z_A(z_B)\;\coloneqq\;\Enc_A\big(\Dec_B(z_B)\big)\ \in\ \Za,
+\label{eq:ideal-lift}
+\end{equation}
+the semantically correct target that the pullback should reproduce.
+\end{definition}
+
+\begin{problem}[Irreducible loss of the underdetermined pullback]
+\label{prob:underdetermined}
+Suppose a single-valued pullback $\Tinv$ has range contained in some $d_B$-dimensional subset
+$\mathcal{R}\subseteq\Za$ (e.g.\ a linear pullback $\Tinv(z_B)=A^{+}(z_B-b)$ lands in the column
+space of $A^{+}$), and let $\Pi_{\mathcal R}$, $\Pi^{\perp}_{\mathcal R}$ be the corresponding
+orthogonal projectors. Then for \emph{any} pullback that depends on $z_B$ alone,
+\begin{equation}
+\E_{z_B}\,\norm{\bar z_A(z_B)-\Tinv(z_B)}
+\;\ge\;
+\E_{z_B}\,\norm{\Pi^{\perp}_{\mathcal R}\,\bar z_A(z_B)},
+\label{eq:irreducible}
+\end{equation}
+i.e.\ the energy of the ideal pullback lying in the \emph{teacher-exclusive subspace}
+$\mathcal{R}^{\perp}$ (the extra $d_A-d_B$ dimensions) cannot be recovered from $z_B$ alone. This
+is the precise meaning of the student $\to$ teacher transport being ``underdetermined and lossy''.
+\end{problem}
+
+\begin{remark}[The equal-dimension boundary $d_A=d_B$]
+\label{rem:equal-dim}
+When $d_A=d_B$ and the chosen $\Tmap$ is invertible, the recoverable subspace is the whole space,
+$\mathcal{R}=\Za$, hence $\Pi^{\perp}_{\mathcal R}=0$ and the right-hand side of
+\eqref{eq:irreducible} vanishes: a single-valued pullback can be exact and there is \emph{no}
+dimension-induced loss. The fiber is a point, so $\bar z_A(z_B)=\Tinv(z_B)$, and the conditional
+pullback introduced below carries no information-theoretic gain
+($I(\bar z_A;h_\theta\mid z_B)=0$, since $\bar z_A$ is then a deterministic function of $z_B$);
+requirement (P4) thus collapses to (P2). This concerns only the \emph{dimension-induced}
+underdetermination: a residual approximation error may still persist if the chosen transport class
+(e.g.\ affine) cannot represent $\bar z_A$, but that error is measured by $\delta_{\Tmap}$
+(Def.~\ref{def:delta}), not by \eqref{eq:irreducible}. In short, $d_A=d_B$ is the degenerate
+boundary of this section at which everything reduces to \S\ref{sec:transport}--\S\ref{sec:pushforward}.
+\end{remark}
+
+\textbf{Conditional pullback: injecting information via the student DiT's hidden states.}
+While computing $v_\theta(z_B,t,c)$ (with $c$ the external conditioning, e.g.\ the text prompt),
+the student transformer produces intermediate hidden states
+\[
+h_\theta(z_B,t,c)\ \in\ \mathcal{H},
+\]
+whose dimension is typically far larger than $d_B$. Augmenting the pullback's domain from $\Zb$
+to $\Zb\times\mathcal{H}$ yields the \emph{conditional pullback}
+\begin{equation}
+\Tinv_{c}:\ \Zb\times\mathcal{H}\to\Za,
+\qquad
+\hat z_A\;\coloneqq\;\Tinv_{c}\big(z_B,\ h_\theta(z_B,t,c)\big).
+\label{eq:cond-pullback}
+\end{equation}
+
+\begin{remark}[Essence: turning an underdetermined inversion into conditional inference]
+\label{rem:essence}
+The essence of this operation is to use the student's own internal representation as
+\emph{side information} to estimate the missing coordinate in the teacher-exclusive subspace
+$\mathcal{R}^{\perp}$, thereby rewriting an ``ill-posed dimensional-expansion inversion'' as a
+``conditional inference / conditional completion'' problem. Its attainable accuracy is governed
+by the \emph{conditional entropy}:
+\begin{equation}
+H\big(\bar z_A \,\big|\, z_B,\ h_\theta\big)
+\;\le\;
+H\big(\bar z_A \,\big|\, z_B\big),
+\qquad
+\text{gain}\;=\;I\big(\bar z_A;\ h_\theta \,\big|\, z_B\big)\;\ge\;0 .
+\label{eq:cond-entropy}
+\end{equation}
+Under squared error, the optimal estimator is the conditional expectation
+$\hat z_A^{\star}=\E[\bar z_A\mid z_B,h_\theta]$, whose irreducible residual is the conditional
+variance $\E\,\mathrm{Var}\big(\Pi^{\perp}_{\mathcal R}\bar z_A\mid z_B,h_\theta\big)$.
+\end{remark}
+
+\begin{remark}[A necessary caveat: hidden states do not create information from nothing]
+\label{rem:determinism}
+Since $h_\theta(z_B,t,c)$ is a \emph{deterministic} function of $(z_B,t,c)$, the genuine
+information gain from conditioning can \emph{only} come from inputs beyond $z_B$, namely the time
+$t$ and the external conditioning $c$:
+\[
+I\big(\bar z_A;\ h_\theta \,\big|\, z_B\big)
+\;\le\;
+I\big(\bar z_A;\ (t,c)\,\big|\, z_B\big),
+\]
+which is strictly positive iff the teacher-exclusive coordinate
+$\Pi^{\perp}_{\mathcal R}\bar z_A$ is correlated with $(t,c)$. The role of the hidden states is
+therefore twofold: (i) they are the natural carrier of the $(z_B,t,c)$ context (in particular the
+prompt $c$, which is \emph{not} a function of $z_B$); and (ii) they are a precomputed, rich
+nonlinear feature that makes the conditional completion learnable in practice. They \emph{cannot}
+recover the part of the information that was \emph{physically deleted} by $\Tmap$ in the forward
+direction and is uncorrelated with $(t,c)$.
+\end{remark}
+
+\begin{remark}[Compatibility with the pushforward]
+\label{rem:compat}
+Substituting the conditional pullback into the pushforward \eqref{eq:pushforward}:
+\[
+(\Tmap\push v_A)(z_B,t)
+\;=\;\Jac_{\Tmap}(\hat z_A)\,v_A(\hat z_A,t),
+\qquad \hat z_A=\Tinv_{c}\big(z_B,h_\theta(z_B,t,c)\big).
+\]
+For an affine $\Tmap=Az+b$, the Jacobian $\Jac_{\Tmap}\equiv A$ is constant, so conditioning
+\emph{does not alter} the velocity-transport operator $A$; it only \emph{relocates} the teacher
+query point $\hat z_A$ to a more correct position within the fiber $\mathcal{F}(z_B)$. That is, it
+sharpens \emph{which} teacher opinion is queried without breaking the linear structure of the
+transport.
+\end{remark}
+
+\section{Formal Requirements of On-Policy Distillation}
 \label{sec:onpolicy}
 
-On-policy 蒸馏的本质特征是：监督信号必须在 \emph{student 自己 rollout 出来的
-状态分布} 上评估，而非在 teacher 预先采样的状态上评估。
+The defining feature of on-policy distillation is that the supervision signal must be evaluated on
+\emph{the state distribution that the student itself rolls out}, rather than on states presampled
+by the teacher.
 
-\paragraph{student 的 on-policy 状态。}
-student 用自身 velocity $v_\theta$ rollout 一条轨迹 $\{z_B(t)\}_{t}\subset\Zb$，
-诱导一个被访问状态的分布 $\rho_\theta$（依赖当前参数 $\theta$，故是 on-policy 的）。
+\paragraph{The student's on-policy states.}
+The student rolls out a trajectory $\{z_B(t)\}_{t}\subset\Zb$ using its own velocity $v_\theta$,
+inducing a distribution $\rho_\theta$ of visited states (it depends on the current parameters
+$\theta$, hence ``on-policy'').
 
-\paragraph{监督信号。}
-对每个被访问状态 $z_B\sim\rho_\theta$，蒸馏要求 teacher 在该点给出"应当如何
-去噪"的意见。但 teacher 的 velocity $v_A$ 只定义在 $\Za$ 上，因此其在 $\Zb$ 中
-的合法取值正是\eqref{eq:pushforward}的推前场 $(\Tmap\push v_A)(z_B,t)$，它依赖
-$\Tinv$（把 $z_B$ 拉回 $\Za$ 查询 teacher）与 $\Jac_{\Tmap}$（把结果变换回 $\Zb$）。
+\paragraph{The supervision signal.}
+For each visited state $z_B\sim\rho_\theta$, distillation requires the teacher's ``opinion'' on
+how to denoise at that point. But the teacher velocity $v_A$ is defined only on $\Za$, so its
+legitimate value in $\Zb$ is exactly the pushforward field $(\Tmap\push v_A)(z_B,t)$ of
+\eqref{eq:pushforward}, which depends on $\Tinv$ (pulling $z_B$ back to $\Za$ to query the
+teacher) and $\Jac_{\Tmap}$ (mapping the result back into $\Zb$).
 
-\paragraph{蒸馏目标（general 形式）。}
-on-policy 蒸馏最小化 student velocity 与传输后 teacher velocity 在 student
-访问分布上的偏差：
+\paragraph{Distillation objective (general form).}
+On-policy distillation minimizes the discrepancy between the student velocity and the transported
+teacher velocity over the student's visited distribution:
 \begin{equation}
 \min_{\theta}\;
 \E_{t}\,\E_{z_B\sim\rho_\theta}\;
@@ -196,48 +337,62 @@ on-policy 蒸馏最小化 student velocity 与传输后 teacher velocity 在 stu
 \mathcal{M}\!\Big(v_\theta(z_B,t),\;(\Tmap\push v_A)(z_B,t)\Big)\Big],
 \label{eq:distill-objective}
 \end{equation}
-其中 $w(t)$ 为时间权重，$\mathcal{M}(\cdot,\cdot)$ 是一个差异度量（例如二次
-回归差，或由动力学诱导的转移分布散度），其具体形式不在本文范围内。该目标
-良定义的前提，正是 $(\Tmap\push v_A)$ 在 $\rho_\theta$ 的支撑上可被求值——即
-$\Tinv$ 与 $\Jac_{\Tmap}$ 存在且可计算。
+where $w(t)$ is a time weight and $\mathcal{M}(\cdot,\cdot)$ is a discrepancy measure (e.g.\ a
+quadratic regression error, or a divergence between the transition distributions induced by the
+dynamics); its concrete form is outside the scope of this note. The objective is well defined
+precisely when $(\Tmap\push v_A)$ can be evaluated on the support of $\rho_\theta$, i.e.\ when
+$\Tinv$ and $\Jac_{\Tmap}$ exist and are computable.
 
-\section{形式化问题陈述}
+\section{Formal Problem Statement}
 \label{sec:problem-statement}
 
-综合 \S\ref{sec:setup}--\S\ref{sec:onpolicy}，跨隐空间 on-policy 蒸馏归结为以下
-传输映射设计问题。
+Combining \S\ref{sec:setup}--\S\ref{sec:onpolicy}, cross-latent on-policy distillation reduces to
+the following transport-map design problem.
 
-\begin{problem}[跨隐空间传输设计]
+\begin{problem}[Cross-latent transport design]
 \label{prob:main}
-给定两个异构隐空间 $\Za,\Zb$、对应的解码器 $\Dec_A,\Dec_B$、teacher velocity
-$v_A$ 与 student velocity $v_\theta$，寻找一对映射 $(\Tmap,\Tinv)$，
-$\Tmap:\Za\to\Zb$、$\Tinv:\Zb\to\Za$，使得：
+Given two heterogeneous latent spaces $\Za,\Zb$, their decoders $\Dec_A,\Dec_B$, the teacher
+velocity $v_A$, and the student velocity $v_\theta$, find a pair of maps $(\Tmap,\Tinv)$,
+$\Tmap:\Za\to\Zb$ and $\Tinv:\Zb\to\Za$, such that:
 \begin{enumerate}[leftmargin=2.4em,label=\textup{(P\arabic*)},itemsep=3pt]
-  \item \textbf{语义一致 (semantic consistency)}：$\Tmap$ 像素一致，即传输
-        一致性误差 $\delta_{\Tmap}$（Def.~\ref{def:delta}）尽可能小，
-        $\Dec_B(\Tmap(z))\approx\Dec_A(z)$；
-  \item \textbf{可逆 (invertibility)}：$\Tinv$ 满足 Def.~\ref{def:transport}
-        的互逆关系，使 student 状态可被拉回 $\Za$ 查询 teacher；
-  \item \textbf{可推前 (differentiable pushforward)}：$\Tmap$ 可微且 Jacobian
-        $\Jac_{\Tmap}$ 可得，从而推前 velocity field
-        \eqref{eq:pushforward} $(\Tmap\push v_A)$ 在 student 访问的状态上可
-        求值。
+  \item \textbf{Semantic consistency}: $\Tmap$ is pixel-consistent, i.e.\ the transport
+        consistency error $\delta_{\Tmap}$ (Def.~\ref{def:delta}) is as small as possible,
+        $\Dec_B(\Tmap(z))\approx\Dec_A(z)$;
+  \item \textbf{Invertibility}: $\Tinv$ satisfies the mutual-inverse relations of
+        Def.~\ref{def:transport}, so student states can be pulled back to $\Za$ to query the
+        teacher;
+  \item \textbf{Differentiable pushforward}: $\Tmap$ is differentiable and its Jacobian
+        $\Jac_{\Tmap}$ is available, so the pushforward velocity field
+        \eqref{eq:pushforward} $(\Tmap\push v_A)$ can be evaluated at the student-visited states;
+  \item \textbf{Conditional invertibility under mismatch} (active only for $d_A>d_B$): with
+        $d_A\ge d_B$, the loss of a single-valued pullback $\Tinv(z_B)$ is lower-bounded by
+        \eqref{eq:irreducible}. When $d_A>d_B$ this bound is generally positive (underdetermined
+        expansion, necessarily lossy), and one should use the conditional pullback
+        $\Tinv_{c}\big(z_B,h_\theta(z_B,t,c)\big)$ (\S\ref{sec:cond-pullback}), using the student
+        DiT's hidden states as side information to complete the teacher-exclusive subspace
+        $\mathcal{R}^{\perp}$, so the pullback error approaches the conditional-variance lower
+        bound \eqref{eq:cond-entropy}. When $d_A=d_B$ the bound vanishes and this requirement
+        reduces to (P2) (Rem.~\ref{rem:equal-dim}).
 \end{enumerate}
-满足 (P1)--(P3) 时，on-policy 蒸馏目标 \eqref{eq:distill-objective} 的监督信号在
-类型上合法、在语义上正确，蒸馏问题随之良定义。
+When (P1)--(P4) hold, the supervision signal of the on-policy distillation objective
+\eqref{eq:distill-objective} is type-legal and semantically correct, and the distillation problem
+becomes well posed.
 \end{problem}
 
-\begin{remark}[需求的层次性]
+\begin{remark}[Hierarchy of requirements]
 \label{rem:layering}
-不同强度的蒸馏对 $(\Tmap,\Tinv)$ 的要求不同：仅在干净样本 $z_A^{0}$ 上做
-\emph{样本传输} $z_B^{0}=\Tmap(z_A^{0})$ 只需要 (P1)；而在 student on-policy
-轨迹上做 \emph{velocity field 传输} 则额外需要 (P2)--(P3)。这两个层次构成了
-问题 \ref{prob:main} 的两种强度版本。
+Different strengths of distillation impose different requirements on $(\Tmap,\Tinv)$: performing
+only \emph{sample transport} $z_B^{0}\coloneqq\Tmap(z_A^{0})$ on clean samples $z_A^{0}$ requires only
+(P1), whereas performing \emph{velocity-field transport} on the student's on-policy trajectory
+additionally requires (P2)--(P3), and, under \emph{strict} dimension mismatch $d_A>d_B$, (P4)
+(at $d_A=d_B$, (P4) reduces to (P2)). These levels constitute the several strength variants of
+Problem~\ref{prob:main}.
 \end{remark}
 
-\begin{remark}[范围声明]
-本文只给出问题的形式化（设定、所需性质、问题陈述），不讨论 $(\Tmap,\Tinv)$
-的任何具体构造、参数化、初始化或求解算法，也不对候选解法做比较与取舍。
+\begin{remark}[Scope statement]
+This note gives only the problem formalization (setup, required properties, problem statement). It
+does not discuss any concrete construction, parameterization, initialization, or solution algorithm
+for $(\Tmap,\Tinv)$, nor does it compare or select among candidate methods.
 \end{remark}
 
 \end{document}
