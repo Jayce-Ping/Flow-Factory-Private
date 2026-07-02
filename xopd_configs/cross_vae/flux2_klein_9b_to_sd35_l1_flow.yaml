@@ -2,7 +2,7 @@
 # M9 FLOW transport: linear P (raw teacher->student, exact L1 pushforward) + a CONDITIONAL
 # NORMALIZING-FLOW inverse Q conditioned on SD3.5 transformer hidden states h_S. The flow is
 # NLL-trained (vs HSCT's latent-MSE), so it samples ON-manifold teacher latents and fixes the
-# MSE-Q conditional-mean/off-manifold collapse (docs/mof/inverse_mapping_methods.tex, Alg. 2).
+# MSE-Q conditional-mean/off-manifold collapse (docs/xopd/inverse_mapping_methods.tex, Alg. 2).
 # Cold-start: fit P (closed-form) + train the flow Q (NLL) on the offline corpus, then FREEZE
 # for L1. Pure L1 (no L0 warmup), ODE. Directly comparable to
 # flux2_klein_9b_to_sd35_l1_hsct_noisy_late.yaml (only the inverse Q differs).

@@ -27,7 +27,7 @@ teacher transformer is swapped into the student pipeline). `cross_vae/` distills
 across **different VAEs** (FLUX.2-dev/9B teacher → SD3.5-medium student): the
 teacher is an **independent frozen adapter** and a `vae_transport` carries its
 signal into the student latent space. Theory & method derivation:
-[`docs/mof/xopd_vae_space_align.tex`](../docs/mof/xopd_vae_space_align.tex).
+[`docs/xopd/xopd_vae_space_align.tex`](../docs/xopd/xopd_vae_space_align.tex).
 
 4 configs (2 teachers × {pure-L1, L0+L1}):
 

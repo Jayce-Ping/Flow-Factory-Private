@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 """Pixel/latent-space one-step DENOISER MATCHING trainer.
 
-Implements docs/mof/pixel_denoiser_matching.tex: an on-policy clean image ``x`` is
+Implements docs/xopd/pixel_denoiser_matching.tex: an on-policy clean image ``x`` is
 encoded / noised to level ``t`` / one-step-denoised (``x0 = z_t - sigma * v``) / (optionally)
 decoded by EACH model's own VAE+denoiser; the student is trained to match the teacher's
 one-step clean prediction. No latent transport, no L1 (a single L0-style epoch loop).

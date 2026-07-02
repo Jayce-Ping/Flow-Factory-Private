@@ -21,7 +21,7 @@ teacher's velocity field / clean samples live in the teacher latent space
 ``VAETransport`` ``T: Z_T -> Z_S`` carries the teacher signal into the student
 space so XOPD's pathwise loss becomes type-legal again.
 
-Theory: ``docs/mof/xopd_vae_space_align.tex``. The key facts used here:
+Theory: ``docs/xopd/xopd_vae_space_align.tex``. The key facts used here:
 
 * **L0 needs only sample transport** (move clean ``z0``); the trainer's L0 path
   does this through the pixel bridge directly and regresses an analytic
@@ -475,7 +475,7 @@ class WhiteningTransport(LinearTransport):
 
     A robust, well-conditioned special case of :class:`LinearTransport` whose
     ``A`` is diagonal: ``T(z) = gamma * resample(z) + beta`` with one
-    ``(gamma, beta)`` per channel. Theory: docs/mof/xopd_vae_space_align.tex
+    ``(gamma, beta)`` per channel. Theory: docs/xopd/xopd_vae_space_align.tex
     (§ "传输的初始化与 AdaLN 式可逆调制", M7). Properties:
 
     * **Closed-form, no least squares** — fit by moment matching (align per-
@@ -1255,7 +1255,7 @@ class M5Transport(ConvTransport):
     (Prop. affine) for higher fidelity on the *clean* correspondence
     ``z0_T <-> z0_S``, which is genuinely non-linear (``z0_S = E_S(D_T(z0_T))``).
 
-    Caveats (the accepted M5 trade-off, see docs/mof/xopd_vae_space_align.tex M5):
+    Caveats (the accepted M5 trade-off, see docs/xopd/xopd_vae_space_align.tex M5):
     * The non-linearity breaks the flow-matching path structure, so on NOISY
       latents the map is only APPROXIMATE — fine for ODE/pathwise L1 on the lower-
       noise steps, NOT for SDE+REINFORCE (noise enters the log-prob).
@@ -1447,7 +1447,7 @@ class MLPTransport(VAETransport):
             "MLPTransport (non-linear VAE latent transport) is not implemented yet. "
             "It needs a learned forward map AND an inverse for the L1 teacher query "
             "(plus a JVP for the velocity pushforward). See "
-            "docs/mof/xopd_vae_space_align.tex (M2-nonlinear, M5). Use "
+            "docs/xopd/xopd_vae_space_align.tex (M2-nonlinear, M5). Use "
             "vae_transport.type in {pixel, linear, whitening, adaln} for now."
         )
 

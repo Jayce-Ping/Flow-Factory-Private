@@ -1,7 +1,7 @@
 # VAE 隐空间对齐 (M3 档A) —— 四条重建路径的形式化
 
 > 配套实现：`scripts/vae_align/train_align.py`（Stage 1b 训练）、`scripts/vae_align/gen_corpus.py`（Stage 1a 语料）。
-> 理论背景：`docs/mof/xopd_vae_space_align.tex` §"M3 深入：维度缺口、L1 逆映射瓶颈与 VAE 对齐"。
+> 理论背景：`docs/xopd/xopd_vae_space_align.tex` §"M3 深入：维度缺口、L1 逆映射瓶颈与 VAE 对齐"。
 >
 > 本文形式化对齐训练可视化网格（`/root/vae_align_ckpt/viz_step*.png`）中的**四行**——即四条重建/映射路径（"四个实验"），给出每条的公式、作用、对应 loss 与验证目标。
 

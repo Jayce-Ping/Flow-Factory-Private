@@ -14,7 +14,7 @@ CONDITIONAL NORMALIZING FLOW ``p(z_T | z_S, h_S)`` trained by maximum likelihood
 flow samples are on-manifold by construction, so the teacher is queried in
 distribution.
 
-Design (see docs/mof/inverse_mapping_methods.tex, Algorithm 2):
+Design (see docs/xopd/inverse_mapping_methods.tex, Algorithm 2):
 
 * forward ``P`` (teacher raw -> student raw) stays LINEAR and closed-form
   (inherited from :class:`HSCTTransport`), so the L1 transition-mean pushforward

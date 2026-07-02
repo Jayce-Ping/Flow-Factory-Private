@@ -281,7 +281,7 @@ class XOPDTrainer(BaseTrainer):
         is frozen, eval, and NOT ``accelerator.prepare``d (own data_ptr; not DDP-
         wrapped), so the CLAUDE.md autocast-cache / DDP-bypass weight-swap
         invariants do not apply (those guard ``.data.copy_()`` swaps, not a fully
-        separate module). See docs/mof/xopd_vae_space_align.tex.
+        separate module). See docs/xopd/xopd_vae_space_align.tex.
 
         VRAM: the teacher transformer + teacher VAE are resident throughout
         training (L1 is on-policy: the teacher is queried at student-visited states

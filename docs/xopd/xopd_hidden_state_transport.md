@@ -1,6 +1,6 @@
 # M8：Hidden-State-Conditioned Transport (HSCT) —— 用 student transformer 的 hidden_states 补全跨 VAE 逆映射
 
-> 配套理论：`docs/mof/xopd_vae_space_align.tex`（§"M3 深入：维度缺口、L1 逆映射瓶颈与 VAE 对齐"）、`docs/mof/vae_align_stage1_formulation.md`（Stage-1 四行形式化）。
+> 配套理论：`docs/xopd/xopd_vae_space_align.tex`（§"M3 深入：维度缺口、L1 逆映射瓶颈与 VAE 对齐"）、`docs/xopd/vae_align_stage1_formulation.md`（Stage-1 四行形式化）。
 > 配套实现锚点：`src/flow_factory/trainers/xopd/transport.py`、`src/flow_factory/trainers/xopd/trainer.py`、`src/flow_factory/models/stable_diffusion/sd3_5.py`、`scripts/vae_align/train_align.py`。
 >
 > 本文是一份**架构设计 + 理论分析方案**（不写生产代码，只定架构、接口、训练目标、理论性质、落地路径与风险）。

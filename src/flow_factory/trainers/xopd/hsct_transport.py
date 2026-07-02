@@ -8,7 +8,7 @@ The cross-VAE inverse Q: student-latent(16ch) -> teacher-latent(32ch) is
 information-starved (d_S<d_T). Conditioning Q on the STUDENT TRANSFORMER hidden
 states h_S (1536ch, prompt-aware, DeepStack multi-layer) supplies the missing
 information (validated offline: inv_lat 1.52->0.53, inv_px 0.10->0.032). See
-docs/mof/xopd_hidden_state_transport.md and scripts/vae_align/train_align_hsct.py
+docs/xopd/xopd_hidden_state_transport.md and scripts/vae_align/train_align_hsct.py
 (the offline trainer whose Q backbones are mirrored here so the package stays
 import-free of the training script).
 

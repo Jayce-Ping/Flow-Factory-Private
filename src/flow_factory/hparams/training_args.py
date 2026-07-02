@@ -2120,7 +2120,7 @@ class XOPDTrainingArguments(TrainingArguments):
                 "teacher transformer is swapped into the student pipeline (shared "
                 "VAE/scheduler). When set, the teacher is built as an independent "
                 "frozen adapter and a `vae_transport` carries its signal into the "
-                "student latent space (see docs/mof/xopd_vae_space_align.tex)."
+                "student latent space (see docs/xopd/xopd_vae_space_align.tex)."
             )
         },
     )
@@ -2714,7 +2714,7 @@ class XOPDTrainingArguments(TrainingArguments):
 
 @dataclass
 class XPDMTrainingArguments(XOPDTrainingArguments):
-    r"""Pixel/latent-space one-step DENOISER MATCHING (docs/mof/pixel_denoiser_matching.tex).
+    r"""Pixel/latent-space one-step DENOISER MATCHING (docs/xopd/pixel_denoiser_matching.tex).
 
     L0-only cross-VAE distillation: an on-policy clean image x is encoded/noised/one-step-
     denoised/decoded by EACH model's own VAE+denoiser, and ``MSE(sg[teacher_x0], student_x0)``

@@ -181,7 +181,7 @@ zero-initialised head net $g$.
 \begin{itemize}[leftmargin=1.4em,itemsep=2pt]
   \item \textbf{Linear $P$ kept.} Both methods only change the inverse $Q$; the forward $P$
         stays a frozen closed-form affine, so the L1 transition-mean pushforward remains exact
-        and analytically consistent (\texttt{docs/mof/xopd\_vae\_space\_align.tex}, Prop.~affine).
+        and analytically consistent (\texttt{docs/xopd/xopd\_vae\_space\_align.tex}, Prop.~affine).
   \item \textbf{Do-no-harm init.} Modelling the residual $r=\zT-b(\zS)$ with a zero-initialised
         flow (Alg.~\ref{alg:coupling}) means at step $0$, $F.\textsc{inverse}(\mathbf{0}\mid c)=\mathbf{0}$
         and $\hat\zT=b(\zS)=P^{+}\zS$ --- exactly the current linear pseudo-inverse baseline; the

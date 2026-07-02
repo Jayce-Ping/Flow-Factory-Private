@@ -3,7 +3,7 @@
 # transport problem is IDENTICAL to flux2_klein_9b_to_sd35_l1_flow.yaml -- this variant is the
 # faster-rollout config for iterating on the flow inverse. Only the inverse Q differs from
 # HSCT: linear P (exact pushforward) + a NLL-trained conditional coupling flow that samples
-# ON-manifold teacher latents (docs/mof/inverse_mapping_methods.tex, Alg. 2). Pure L1, ODE.
+# ON-manifold teacher latents (docs/xopd/inverse_mapping_methods.tex, Alg. 2). Pure L1, ODE.
 
 # ===== Environment =====
 launcher: "accelerate"

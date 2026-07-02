@@ -1,7 +1,7 @@
 # Cross-VAE XOPD: FLUX.2-klein-base-9B (teacher) -> SD3.5-medium (student)
 # HETEROGENEOUS latent spaces: teacher and student use DIFFERENT VAEs, so the
 # teacher signal is carried into the student latent space by a `vae_transport`
-# (see docs/mof/xopd_vae_space_align.tex). The teacher is built as an INDEPENDENT
+# (see docs/xopd/xopd_vae_space_align.tex). The teacher is built as an INDEPENDENT
 # frozen adapter (its own VAE / scheduler / text encoder); the student is SD3.5.
 #
 # This file: pure L1 (l0_warmup_epochs=0) with the STRICTLY-LINEAR CONV transport.

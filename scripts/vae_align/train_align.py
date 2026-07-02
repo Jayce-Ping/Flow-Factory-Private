@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 """Stage 1b: VAE latent-space alignment (M3, variant A).
 
-Goal (see docs/mof/xopd_vae_space_align.tex, sec "M3 深入"): make the FLUX.2-klein
+Goal (see docs/xopd/xopd_vae_space_align.tex, sec "M3 深入"): make the FLUX.2-klein
 teacher VAE latent space and the SD3.5 student VAE latent space *linearly
 interchangeable*, and force the student->teacher inverse onto the teacher
 manifold, so cross-VAE XOPD L1 stops collapsing.
