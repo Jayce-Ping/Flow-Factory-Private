@@ -45,7 +45,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_baseline_l0w0"  # Baseline ablation: l0_warmup_epochs=0 (pure L1, no L0 warmup)
+  run_name: "flux2klein_32b_to_4b_baseline_l0w0_cfg_geneval"  # Baseline ablation: l0_warmup_epochs=0 (pure L1, no L0 warmup)
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"                      # Checkpoint / log directory
@@ -55,6 +55,7 @@ log:
 # ===== Training (XOPD) =====
 train:
   trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
+  max_epochs: 500                         # CFG ablation (user-set)
 
   # --- Cross-model teacher ---
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"  # Teacher path; only its transformer (~64GB) is loaded. VAE reused from student; teacher text encoder (Mistral3) is precomputed offline then offloaded (see Flux2KleinAdapter.preprocess_func)
@@ -62,8 +63,8 @@ train:
   assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
-  teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
-  student_guidance_scale: 1.0             # Student CFG for forward + rollout; synced into base guidance_scale
+  teacher_guidance_scale: 4.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
+  student_guidance_scale: 4.0             # Student CFG for forward + rollout; synced into base guidance_scale
 
   # --- L0: velocity-regression warmup (teacher-generated data) ---
   l0_warmup_epochs: 0                     # Run L0 for the first N epochs, then switch to L1 (0 disables L0)

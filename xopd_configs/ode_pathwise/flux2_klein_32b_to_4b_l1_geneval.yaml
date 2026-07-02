@@ -1,4 +1,9 @@
-# Cross-OPD (XOPD): FLUX.2-klein-base-9B (teacher) -> FLUX.2-klein-base-4B (student)
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
+# Cross-FAMILY distillation: teacher and student share the VAE / latent space
+# (AutoencoderKLFlux2, in_channels=128) but use DIFFERENT text encoders -- dev's
+# Mistral3 (dim 15360) vs klein's Qwen3 (dim 7680). Teacher text embeddings are
+# precomputed during preprocessing and the 48GB teacher text encoder is offloaded
+# before training; the 64GB teacher transformer stays resident.
 # Single run runs L0 velocity-regression warmup (teacher-generated data) then
 # switches to L1 on-policy transition matching at epoch == l0_warmup_epochs.
 
@@ -40,7 +45,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_9b_to_4b_baseline_l0w0_cfg"  # Baseline ablation: l0_warmup_epochs=0 (pure L1, no L0 warmup)
+  run_name: "flux2klein_32b_to_4b_baseline_l0w0_geneval"  # Baseline ablation: l0_warmup_epochs=0 (pure L1, no L0 warmup)
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"                      # Checkpoint / log directory
@@ -50,16 +55,15 @@ log:
 # ===== Training (XOPD) =====
 train:
   trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
-  max_epochs: 500                         # CFG ablation (user-set)
 
   # --- Cross-model teacher ---
-  teacher_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"  # Teacher path; only its transformer is loaded, VAE/TE reused from student
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"  # Teacher path; only its transformer (~64GB) is loaded. VAE reused from student; teacher text encoder (Mistral3) is precomputed offline then offloaded (see Flux2KleinAdapter.preprocess_func)
   teacher_param_device: "cuda"            # Teacher transformer device. Options: cuda (only cuda supported today), cpu
-  assume_shared_vae_text_encoder: true    # Assume 9B/4B share VAE + text encoder (klein family); false raises (separate pipeline unsupported)
+  assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
-  teacher_guidance_scale: 4.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
-  student_guidance_scale: 4.0             # Student CFG for forward + rollout; synced into base guidance_scale
+  teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
+  student_guidance_scale: 1.0             # Student CFG for forward + rollout; synced into base guidance_scale
 
   # --- L0: velocity-regression warmup (teacher-generated data) ---
   l0_warmup_epochs: 0                     # Run L0 for the first N epochs, then switch to L1 (0 disables L0)
@@ -84,9 +88,9 @@ train:
   # --- Sampling / batch ---
   resolution: 512                         # Generation resolution (int or [H, W]); klein native is 1024, lower to save memory
   num_inference_steps: 28                 # L1 student rollout steps (undistilled base models need more steps)
-  per_device_batch_size: 4                # Per-device batch size (batch-search optimum; unique=128 -> 1 micro-batch/GPU on 32 GPUs; ~69GB/GPU)
+  per_device_batch_size: 1                # Conservative start: the FLUX.2-dev teacher transformer is ~64GB resident, so bs=4 (9B optimum) OOMs even with the 48GB teacher TE offloaded. Re-run a batch search once GPUs are free to raise it.
   group_size: 1                           # Group size (XOPD default 1; only >1 if you add grouped REINFORCE)
-  unique_sample_num_per_epoch: 128        # geneval-only: 384/3 = 128 unique prompts/epoch
+  unique_sample_num_per_epoch: 64        # geneval-only: 192/3 = 64 unique prompts/epoch
   gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps)
   num_inner_epochs: 1                     # MUST be 1 for XOPD (no rollout reuse); enforced at startup
   gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps
@@ -104,7 +108,7 @@ train:
   ema_device: "cuda"                      # EMA storage device. Options: cpu, cuda
 
   # --- Memory / misc ---
-  enable_gradient_checkpointing: false    # Gradient checkpointing: save memory at extra compute
+  enable_gradient_checkpointing: true     # On: the FLUX.2-dev teacher transformer (~64GB) leaves little headroom; trade compute for memory
   offload_samples_to_cpu: false           # Offload sample tensors to CPU between sample() and optimize() to cut peak VRAM
   seed: 42                                # Random seed
 
