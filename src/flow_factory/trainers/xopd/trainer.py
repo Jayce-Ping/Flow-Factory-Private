@@ -146,6 +146,14 @@ class XOPDTrainer(BaseTrainer):
         # captured at warm-up and injected into the affine-transport converters.
         self._teacher_latent_ids = None
         self._teacher_spatial_hw = None
+        # Transport/HSCT flags: default here so BOTH teacher backends (cross-VAE and
+        # same-arch) always define them. _init_cross_vae_teacher refines _is_hsct/_pixel_loss
+        # per transport; the same-arch (shared-VAE, identity-transport) path keeps these
+        # defaults (no HSCT capture, no pixel-space L1).
+        self._is_hsct = ta.vae_transport in ("hsct", "flow")
+        self._pixel_loss = bool(ta.xopd_pixel_loss)
+        self._hsct_hidden: Dict[int, torch.Tensor] = {}
+        self._hsct_capture = False
         if self._cross_vae:
             self._init_cross_vae_teacher()
         else:
@@ -885,9 +893,17 @@ class XOPDTrainer(BaseTrainer):
         chart (both live under ``eval/{test_set}/...``). No-op for the teacher
         part until :meth:`evaluate_teacher_baseline` has populated the cache.
         """
+        # Batch the whole student eval + teacher re-emit into ONE log call so all
+        # test sets land on the SAME wandb step (previously each test set logged
+        # separately, spreading eval metrics across stepless auto-incremented steps).
+        self._eval_log_sink = {}
         super().evaluate()
-        if self.accelerator.is_main_process and self._teacher_baseline_scalars:
-            self.log_data(dict(self._teacher_baseline_scalars), step=self.step)
+        if self.accelerator.is_main_process:
+            if self._teacher_baseline_scalars:
+                self._eval_log_sink.update(self._teacher_baseline_scalars)
+            if self._eval_log_sink:
+                self.log_data(self._eval_log_sink, step=self.step)
+        self._eval_log_sink = None
 
     def evaluate_teacher_baseline(self) -> None:
         """Evaluate the frozen teacher on every test set (fair student protocol).
@@ -912,8 +928,14 @@ class XOPDTrainer(BaseTrainer):
 
         self.adapter.eval()
         logger.info("XOPD: evaluating teacher baseline on all test sets")
+        # Batch all test sets into ONE log call so the teacher baseline lands on a
+        # single wandb step (step 0), not spread across stepless auto-steps.
+        self._eval_log_sink = {}
         for test_set_name in sorted(self.test_dataloaders.keys()):
             self._evaluate_teacher_test_set(test_set_name)
+        if self.accelerator.is_main_process and self._eval_log_sink:
+            self.log_data(self._eval_log_sink, step=self.step)
+        self._eval_log_sink = None
         self.accelerator.wait_for_everyone()
 
     def _evaluate_teacher_test_set(self, test_set_name: str) -> None:

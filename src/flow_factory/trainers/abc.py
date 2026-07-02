@@ -76,6 +76,10 @@ class BaseTrainer(ABC):
         self.adapter = adapter
         self.epoch = 0
         self.step = 0
+        # When non-None, `_log_eval_reward_metrics` accumulates into this dict instead
+        # of logging per test set, so a whole evaluate() is emitted in ONE log call
+        # (single wandb step). Trainers that want per-eval step batching set/clear it.
+        self._eval_log_sink: Optional[Dict[str, Any]] = None
 
         self._initialization()
         self.adapter.post_init()
@@ -638,7 +642,14 @@ class BaseTrainer(ABC):
 
         samples_key = "eval_samples" if log_pfx == "eval" else f"{log_pfx}/eval_samples"
         log_data[samples_key] = all_samples
-        self.log_data(log_data, step=self.step)
+        # If an eval-log sink is active (set by a trainer that batches a whole
+        # evaluate() into ONE log call), accumulate into it so all test sets land
+        # on the SAME wandb step instead of spreading across stepless auto-steps.
+        sink = getattr(self, "_eval_log_sink", None)
+        if sink is not None:
+            sink.update(log_data)
+        else:
+            self.log_data(log_data, step=self.step)
 
     def _maybe_offload_samples_to_cpu(self, samples: List[BaseSample]) -> None:
         """Move every sample's tensor fields to CPU when ``offload_samples_to_cpu`` is enabled.
