@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/opd/sde.py
+# src/flow_factory/trainers/opd/trainer.py
 """On-Policy Distillation (OPD) Trainer for Flow Matching, SDE regime.
 
 Implements the REINFORCE form of the trajectory-level reverse KL
@@ -61,6 +61,7 @@ from .common import (
     load_teachers,
     pcgrad_project_gradients,
     pcgrad_project_velocities,
+    pcgrad_project_velocities_patchwise,
     teacher_indices_for_batch,
 )
 
@@ -1000,8 +1001,15 @@ class OPDTrainer(BaseTrainer):
                         loss_info=loss_info,
                         batch_samples=batch_samples,
                     )
-                elif self.training_args.teacher_aggregation == "v_pcgrad":
-                    # v_pcgrad: PCGrad in velocity space, single backward per timestep
+                elif self.training_args.teacher_aggregation in (
+                    "v_pcgrad",
+                    "v_average",
+                    "v_pcgrad_patchwise",
+                ):
+                    # Velocity-space fusion family (routed mean / global PCGrad /
+                    # patchwise PCGrad), single backward per timestep. The fusion
+                    # operator is selected inside _optimize_train_pass_v_pcgrad via
+                    # _fuse_teacher_velocities.
                     d_per_teacher_list, mu_teacher_v = self._precompute_d_per_timestep_pcgrad(
                         batch=batch,
                         latents_index_map=latents_index_map,
@@ -1541,6 +1549,75 @@ class OPDTrainer(BaseTrainer):
 
         return loss_info
 
+    def _resolve_pcgrad_patch_size(self) -> int:
+        """Patch size for ``v_pcgrad_patchwise``: config override or DiT patch_size.
+
+        Uses ``training_args.pcgrad_patch_size`` when set, otherwise falls back to
+        the adapter transformer's own ``config.patch_size`` (one PCGrad group per
+        DiT token). Fails fast if neither is available.
+        """
+        p = self.training_args.pcgrad_patch_size
+        if p is not None:
+            return int(p)
+        pipeline = getattr(self.adapter, "pipeline", None)
+        transformer = getattr(pipeline, "transformer", None)
+        p = getattr(getattr(transformer, "config", None), "patch_size", None)
+        if p is None:
+            raise ValueError(
+                "teacher_aggregation='v_pcgrad_patchwise' needs a patch size, but "
+                "train.pcgrad_patch_size is None and the adapter's transformer "
+                f"exposes no config.patch_size (adapter={type(self.adapter).__name__}). "
+                "Set train.pcgrad_patch_size explicitly."
+            )
+        return int(p)
+
+    def _fuse_teacher_velocities(
+        self,
+        velocities: List[torch.Tensor],
+        teacher_masks: List[Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        """Fuse per-teacher residual velocities per ``teacher_aggregation``.
+
+        ``velocities[k]`` is ``mu_T^k - mu_S.detach()`` with non-applicable
+        samples already zeroed by the source-routing mask; ``teacher_masks[k]``
+        is the per-sample bool mask (or ``None`` when the teacher applies to all
+        samples). The returned residual is added back to ``mu_S.detach()`` by the
+        caller to form the fused transition mean.
+
+        - ``v_average``: per-sample equal-weight mean over the *applicable*
+          teachers (``sum_k v_k / n_applicable``); with no routing this is the
+          plain mean over all K.
+        - ``v_pcgrad``: global velocity-space PCGrad (one dot product per sample).
+        - ``v_pcgrad_patchwise``: velocity-space PCGrad done independently per DiT
+          token / ``pcgrad_patch_size`` spatial patch.
+        """
+        agg = self.training_args.teacher_aggregation
+        if agg == "v_average":
+            fused = velocities[0]
+            for k in range(1, len(velocities)):
+                fused = fused + velocities[k]
+            # Per-sample count of applicable teachers (None mask => applies to all).
+            counts = torch.zeros(
+                velocities[0].shape[0],
+                device=velocities[0].device,
+                dtype=fused.dtype,
+            )
+            for mask_k in teacher_masks:
+                if mask_k is None:
+                    counts = counts + 1.0
+                else:
+                    counts = counts + mask_k.to(counts.dtype)
+            counts = counts.clamp_min(1.0).view(-1, *([1] * (fused.ndim - 1)))
+            return fused / counts
+        if agg == "v_pcgrad_patchwise":
+            return pcgrad_project_velocities_patchwise(
+                velocities,
+                patch_size=self._resolve_pcgrad_patch_size(),
+                eps=self.training_args.pcgrad_eps,
+            )
+        # Default / "v_pcgrad": global velocity-space PCGrad.
+        return pcgrad_project_velocities(velocities, eps=self.training_args.pcgrad_eps)
+
     def _optimize_train_pass_v_pcgrad(
         self,
         batch: Dict[str, Any],
@@ -1552,16 +1629,20 @@ class OPDTrainer(BaseTrainer):
         loss_info: Dict[str, List[torch.Tensor]],
         batch_samples: Optional[List["BaseSample"]] = None,
     ) -> Dict[str, List[torch.Tensor]]:
-        """v_pcgrad: PCGrad conflict resolution in velocity (prediction) space.
+        """Velocity-space teacher fusion with a single backward per timestep.
 
-        Instead of K backward passes + gradient projection (expensive), this mode:
-        1. Computes per-teacher residual velocities v_m = mu_T^m - mu_S.detach()
-        2. Projects conflicting residuals via PCGrad in prediction space
-        3. Fuses into a single target: mu_T_fused = mu_S.detach() + sum(v_m^PC)
-        4. Single backward per timestep (same as ``sum`` mode)
+        Shared main pass for the ``v_pcgrad`` / ``v_average`` /
+        ``v_pcgrad_patchwise`` modes. Per timestep:
+        1. Compute per-teacher residual velocities v_m = mu_T^m - mu_S.detach()
+           (non-applicable teachers zeroed by the source-routing mask).
+        2. Fuse them via :meth:`_fuse_teacher_velocities` (routed equal-weight
+           mean for ``v_average``; global PCGrad for ``v_pcgrad``; per-DiT-token
+           PCGrad for ``v_pcgrad_patchwise``).
+        3. Form a single target mu_T_fused = mu_S.detach() + fused_velocity.
+        4. Single backward per timestep (same as ``sum`` mode).
 
-        This gives similar conflict resolution at a fraction of the cost:
-        - 1 backward per timestep (vs K for pcgrad)
+        This gives conflict resolution / mixing at a fraction of the cost:
+        - 1 backward per timestep (vs K for gradient-space pcgrad)
         - O(K * latent_size) memory (vs K * model_params for pcgrad)
         - Native per-timestep accumulate() (vs manual p.grad for pcgrad)
         """
@@ -1629,10 +1710,9 @@ class OPDTrainer(BaseTrainer):
                             v_k = v_k * broadcast_mask
                         velocities.append(v_k)
 
-                    # PCGrad projection in velocity space
-                    fused_velocity = pcgrad_project_velocities(
-                        velocities, eps=self.training_args.pcgrad_eps
-                    )
+                    # Fuse per-teacher residuals (routed mean / global PCGrad /
+                    # patchwise PCGrad) per teacher_aggregation.
+                    fused_velocity = self._fuse_teacher_velocities(velocities, teacher_masks)
 
                     # Fused target
                     mu_T_fused = mu_S_detached + fused_velocity

@@ -318,6 +318,110 @@ def pcgrad_project_velocities(
     return result
 
 
+def pcgrad_project_velocities_patchwise(
+    velocities: List[torch.Tensor],
+    *,
+    patch_size: int,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Apply PCGrad projection independently per DiT token / spatial patch.
+
+    Partitions each velocity tensor ``(B, C, H, W)`` into non-overlapping
+    ``patch_size x patch_size`` spatial patches, flattens every patch (all
+    channels included) into a per-token vector of length ``C * patch_size**2``,
+    and runs the per-sample PCGrad projection of
+    :func:`pcgrad_project_velocities` INDEPENDENTLY on each token. The projected
+    tokens are summed across teachers and stitched back into the original
+    ``(B, C, H, W)`` layout.
+
+    This is the per-token (DiT-patch) analogue of the global
+    :func:`pcgrad_project_velocities`; it mirrors the 3D per-token path of
+    ``pcgrad_blend_noise_preds_channelwise`` in
+    ``trainers/ensemble_eval/common.py`` (group dim = tokens, feature = channels
+    within the patch).
+
+    Args:
+        velocities: K tensors of shape ``(B, C, H, W)``, each representing one
+            teacher's residual pull ``mu_T^m - mu_S.detach()``.
+        patch_size: Spatial patch edge in latent-grid units. ``H`` and ``W``
+            must both be divisible by it (``patch_size=2`` == one SD3.5 DiT
+            token).
+        eps: Minimum per-token ``||v_j||^2`` for denominator clamping.
+
+    Returns:
+        Fused velocity ``sum_m v_m^PC``, same shape ``(B, C, H, W)`` as each input.
+
+    Raises:
+        ValueError: Empty input, non-4D tensors, mismatched shapes, invalid
+            ``patch_size``, or ``H``/``W`` not divisible by ``patch_size``.
+    """
+    K = len(velocities)
+    if K == 0:
+        raise ValueError(
+            "pcgrad_project_velocities_patchwise requires at least one velocity tensor."
+        )
+    if patch_size < 1:
+        raise ValueError(f"patch_size must be >= 1, got patch_size={patch_size}.")
+
+    ref = velocities[0]
+    if ref.ndim != 4:
+        raise ValueError(
+            "pcgrad_project_velocities_patchwise expects 4D (B, C, H, W) tensors, "
+            f"got ndim={ref.ndim} (shape={tuple(ref.shape)})."
+        )
+    B, C, H, W = ref.shape
+    for idx, v in enumerate(velocities):
+        if v.shape != ref.shape:
+            raise ValueError(
+                "pcgrad_project_velocities_patchwise expects all tensors to share "
+                f"shape {tuple(ref.shape)}, got index {idx} shape {tuple(v.shape)}."
+            )
+    if H % patch_size != 0 or W % patch_size != 0:
+        raise ValueError(
+            "pcgrad_project_velocities_patchwise requires H and W divisible by "
+            f"patch_size={patch_size}, got H={H}, W={W}."
+        )
+
+    if K == 1:
+        return velocities[0]
+
+    p = patch_size
+    n_h, n_w = H // p, W // p
+    num_tokens = n_h * n_w
+    feat = C * p * p
+    group_batch = B * num_tokens
+    broadcast_shape = (B, num_tokens, 1)
+
+    def _patchify(x: torch.Tensor) -> torch.Tensor:
+        # (B, C, H, W) -> (B, num_tokens, C*p*p)
+        x = x.reshape(B, C, n_h, p, n_w, p)
+        return x.permute(0, 2, 4, 1, 3, 5).reshape(B, num_tokens, feat)
+
+    tokens = [_patchify(v) for v in velocities]  # each (B, num_tokens, feat)
+    flat_orig = [t.reshape(group_batch, feat) for t in tokens]
+    norm_sq = [(f * f).sum(dim=1).clamp_min(eps).view(broadcast_shape) for f in flat_orig]
+
+    # Per-token PCGrad: project away conflicting components using the *original*
+    # tokens[j], one dot product per (sample, token).
+    pc = [t.clone() for t in tokens]
+    for i in range(K):
+        for j in range(K):
+            if i == j:
+                continue
+            flat_pc_i = pc[i].reshape(group_batch, feat)
+            dot = (flat_pc_i * flat_orig[j]).sum(dim=1).view(broadcast_shape)
+            proj = (dot / norm_sq[j]) * tokens[j]
+            pc[i] = torch.where(dot < 0, pc[i] - proj, pc[i])
+
+    fused_tokens = pc[0]
+    for i in range(1, K):
+        fused_tokens = fused_tokens + pc[i]
+
+    # Unpatchify: (B, num_tokens, C*p*p) -> (B, C, H, W) (exact inverse of _patchify).
+    fused = fused_tokens.reshape(B, n_h, n_w, C, p, p)
+    return fused.permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)
+
+
 def prepare_train_timesteps(
     scheduler,
     *,

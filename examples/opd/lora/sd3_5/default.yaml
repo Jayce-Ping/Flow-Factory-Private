@@ -70,7 +70,8 @@ train:
     # - "/path/to/local/lora_dir"          # local directory
     # - "owner/repo@v1.0.0"                # pinned revision
   teacher_param_device: 'cuda'           # Options: cpu, cuda. 'cuda' is faster but costs LoRA-sized VRAM per teacher.
-  teacher_aggregation: 'round_robin'     # Options: 'round_robin' (1 teacher per batch, cycling), 'average' (forward every teacher per timestep)
+  teacher_aggregation: 'round_robin'     # Options: round_robin | average | sum | pcgrad | v_pcgrad | v_average | v_pcgrad_patchwise
+  pcgrad_patch_size: null                # Only for teacher_aggregation='v_pcgrad_patchwise'. Latent patch edge; null = auto (DiT transformer patch_size, e.g. 2 for SD3.5).
   reinforce_coef: 1.0                    # Coefficient on the REINFORCE term; 0 disables the trajectory term (cheapest estimator).
 
   # ---- KL anchor to the pre-trained base model ----

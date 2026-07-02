@@ -15,7 +15,7 @@
 # src/flow_factory/trainers/opd/__init__.py
 """On-Policy Distillation (OPD) trainer.
 
-:class:`OPDTrainer` (``sde.py``) supports both SDE and ODE dynamics:
+:class:`OPDTrainer` (``trainer.py``) supports both SDE and ODE dynamics:
 - SDE (Flow-SDE): REINFORCE + pathwise loss with time-reweighted KL
 - ODE: pathwise-only MSE (σ²=1 convention, set via dynamics_type='ODE')
 
@@ -25,6 +25,6 @@ Teacher LoRA loading and per-batch selection shared via
 Registry key: ``'opd'`` -> :class:`OPDTrainer`
 """
 
-from .sde import OPDTrainer
+from .trainer import OPDTrainer
 
 __all__ = ["OPDTrainer"]

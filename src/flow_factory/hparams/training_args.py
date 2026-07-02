@@ -1808,7 +1808,15 @@ class OPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    teacher_aggregation: Literal["round_robin", "average", "sum", "pcgrad", "v_pcgrad"] = field(
+    teacher_aggregation: Literal[
+        "round_robin",
+        "average",
+        "sum",
+        "pcgrad",
+        "v_pcgrad",
+        "v_average",
+        "v_pcgrad_patchwise",
+    ] = field(
         default="round_robin",
         metadata={
             "help": (
@@ -1824,7 +1832,15 @@ class OPDTrainingArguments(TrainingArguments):
                 "PCGrad (Projected Gradient Descent) to resolve conflicts. "
                 "'v_pcgrad': PCGrad conflict resolution in velocity "
                 "(prediction) space — projects conflicting teacher residuals "
-                "before forming a fused target. Single backward per timestep."
+                "before forming a fused target. Single backward per timestep. "
+                "'v_average': routed equal-weight mean of the applicable "
+                "teachers' velocity residuals (respects teacher_route_by_source: "
+                "per sample, mean over the teachers whose sources match). Single "
+                "backward per timestep. "
+                "'v_pcgrad_patchwise': like 'v_pcgrad' but the velocity-space "
+                "PCGrad projection runs independently per DiT token/patch (see "
+                "pcgrad_patch_size), then the projected patches are stitched back. "
+                "Single backward per timestep."
             )
         },
     )
@@ -1836,6 +1852,21 @@ class OPDTrainingArguments(TrainingArguments):
                 "teacher_aggregation='pcgrad', used to prevent division by zero "
                 "when computing the projection of grad_i onto grad_j. "
                 "Default 1e-8 is typically safe."
+            )
+        },
+    )
+    pcgrad_patch_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Spatial patch size (in latent-grid units) for "
+                "teacher_aggregation='v_pcgrad_patchwise'. PCGrad conflict "
+                "resolution runs independently on each non-overlapping "
+                "patch_size x patch_size latent patch (all channels flattened "
+                "into the per-patch vector), then the patches are stitched back. "
+                "None (default) = auto: use the DiT transformer's own patch_size "
+                "(e.g. 2 for SD3.5, i.e. one PCGrad group per transformer token). "
+                "Ignored unless teacher_aggregation='v_pcgrad_patchwise'."
             )
         },
     )
@@ -2031,16 +2062,35 @@ class OPDTrainingArguments(TrainingArguments):
                 f"Invalid kl_type for OPD: {self.kl_type!r}. "
                 "Valid options are: ['v-based', 'x-based']."
             )
-        if self.teacher_aggregation not in ["round_robin", "average", "sum", "pcgrad", "v_pcgrad"]:
+        valid_teacher_aggregation = [
+            "round_robin",
+            "average",
+            "sum",
+            "pcgrad",
+            "v_pcgrad",
+            "v_average",
+            "v_pcgrad_patchwise",
+        ]
+        if self.teacher_aggregation not in valid_teacher_aggregation:
             raise ValueError(
                 f"Invalid teacher_aggregation for OPD: {self.teacher_aggregation!r}. "
-                "Valid options are: ['round_robin', 'average', 'sum', 'pcgrad', 'v_pcgrad']."
+                f"Valid options are: {valid_teacher_aggregation}."
             )
         if self.pcgrad_eps < 0:
             raise ValueError(f"`pcgrad_eps` must be >= 0, got pcgrad_eps={self.pcgrad_eps!r}.")
-        if self.teacher_aggregation in ("pcgrad", "sum", "v_pcgrad") and len(self.teacher_paths) < 2:
+        if self.pcgrad_patch_size is not None and self.pcgrad_patch_size < 1:
             raise ValueError(
-                "PCGrad aggregation requires at least 2 teachers; "
+                "`pcgrad_patch_size` must be >= 1 or None, got "
+                f"pcgrad_patch_size={self.pcgrad_patch_size!r}."
+            )
+        if (
+            self.teacher_aggregation
+            in ("pcgrad", "sum", "v_pcgrad", "v_average", "v_pcgrad_patchwise")
+            and len(self.teacher_paths) < 2
+        ):
+            raise ValueError(
+                "Multi-teacher aggregation "
+                f"({self.teacher_aggregation!r}) requires at least 2 teachers; "
                 f"got {len(self.teacher_paths)} teacher(s)."
             )
 

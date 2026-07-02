@@ -19,7 +19,7 @@ import unittest
 import torch
 
 from flow_factory.hparams.training_args import OPDTrainingArguments
-from flow_factory.trainers.opd.sde import OPDTrainer
+from flow_factory.trainers.opd.trainer import OPDTrainer
 
 
 class TestOPDReverseCumulative(unittest.TestCase):
