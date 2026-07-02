@@ -2734,6 +2734,15 @@ class XPDMTrainingArguments(XOPDTrainingArguments):
                 f"({self.pdm_sigma_min}, {self.pdm_sigma_max})."
             )
 
+    def get_num_train_timesteps(self, args) -> int:
+        """Auto-GAS alignment for PDM. The auto-GAS machinery computes
+        ``(num_batches_per_epoch // gradient_step_per_epoch) * get_num_train_timesteps``. PDM's
+        ``_pdm_epoch`` iterates ``pdm_inner_steps`` accumulate micro-batches per rolled batch (NOT
+        the denoising trajectory), so returning ``pdm_inner_steps`` makes GAS =
+        num_batches_per_epoch * pdm_inner_steps / gradient_step_per_epoch -> exactly
+        ``gradient_step_per_epoch`` optimizer updates/epoch (one update over all micro-batches)."""
+        return max(1, self.pdm_inner_steps)
+
 
 @dataclass
 class MoFDistillTrainingArguments(TrainingArguments):

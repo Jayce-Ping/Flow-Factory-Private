@@ -38,8 +38,9 @@ logger = setup_logger(__name__)
 class XPDMTrainer(XOPDTrainer):
     """One-step denoiser matching in latent (same-VAE) or pixel (cross-VAE) space."""
 
-    # Custom (non-L1) optimize loop -> skip XOPD's L1 one-step-per-epoch GAS invariant.
-    _validates_l1_one_step = False
+    # Keep XOPD's one-step-per-epoch validation: get_num_train_timesteps() is overridden to
+    # pdm_inner_steps, so it checks GAS == num_batches * pdm_inner_steps -> exactly
+    # gradient_step_per_epoch updates/epoch (auto GAS). See experiment-batch-geometry rule.
 
     # ---------------------------- main loop (L0-only) ----------------------------
     def start(self):

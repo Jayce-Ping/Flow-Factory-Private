@@ -70,10 +70,10 @@ train:
   num_inference_steps: 28
   per_device_batch_size: 1
   group_size: 1
-  unique_sample_num_per_epoch: 64
+  unique_sample_num_per_epoch: 128
   gradient_step_per_epoch: 1
   num_inner_epochs: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: auto
 
   learning_rate: 1.0e-4
   adam_weight_decay: 1.0e-4

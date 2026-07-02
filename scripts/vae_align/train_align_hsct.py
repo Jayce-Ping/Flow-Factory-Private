@@ -328,6 +328,19 @@ def set_requires_grad(m, flag):
         p.requires_grad_(flag)
 
 
+def _allreduce_mean_grads(params):
+    """Manually DDP-average grads for params NOT wrapped by accelerate (the student VAE
+    encoder is trained alongside the accelerate-prepared Q)."""
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    world = dist.get_world_size()
+    for p in params:
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad /= world
+
+
 _RANK_RE = re.compile(r"rank_(\d+)/(\d+)\.png$")
 
 
@@ -390,6 +403,32 @@ class CorpusWithPrompts(Dataset):
             except (OSError, ValueError):
                 continue
         raise RuntimeError("CorpusWithPrompts: no decodable image found in corpus")
+
+
+class IndexCorpus(Dataset):
+    """Corpus loaded from ``{root}/index.jsonl`` ({"path","prompt"} per line): a robust
+    path->prompt mapping with no prompt reconstruction / num_procs matching needed."""
+
+    def __init__(self, root, res):
+        with open(os.path.join(root, "index.jsonl")) as f:
+            self.entries = [json.loads(l) for l in f if l.strip()]
+        if not self.entries:
+            raise FileNotFoundError(f"empty index.jsonl under {root}")
+        self.tf = TT.Compose([TT.Resize(res), TT.CenterCrop(res), TT.ToTensor()])
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, i):
+        n = len(self.entries)
+        for off in range(n):
+            e = self.entries[(i + off) % n]
+            try:
+                img = Image.open(e["path"]).convert("RGB")
+                return self.tf(img) * 2.0 - 1.0, e["prompt"]
+            except (OSError, ValueError):
+                continue
+        raise RuntimeError("IndexCorpus: no decodable image found in corpus")
 
 
 def _save_viz(out, step, x, x_inv, n):
@@ -456,13 +495,21 @@ def main():
     ap.add_argument("--dit_dim", type=int, default=384)
     ap.add_argument("--dit_heads", type=int, default=6)
     ap.add_argument("--depth", type=int, default=4)
-    ap.add_argument("--sigma", type=float, default=0.0, help="noise fraction fed to the transformer (clean=0)")
+    ap.add_argument("--sigma", type=float, default=0.0, help="fixed noise fraction (clean=0) when sigma_max=0")
+    ap.add_argument("--sigma_max", type=float, default=0.0,
+                    help="if >0: per-sample sigma~U(0,sigma_max) CLEAN+LOW-NOISE mix on z_S "
+                         "(target stays clean z_T); else fixed --sigma")
     # losses
     ap.add_argument("--w_inv_px", type=float, default=1.0)
     ap.add_argument("--w_inv_lat", type=float, default=1.0)
     ap.add_argument("--w_adv", type=float, default=0.0)
     ap.add_argument("--d_lr", type=float, default=2e-4)
     ap.add_argument("--adv_start_step", type=int, default=400)
+    # --- M3: finetune the student VAE ENCODER so z_S encodes more of the teacher's info ---
+    ap.add_argument("--finetune_vae", type=int, default=0, help="1: train student VAE encoder (M3)")
+    ap.add_argument("--vae_lr", type=float, default=1e-5)
+    ap.add_argument("--w_recon", type=float, default=1.0,
+                    help="student recon anchor |D_S(z_S)-x| (frozen decoder) -> preserves generation")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -485,6 +532,18 @@ def main():
         t_vae.enable_gradient_checkpointing()  # teacher decode is in the Q graph
     s_scale = float(s_vae.config.scaling_factor)
     s_shift = float(getattr(s_vae.config, "shift_factor", 0.0) or 0.0)
+
+    # M3: optionally UNFREEZE the student VAE encoder (+ quant_conv) so z_S can be reshaped to
+    # carry more of the teacher's information. The DECODER stays frozen; the recon anchor
+    # |D_S(z_S)-x| keeps z_S on the student decoder's manifold -> preserves generation quality.
+    ft_vae = bool(args.finetune_vae)
+    if ft_vae:
+        s_vae.encoder.train()
+        for p in s_vae.encoder.parameters():
+            p.requires_grad_(True)
+        if getattr(s_vae, "quant_conv", None) is not None:
+            for p in s_vae.quant_conv.parameters():
+                p.requires_grad_(True)
 
     # ---- SD3.5 transformer + text encoders (frozen), only if conditioning ------
     use_hidden = bool(args.use_hidden)
@@ -515,18 +574,17 @@ def main():
             sd3.transformer.transformer_blocks[b].register_forward_hook(_mk_hook(b))
 
     @torch.no_grad()
-    def get_hidden(z_S, prompts):
-        """Frozen SD3.5 forward -> list of K block image-stream maps (B,1536,32,32)."""
+    def get_hidden(z_tf_scaled, prompts, ts):
+        """Frozen SD3.5 forward on an already-SCALED (possibly noised) latent at per-sample
+        timestep ``ts`` -> list of K block image-stream maps (B,1536,32,32)."""
         enc = sd3.encode_prompt(
             prompt=list(prompts), prompt_2=list(prompts), prompt_3=list(prompts),
             device=dev, do_classifier_free_guidance=False,
         )
         prompt_embeds, _, pooled, _ = enc
-        z_tf = ((z_S - s_shift) * s_scale).to(sd3.transformer.dtype)
-        B = z_S.shape[0]
-        timestep = torch.full((B,), args.sigma * 1000.0, device=dev, dtype=sd3.transformer.dtype)
+        z_tf = z_tf_scaled.to(sd3.transformer.dtype)
         sd3.transformer(
-            hidden_states=z_tf, timestep=timestep,
+            hidden_states=z_tf, timestep=ts.to(sd3.transformer.dtype),
             encoder_hidden_states=prompt_embeds.to(sd3.transformer.dtype),
             pooled_projections=pooled.to(sd3.transformer.dtype),
             return_dict=False,
@@ -554,8 +612,14 @@ def main():
     disc = PatchGANDiscriminator(3) if args.w_adv > 0 else None
     opt = torch.optim.AdamW(q.parameters(), lr=args.lr, weight_decay=1e-4)
     opt_d = torch.optim.AdamW(disc.parameters(), lr=args.d_lr, betas=(0.5, 0.9)) if disc else None
+    # M3 VAE-encoder optimizer (params are NOT accelerate-prepared -> grads all-reduced manually)
+    vae_params = [p for p in s_vae.parameters() if p.requires_grad] if ft_vae else []
+    opt_vae = torch.optim.AdamW(vae_params, lr=args.vae_lr, weight_decay=1e-4) if vae_params else None
 
-    ds = CorpusWithPrompts(args.corpus, args.prompt_files, args.num_images, args.num_procs, args.res)
+    if os.path.exists(os.path.join(args.corpus, "index.jsonl")):
+        ds = IndexCorpus(args.corpus, args.res)
+    else:
+        ds = CorpusWithPrompts(args.corpus, args.prompt_files, args.num_images, args.num_procs, args.res)
     dl = DataLoader(ds, batch_size=args.bs, shuffle=True, num_workers=8, drop_last=True, pin_memory=True)
 
     if disc is not None:
@@ -567,9 +631,12 @@ def main():
         n_params = sum(p.numel() for p in acc.unwrap_model(q).parameters()) / 1e6
         print(
             f"[hsct] arch={args.q_arch} inject={args.inject} blocks={args.hidden_blocks} "
-            f"use_hidden={use_hidden} sigma={args.sigma} | Q={n_params:.2f}M | "
+            f"use_hidden={use_hidden} "
+            f"noise={('U(0,%.2f)' % args.sigma_max) if args.sigma_max > 0 else ('fixed %.2f' % args.sigma)} "
+            f"| Q={n_params:.2f}M | "
             f"c_T={c_T} c_S={c_S} | corpus={len(ds)} | bs={args.bs} epochs={args.epochs} "
-            f"| w_adv={args.w_adv} | out={args.out}",
+            f"| w_adv={args.w_adv} | ft_vae={int(ft_vae)}(vae_lr={args.vae_lr},w_recon={args.w_recon}) "
+            f"| out={args.out}",
             flush=True,
         )
 
@@ -580,21 +647,49 @@ def main():
             adv_on = disc is not None and step >= args.adv_start_step
             with acc.autocast():
                 with torch.no_grad():
-                    z_T = t_vae.encode(x).latent_dist.mode()
-                    z_S = s_vae.encode(x).latent_dist.mode()
-                h_list = get_hidden(z_S, prompts) if use_hidden else None
-                z_T_pred = q(z_S, h_list)
+                    z_T = t_vae.encode(x).latent_dist.mode()   # clean teacher TARGET (frozen)
+                if ft_vae:
+                    z_S = s_vae.encode(x).latent_dist.mode()   # trainable encoder -> grad to E_S
+                else:
+                    with torch.no_grad():
+                        z_S = s_vae.encode(x).latent_dist.mode()   # clean student (frozen)
+                # CLEAN + LOW-NOISE mix on the student INPUT: per-sample sigma in scaled
+                # (flow-matching) space; the target z_T stays CLEAN (recover the clean teacher
+                # latent from any low-noise student state). sigma_max=0 -> pure clean.
+                B = z_S.shape[0]
+                if args.sigma_max > 0:
+                    sig = torch.rand(B, 1, 1, 1, device=dev) * args.sigma_max
+                else:
+                    sig = torch.full((B, 1, 1, 1), args.sigma, device=dev)
+                zS_scaled = (z_S - s_shift) * s_scale
+                zS_n = (1.0 - sig) * zS_scaled + sig * torch.randn_like(zS_scaled)
+                z_S_in = zS_n / s_scale + s_shift
+                ts = sig.reshape(B) * 1000.0
+                h_list = get_hidden(zS_n, prompts, ts) if use_hidden else None
+                z_T_pred = q(z_S_in, h_list)
                 x_inv = t_vae.decode(z_T_pred).sample
                 l_inv_lat = F.mse_loss(z_T_pred.float(), z_T.float())
                 l_inv_px = F.l1_loss(x_inv.float(), x.float())
                 loss = args.w_inv_px * l_inv_px + args.w_inv_lat * l_inv_lat
+                l_recon = x.new_zeros(())
+                if ft_vae:
+                    # recon anchor: keep z_S decodable by the FROZEN student decoder -> the
+                    # student's generation quality is preserved while E_S aligns toward z_T.
+                    x_rec = s_vae.decode(z_S).sample
+                    l_recon = F.l1_loss(x_rec.float(), x.float())
+                    loss = loss + args.w_recon * l_recon
                 g_adv = x.new_zeros(())
                 if adv_on:
                     set_requires_grad(disc, False)
                     g_adv = -disc(x_inv).mean()
                     loss = loss + args.w_adv * g_adv
             opt.zero_grad(set_to_none=True)
+            if opt_vae is not None:
+                opt_vae.zero_grad(set_to_none=True)
             acc.backward(loss)
+            if opt_vae is not None:
+                _allreduce_mean_grads(vae_params)   # DDP-average the VAE encoder grads
+                opt_vae.step()
             opt.step()
 
             d_loss = x.new_zeros(())
@@ -611,6 +706,7 @@ def main():
                 print(
                     f"ep{ep} step{step} loss={loss.item():.4f} "
                     f"inv_px={l_inv_px.item():.4f} inv_lat={l_inv_lat.item():.4f} "
+                    f"recon={float(l_recon.detach()):.4f} "
                     f"g_adv={float(g_adv.detach()):.4f} d_loss={float(d_loss.detach()):.4f}",
                     flush=True,
                 )
