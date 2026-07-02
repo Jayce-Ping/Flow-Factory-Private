@@ -1460,7 +1460,7 @@ class MLPTransport(VAETransport):
 
 def build_transport(transport_type: str, **kwargs) -> VAETransport:
     """Factory: ``transport_type`` in
-    {identity, pixel, linear, whitening, adaln, conv, m5, aligned, hsct, mlp}."""
+    {identity, pixel, linear, whitening, adaln, conv, m5, aligned, hsct, flow, mlp}."""
     t = (transport_type or "identity").lower()
     if t == "identity":
         return IdentityTransport()
@@ -1487,10 +1487,17 @@ def build_transport(transport_type: str, **kwargs) -> VAETransport:
         from .hsct_transport import HSCTTransport
 
         return HSCTTransport(**kwargs)
+    if t == "flow":
+        # M9: conditional-flow inverse (linear P + NLL-trained conditional coupling flow
+        # Q on student transformer hidden states). Lazy import (flow_transport imports
+        # HSCTTransport from this package).
+        from .flow_transport import FlowTransport
+
+        return FlowTransport(**kwargs)
     if t == "mlp":
         return MLPTransport(**kwargs)
     raise ValueError(
         f"Unknown vae_transport type {transport_type!r}; expected one of "
         "{'identity', 'pixel', 'linear', 'whitening', 'adaln', 'conv', 'm5', 'aligned', "
-        "'hsct', 'mlp'}."
+        "'hsct', 'flow', 'mlp'}."
     )

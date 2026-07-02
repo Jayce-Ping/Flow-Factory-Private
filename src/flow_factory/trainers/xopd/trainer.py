@@ -332,7 +332,10 @@ class XOPDTrainer(BaseTrainer):
         # Build the transport. Adapter latent-layout converters (native <-> BCHW)
         # let an affine transport accept/return native latents; identity for an
         # already-BCHW adapter (SD3.5), unpack/pack for FLUX.2.
-        self._is_hsct = ta.vae_transport == "hsct"
+        # HSCT-family (hsct + flow): both are hidden-state-conditioned, cold-started
+        # transports whose L1 query needs the captured student hidden states h_S. This
+        # one flag gates the shared machinery (hooks, _hsct_h_list, cold-start, L1 threading).
+        self._is_hsct = ta.vae_transport in ("hsct", "flow")
         self._pixel_loss = bool(ta.xopd_pixel_loss)  # cross-VAE L1 in decoded pixel space
         self._hsct_hidden: Dict[int, torch.Tensor] = {}
         self._hsct_capture = False
@@ -411,6 +414,30 @@ class XOPDTrainer(BaseTrainer):
                 q_dit_dim=ta.hsct_dit_dim,
                 q_dit_heads=ta.hsct_dit_heads,
                 n_blocks=len(ta.hsct_hidden_blocks),
+            )
+            self._register_hsct_hooks()
+        elif ta.vae_transport == "flow":
+            # M9: conditional-flow inverse. Linear P (raw teacher->student, closed-form,
+            # exact pushforward) + a conditional coupling flow Q (NLL-trained, conditioned
+            # on SD3.5 hidden h_S) that samples ON-manifold teacher latents. Reuses the HSCT
+            # raw<->packed bridge + cold-start; only the inverse Q differs.
+            s_vae_cfg = self.adapter.pipeline.vae.config
+            t_vae_cfg = self.teacher_adapter.pipeline.vae.config
+            self.transport = build_transport(
+                "flow",
+                teacher_adapter=self.teacher_adapter,
+                student_to_spatial=self._student_to_spatial,
+                student_from_spatial=self._student_from_spatial,
+                c_T=int(t_vae_cfg.latent_channels),
+                c_S=int(s_vae_cfg.latent_channels),
+                student_scaling=float(s_vae_cfg.scaling_factor),
+                student_shift=float(getattr(s_vae_cfg, "shift_factor", 0.0) or 0.0),
+                n_blocks=len(ta.hsct_hidden_blocks),
+                cond_proj=ta.flow_cond_proj,
+                flow_n_coupling_blocks=ta.flow_n_coupling_blocks,
+                flow_hidden=ta.flow_hidden,
+                flow_query_mode=ta.flow_query_mode,
+                flow_num_samples=ta.flow_num_samples,
             )
             self._register_hsct_hooks()
         elif ta.vae_transport == "aligned":

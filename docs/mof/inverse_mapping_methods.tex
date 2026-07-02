@@ -1,0 +1,199 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\Za}{\mathcal{Z}_{T}}
+\newcommand{\Zb}{\mathcal{Z}_{S}}
+\newcommand{\Enc}{\mathcal{E}}
+\newcommand{\Dec}{\mathcal{D}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\sg}{\mathrm{sg}}
+
+\newcommand{\zT}{z_{T}}
+\newcommand{\zS}{z_{S}}
+\newcommand{\hS}{h_{S}}
+
+\title{\textbf{Learning the Cross-VAE Inverse Mapping}\\[0.3em]
+\large Latent-Discriminator and Conditional-Flow Methods (Algorithm Pseudocode)}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Companion to \texttt{avoid\_inverse\_transport\_analysis.tex} and the XOPD cross-VAE code
+(\texttt{trainers/xopd}). In the cross-VAE setting with $d_T>d_S$ (teacher VAE has more
+channels), the forward transport $P:\Za\!\to\!\Zb$ (teacher$\to$student, high$\to$low) is
+easy and well learned, while the inverse $Q:\Zb\!\to\!\Za$ (student$\to$teacher, low$\to$high)
+is underdetermined. The current $Q$ is trained by latent MSE, which converges to the
+\emph{conditional mean} $\E[\zT\mid\zS,\hS]$; on a curved teacher manifold that mean is
+\emph{off-manifold}, so the L1 teacher velocity is queried out-of-distribution and training
+collapses (and the learned $Q$ cannot beat the on-manifold pixel bridge
+$\Enc_T(\Dec_S(\zS))$). This note gives pseudocode for two inverse-learning methods that
+replace the mean-seeking MSE with \emph{manifold-respecting} objectives: (1) a
+latent-discriminator (adversarial + cycle-consistency) inverse, and (2) a conditional
+normalizing-flow inverse trained by maximum likelihood. Both keep the \emph{linear} forward
+$P$ so the L1 transition-mean pushforward stays exact.
+\end{abstract}
+
+\section{Setup and Notation}
+\label{sec:setup}
+
+Frozen VAEs give encoders/decoders $(\Enc_T,\Dec_T)$ on the teacher latent space
+$\Za\subseteq\R^{d_T}$ and $(\Enc_S,\Dec_S)$ on the student latent space
+$\Zb\subseteq\R^{d_S}$, with $d_T>d_S$. The student transformer produces hidden states
+$\hS=\hS(\zS,t,c)$ (prompt-aware; DeepStack multi-layer). We learn:
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+  \item forward $P:\Za\!\to\!\Zb$ --- \textbf{linear/affine}, closed-form least squares, frozen;
+        keeps the L1 transition-mean pushforward exact ($\E[Pz]=P\,\E[z]$);
+  \item inverse $Q:\Zb\!\to\!\Za$ --- the hard, underdetermined direction; the object both
+        algorithms below learn.
+\end{itemize}
+The ideal (on-manifold) inverse target is the pixel bridge
+$\bar\zT(\zS)=\Enc_T(\Dec_S(\zS))$; any learned $Q$ must be at least as on-manifold as this.
+$\sg[\cdot]$ is stop-gradient; noise fraction $\sigma\in[0,1]$ with
+$z_\sigma=(1-\sigma)z+\sigma\varepsilon$, $\varepsilon\sim\N(0,I)$.
+
+\section{Method 1: Latent-Discriminator Inverse (CrossNet-style)}
+\label{sec:disc}
+
+Idea (Sendik et al., CrossNet 2020): force $Q(\zS,\hS)$ onto the teacher \emph{latent}
+manifold with a discriminator on $\Za$, and keep $P,Q$ mutually consistent with latent
+cycle-consistency, instead of regressing to the (off-manifold) mean. Trained offline on a
+corpus of images; only $Q$ (and, if desired, $P$) is kept for L1.
+
+\begin{algorithm}[h]
+\caption{Latent-Discriminator Inverse --- offline training}
+\label{alg:disc}
+\begin{algorithmic}[1]
+\Require frozen $\Enc_T,\Dec_T,\Enc_S$, student transformer; linear $P$ (pre-fit); inverse
+$Q_\psi$; latent discriminator $\mathrm{Disc}_\phi:\Za\!\to\!\R$; weights
+$\lambda_{\mathrm{cyc}},\lambda_{\mathrm{rec}}$; max noise $\sigma_{\max}$.
+\For{each minibatch of images $x$}
+  \State $\zT \gets \Enc_T(x)$ \Comment{clean teacher latent (real sample on $\Za$)}
+  \State $\zS \gets \Enc_S(x)$; \quad $\sigma\sim U(0,\sigma_{\max})$; \quad
+         $\zS^{\sigma}\gets(1-\sigma)\zS+\sigma\varepsilon$ \Comment{cross-$\sigma$ (on-policy-like)}
+  \State $\hS \gets \textsc{StudentHidden}(\zS^{\sigma}, c, \sigma)$ \Comment{DeepStack maps, no grad}
+  \State $\hat\zT \gets Q_\psi(\zS^{\sigma}, \hS)$
+  \Statex \textbf{-- update $Q_\psi$ (generator) --}
+  \State $\mathcal{L}_{\mathrm{adv}} \gets \big(\mathrm{Disc}_\phi(\hat\zT)-1\big)^2$
+         \Comment{LS-GAN: push $\hat\zT$ onto the teacher latent manifold}
+  \State $\mathcal{L}_{\mathrm{cyc}} \gets \norm{P(\hat\zT)-\zS}^2 + \norm{Q_\psi(P(\zT),\hS)-\zT}^2$
+         \Comment{$P\!\circ\!Q,\ Q\!\circ\!P$ bijection}
+  \State $\mathcal{L}_{\mathrm{rec}} \gets \norm{\Dec_T(\hat\zT)-x}_1$ \Comment{weak on-manifold anchor}
+  \State $\psi \gets \psi - \eta\,\nabla_\psi\big(\mathcal{L}_{\mathrm{adv}}
+         +\lambda_{\mathrm{cyc}}\mathcal{L}_{\mathrm{cyc}}+\lambda_{\mathrm{rec}}\mathcal{L}_{\mathrm{rec}}\big)$
+  \Statex \textbf{-- update $\mathrm{Disc}_\phi$ --}
+  \State $\mathcal{L}_{D}\gets\big(\mathrm{Disc}_\phi(\zT)-1\big)^2+\big(\mathrm{Disc}_\phi(\sg[\hat\zT])\big)^2$
+  \State $\phi \gets \phi - \eta_D\,\nabla_\phi\,\mathcal{L}_{D}$
+\EndFor
+\State \Return $Q_\psi$ \Comment{used as the L1 inverse; query point is deterministic $Q_\psi(\zS,\hS)$}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Method 2: Conditional-Flow Inverse (cINN-style, the fundamental fix)}
+\label{sec:flow}
+
+Idea (Ardizzone/Rombach et al., conditional INN): model the full conditional distribution
+$p(\zT\mid\zS,\hS)$ with a conditional normalizing flow $F$ trained by maximum likelihood,
+instead of a point estimate. Sampling $F$ produces \emph{on-manifold} teacher latents by
+construction; the mean-seeking failure disappears. We model the \emph{residual} around the
+linear pseudo-inverse base $b(\zS)=P^{+}(\zS-\beta)$ so a zero-initialised flow starts exactly
+at the linear baseline (do-no-harm).
+
+\begin{algorithm}[h]
+\caption{Conditional-Flow Inverse --- offline training (NLL)}
+\label{alg:flow-train}
+\begin{algorithmic}[1]
+\Require frozen $\Enc_T,\Dec_T,\Enc_S$, student transformer; linear $P$ (pre-fit),
+base $b(\cdot)=P^{+}(\cdot-\beta)$; conditional flow $F_\psi$ (base dist $\N(0,I)$);
+weight $\lambda_{\mathrm{px}}$; max noise $\sigma_{\max}$.
+\For{each minibatch of images $x$}
+  \State $\zT \gets \Enc_T(x)$; \quad $\zS \gets \Enc_S(x)$
+  \State $\sigma\sim U(0,\sigma_{\max})$; \quad $\zS^{\sigma}\gets(1-\sigma)\zS+\sigma\varepsilon$;
+         \quad $\hS \gets \textsc{StudentHidden}(\zS^{\sigma},c,\sigma)$
+  \State $c_{\mathrm{cond}} \gets \textsc{Fuse}(\zS^{\sigma}, \hS)$ \Comment{conditioning tensor}
+  \State $r \gets \zT - b(\zS^{\sigma})$ \Comment{residual to model}
+  \State $(v,\ \log\!\det) \gets F_\psi.\textsc{forward}(r \mid c_{\mathrm{cond}})$
+         \Comment{normalize to base space}
+  \State $\mathcal{L}_{\mathrm{nll}} \gets \tfrac{1}{2}\norm{v}^2 - \log\!\det$
+         \Comment{$-\log p_\psi(\zT\mid\zS,\hS)$ up to const}
+  \State $\mathcal{L}_{\mathrm{px}} \gets \norm{\Dec_T\big(b(\zS^{\sigma})+F_\psi.\textsc{inverse}(\mathbf{0}\mid c_{\mathrm{cond}})\big)-x}_1$
+         \Comment{optional mode ($v{=}0$) anchor}
+  \State $\psi \gets \psi - \eta\,\nabla_\psi\big(\mathcal{L}_{\mathrm{nll}}+\lambda_{\mathrm{px}}\mathcal{L}_{\mathrm{px}}\big)$
+\EndFor
+\State \Return $F_\psi$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{Conditional-Flow Inverse --- L1 teacher query (inside \texttt{transition\_mean\_to\_student})}
+\label{alg:flow-query}
+\begin{algorithmic}[1]
+\Require student on-policy state $\zS$ (+ its $\hS$); trained $F_\psi$, base $b$, linear $P$;
+teacher transition operator $\textsc{TeacherNext}(\cdot)$; \texttt{query\_mode}$\in\{$mode,sample,mean\_k$\}$.
+\State $c_{\mathrm{cond}} \gets \textsc{Fuse}(\zS,\hS)$
+\If{\texttt{query\_mode} $=$ mode} \State $v \gets \mathbf{0}$
+\ElsIf{\texttt{query\_mode} $=$ sample} \State $v \sim \N(0,I)$
+\Else \Comment{mean\_k} \State $v \gets$ (average over $K$ draws handled below)
+\EndIf
+\State $\hat\zT \gets b(\zS) + F_\psi.\textsc{inverse}(v \mid c_{\mathrm{cond}})$
+       \Comment{on-manifold teacher latent (mean\_k: average $\hat\zT$ over $K$ draws)}
+\State $\mu_T \gets \textsc{TeacherNext}(\hat\zT)$ \Comment{teacher next-step mean in $\Za$}
+\State \Return $\zS + \big(P(\mu_T) - P(\hat\zT)\big)$
+       \Comment{displacement anchoring: cancels $P$'s self-recon bias (velocity matching)}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{Conditional affine-coupling block (one step of $F_\psi$)}
+\label{alg:coupling}
+\begin{algorithmic}[1]
+\Require input $u\in\R^{C\times H\times W}$, condition $c_{\mathrm{cond}}$; split index $C/2$;
+zero-initialised head net $g$.
+\State $u \gets \textsc{ActNorm}(u)$; \quad accumulate $\log\!\det \mathrel{+}= HW\sum_c\log|s^{\mathrm{an}}_c|$
+\State $u \gets \textsc{Permute}(u)$ \Comment{fixed channel flip (mixes halves across blocks)}
+\State $(u_a,u_b)\gets\textsc{split}(u)$
+\State $(\log s,\,\tau) \gets g\big([\,u_b,\ c_{\mathrm{cond}}\,]\big)$ \Comment{$g$ last layer zero-init $\Rightarrow$ identity at start}
+\State $u_a' \gets u_a\odot\exp(\log s) + \tau$; \quad $\log\!\det \mathrel{+}= \sum \log s$
+\State \Return $[\,u_a',\ u_b\,]$ \Comment{inverse: undo $\tau,\exp$, then inverse permute/actnorm}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Notes}
+\label{sec:notes}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Linear $P$ kept.} Both methods only change the inverse $Q$; the forward $P$
+        stays a frozen closed-form affine, so the L1 transition-mean pushforward remains exact
+        and analytically consistent (\texttt{docs/mof/xopd\_vae\_space\_align.tex}, Prop.~affine).
+  \item \textbf{Do-no-harm init.} Modelling the residual $r=\zT-b(\zS)$ with a zero-initialised
+        flow (Alg.~\ref{alg:coupling}) means at step $0$, $F.\textsc{inverse}(\mathbf{0}\mid c)=\mathbf{0}$
+        and $\hat\zT=b(\zS)=P^{+}\zS$ --- exactly the current linear pseudo-inverse baseline; the
+        flow can only improve on-manifoldness.
+  \item \textbf{Why this fixes the collapse.} A deterministic MSE $Q$ returns the conditional
+        mean (off-manifold). Method 1's discriminator and Method 2's likelihood both reward
+        \emph{distribution membership}, so $\hat\zT$ lands on $\Za$ and the teacher is queried
+        in-distribution; the L1 guidance becomes meaningful.
+  \item \textbf{L1 mean matching.} $D_k$ matches transition means; default \texttt{query\_mode}
+        $=$ mode ($v{=}0$, deterministic, on-manifold central point). \texttt{sample} injects
+        stochastic-but-on-manifold teacher opinions; \texttt{mean\_k} averages $K$ samples to
+        approximate $\E[\zT\mid\cdot]$ at $K\times$ cost.
+\end{itemize}
+
+\end{document}

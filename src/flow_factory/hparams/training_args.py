@@ -2140,7 +2140,7 @@ class XOPDTrainingArguments(TrainingArguments):
     )
     vae_transport: Literal[
         "identity", "pixel", "linear", "whitening", "adaln",
-        "conv", "conv_linear", "m5", "conv_nl", "nonlinear", "aligned", "hsct", "mlp"
+        "conv", "conv_linear", "m5", "conv_nl", "nonlinear", "aligned", "hsct", "flow", "mlp"
     ] = field(
         default="identity",
         metadata={
@@ -2164,6 +2164,10 @@ class XOPDTrainingArguments(TrainingArguments):
                 "scaffolding as 'conv' but with NON-LINEAR residual nets + a learned "
                 "(non-analytic) inverse — higher clean fidelity at the cost of an only-"
                 "APPROXIMATE L1 pushforward (the doc's M5 cycle-consistent transport). "
+                "'flow': M9 conditional-flow inverse — linear P (exact pushforward) + a "
+                "conditional normalizing-flow Q (NLL-trained, hidden-state-conditioned) "
+                "that samples ON-manifold teacher latents, fixing the MSE-Q conditional-"
+                "mean/off-manifold collapse; cold-started like 'hsct'. "
                 "'mlp': non-linear placeholder (NotImplementedError). All "
                 "non-pixel transports are frozen during L1; L0 always uses the pixel "
                 "bridge. This selects the L1 transition-mean transport."
@@ -2355,6 +2359,34 @@ class XOPDTrainingArguments(TrainingArguments):
         default=1.0e-4, metadata={"help": "HSCT cold-start Q learning rate."},
     )
 
+    # ---- M9 conditional-flow inverse (vae_transport='flow') ----
+    # The flow reuses the HSCT wiring (hsct_hidden_blocks, hsct_coldstart_* for the cold-start
+    # data/schedule/lr); these knobs size the conditional coupling flow and pick the L1 query.
+    flow_n_coupling_blocks: int = field(
+        default=8,
+        metadata={"help": "Number of conditional affine-coupling blocks in the flow Q."},
+    )
+    flow_hidden: int = field(
+        default=256, metadata={"help": "Hidden width of each coupling block's conv net."},
+    )
+    flow_cond_proj: int = field(
+        default=256,
+        metadata={"help": "Channels of the fused conditioning tensor c=fuse(z_S,h_S) fed to the flow."},
+    )
+    flow_query_mode: Literal["mode", "sample", "mean_k"] = field(
+        default="mode",
+        metadata={
+            "help": (
+                "How the L1 teacher-query point z_T is drawn from the flow: 'mode' (v=0, "
+                "deterministic on-manifold centre; default), 'sample' (v~N(0,I), stochastic), "
+                "'mean_k' (average of flow_num_samples draws ~= E[z_T|z_S,h_S])."
+            )
+        },
+    )
+    flow_num_samples: int = field(
+        default=4, metadata={"help": "K for flow_query_mode='mean_k' (ignored otherwise)."},
+    )
+
     # ---- Dual classifier-free guidance ----
     teacher_guidance_scale: float = field(
         default=1.0,
@@ -2481,8 +2513,9 @@ class XOPDTrainingArguments(TrainingArguments):
                 "L1 in pixels. This DROPS the learned P transport from the loss target, "
                 "removing the ~0.24 raw-latent floor (student-recon + latent non-uniqueness) "
                 "that the decode-reencode diagnostic showed is image-irrelevant. Requires a "
-                "cross-VAE 'hsct' transport (Q still bridges x_S->teacher space for the "
-                "on-policy teacher query). Adds ~one D_S fwd+bwd + one D_T fwd per matched step."
+                "cross-VAE HSCT-family transport ('hsct' or 'flow'; Q still bridges "
+                "x_S->teacher space for the on-policy teacher query). Adds ~one D_S fwd+bwd "
+                "+ one D_T fwd per matched step."
             )
         },
     )
@@ -2555,10 +2588,10 @@ class XOPDTrainingArguments(TrainingArguments):
                     f"transport_base_warmup_epochs={self.transport_base_warmup_epochs!r}, "
                     f"transport_warmup_epochs={self.transport_warmup_epochs!r}."
                 )
-            if self.xopd_pixel_loss and self.vae_transport != "hsct":
+            if self.xopd_pixel_loss and self.vae_transport not in ("hsct", "flow"):
                 raise ValueError(
-                    "xopd_pixel_loss=True needs the HSCT transport (Q bridges "
-                    "x_S->teacher space for the on-policy teacher query, then D_T/D_S "
+                    "xopd_pixel_loss=True needs an HSCT-family transport (hsct/flow): Q "
+                    "bridges x_S->teacher space for the on-policy teacher query, then D_T/D_S "
                     f"decode both sides to pixels); got vae_transport={self.vae_transport!r}."
                 )
             if self.xopd_pixel_loss and self.reinforce_coef > 0:
