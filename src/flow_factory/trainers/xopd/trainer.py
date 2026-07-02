@@ -44,7 +44,7 @@ Registry key: ``'xopd'`` -> :class:`XOPDTrainer`.
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -177,12 +177,15 @@ class XOPDTrainer(BaseTrainer):
         # is FIXED, so use get_num_train_timesteps (the canonical fixed count) rather
         # than len() of one (possibly random) draw, keeping GAS consistent across epochs.
         self.num_train_timesteps = ta.get_num_train_timesteps(self.config)
-        validate_l1_one_step_per_epoch(
-            num_batches_per_epoch=ta.num_batches_per_epoch,
-            num_train_timesteps=self.num_train_timesteps,
-            gradient_accumulation_steps=ta.gradient_accumulation_steps,
-            num_inner_epochs=ta.num_inner_epochs,
-        )
+        # Subclasses with a custom (non-L1) optimize loop (e.g. XPDM denoiser matching)
+        # disable this L1-only one-step-per-epoch GAS invariant.
+        if getattr(self, "_validates_l1_one_step", True):
+            validate_l1_one_step_per_epoch(
+                num_batches_per_epoch=ta.num_batches_per_epoch,
+                num_train_timesteps=self.num_train_timesteps,
+                gradient_accumulation_steps=ta.gradient_accumulation_steps,
+                num_inner_epochs=ta.num_inner_epochs,
+            )
 
         self.l0_inner_steps = ta.l0_inner_steps
         if ta.l0_warmup_epochs > 0:
@@ -330,6 +333,7 @@ class XOPDTrainer(BaseTrainer):
         # let an affine transport accept/return native latents; identity for an
         # already-BCHW adapter (SD3.5), unpack/pack for FLUX.2.
         self._is_hsct = ta.vae_transport == "hsct"
+        self._pixel_loss = bool(ta.xopd_pixel_loss)  # cross-VAE L1 in decoded pixel space
         self._hsct_hidden: Dict[int, torch.Tensor] = {}
         self._hsct_capture = False
         if ta.vae_transport == "pixel":
@@ -404,6 +408,8 @@ class XOPDTrainer(BaseTrainer):
                 q_inject=ta.hsct_q_inject,
                 q_hidden=ta.hsct_q_hidden,
                 q_depth=ta.hsct_q_depth,
+                q_dit_dim=ta.hsct_dit_dim,
+                q_dit_heads=ta.hsct_dit_heads,
                 n_blocks=len(ta.hsct_hidden_blocks),
             )
             self._register_hsct_hooks()
@@ -2116,32 +2122,21 @@ class XOPDTrainer(BaseTrainer):
             )
         return out.next_latents_mean.detach()
 
-    def _teacher_next_latents_mean_cross_vae(
+    def _build_teacher_query(
         self,
         forward_kwargs: Dict[str, Any],
         teacher_text_cond: Dict[str, torch.Tensor],
-        student_hidden: Optional[List[torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        """Cross-VAE teacher transition mean, mapped into the student space.
+    ) -> Callable[..., torch.Tensor]:
+        """Build the no-grad teacher transition-mean query closure for the current state.
 
-        The student transition was computed at student state ``x_S`` (the
-        ``latents`` in ``forward_kwargs``) for ``(t, t_next)``. The transport maps
-        ``x_S`` back to the teacher space, where the INDEPENDENT teacher adapter
-        runs its own transition step (its VAE/scheduler/forward), then maps the
-        teacher mean back to the student space:
-        ``mu_S = transport.transition_mean_to_student(x_S, query_teacher_mean)``.
-        For an affine transport this is exact and cheap (Prop. 3); for the pixel
-        bridge it decodes/encodes through pixels (lossy, slow). All under no_grad.
+        TIMESTEP/SIGMA ALIGNMENT (verified force-aligned): t/t_next are the STUDENT's
+        rollout timesteps. They are passed straight to the teacher, and because we always
+        provide `t_next`, `FlowMatchEulerDiscreteSDEScheduler.step` takes the
+        `sigma = t/1000`, `sigma_prev = t_next/1000` branch (it does NOT index the teacher's
+        own shifted `self.sigmas`). So the teacher steps at EXACTLY the student's sigma, and
+        its transformer sees `t/1000` = the student's noise fraction. => no student->teacher
+        sigma mismatch in the L1 target.
         """
-        x_S = forward_kwargs["latents"]
-        # TIMESTEP/SIGMA ALIGNMENT (verified force-aligned): t/t_next are the STUDENT's
-        # rollout timesteps. They are passed straight to the teacher, and because we always
-        # provide `t_next`, `FlowMatchEulerDiscreteSDEScheduler.step` takes the
-        # `sigma = t/1000`, `sigma_prev = t_next/1000` branch (it does NOT index the teacher's
-        # own shifted `self.sigmas`). So the teacher steps at EXACTLY the student's sigma, and
-        # its transformer sees `t/1000` = the student's noise fraction. The teacher's dynamic
-        # shift (compute_empirical_mu) is only used in its standalone rollout, never here.
-        # => no student->teacher sigma mismatch in the L1 target.
         t = forward_kwargs.get("t")
         t_next = forward_kwargs.get("t_next")
 
@@ -2174,12 +2169,26 @@ class XOPDTrainer(BaseTrainer):
                 )
             return out.next_latents_mean.detach()
 
+        return query_teacher_mean
+
+    def _teacher_next_latents_mean_cross_vae(
+        self,
+        forward_kwargs: Dict[str, Any],
+        teacher_text_cond: Dict[str, torch.Tensor],
+        student_hidden: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Cross-VAE teacher transition mean, mapped into the student LATENT space (P).
+
+        The transport maps ``x_S`` to teacher space (Q), the INDEPENDENT teacher adapter
+        steps there, then the teacher mean is mapped back to the student space via the linear
+        P (displacement form). Exact & cheap for affine P (Prop. 3). All under no_grad.
+        """
+        x_S = forward_kwargs["latents"]
+        query_teacher_mean = self._build_teacher_query(forward_kwargs, teacher_text_cond)
         # Pass the student's current noise level as the scheduler-agnostic fraction
         # sigma=t/num_train_timesteps so a sigma-conditioned transport (adaln) modulates
-        # at the matching level (consistent with warm-up); affine transports ignore the
-        # kwarg. For any fixed sigma the adaln map is still affine, so this transition-
-        # mean pushforward stays exact (Prop. 3).
-        sigma = self._noise_fraction(self.adapter, t)
+        # at the matching level; affine transports ignore the kwarg (still exact, Prop. 3).
+        sigma = self._noise_fraction(self.adapter, forward_kwargs.get("t"))
         transport_ctx = {}
         if student_hidden is not None:
             transport_ctx["student_hidden"] = student_hidden
@@ -2187,6 +2196,41 @@ class XOPDTrainer(BaseTrainer):
             x_S, query_teacher_mean, sigma=sigma, **transport_ctx
         )
         return mu_S.detach()
+
+    def _teacher_next_pixels_cross_vae(
+        self,
+        forward_kwargs: Dict[str, Any],
+        teacher_text_cond: Dict[str, torch.Tensor],
+        student_hidden: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """PIXEL-space L1 target: the teacher next state decoded by its OWN decoder D_T.
+
+        Skips the P transport entirely -> the loss never pays P's raw-latent floor. Returns
+        detached teacher pixels ``(B,3,H,W)`` to compare against ``D_S(mu_student)``.
+        """
+        x_S = forward_kwargs["latents"]
+        query_teacher_mean = self._build_teacher_query(forward_kwargs, teacher_text_cond)
+        sigma = self._noise_fraction(self.adapter, forward_kwargs.get("t"))
+        transport_ctx = {}
+        if student_hidden is not None:
+            transport_ctx["student_hidden"] = student_hidden
+        raw_muT = self.transport.teacher_next_mean_raw(
+            x_S, query_teacher_mean, sigma=sigma, **transport_ctx
+        )
+        return self._decode_teacher_pixels(raw_muT)
+
+    def _decode_teacher_pixels(self, raw_T: torch.Tensor) -> torch.Tensor:
+        """Decode a RAW teacher latent (B,32,64,64) to pixels via the teacher VAE (no grad)."""
+        t_vae = self.teacher_adapter.pipeline.vae
+        with torch.no_grad():
+            return t_vae.decode(raw_T.to(t_vae.dtype)).sample.detach()
+
+    def _decode_student_pixels(self, mu_student_scaled: torch.Tensor) -> torch.Tensor:
+        """Decode the student next-mean (SCALED rollout space) to pixels via the student VAE,
+        KEEPING grad so the pixel L1 backprops through the frozen D_S into the LoRA."""
+        s_vae = self.adapter.pipeline.vae
+        raw_S = self.transport._student_scaled_to_raw(mu_student_scaled)
+        return s_vae.decode(raw_S.to(s_vae.dtype)).sample
 
     def _build_teacher_text_cond(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Teacher text conditioning for the L1 teacher query.
@@ -2284,6 +2328,17 @@ class XOPDTrainer(BaseTrainer):
                     self._hsct_h_list(forward_kwargs["latents"].shape[0])
                     if self._is_hsct else None
                 )
+                if self._pixel_loss:
+                    # PIXEL-space target: cache the teacher next state decoded by D_T (detached).
+                    # d_k here feeds only REINFORCE (disabled with pixel loss), so a per-sample
+                    # zero placeholder keeps r_per_k shapes without an extra student decode.
+                    teacher_px = self._teacher_next_pixels_cross_vae(
+                        forward_kwargs, teacher_text_cond, student_hidden=student_hidden
+                    )
+                    mu_teacher_list.append(teacher_px)
+                    d_list.append(torch.zeros(teacher_px.shape[0], device=device))
+                    continue
+
                 mu_teacher = self._teacher_mean_dispatch(
                     forward_kwargs, teacher_text_cond, student_hidden=student_hidden
                 )
@@ -2352,13 +2407,23 @@ class XOPDTrainer(BaseTrainer):
 
                     mu_teacher = mu_teacher_list[k_idx]
 
-                    d_k_grad = compute_per_step_kl(
-                        mu_student=student_out.next_latents_mean,
-                        mu_teacher=mu_teacher,
-                        std_dev_t=student_out.std_dev_t,
-                        dt=student_out.dt,
-                        normalize=self.normalize_d_k,
-                    )
+                    if self._pixel_loss:
+                        # DECODE-space L1: D_S(mu_student) (grad -> LoRA) vs cached D_T(mu_teacher)
+                        # pixels. Both faithful decoders land in the SAME RGB space, so the match
+                        # is unbiased with NO base-point/displacement correction (unlike raw
+                        # latent), and never pays P's ~0.24 image-irrelevant floor.
+                        student_px = self._decode_student_pixels(student_out.next_latents_mean)
+                        d_k_grad = (student_px.float() - mu_teacher.float()).abs().mean(
+                            dim=tuple(range(1, student_px.ndim))
+                        )
+                    else:
+                        d_k_grad = compute_per_step_kl(
+                            mu_student=student_out.next_latents_mean,
+                            mu_teacher=mu_teacher,
+                            std_dev_t=student_out.std_dev_t,
+                            dt=student_out.dt,
+                            normalize=self.normalize_d_k,
+                        )
 
                     pathwise_loss = d_k_grad.mean()
 

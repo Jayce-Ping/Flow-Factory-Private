@@ -1,0 +1,124 @@
+# PDM round-1 (same-VAE): FLUX.2-dev (32B) teacher -> FLUX.2-klein-base-4B student.
+# SAME-ARCH path: teacher_model_type UNSET -> transformer-swap teacher + shared VAE; the 48GB
+# Mistral3 teacher TE is precomputed offline (teacher_* embeds) then offloaded (no resident TE).
+# match_space=latent. rollout_ratio=1.0 => on-policy images from the STUDENT rollout.
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs: ["dataset/geneval"]
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 2000
+  sampler_type: "auto"
+
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "pdm_dev32b_to_4b_stu"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+train:
+  trainer_type: "xpdm"
+  eval_teacher_at_start: false
+  max_epochs: 2000
+
+  # --- SAME-ARCH teacher (shared VAE + transformer swap; teacher TE precomputed + offloaded) ---
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+
+  vae_transport: "identity"
+  transport_warmup_batches: 1
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  # --- PDM ---
+  rollout_ratio: 1.0
+  pdm_match_space: "latent"
+  pdm_num_inference_steps: 28
+  pdm_inner_steps: 4
+  pdm_sigma_min: 0.0
+  pdm_sigma_max: 1.0
+  l0_time_sampling: "logit_normal"
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: 4
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  num_inference_steps: 28
+  guidance_scale: 1.0
+  eval_freq: 25
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1, dataset_dir: dataset/geneval, split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false

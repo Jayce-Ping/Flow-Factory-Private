@@ -2311,6 +2311,8 @@ class XOPDTrainingArguments(TrainingArguments):
     hsct_h_proj: int = field(default=256, metadata={"help": "HSCT hidden projection dim."})
     hsct_q_hidden: int = field(default=256, metadata={"help": "HSCT conv-Q hidden width."})
     hsct_q_depth: int = field(default=4, metadata={"help": "HSCT Q depth (conv stages / dit blocks)."})
+    hsct_dit_dim: int = field(default=384, metadata={"help": "HSCT dit-Q token dim (offline best: 512)."})
+    hsct_dit_heads: int = field(default=6, metadata={"help": "HSCT dit-Q attention heads (offline best: 8)."})
     hsct_coldstart_source: Literal["offline_corpus", "online_gen"] = field(
         default="offline_corpus",
         metadata={"help": "Cold-start data: read offline corpus from disk, or teacher-generate online."},
@@ -2469,6 +2471,21 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    xopd_pixel_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "CROSS-VAE L1 ONLY: match the transition in DECODED PIXEL space instead of "
+                "raw teacher-latent space. The teacher next-mean is decoded with its OWN "
+                "decoder D_T (exact, no grad) and the student next-mean with D_S (grad), then "
+                "L1 in pixels. This DROPS the learned P transport from the loss target, "
+                "removing the ~0.24 raw-latent floor (student-recon + latent non-uniqueness) "
+                "that the decode-reencode diagnostic showed is image-irrelevant. Requires a "
+                "cross-VAE 'hsct' transport (Q still bridges x_S->teacher space for the "
+                "on-policy teacher query). Adds ~one D_S fwd+bwd + one D_T fwd per matched step."
+            )
+        },
+    )
 
     # ---- Multi-source training data (optional) ----
     source_ratio: Optional[Dict[str, float]] = field(
@@ -2538,6 +2555,22 @@ class XOPDTrainingArguments(TrainingArguments):
                     f"transport_base_warmup_epochs={self.transport_base_warmup_epochs!r}, "
                     f"transport_warmup_epochs={self.transport_warmup_epochs!r}."
                 )
+            if self.xopd_pixel_loss and self.vae_transport != "hsct":
+                raise ValueError(
+                    "xopd_pixel_loss=True needs the HSCT transport (Q bridges "
+                    "x_S->teacher space for the on-policy teacher query, then D_T/D_S "
+                    f"decode both sides to pixels); got vae_transport={self.vae_transport!r}."
+                )
+            if self.xopd_pixel_loss and self.reinforce_coef > 0:
+                raise ValueError(
+                    "xopd_pixel_loss=True is pathwise-only; the pixel target caches D_T pixels "
+                    "and skips the per-step REINFORCE d_k. Set reinforce_coef=0, got "
+                    f"reinforce_coef={self.reinforce_coef!r}."
+                )
+        elif self.xopd_pixel_loss:
+            raise ValueError(
+                "xopd_pixel_loss=True is cross-VAE only (teacher_model_type must be set)."
+            )
         else:
             if self.vae_transport != "identity":
                 raise ValueError(
@@ -2644,6 +2677,62 @@ class XOPDTrainingArguments(TrainingArguments):
             self.student_guidance_scale,
             self.guidance_scale,
         )
+
+
+@dataclass
+class XPDMTrainingArguments(XOPDTrainingArguments):
+    r"""Pixel/latent-space one-step DENOISER MATCHING (docs/mof/pixel_denoiser_matching.tex).
+
+    L0-only cross-VAE distillation: an on-policy clean image x is encoded/noised/one-step-
+    denoised/decoded by EACH model's own VAE+denoiser, and ``MSE(sg[teacher_x0], student_x0)``
+    trains the student. No latent transport, no L1 (the trainer runs a single denoiser-matching
+    epoch loop). Inherits the cross-VAE teacher fields from XOPDTrainingArguments; set
+    ``vae_transport: "pixel"`` (cheap, unused) to satisfy the cross-VAE guard.
+    """
+
+    rollout_ratio: float = field(
+        default=1.0,
+        metadata={"help": (
+            "On-policy image source = student:teacher fraction. 1.0=pure student rollout "
+            "(on-policy w.r.t. student output), 0.0=pure teacher rollout, 0.5=1:1 mix. "
+            "Ablation axis."
+        )},
+    )
+    pdm_match_space: str = field(
+        default="latent",
+        metadata={"help": (
+            "Where to compare the two one-step x0 predictions: 'latent' (SAME-VAE only -> "
+            "cheaper, exact denoiser matching in the shared latent, needs identical VAE) or "
+            "'pixel' (CROSS-VAE -> decode both with each model's own decoder, MSE in [0,1] "
+            "pixels)."
+        )},
+    )
+    pdm_num_inference_steps: int = field(
+        default=28, metadata={"help": "Rollout steps to generate the on-policy image x."},
+    )
+    pdm_inner_steps: int = field(
+        default=4, metadata={"help": "Denoiser-matching optimizer micro-steps per rolled batch."},
+    )
+    pdm_sigma_min: float = field(
+        default=0.0, metadata={"help": "Lower clamp on sigma=t/1000 for t sampling (skip VAE-floor region)."},
+    )
+    pdm_sigma_max: float = field(
+        default=1.0, metadata={"help": "Upper clamp on sigma=t/1000 for t sampling."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not (0.0 <= self.rollout_ratio <= 1.0):
+            raise ValueError(f"rollout_ratio must be in [0,1], got {self.rollout_ratio!r}.")
+        if self.pdm_match_space not in ("latent", "pixel"):
+            raise ValueError(
+                f"pdm_match_space must be 'latent' or 'pixel', got {self.pdm_match_space!r}."
+            )
+        if not (0.0 <= self.pdm_sigma_min < self.pdm_sigma_max <= 1.0):
+            raise ValueError(
+                "require 0 <= pdm_sigma_min < pdm_sigma_max <= 1, got "
+                f"({self.pdm_sigma_min}, {self.pdm_sigma_max})."
+            )
 
 
 @dataclass
@@ -3293,6 +3382,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "crd": CRDTrainingArguments,
     "opd": OPDTrainingArguments,
     "xopd": XOPDTrainingArguments,
+    "xpdm": XPDMTrainingArguments,
     "diffusion-opd": DiffusionOPDTrainingArguments,
     "ensemble-eval": EnsembleEvalTrainingArguments,
 }

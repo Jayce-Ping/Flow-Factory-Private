@@ -340,18 +340,26 @@ class HSCTTransport(VAETransport, nn.Module):
         raw_T = self._packed_to_raw(z_T, ids) if z_T.dim() == 3 else z_T
         return self._student_raw_to_scaled(self._forward_P(raw_T))
 
-    def transition_mean_to_student(self, x_S, query_teacher_mean, sigma=None, **ctx):
+    def _query_teacher_raw_next(self, x_S, query_teacher_mean, ctx):
+        """Q bridges x_S(student scaled) -> raw_T_pred (teacher raw, Z_t); the teacher steps
+        there -> raw_muT (teacher raw, Z_{t-1}). Returns ``(raw_T_pred, raw_muT)`` both in the
+        RAW teacher latent space. Shared by the latent (P) and pixel (D_T) L1 targets."""
         h_list = ctx.get("student_hidden")
         if h_list is None:
             raise ValueError(
-                "HSCTTransport.transition_mean_to_student needs ctx['student_hidden'] "
+                "HSCTTransport teacher-mean query needs ctx['student_hidden'] "
                 "(list of SD3.5 transformer hidden maps); thread it from the L1 pre-pass."
             )
         raw_S = self._student_scaled_to_raw(x_S)
-        raw_T_pred = self.Q(raw_S.to(self.Q.base.weight.dtype), [h.to(self.Q.base.weight.dtype) for h in h_list]).to(raw_S.dtype)  # Z_t
+        qd = self.Q.base.weight.dtype
+        raw_T_pred = self.Q(raw_S.to(qd), [h.to(qd) for h in h_list]).to(raw_S.dtype)  # Z_t
         x_T, ids_T = self._raw_to_packed(raw_T_pred)
         mu_T = query_teacher_mean(x_T, latent_ids=ids_T)                    # Z_{t-1} (teacher next mean)
         raw_muT = self._packed_to_raw(mu_T, ids_T)
+        return raw_T_pred, raw_muT
+
+    def transition_mean_to_student(self, x_S, query_teacher_mean, sigma=None, **ctx):
+        raw_T_pred, raw_muT = self._query_teacher_raw_next(x_S, query_teacher_mean, ctx)
         # VELOCITY/DISPLACEMENT transport (anchor at the student's OWN state x_S):
         # return  x_S + [ P(Z_{t-1}) - P(Z_t) ]  instead of the ABSOLUTE  P(Z_{t-1}).
         # The absolute form has base point P(Q(x_S)) != x_S, so the L1 loss baked in the
@@ -362,6 +370,15 @@ class HSCTTransport(VAETransport, nn.Module):
         z_next = self._student_raw_to_scaled(self._forward_P(raw_muT))       # P(Z_{t-1})
         z_self = self._student_raw_to_scaled(self._forward_P(raw_T_pred))    # P(Z_t) = P(Q(x_S))
         return x_S + (z_next - z_self)
+
+    def teacher_next_mean_raw(self, x_S, query_teacher_mean, sigma=None, **ctx):
+        """PIXEL-space L1 target: the teacher next-latent mean in RAW teacher space (Z_{t-1}),
+        to be decoded by the teacher's OWN decoder D_T. Skips the linear P entirely, so the
+        loss never pays P's raw-latent floor; the pixel comparison against D_S(mu_student) is
+        unbiased because both faithful decoders land in the SAME RGB space (no base-point
+        correction needed). Q is still used only to bridge x_S -> teacher space for the query."""
+        _, raw_muT = self._query_teacher_raw_next(x_S, query_teacher_mean, ctx)
+        return raw_muT.detach()
 
     # ----- cold-start training (P closed-form + Q gradient) --------------------
     def set_online_lr(self, lr: float):
