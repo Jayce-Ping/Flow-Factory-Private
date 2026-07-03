@@ -1,15 +1,15 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
+# PROMPT-SET ABLATION: train on the PickScore prompt set (contrast with *_geneval / *_ocr).
 # Cross-FAMILY distillation: teacher and student share the VAE / latent space
 # (AutoencoderKLFlux2, in_channels=128) but use DIFFERENT text encoders -- dev's
 # Mistral3 (dim 15360) vs klein's Qwen3 (dim 7680). Teacher text embeddings are
 # precomputed during preprocessing and the 48GB teacher text encoder is offloaded
 # before training; the 64GB teacher transformer stays resident.
-# Single run runs L0 velocity-regression warmup (teacher-generated data) then
-# switches to L1 on-policy transition matching at epoch == l0_warmup_epochs.
+# Non-CFG (teacher_gs = student_gs = 1.0); pure L1 (l0_warmup_epochs=0).
 
 # ===== Environment =====
 launcher: "accelerate"                    # Launcher. Options: accelerate
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Distributed config; use zero3 / fsdp if VRAM-limited (9B teacher + 4B student)
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Distributed config; use zero3 / fsdp if VRAM-limited (64GB teacher + 4B student)
 num_processes: 8                          # Number of processes (GPUs); overrides the config file
 main_process_port: 29500                  # Master process port
 mixed_precision: "bf16"                   # Mixed precision. Options: no, fp16, bf16
@@ -17,14 +17,11 @@ mixed_precision: "bf16"                   # Mixed precision. Options: no, fp16, 
 # ===== Data (prompts only; L0's z0 is teacher-generated) =====
 data:
   dataset_dir: "dataset/geneval"          # Eval/test fallback (test split is read from here when eval.test_sets omits a dataset_dir).
-  # --- Multi-source training (geneval + ocr + pickscore, equal weights) ---
-  # Each directory is preprocessed independently (teacher text embeddings are
-  # precomputed per source) and L0/L1 sampling block-cycles across them per
-  # train.source_ratio below. The source name is the basename of each directory.
+  # --- Training prompt set: PickScore only (prompt-set ablation) ---
   dataset_dirs:
-    - "dataset/geneval"
-    # - "dataset/ocr"   # disabled: train on geneval only
-    # - "dataset/pickscore"   # disabled: train on geneval only
+    - "dataset/pickscore"
+    # - "dataset/geneval"     # disabled: PickScore prompt-set ablation
+    # - "dataset/ocr"         # disabled: PickScore prompt-set ablation
   preprocessing_batch_size: 32            # Batch size for offline teacher text encoding (raised 8->32 to speed up preprocessing)
   dataloader_num_workers: 16              # DataLoader worker processes
   force_reprocess: false                  # true: ignore cache and re-preprocess
@@ -45,7 +42,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_baseline_l0w0_cfg_geneval"  # Baseline ablation: l0_warmup_epochs=0 (pure L1, no L0 warmup)
+  run_name: "flux2klein_32b_to_4b_baseline_l0w0_pickscore"  # Prompt-set ablation: train on PickScore
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"                      # Checkpoint / log directory
@@ -55,7 +52,7 @@ log:
 # ===== Training (XOPD) =====
 train:
   trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
-  max_epochs: 500                         # CFG ablation (user-set)
+  max_epochs: 500                         # Match the CFG/geneval baselines for a comparable prompt-set ablation
 
   # --- Cross-model teacher ---
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"  # Teacher path; only its transformer (~64GB) is loaded. VAE reused from student; teacher text encoder (Mistral3) is precomputed offline then offloaded (see Flux2KleinAdapter.preprocess_func)
@@ -63,8 +60,8 @@ train:
   assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
-  teacher_guidance_scale: 4.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
-  student_guidance_scale: 4.0             # Student CFG for forward + rollout; synced into base guidance_scale
+  teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
+  student_guidance_scale: 1.0             # Student CFG for forward + rollout; synced into base guidance_scale
 
   # --- L0: velocity-regression warmup (teacher-generated data) ---
   l0_warmup_epochs: 0                     # Run L0 for the first N epochs, then switch to L1 (0 disables L0)
@@ -83,15 +80,12 @@ train:
   kl_type: "x-based"                      # KL anchor type vs base. Options: x-based, v-based
   kl_beta: 0.0                            # KL anchor coefficient; 0 disables
 
-  # --- Multi-source sampling ratio (active; requires data.dataset_dirs) ---
-  # source_ratio: {geneval: 1}   # disabled: single-source (geneval only); None -> round-robin over the lone source
-
   # --- Sampling / batch ---
   resolution: 512                         # Generation resolution (int or [H, W]); klein native is 1024, lower to save memory
   num_inference_steps: 28                 # L1 student rollout steps (undistilled base models need more steps)
-  per_device_batch_size: 1                # Conservative start: the FLUX.2-dev teacher transformer is ~64GB resident, so bs=4 (9B optimum) OOMs even with the 48GB teacher TE offloaded. Re-run a batch search once GPUs are free to raise it.
+  per_device_batch_size: 1                # Conservative: the FLUX.2-dev teacher transformer is ~64GB resident. Re-run a batch search once GPUs are free to raise it.
   group_size: 1                           # Group size (XOPD default 1; only >1 if you add grouped REINFORCE)
-  unique_sample_num_per_epoch: 64        # geneval-only: 192/3 = 64 unique prompts/epoch
+  unique_sample_num_per_epoch: 64         # Unique prompts sampled per epoch (matched across the prompt-set ablation; PickScore train has ~15.5k)
   gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps)
   num_inner_epochs: 1                     # MUST be 1 for XOPD (no rollout reuse); enforced at startup
   gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps
@@ -115,13 +109,13 @@ train:
 
 # ===== Scheduler =====
 scheduler:
-  dynamics_type: "ODE"               # Dynamics. Options: Flow-SDE, Dance-SDE, CPS, ODE (REINFORCE only meaningful under SDE)
+  dynamics_type: "ODE"                    # Dynamics. Options: Flow-SDE, Dance-SDE, CPS, ODE (REINFORCE only meaningful under SDE)
   noise_level: 0.0                        # SDE noise level a
-  num_sde_steps: null                        # Number of noise-injection steps per training step
-  sde_steps: null                       # Candidate noise window (randomly chosen during training); null = auto
+  num_sde_steps: null                     # Number of noise-injection steps per training step
+  sde_steps: null                         # Candidate noise window (randomly chosen during training); null = auto
   seed: 42                                # Scheduler seed
 
-# ===== Evaluation =====
+# ===== Evaluation (identical across the ablation so all prompt sets are comparable) =====
 eval:
   resolution: 1024                        # Eval resolution
   per_device_batch_size: 1                # Eval batch size
@@ -130,8 +124,6 @@ eval:
   eval_freq: 20                           # Eval every N epochs (0 disables)
   seed: 42                                # Eval seed
   test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
-                                          # eval_reward_names selects which reward (from the `rewards` list below) runs per set;
-                                          # [] = generate images only, no scoring. wandb keys: eval/{name}/reward_{reward}_mean.
     - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
     - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
     - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
@@ -140,10 +132,6 @@ eval:
     - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
 
 # ===== Rewards (optional for XOPD; logging only, NOT part of the distillation loss) =====
-# These also serve as the EVAL rewards (no separate `eval_rewards` block -> eval falls back
-# to this list, indexed by `name`). eval.test_sets[*].eval_reward_names reference these names.
-# GenEval deps (mmcv 2.1.0 + mmdet 3.3.0 + open_clip) installed on all nodes via
-# Flow-Factory/scripts/install_geneval_deps.sh; Mask2Former + CLIP ViT-L-14 weights pre-staged.
 rewards:
   - name: "geneval"                       # Reward name (referenced by eval_reward_names: [geneval])
     reward_model: "geneval"               # Reward model type (matches dataset/geneval)

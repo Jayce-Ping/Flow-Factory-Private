@@ -25,7 +25,7 @@ data:
     - "dataset/geneval"
     # - "dataset/ocr"   # disabled: train on geneval only
     # - "dataset/pickscore"   # disabled: train on geneval only
-  preprocessing_batch_size: 8             # Batch size for offline text encoding
+  preprocessing_batch_size: 32            # Batch size for offline teacher text encoding (raised 8->32 to speed up preprocessing)
   dataloader_num_workers: 16              # DataLoader worker processes
   force_reprocess: false                  # true: ignore cache and re-preprocess
   cache_dir: "~/.cache/flow_factory/datasets"  # Preprocess cache directory
@@ -55,6 +55,7 @@ log:
 # ===== Training (XOPD) =====
 train:
   trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
+  max_epochs: 500                         # Match the CFG baseline for a comparable CFG ablation (default None = train forever)
 
   # --- Cross-model teacher ---
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"  # Teacher path; only its transformer (~64GB) is loaded. VAE reused from student; teacher text encoder (Mistral3) is precomputed offline then offloaded (see Flux2KleinAdapter.preprocess_func)
@@ -108,7 +109,7 @@ train:
   ema_device: "cuda"                      # EMA storage device. Options: cpu, cuda
 
   # --- Memory / misc ---
-  enable_gradient_checkpointing: true     # On: the FLUX.2-dev teacher transformer (~64GB) leaves little headroom; trade compute for memory
+  enable_gradient_checkpointing: false    # Off: 32B teacher is frozen/no_grad (stores no activations); 4B LoRA student (bs=1, 512) fits without it -> ~faster
   offload_samples_to_cpu: false           # Offload sample tensors to CPU between sample() and optimize() to cut peak VRAM
   seed: 42                                # Random seed
 
@@ -124,17 +125,17 @@ scheduler:
 eval:
   resolution: 1024                        # Eval resolution
   per_device_batch_size: 1                # Eval batch size
-  num_inference_steps: 28                 # Eval steps
+  num_inference_steps: 40                 # Eval steps
   guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
   eval_freq: 20                           # Eval every N epochs (0 disables)
   seed: 42                                # Eval seed
   test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
                                           # eval_reward_names selects which reward (from the `rewards` list below) runs per set;
                                           # [] = generate images only, no scoring. wandb keys: eval/{name}/reward_{reward}_mean.
-    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}
-    - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval]}
-    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: []}       # OCR reward deps not staged yet -> images only
-    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: []}       # OCR reward deps not staged yet -> images only
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
     - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
     - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
 
@@ -157,11 +158,13 @@ rewards:
     device: "cuda"
     dtype: bfloat16
     async_reward: false
-  # OCR reward: enable once OCR deps (e.g. PaddleOCR) are staged on all nodes, then set the
-  # ocr_gs1/ocr_gs4 test sets' eval_reward_names to [ocr].
-  # - name: "ocr"
-  #   reward_model: "ocr"
-  #   batch_size: 64
-  #   device: "cuda"
-  #   dtype: bfloat16
-  #   async_reward: false
+  # OCR reward runs OUT-OF-PROCESS in the isolated `ocr` conda env (paddleocr 2.9.1,
+  # numpy<2) spawned by rewards/ocr.py, so ff's numpy2/torch stack stays untouched.
+  # The PaddleOCR worker is CPU-only; override its interpreter via env OCR_ENV_PYTHON
+  # (default /opt/conda/envs/ocr/bin/python).
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cpu"          # inert: the PaddleOCR worker always runs on CPU
+    dtype: float32
+    async_reward: false
