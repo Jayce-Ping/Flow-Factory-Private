@@ -124,6 +124,56 @@ class ModelArguments(ArgABC):
         },
     )
 
+    # --- Weight-space Mixture-of-Experts (Flux2 Klein only) ---
+    moe_enabled: bool = field(
+        default=False,
+        metadata={"help": "Build a weight-space MoE student (Flux2MoETransformer2DModel) instead of the "
+                          "plain transformer. Only supported for model_type 'flux2-klein'."},
+    )
+    moe_num_experts: int = field(
+        default=4,
+        metadata={"help": "Number of MoE experts (MLP banks). Ignored unless moe_enabled."},
+    )
+    moe_top_k: int = field(
+        default=1,
+        metadata={"help": "Experts activated per token (top-k). Ignored unless moe_enabled."},
+    )
+    moe_router_type: Literal['token_linear', 'global'] = field(
+        default='token_linear',
+        metadata={"help": "MoE router: 'token_linear' (LLM-style per-token linear gate on the hidden "
+                          "state + timestep term) or 'global' (per-sample gate over prompt+timestep)."},
+    )
+    moe_init: Literal['replicate', 'experts'] = field(
+        default='replicate',
+        metadata={"help": "MoE init: 'replicate' (copy the base transformer MLP into n experts) or "
+                          "'experts' (load moe_expert_paths: MLP-only experts on the shared base backbone)."},
+    )
+    moe_expert_paths: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "For moe_init='experts': list of n klein checkpoints (MLP-only trained on the "
+                          "shared frozen base backbone) whose MLP layers become the experts."},
+    )
+    moe_noise_std: float = field(
+        default=0.0,
+        metadata={"help": "Std of per-expert Gaussian noise at replicate-init (symmetry breaking)."},
+    )
+    moe_router_hidden_dim: int = field(
+        default=256,
+        metadata={"help": "Hidden dim for the 'global' router (unused for 'token_linear')."},
+    )
+    moe_base_transformer_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "For moe_init='replicate': load THIS transformer (HF repo id or local dir; "
+                          "subfolder 'transformer') as the base whose MLP is replicated into n experts, "
+                          "instead of model_name_or_path. Use to copy-init from a specialist expert."},
+    )
+    moe_assert_mlp_only: bool = field(
+        default=True,
+        metadata={"help": "For moe_init='experts': assert each expert's non-MLP (backbone) weights match "
+                          "base (lossless merge). Set False when experts were trained on the fused "
+                          "single-block projection (single-block attention then drifts and is discarded)."},
+    )
+
     def __post_init__(self):        
         if isinstance(self.master_weight_dtype, str):
             self.master_weight_dtype = dtype_map[self.master_weight_dtype]

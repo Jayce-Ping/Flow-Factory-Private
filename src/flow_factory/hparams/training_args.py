@@ -328,6 +328,17 @@ class TrainingArguments(ArgABC):
         default=False,
         metadata={"help": "Whether to enable gradient checkpointing."},
     )
+    moe_load_balance_coeff: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Coefficient for the weight-space MoE load-balancing auxiliary loss "
+                "(Switch/GShard N*sum_e f_e*P_e), added to the student distillation loss. "
+                "Only active when the student is a Flux2MoETransformer2DModel with "
+                "token_linear routing; 0 disables (default)."
+            )
+        },
+    )
     ddp_find_unused_parameters: bool = field(
         default=True,
         metadata={

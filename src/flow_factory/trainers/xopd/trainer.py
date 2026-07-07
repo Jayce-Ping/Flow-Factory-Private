@@ -2485,6 +2485,17 @@ class XOPDTrainer(BaseTrainer):
 
                     loss = self.pathwise_coef * pathwise_loss + self.reinforce_coef * reinforce_loss
 
+                    # MoE load-balancing aux (only when the student is a weight-space MoE
+                    # and moe_load_balance_coeff > 0; a no-op otherwise). Read right after
+                    # the student forward so the aux is from this timestep's graph.
+                    moe_coef = getattr(self.training_args, "moe_load_balance_coeff", 0.0)
+                    collect_moe_aux = getattr(self.adapter, "collect_moe_aux_loss", None)
+                    if moe_coef > 0 and collect_moe_aux is not None:
+                        moe_aux = collect_moe_aux()
+                        if moe_aux is not None:
+                            loss = loss + moe_coef * moe_aux
+                            loss_info["moe_aux"].append(moe_aux.detach())
+
                     if self.enable_kl_loss:
                         kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
                         loss = loss + kl_loss

@@ -1,0 +1,156 @@
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert weight-space MoE student (klein-4B experts)
+# MERGE-METHOD ABLATION -- variant A (two-specialist merge / Branch-Train-MiX):
+#   experts = [OCR expert, PickScore expert]  (from *_ocr_expert / *_pickscore_expert runs)
+# then mix-train (on-policy XOPD distill to the dev teacher) on OCR + PickScore (1:1).
+#
+# Compares against:
+#   B (*_copy2base):  both experts copied from base klein-4B  (sparse-upcycling baseline)
+#   C (*_copy2ocr):   both experts copied from the OCR expert (single-specialist copy)
+# All three share this exact mix-train recipe and differ ONLY in initialization, so the
+# per-domain (ocr/pickscore) + aggregate deltas isolate the value of specialist-diverse init.
+#
+# MoE: 2 experts, top_k=1 (route each token to ONE expert -> ~4B active), token_linear router
+# (LLM-style per-token linear gate on the hidden state + timestep term). Trainable = expert
+# MLPs + router (target_modules=[experts, router]); shared backbone (attention/norm/embed) frozen.
+# Load-balancing aux on (moe_load_balance_coeff) to avoid routing collapse with only 2 experts.
+#
+# All three variants share the SAME base klein backbone (base_path=model_name_or_path) and
+# differ ONLY in the expert MLP init. Experts are double-stream-MLP-only, so the merge is
+# LOSSLESS (moe_assert_mlp_only=true): single-stream MLP == base across experts at init and
+# is re-specialized by this mix-train.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (OCR + PickScore, equal 1:1) =====
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/ocr"
+    - "dataset/pickscore"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (2-expert MoE student; init = merge the two specialists) =====
+model:
+  finetune_type: "full"                   # train the selected (MoE) params in full precision
+  target_modules:                         # freeze shared backbone; train ONLY expert MLPs + routers
+    - "experts"
+    - "router"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"   # shared backbone source (also VAE/text-encoder for the pipeline)
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+  # --- MoE construction ---
+  moe_enabled: true
+  moe_init: "experts"                     # variant A: stack the two specialists' MLPs
+  moe_num_experts: 2
+  moe_top_k: 1
+  moe_router_type: "token_linear"
+  moe_assert_mlp_only: true               # double-stream-MLP-only experts -> backbone (incl. single blocks) == base -> lossless
+  moe_expert_paths:                       # <-- FILL after the expert runs: dirs loadable via from_pretrained(subfolder="transformer")
+    - "saves/flux2klein_32b_to_4b_l1_ocr_expert/FILL_CHECKPOINT_DIR"
+    - "saves/flux2klein_32b_to_4b_l1_pickscore_expert/FILL_CHECKPOINT_DIR"
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_moe2_ocr_pickscore_merge"   # A: two-specialist merge
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 50
+  save_model_only: true
+
+# ===== Training (XOPD mix-train, distill to dev) =====
+train:
+  trainer_type: "xopd"
+  max_epochs: 500
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  # --- MoE load-balancing aux (Switch/GShard); 0 disables ---
+  moe_load_balance_coeff: 0.01
+
+  # --- Multi-source sampling (OCR + PickScore, equal) ---
+  source_ratio: {ocr: 1, pickscore: 1}    # 1:1 -> 2 batches/source/epoch
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 128        # 2 x 64: each source 64/epoch (= single-source). num_batches_per_epoch = 4; GAS auto = 4*28.
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-5
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: true     # ~21B-resident MoE (2 experts here) -> keep on
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (shared across the ablation) =====
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 20
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (logging only; not part of the XOPD loss) =====
+rewards:
+  - {name: "geneval", reward_model: "geneval", weight: 1, batch_size: 64, device: "cuda", dtype: float32, async_reward: false}
+  - {name: "pick_score", reward_model: "PickScore", batch_size: 64, device: "cuda", dtype: bfloat16, async_reward: false}
+  - {name: "ocr", reward_model: "ocr", batch_size: 64, device: "cpu", dtype: float32, async_reward: false}

@@ -112,12 +112,78 @@ class Flux2KleinAdapter(BaseAdapter):
             vae = AutoencoderKLFlux2.from_pretrained(
                 self.model_args.vae_name_or_path, subfolder="vae"
             )
-            return Flux2KleinPipeline.from_pretrained(
+            pipeline = Flux2KleinPipeline.from_pretrained(
                 self.model_args.model_name_or_path, vae=vae, low_cpu_mem_usage=False
             )
-        return Flux2KleinPipeline.from_pretrained(
-            self.model_args.model_name_or_path, low_cpu_mem_usage=False
+        else:
+            pipeline = Flux2KleinPipeline.from_pretrained(
+                self.model_args.model_name_or_path, low_cpu_mem_usage=False
+            )
+        self._maybe_build_moe_transformer(pipeline)
+        return pipeline
+
+    def _maybe_build_moe_transformer(self, pipeline: Flux2KleinPipeline) -> None:
+        """When ``model_args.moe_enabled``, replace the plain student transformer with a
+        weight-space MoE (``Flux2MoETransformer2DModel``) built from the just-loaded base.
+        Done before freezing / LoRA / precision so the whole downstream pipeline operates
+        on the MoE student. The teacher (loaded separately) stays a plain transformer."""
+        if not getattr(self.model_args, "moe_enabled", False):
+            return
+        from .flux2_moe_transformer import Flux2MoETransformer2DModel
+
+        base_tf = pipeline.transformer
+        common = dict(
+            top_k=self.model_args.moe_top_k,
+            router_type=self.model_args.moe_router_type,
+            router_hidden_dim=self.model_args.moe_router_hidden_dim,
         )
+        if self.model_args.moe_init == "experts":
+            if not self.model_args.moe_expert_paths:
+                raise ValueError("moe_init='experts' requires model_args.moe_expert_paths (list of n checkpoints).")
+            moe = Flux2MoETransformer2DModel.from_expert_checkpoints(
+                self.model_args.moe_expert_paths,
+                base_path=self.model_args.model_name_or_path,
+                assert_mlp_only=self.model_args.moe_assert_mlp_only,
+                noise_std=self.model_args.moe_noise_std,
+                **common,
+            )
+        elif self.model_args.moe_init == "replicate":
+            if self.model_args.moe_base_transformer_path:
+                # copy-init from a specific transformer (e.g. a domain specialist) rather than base
+                moe = Flux2MoETransformer2DModel.from_base_replicated(
+                    self.model_args.moe_base_transformer_path,
+                    num_experts=self.model_args.moe_num_experts,
+                    noise_std=self.model_args.moe_noise_std,
+                    **common,
+                )
+            else:
+                moe = Flux2MoETransformer2DModel.from_base_model(
+                    base_tf,
+                    num_experts=self.model_args.moe_num_experts,
+                    noise_std=self.model_args.moe_noise_std,
+                    **common,
+                )
+        else:
+            raise ValueError(f"unknown moe_init={self.model_args.moe_init!r}; expected 'replicate' or 'experts'")
+
+        moe = moe.to(device=base_tf.device, dtype=base_tf.dtype)
+        pipeline.transformer = moe
+        del base_tf
+        logger.info(
+            f"[MoE] student transformer -> Flux2MoETransformer2DModel "
+            f"(num_experts={moe.config.num_experts}, top_k={moe.config.top_k}, "
+            f"router={moe.config.router_type}, init={self.model_args.moe_init})"
+        )
+
+    def collect_moe_aux_loss(self) -> Optional[torch.Tensor]:
+        """MoE load-balancing aux loss from the last student forward, or None if the
+        student is not a weight-space MoE. Consumed by the XOPD trainer, scaled by
+        ``training_args.moe_load_balance_coeff``."""
+        tf = self._unwrap(self.transformer)
+        if hasattr(tf, "_orig_mod"):  # torch.compile
+            tf = tf._orig_mod
+        fn = getattr(tf, "moe_aux_loss", None)
+        return fn() if callable(fn) else None
 
     @property
     def default_target_modules(self) -> List[str]:
