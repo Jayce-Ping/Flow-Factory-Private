@@ -110,11 +110,11 @@ scheduler:
 
 # ===== Evaluation (shared across the ablation) =====
 eval:
-  resolution: 1024
+  resolution: 512                         # Eval @ 512px = train res (avoid resolution gap; cheaper). Teacher@512 ceiling from vsru0123.
   per_device_batch_size: 1
   num_inference_steps: 40
   guidance_scale: 1.0
-  eval_freq: 20
+  eval_freq: 40                           # raised 20->40 to cut eval walltime tax
   seed: 42
   test_sets:
     - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}

@@ -1,7 +1,9 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# FULL-FINETUNE single-domain OCR: 4B student full-FT (not LoRA) distilled from the
-# 32B teacher, trained on OCR prompts only. Tests whether full-FT breaks the OCR
-# capacity ceiling that LoRA single-ocr hit (~0.61/0.68 vs teacher 0.82).
+# FULL-RANK (non-LoRA) single-domain OCR, MLP-ONLY: 4B student distilled from the 32B
+# teacher on OCR prompts. target_modules is restricted to the DOUBLE-stream MLP
+# (ff/ff_context) so this ONE run doubles as (a) Gate A -- does full-rank MLP-only FT
+# break the OCR ceiling LoRA hit (~0.61/0.68 vs teacher 0.82) -- and (b) OCR expert E1
+# for the MoE merge (save_freq>0; losslessly mergeable, shared backbone). eval @ 512px.
 # Cross-FAMILY distillation: teacher and student share the VAE / latent space
 # (AutoencoderKLFlux2, in_channels=128) but use DIFFERENT text encoders -- dev's
 # Mistral3 (dim 15360) vs klein's Qwen3 (dim 7680). Teacher text embeddings are
@@ -35,7 +37,12 @@ data:
 
 # ===== Model (student = the small model being trained, FULL finetune) =====
 model:
-  finetune_type: "full"                   # FULL finetune (vs LoRA) — tests if full-FT breaks the OCR ceiling
+  finetune_type: "full"                   # full-rank (vs LoRA); restricted to the double-stream MLP below (aligns with ocr/pickscore experts -> lossless MoE merge)
+  target_modules:                         # DOUBLE-stream MLP ONLY (ff/ff_context) -- matches *_ocr_expert / *_pickscore_expert, so this run IS OCR expert E1.
+    - "ff.linear_in"                      # (single-stream MLP is fused with QKV/attn-out in one tensor each and cannot be
+    - "ff.linear_out"                     #  isolated by substrings, so it stays == base and is re-specialized during the MoE mix-train.)
+    - "ff_context.linear_in"
+    - "ff_context.linear_out"
   model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"  # Student path (HF repo id or local)
   model_type: "flux2-klein"               # Adapter registry key (fixed for klein)
   resume_path: null                       # Checkpoint/LoRA to resume from; null = none
@@ -47,7 +54,7 @@ log:
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"                      # Checkpoint / log directory
-  save_freq: 0                            # Save every N epochs (0 disables)
+  save_freq: 50                           # SAVE checkpoints: this run doubles as OCR expert E1 (consumed by MoE merge moe_expert_paths)
   save_model_only: true                   # Save only model weights (not optimizer/scheduler state)
 
 # ===== Training (XOPD) =====
@@ -121,11 +128,11 @@ scheduler:
 
 # ===== Evaluation (identical across the ablation so all runs are comparable) =====
 eval:
-  resolution: 1024                        # Eval resolution
+  resolution: 512                         # Eval @ 512px = TRAIN res (avoid train/eval resolution gap; cheaper eval). Teacher@512 ceiling from run vsru0123.
   per_device_batch_size: 1                # Eval batch size
   num_inference_steps: 40                 # Eval steps
   guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
-  eval_freq: 20                           # Eval every N epochs (0 disables)
+  eval_freq: 40                           # Eval every N epochs (raised 20->40: eval is ~43% of walltime; halve the tax)
   seed: 42                                # Eval seed
   test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
     - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
