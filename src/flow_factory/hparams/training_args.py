@@ -328,6 +328,19 @@ class TrainingArguments(ArgABC):
         default=False,
         metadata={"help": "Whether to enable gradient checkpointing."},
     )
+    fsdp_shard_teacher: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "OOM fallback for cross-model distillation (XOPD same-arch): wrap the "
+                "trainable student AND the frozen teacher transformer into a single "
+                "ModelBundle root so accelerate FSDP shards BOTH (teacher ~64GB/GPU -> "
+                "~64GB/num_gpus). Requires an FSDP config_file (config/accelerate_configs/"
+                "fsdp2.yaml); ignored under DeepSpeed. Default False keeps the teacher "
+                "replicated (ZeRO-2/DDP path, unchanged)."
+            )
+        },
+    )
     moe_load_balance_coeff: float = field(
         default=0.0,
         metadata={

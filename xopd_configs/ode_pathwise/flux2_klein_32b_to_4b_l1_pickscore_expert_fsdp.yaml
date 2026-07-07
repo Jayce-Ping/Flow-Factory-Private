@@ -1,0 +1,131 @@
+# [FSDP FULL-SHARD VARIANT] OOM fallback for pickscore expert (E2): FSDP shards the 32B teacher too.
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
+# PICKSCORE EXPERT for the MoE merge ablation. Identical recipe to *_ocr_expert
+# (full-FT restricted to the DOUBLE-stream MLP ff/ff_context) but trained on the PickScore
+# prompt set. Paired with the OCR expert to seed the 2-expert MoE (merge config A).
+#
+# See *_ocr_expert for why only the double-stream MLP is trained (single-stream MLP is
+# fused with attention in one tensor and can't be isolated by target_modules); the merge
+# is therefore lossless MLP-only and the MoE mix-train re-specializes the single stream.
+# save_freq>0: consumed by the merge config (moe_expert_paths).
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/accelerate_configs/fsdp2.yaml  # FSDP full-shard: shard BOTH student(4B)+teacher(32B) via ModelBundle (OOM fallback)
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (PickScore prompts only) =====
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/pickscore"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (student = PickScore expert, full-FT restricted to MoE-able MLP layers) =====
+model:
+  finetune_type: "full"
+  target_modules:                         # DOUBLE-stream MLP ONLY (see header); lossless mergeable
+    - "ff.linear_in"
+    - "ff.linear_out"
+    - "ff_context.linear_in"
+    - "ff_context.linear_out"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_l1_pickscore_expert_fsdp"   # PickScore expert (MLP-able) for MoE merge
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 50
+  save_model_only: true
+
+# ===== Training (XOPD) =====
+train:
+  trainer_type: "xopd"
+  fsdp_shard_teacher: true                 # OOM fallback: one ModelBundle FSDP root shards student+teacher (needs config_file=fsdp2.yaml)
+  max_epochs: 500
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-5
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false     # OFF: fsdp2.yaml fsdp_activation_checkpointing handles AC (avoid double-GC)
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (shared across the ablation) =====
+eval:
+  resolution: 512                         # Eval @ 512px = train res (avoid resolution gap; cheaper). Teacher@512 ceiling from vsru0123.
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 40                           # raised 20->40 to cut eval walltime tax
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (logging only; not part of the XOPD loss) =====
+rewards:
+  - {name: "geneval", reward_model: "geneval", weight: 1, batch_size: 64, device: "cuda", dtype: float32, async_reward: false}
+  - {name: "pick_score", reward_model: "PickScore", batch_size: 64, device: "cuda", dtype: bfloat16, async_reward: false}
+  - {name: "ocr", reward_model: "ocr", batch_size: 64, device: "cpu", dtype: float32, async_reward: false}

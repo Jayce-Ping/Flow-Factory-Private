@@ -239,7 +239,24 @@ class XOPDTrainer(BaseTrainer):
     # ============================ Teacher backends ============================
     def _init_same_arch_teacher(self) -> None:
         """Same-architecture teacher: swap the teacher transformer into the student
-        pipeline (shared VAE / scheduler / latent space). Identity transport."""
+        pipeline (shared VAE / scheduler / latent space). Identity transport.
+
+        Default (ZeRO-2/DDP) path loads the teacher here. The FSDP full-shard path
+        (``fsdp_shard_teacher``) loads it EARLIER in ``_initialization`` (before
+        ``accelerator.prepare``, so it can be bundled with the student); this then only
+        sets the transport."""
+        if not getattr(self, "_teacher_loaded_early", False):
+            self._load_same_arch_teacher_transformer()
+        # Same-architecture cross-model XOPD: the teacher transformer expects text
+        # embeddings from its OWN encoder; those are precomputed during
+        # preprocessing and cached (teacher_* columns), and the teacher text
+        # encoder is freed before training (see _init_dataloader). Identity
+        # transport: teacher velocities already live in the student latent space.
+        self.transport = build_transport("identity")
+
+    def _load_same_arch_teacher_transformer(self) -> None:
+        """Load the frozen same-arch teacher transformer into the student adapter
+        (validation + device/dtype). Idempotent via ``_teacher_loaded_early``."""
         ta = self.training_args
         if not (
             hasattr(self.adapter, "load_teacher_transformer")
@@ -264,12 +281,30 @@ class XOPDTrainer(BaseTrainer):
             device=self.accelerator.device,
             dtype=self.adapter._inference_dtype,
         )
-        # Same-architecture cross-model XOPD: the teacher transformer expects text
-        # embeddings from its OWN encoder; those are precomputed during
-        # preprocessing and cached (teacher_* columns), and the teacher text
-        # encoder is freed before training (see _init_dataloader). Identity
-        # transport: teacher velocities already live in the student latent space.
-        self.transport = build_transport("identity")
+        self._teacher_loaded_early = True
+
+    def _initialization(self):
+        """XOPD initialization. Default path defers to the base (student-only prepare;
+        teacher loaded later in ``_init_same_arch_teacher``). The FSDP full-shard OOM
+        path (``fsdp_shard_teacher``, same-arch only) loads the teacher and wraps
+        student+teacher into ONE ModelBundle BEFORE ``accelerator.prepare`` (single FSDP
+        root shards both), then installs routing proxies AFTER prepare."""
+        ta = self.training_args
+        use_bundle = (
+            getattr(ta, "fsdp_shard_teacher", False)
+            and ta.teacher_model_type is None
+            and hasattr(self.adapter, "build_xopd_transformer_bundle")
+        )
+        if use_bundle:
+            logger.info(
+                "[FSDP-bundle] fsdp_shard_teacher=True (same-arch): load teacher + bundle "
+                "with student BEFORE prepare, so one FSDP root shards both."
+            )
+            self._load_same_arch_teacher_transformer()
+            self.adapter.build_xopd_transformer_bundle()
+        super()._initialization()
+        if use_bundle:
+            self.adapter.install_xopd_bundle_proxies(self.adapter.get_component("transformer"))
 
     def _init_cross_vae_teacher(self) -> None:
         """Cross-VAE teacher: build an INDEPENDENT frozen teacher adapter (its own

@@ -97,6 +97,13 @@ class Flux2KleinAdapter(BaseAdapter):
         # on demand via `load_teacher_transformer`. Shares the student
         # pipeline's VAE / scheduler. None until loaded.
         self._teacher_transformer: Optional[torch.nn.Module] = None
+        # FSDP full-shard OOM fallback (training_args.fsdp_shard_teacher): the student
+        # and teacher transformers are wrapped in ONE ModelBundle FSDP root and each
+        # forward is routed through it by a proxy. None unless that path is active
+        # (see build_xopd_transformer_bundle / install_xopd_bundle_proxies).
+        self._xopd_bundle: Optional[torch.nn.Module] = None
+        self._student_proxy = None
+        self._teacher_proxy = None
         # The teacher's OWN text encoder (XOPD cross-model) is managed by
         # BaseAdapter (`_teacher_pipeline`, load/unload/encode_teacher_prompt):
         # loaded text-only for offline preprocessing then freed, architecture-
@@ -1571,3 +1578,62 @@ class Flux2KleinAdapter(BaseAdapter):
                 self.set_component("transformer", prev)
             else:
                 self._components.pop("transformer", None)
+
+    # ---------------------- FSDP teacher sharding (OOM fallback) ----------------------
+    def build_xopd_transformer_bundle(self):
+        """Pre-``accelerator.prepare`` hook (XOPD FSDP full-shard path): wrap the active
+        student ``transformer`` and the already-loaded frozen teacher into ONE
+        :class:`ModelBundle`, installed as the ``transformer`` component so the base
+        trainer prepares a SINGLE FSDP root that shards BOTH. Idempotent; must run after
+        ``load_teacher_transformer`` and before prepare."""
+        from ..model_bundle import ModelBundle
+
+        if self._teacher_transformer is None:
+            raise RuntimeError(
+                "build_xopd_transformer_bundle() called before load_teacher_transformer(); "
+                "no teacher transformer to bundle."
+            )
+        student = self.get_component("transformer")
+        if isinstance(student, ModelBundle) or self._xopd_bundle is not None:
+            return  # already bundled
+        bundle = ModelBundle({"student": student, "teacher": self._teacher_transformer})
+        self.set_component("transformer", bundle)
+        logger.info(
+            "[FSDP-bundle] wrapped student + teacher into one ModelBundle root "
+            "(single FSDP shard group)."
+        )
+
+    def install_xopd_bundle_proxies(self, prepared_bundle: torch.nn.Module):
+        """Post-prepare hook: keep the prepared FSDP bundle as the trainable root and
+        install :class:`RoutedComponentProxy` objects that route the student/teacher
+        forward through it. The active ``transformer`` becomes the student proxy;
+        ``use_teacher_transformer`` swaps to the teacher proxy (both drive the same FSDP
+        root). ``_teacher_transformer`` is repointed to the teacher proxy so the existing
+        swap logic is unchanged."""
+        from ..model_bundle import RoutedComponentProxy
+
+        self._xopd_bundle = prepared_bundle
+        root = self._unwrap(prepared_bundle)
+        if not hasattr(root, "members"):
+            raise RuntimeError(
+                "install_xopd_bundle_proxies: unwrapped prepared module is not a ModelBundle "
+                f"(got {type(root).__name__}); expected .members['student'|'teacher']."
+            )
+        self._student_proxy = RoutedComponentProxy(prepared_bundle, "student", root.members["student"])
+        self._teacher_proxy = RoutedComponentProxy(prepared_bundle, "teacher", root.members["teacher"])
+        self.set_component("transformer", self._student_proxy)
+        # use_teacher_transformer() swaps _components["transformer"] to this; make it the
+        # teacher PROXY so teacher forwards also route through the single FSDP root.
+        self._teacher_transformer = self._teacher_proxy
+        logger.info(
+            "[FSDP-bundle] installed student/teacher routing proxies over the prepared FSDP root."
+        )
+
+    @property
+    def trainable_components(self) -> List[torch.nn.Module]:
+        """Under the FSDP bundle, ``accelerator.accumulate(...)`` must see the single
+        prepared FSDP root (the bundle) for gradient-sync control; otherwise fall back to
+        the base behavior (the prepared student transformer)."""
+        if getattr(self, "_xopd_bundle", None) is not None:
+            return [self._xopd_bundle]
+        return super().trainable_components
