@@ -120,7 +120,7 @@ scheduler:
 
 # ===== Evaluation (shared across the ablation) =====
 eval:
-  resolution: 1024
+  resolution: 512                         # eval @ 512px = train res (avoid resolution gap; cheaper; eval pbs = train pbs = 1 -> no OOM)
   per_device_batch_size: 1
   num_inference_steps: 40
   guidance_scale: 1.0
