@@ -52,7 +52,7 @@ log:
   run_name: "flux2klein_32b_to_4b_moe2_ocr_pickscore_copy2base"   # B: copy-2 from base
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
-  save_dir: "saves/"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
   save_freq: 50
   save_model_only: true
 

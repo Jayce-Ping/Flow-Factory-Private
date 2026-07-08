@@ -57,15 +57,15 @@ model:
   moe_router_type: "token_linear"
   moe_assert_mlp_only: true               # double-stream-MLP-only experts -> backbone (incl. single blocks) == base -> lossless
   moe_expert_paths:                       # <-- FILL after the expert runs: dirs loadable via from_pretrained(subfolder="transformer")
-    - "saves/flux2klein_32b_to_4b_l1_ocr_expert/FILL_CHECKPOINT_DIR"
-    - "saves/flux2klein_32b_to_4b_l1_pickscore_expert/FILL_CHECKPOINT_DIR"
+    - "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints/flux2klein_32b_to_4b_l1_ocr_expert/checkpoints/FILL_CHECKPOINT_DIR"
+    - "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints/flux2klein_32b_to_4b_l1_pickscore_expert/checkpoints/FILL_CHECKPOINT_DIR"
 
 # ===== Logging =====
 log:
   run_name: "flux2klein_32b_to_4b_moe2_ocr_pickscore_merge"   # A: two-specialist merge
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
-  save_dir: "saves/"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
   save_freq: 50
   save_model_only: true
 

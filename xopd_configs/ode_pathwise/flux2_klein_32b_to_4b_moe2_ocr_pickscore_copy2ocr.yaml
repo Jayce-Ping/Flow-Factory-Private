@@ -48,15 +48,15 @@ model:
   moe_assert_mlp_only: true               # double-stream-MLP-only experts -> lossless
   moe_noise_std: 0.02                     # break symmetry: both experts start from the SAME OCR MLP
   moe_expert_paths:                       # <-- FILL: the SAME OCR expert dir, twice
-    - "saves/flux2klein_32b_to_4b_l1_ocr_expert/FILL_CHECKPOINT_DIR"
-    - "saves/flux2klein_32b_to_4b_l1_ocr_expert/FILL_CHECKPOINT_DIR"
+    - "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints/flux2klein_32b_to_4b_l1_ocr_expert/checkpoints/FILL_CHECKPOINT_DIR"
+    - "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints/flux2klein_32b_to_4b_l1_ocr_expert/checkpoints/FILL_CHECKPOINT_DIR"
 
 # ===== Logging =====
 log:
   run_name: "flux2klein_32b_to_4b_moe2_ocr_pickscore_copy2ocr"   # C: copy-2 from OCR expert
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
-  save_dir: "saves/"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
   save_freq: 50
   save_model_only: true
 
