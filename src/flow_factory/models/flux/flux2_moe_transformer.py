@@ -628,6 +628,21 @@ class Flux2MoETransformer2DModel(
             router_hidden_dim=router_hidden_dim,
         )
 
+    @staticmethod
+    def _base_config_from_moe(c) -> dict:
+        """Inverse of ``_moe_config_from_base``: the plain ``Flux2Transformer2DModel`` config,
+        i.e. drop the MoE-only fields (num_experts / top_k / router_type / moe_on /
+        router_hidden_dim). Built explicitly from the known base keys so ConfigMixin
+        bookkeeping keys (``_class_name`` etc.) never leak into the constructor."""
+        return dict(
+            patch_size=c["patch_size"], in_channels=c["in_channels"], out_channels=c.get("out_channels"),
+            num_layers=c["num_layers"], num_single_layers=c["num_single_layers"],
+            attention_head_dim=c["attention_head_dim"], num_attention_heads=c["num_attention_heads"],
+            joint_attention_dim=c["joint_attention_dim"], timestep_guidance_channels=c["timestep_guidance_channels"],
+            mlp_ratio=c["mlp_ratio"], axes_dims_rope=tuple(c["axes_dims_rope"]), rope_theta=c["rope_theta"],
+            eps=c["eps"], guidance_embeds=c.get("guidance_embeds", False),
+        )
+
     @torch.no_grad()
     def _load_shared_from_base(self, base: Flux2Transformer2DModel):
         self.x_embedder.load_state_dict(base.x_embedder.state_dict())
@@ -706,3 +721,54 @@ class Flux2MoETransformer2DModel(
                             f"expert {i} single-block attention slice {name} diverges by {max_diff:.3e} > {atol}; "
                             f"experts must be MLP-only."
                         )
+
+    # ------------------------------------------------------------------ split (inverse)
+    @torch.no_grad()
+    def extract_expert(self, expert_idx: int) -> Flux2Transformer2DModel:
+        """Reconstruct expert ``expert_idx`` as a standalone plain ``Flux2Transformer2DModel``
+        (a standard flux2-klein-4B): the SHARED backbone + that expert's MLP. This is the exact
+        INVERSE of ``_load_shared_from_base`` + ``_load_experts_from_base``; the router is dropped
+        (the returned model is dense). Running it on a prompt is "every token through expert i",
+        vs the MoE's routed mix.
+
+        Backbone weights are copied FROM THIS MoE (not assumed equal to the original base), so a
+        trained backbone is preserved. All klein Linears are bias-free, so the single-block fused
+        projections are re-assembled from weights only: ``to_qkv_mlp_proj = cat([to_qkv, mlp_in], 0)``
+        and ``to_out = cat([attn_out, mlp_out], 1)`` (if bias is ever added, concat biases too)."""
+        n = self.config.num_experts
+        if not (0 <= expert_idx < n):
+            raise ValueError(f"expert_idx must be in [0, {n}), got {expert_idx}")
+
+        p = next(self.parameters())
+        base = Flux2Transformer2DModel(**self._base_config_from_moe(self.config)).to(device=p.device, dtype=p.dtype)
+
+        # shared backbone (inverse of _load_shared_from_base, minus the single-block re-fuse)
+        base.x_embedder.load_state_dict(self.x_embedder.state_dict())
+        base.context_embedder.load_state_dict(self.context_embedder.state_dict())
+        base.time_guidance_embed.load_state_dict(self.time_guidance_embed.state_dict())
+        base.double_stream_modulation_img.load_state_dict(self.double_stream_modulation_img.state_dict())
+        base.double_stream_modulation_txt.load_state_dict(self.double_stream_modulation_txt.state_dict())
+        base.single_stream_modulation.load_state_dict(self.single_stream_modulation.state_dict())
+        base.norm_out.load_state_dict(self.norm_out.state_dict())
+        base.proj_out.load_state_dict(self.proj_out.state_dict())
+
+        # double-stream: shared attn + this expert's ff / ff_context
+        for bb, mb in zip(base.transformer_blocks, self.transformer_blocks):
+            bb.attn.load_state_dict(mb.attn.state_dict())
+            bb.ff.load_state_dict(mb.ff.experts[expert_idx].state_dict())
+            bb.ff_context.load_state_dict(mb.ff_context.experts[expert_idx].state_dict())
+
+        # single-stream: re-fuse shared attn (to_qkv / attn_out) with this expert's MLP (mlp_in / mlp_out)
+        for bb, mb in zip(base.single_transformer_blocks, self.single_transformer_blocks):
+            bb.attn.norm_q.load_state_dict(mb.attn.norm_q.state_dict())
+            bb.attn.norm_k.load_state_dict(mb.attn.norm_k.state_dict())
+            expert = mb.attn.moe.experts[expert_idx]
+            bb.attn.to_qkv_mlp_proj.weight.copy_(torch.cat([mb.attn.to_qkv.weight, expert.mlp_in.weight], dim=0))
+            bb.attn.to_out.weight.copy_(torch.cat([mb.attn.attn_out.weight, expert.mlp_out.weight], dim=1))
+
+        return base
+
+    @torch.no_grad()
+    def extract_all_experts(self) -> List[Flux2Transformer2DModel]:
+        """Split this MoE into its ``num_experts`` standalone dense ``Flux2Transformer2DModel``s."""
+        return [self.extract_expert(i) for i in range(self.config.num_experts)]
