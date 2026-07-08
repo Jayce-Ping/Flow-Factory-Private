@@ -1,0 +1,134 @@
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert WEIGHT-SPACE MoE student (Experiment 1).
+# Both experts = copies of base FLUX.2-klein-base-4B (+ symmetry-breaking noise), token-linear
+# top-1 router; trained via LoRA (rank 64, target_modules 'all-linear') on OCR-only, distilled to
+# dev-32B with pure on-policy L1 (pathwise) + Switch/GShard load-balance aux.
+# Capacity-scaling study: does a 2-expert MoE beat the single-ocr 32b->4b baseline (== E1)?
+# 2 experts (~6B) + 32B teacher fit ZeRO-2 on a single node (8 GPUs); no EP/FSDP needed.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (OCR-only) =====
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (2-expert MoE; init = copy-2 from base; LoRA rank 64 / all-linear) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all-linear"            # LoRA all linears (experts + router + backbone); rank 64 >> N -> router fully expressive
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+  # --- MoE construction ---
+  moe_enabled: true
+  moe_init: "replicate"                   # copy the base MLP into both experts
+  moe_num_experts: 2
+  moe_top_k: 1
+  moe_router_type: "token_linear"
+  moe_noise_std: 0.02                     # break symmetry (copies are identical otherwise)
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_moe2_base"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 50
+  save_model_only: true
+
+# ===== Training (XOPD distill to dev-32B, OCR-only) =====
+train:
+  trainer_type: "xopd"
+  max_epochs: 500
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  moe_load_balance_coeff: 0.01
+  source_ratio: {ocr: 1}
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (eval @ 512 on all 3 domains to measure cross-domain transfer) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 40
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (logging only; not part of the XOPD loss) =====
+rewards:
+  - {name: "geneval", reward_model: "geneval", weight: 1, batch_size: 64, device: "cuda", dtype: float32, async_reward: false}
+  - {name: "pick_score", reward_model: "PickScore", batch_size: 64, device: "cuda", dtype: bfloat16, async_reward: false}
+  - {name: "ocr", reward_model: "ocr", batch_size: 64, device: "cpu", dtype: float32, async_reward: false}

@@ -1,32 +1,27 @@
-# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 8-expert VELOCITY-space MoF student (Config 2).
-# "MoF-V": 8 INDEPENDENT full FLUX.2-klein-base-4B experts (LoRA-adapted copies of base) whose
-# OUTPUT velocities are blended by one shared per-token router (softmax + top-2, renormalized),
-# jointly distilled to the dev-32B teacher with pure on-policy L1 (pathwise) + a Switch/GShard
-# load-balance aux. Contrast with Config 1 (weight-space MoE, flux2_klein_32b_to_4b_moe8_l1.yaml):
-# there top-1 gives ~4B active per token; here per-token routing runs ALL 8 experts each step
-# (top-k only sparsifies the blend) -> ~8x student forward + the 32B teacher.
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 8-expert VELOCITY-space MoF student (Experiment 4).
+# 8 INDEPENDENT full FLUX.2-klein-base-4B experts (LoRA-adapted copies of base); one shared
+# per-token router picks top-2 experts/token (softmax + renorm) and blends their OUTPUT
+# velocities; distilled to dev-32B (L1 + load-balance aux). Contrast with Experiment 3
+# (weight-space MoE): there top-k gives sparse MLP compute; here per-token routing runs ALL 8
+# expert forwards each step (top-k only sparsifies the blend) -> ~8x student forward.
 #
-# EXPERTS ARE LORA (rank 64 / alpha 128, target_modules 'all'): the 8 base copies are frozen and
-# only LoRA adapters + the router train -> small optimizer/trainable footprint on top of the 8x4B.
-#
-# SCALE / MEMORY: 8x4B experts (frozen base) + 32B teacher (~96B resident) -> FSDP2 full-shard of
-# BOTH via fsdp_shard_teacher (ModelBundle) + config/accelerate_configs/fsdp2_prefetch.yaml. Same
-# load-time materialization risk as Config 1; a real launch needs a load smoke on free GPUs.
+# SCALE / MEMORY: 8x4B experts (frozen base) + 32B teacher (~96B) -> FSDP2 full-shard of both
+# (fsdp_shard_teacher + fsdp2_prefetch.yaml). LoRA (rank 64, 'all-linear') keeps trainable/optimizer
+# tiny. A single-node (8-GPU) feasibility test decides whether offload is needed (token-EP does
+# NOT apply to full-model experts).
 
 # ===== Environment =====
 launcher: "accelerate"
-config_file: config/accelerate_configs/fsdp2_prefetch.yaml   # FSDP2 full-shard + prefetch (shards experts+teacher)
+config_file: config/accelerate_configs/fsdp2_prefetch.yaml
 num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
 
-# ===== Data (multi-domain: geneval + ocr + pickscore, equal 1:1:1 -- 8 experts must cover domains) =====
+# ===== Data (OCR-only) =====
 data:
   dataset_dir: "dataset/geneval"
   dataset_dirs:
-    - "dataset/geneval"
     - "dataset/ocr"
-    - "dataset/pickscore"
   preprocessing_batch_size: 32
   dataloader_num_workers: 16
   force_reprocess: false
@@ -34,12 +29,12 @@ data:
   max_dataset_size: null
   sampler_type: "auto"
 
-# ===== Model (8-expert velocity-space MoF student; LoRA on base-copy experts + shared router) =====
+# ===== Model (8-expert velocity MoF; copy-8 from base; per-token top-2; LoRA rank 64 / all-linear) =====
 model:
   finetune_type: "lora"
   lora_rank: 64
   lora_alpha: 128
-  target_modules: "all"                   # LoRA all linears of the experts + router (rank 64 >> N=8 -> router fully expressive)
+  target_modules: "all-linear"
   model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
   model_type: "flux2-klein"
   resume_path: null
@@ -47,24 +42,24 @@ model:
   # --- MoF-V construction ---
   mof_enabled: true
   mof_num_experts: 8
-  mof_top_k: 2                            # blend top-2 experts per token
+  mof_top_k: 2
   mof_route_granularity: "token"          # per-token routing (runs all 8 experts; top-k sparsifies the blend)
-  mof_router_type: "token_linear"         # per-token gate on input latent + timestep
-  mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry -> no base noise needed
+  mof_router_type: "token_linear"         # one shared per-token gate on input latent + timestep
+  mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_mofv8_l1"
+  run_name: "flux2klein_32b_to_4b_mof8_base"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
-  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"   # shared cephfs
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
   save_freq: 50
   save_model_only: true
 
-# ===== Training (XOPD joint distill to dev-32B) =====
+# ===== Training (XOPD distill to dev-32B, OCR-only) =====
 train:
   trainer_type: "xopd"
-  fsdp_shard_teacher: true                # wrap the 8-expert MoF student + 32B teacher in one ModelBundle FSDP root
+  fsdp_shard_teacher: true                # shard the 8-expert MoF student + 32B teacher in one ModelBundle FSDP root
   max_epochs: 500
 
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
@@ -90,19 +85,19 @@ train:
   kl_type: "x-based"
   kl_beta: 0.0
 
-  moe_load_balance_coeff: 0.01            # reused for the MoF router load-balance aux (keep all 8 experts used)
-  source_ratio: {geneval: 1, ocr: 1, pickscore: 1}   # 1:1:1 -> 2 batches/source/epoch
+  moe_load_balance_coeff: 0.01            # reused for the MoF router load-balance aux
+  source_ratio: {ocr: 1}
 
   resolution: 512
   num_inference_steps: 28
   per_device_batch_size: 1
   group_size: 1
-  unique_sample_num_per_epoch: 192        # 3 x 64: each source 64/epoch. num_batches_per_epoch = 6; GAS auto = 6*28.
+  unique_sample_num_per_epoch: 64
   gradient_step_per_epoch: 1
   num_inner_epochs: 1
   gradient_accumulation_steps: auto
 
-  learning_rate: 1.0e-4                   # LoRA (matches the E1/E2 LoRA expert runs)
+  learning_rate: 1.0e-4
   adam_weight_decay: 1.0e-4
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8
@@ -112,7 +107,7 @@ train:
   ema_update_interval: 4
   ema_device: "cuda"
 
-  enable_gradient_checkpointing: false    # OFF: fsdp2_prefetch.yaml fsdp_activation_checkpointing handles AC (avoid double-AC)
+  enable_gradient_checkpointing: false    # FSDP activation checkpointing handles AC (avoid double-AC)
   offload_samples_to_cpu: false
   seed: 42
 
@@ -124,7 +119,7 @@ scheduler:
   sde_steps: null
   seed: 42
 
-# ===== Evaluation (eval @ 512px = train res; eval pbs = train pbs = 1) =====
+# ===== Evaluation (eval @ 512 on all 3 domains) =====
 eval:
   resolution: 512
   per_device_batch_size: 1
