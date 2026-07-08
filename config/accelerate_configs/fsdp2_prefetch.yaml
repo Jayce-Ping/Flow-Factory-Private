@@ -1,0 +1,32 @@
+# FSDP2 (fully_shard) tuned for the large N=8 weight-space MoE + FSDP-sharded 32B teacher.
+# Full-shard (low peak memory) + forward prefetch (overlap the next unit's all-gather with
+# current compute) + CPU-RAM-efficient loading (rank-0 loads, shards are distributed) so each
+# rank does NOT materialize the full ~53B (MoE + teacher) bundle -- that per-rank materialization
+# is what OOMed the N=2 full-shard smoke run with cpu_ram_efficient_loading=false.
+#
+# FSDP2 does backward prefetch implicitly (no fsdp_backward_prefetch key; that is FSDP1-only).
+# Use with model.fsdp_shard_teacher: true (ModelBundle wraps student+teacher as one FSDP root).
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+downcast_bf16: 'no'
+fsdp_config:
+  fsdp_version: 2
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_forward_prefetch: true            # overlap next transformer block's all-gather with current compute
+  fsdp_offload_params: false
+  fsdp_reshard_after_forward: true       # FULL_SHARD: reshard after forward -> low peak memory (required for the big MoE+teacher bundle; SHARD_GRAD_OP/false would keep ~full model resident and OOM)
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_cpu_ram_efficient_loading: true   # rank-0 CPU load + distribute shards -> avoids per-rank full-model materialization (the N-large load-OOM)
+  fsdp_activation_checkpointing: true    # FSDP-side AC (set model enable_gradient_checkpointing: false to avoid double-AC)
+  fsdp_sync_module_states: true
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1                          # placeholder; ff-train/cli.py overrides to NUM_MACHINES*GPUS_PER_NODE
+num_processes: 8                         # placeholder; overridden at launch (4 nodes x 8 = 32)
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
