@@ -920,7 +920,7 @@ class BaseAdapter(ABC):
             if modules == 'default':
                 modules = self.default_target_modules
             elif modules == 'all':
-                modules = 'all' # Keep as 'all' for PEFT
+                modules = 'all-linear'  # PEFT's all-linear sentinel (bare 'all' is rejected by PEFT)
             elif not modules:
                 logger.warning(f"No target modules for {comp}, skipping LoRA")
                 continue

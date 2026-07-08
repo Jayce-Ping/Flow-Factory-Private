@@ -351,6 +351,9 @@ class Flux2MoETransformer2DModel(
     _supports_gradient_checkpointing = True
     _no_split_modules = ["Flux2MoETransformerBlock", "Flux2MoESingleTransformerBlock"]
     _repeated_blocks = ["Flux2MoETransformerBlock", "Flux2MoESingleTransformerBlock"]
+    # The XOPD teacher is a plain dev transformer, NOT this MoE class; the adapter reads this to
+    # load the teacher as a Flux2Transformer2DModel (see load_teacher_transformer).
+    teacher_transformer_cls = Flux2Transformer2DModel
 
     @register_to_config
     def __init__(

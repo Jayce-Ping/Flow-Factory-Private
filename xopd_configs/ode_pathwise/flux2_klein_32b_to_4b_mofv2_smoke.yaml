@@ -1,0 +1,128 @@
+# SMOKE config for Config 2 (velocity-space MoF): N=2 experts, eval+save OFF, few epochs, bs=1.
+# Purpose: on a free-GPU window, verify the MoF-V path end-to-end -- build (2x4B experts + router)
+# + FSDP2 full-shard of experts+teacher + N expert forwards + per-token velocity blend + L1 to the
+# dev-32B teacher + the router load-balance aux -- CHEAPLY (2 forwards, OCR-only, no eval/save).
+# Flip mof_route_granularity to 'sample' to smoke the per-sample (top-k-forward) path too.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/accelerate_configs/fsdp2_prefetch.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (OCR-only = cheapest single source) =====
+data:
+  dataset_dir: "dataset/ocr"
+  dataset_dirs:
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (2-expert MoF-V; LoRA base copies + router) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+  mof_enabled: true
+  mof_num_experts: 2
+  mof_top_k: 1
+  mof_route_granularity: "token"          # flip to 'sample' to smoke the per-sample path
+  mof_router_type: "token_linear"
+  mof_noise_std: 0.0
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_mofv2_smoke"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "none"
+  save_dir: "saves/"
+  save_freq: 0                            # save OFF
+  save_model_only: true
+
+# ===== Training =====
+train:
+  trainer_type: "xopd"
+  fsdp_shard_teacher: true
+  max_epochs: 3
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  moe_load_balance_coeff: 0.01
+  source_ratio: {ocr: 1}
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.0                          # EMA off for the smoke
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (OFF) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 0                            # eval OFF
+  seed: 42
+  test_sets:
+    - {name: ocr_gs1, dataset_dir: dataset/ocr, split: test, guidance_scale: 1.0, eval_reward_names: []}
+
+# ===== Rewards (logging only) =====
+rewards:
+  - {name: "ocr", reward_model: "ocr", batch_size: 64, device: "cpu", dtype: float32, async_reward: false}

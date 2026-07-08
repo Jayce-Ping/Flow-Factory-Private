@@ -127,6 +127,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 self.model_args.model_name_or_path, low_cpu_mem_usage=False
             )
         self._maybe_build_moe_transformer(pipeline)
+        self._maybe_build_mof_transformer(pipeline)
         return pipeline
 
     def _maybe_build_moe_transformer(self, pipeline: Flux2KleinPipeline) -> None:
@@ -182,10 +183,45 @@ class Flux2KleinAdapter(BaseAdapter):
             f"router={moe.config.router_type}, init={self.model_args.moe_init})"
         )
 
+    def _maybe_build_mof_transformer(self, pipeline: Flux2KleinPipeline) -> None:
+        """When ``model_args.mof_enabled``, replace the plain student transformer with a
+        velocity-space MoF (``Flux2VelocityMoFTransformer2DModel``): N independent full
+        transformers whose output velocities are blended by a shared router. Built from the
+        just-loaded base (before freezing / LoRA / precision). The teacher stays a plain
+        transformer (see ``teacher_transformer_cls``)."""
+        if not getattr(self.model_args, "mof_enabled", False):
+            return
+        from .flux2_mof_velocity import Flux2VelocityMoFTransformer2DModel
+
+        base_tf = pipeline.transformer
+        common = dict(
+            num_experts=self.model_args.mof_num_experts,
+            top_k=self.model_args.mof_top_k,
+            route_granularity=self.model_args.mof_route_granularity,
+            router_type=self.model_args.mof_router_type,
+            router_hidden_dim=self.model_args.mof_router_hidden_dim,
+            noise_std=self.model_args.mof_noise_std,
+        )
+        if self.model_args.mof_base_transformer_path:
+            mof = Flux2VelocityMoFTransformer2DModel.from_base_replicated(
+                self.model_args.mof_base_transformer_path, **common,
+            )
+        else:
+            mof = Flux2VelocityMoFTransformer2DModel.from_base_model(base_tf, **common)
+
+        mof = mof.to(device=base_tf.device, dtype=base_tf.dtype)
+        pipeline.transformer = mof
+        del base_tf
+        logger.info(
+            f"[MoF-V] student transformer -> Flux2VelocityMoFTransformer2DModel "
+            f"(num_experts={mof.config.num_experts}, top_k={mof.config.top_k}, "
+            f"granularity={mof.config.route_granularity}, router={mof.config.router_type})"
+        )
+
     def collect_moe_aux_loss(self) -> Optional[torch.Tensor]:
-        """MoE load-balancing aux loss from the last student forward, or None if the
-        student is not a weight-space MoE. Consumed by the XOPD trainer, scaled by
-        ``training_args.moe_load_balance_coeff``."""
+        """MoE / MoF load-balancing aux loss from the last student forward, or None if the
+        student is neither a weight-space MoE nor a velocity-space MoF. Consumed by the XOPD
+        trainer, scaled by ``training_args.moe_load_balance_coeff``."""
         tf = self._unwrap(self.transformer)
         if hasattr(tf, "_orig_mod"):  # torch.compile
             tf = tf._orig_mod
@@ -1507,7 +1543,11 @@ class Flux2KleinAdapter(BaseAdapter):
         if dtype is None:
             dtype = self.pipeline.transformer.dtype
 
-        transformer_cls = type(self.pipeline.transformer)
+        # The XOPD teacher is a PLAIN transformer checkpoint (e.g. FLUX.2-dev). When the student is a
+        # wrapper (weight-space MoE / velocity-space MoF), its class cannot load the plain checkpoint,
+        # so those wrappers expose ``teacher_transformer_cls`` (the base ``Flux2Transformer2DModel``).
+        student_tf = self.pipeline.transformer
+        transformer_cls = getattr(student_tf, "teacher_transformer_cls", type(student_tf))
         teacher = transformer_cls.from_pretrained(
             teacher_path,
             subfolder="transformer",

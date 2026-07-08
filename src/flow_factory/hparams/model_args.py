@@ -174,6 +174,47 @@ class ModelArguments(ArgABC):
                           "single-block projection (single-block attention then drifts and is discarded)."},
     )
 
+    # --- Velocity-space Mixture-of-Flow (MoF-V; Flux2 Klein only) ---
+    mof_enabled: bool = field(
+        default=False,
+        metadata={"help": "Build a velocity-space MoF student (Flux2VelocityMoFTransformer2DModel): N "
+                          "independent full transformers whose output velocities are blended by a shared "
+                          "router. Mutually exclusive with moe_enabled. Flux2 Klein only."},
+    )
+    mof_num_experts: int = field(
+        default=4,
+        metadata={"help": "Number of independent MoF-V experts (full transformers). Ignored unless mof_enabled."},
+    )
+    mof_top_k: int = field(
+        default=1,
+        metadata={"help": "Experts blended per token/sample (top-k). Ignored unless mof_enabled."},
+    )
+    mof_route_granularity: Literal['token', 'sample'] = field(
+        default='token',
+        metadata={"help": "MoF-V routing: 'token' (run all N experts, blend per token; top-k only sparsifies "
+                          "the blend) or 'sample' (run only the top-k experts each sample routed to; at "
+                          "per_device_batch_size=1 this is exactly top-k forwards)."},
+    )
+    mof_router_type: Literal['token_linear', 'global'] = field(
+        default='token_linear',
+        metadata={"help": "MoF-V router: 'token_linear' (per-token linear gate on the input latent + timestep) "
+                          "or 'global' (per-sample gate on pooled prompt + timestep; route_granularity='sample' only)."},
+    )
+    mof_noise_std: float = field(
+        default=0.0,
+        metadata={"help": "Std of per-expert Gaussian noise at MoF-V init (symmetry breaking). With LoRA the "
+                          "gaussian adapter init already breaks symmetry, so this defaults to 0."},
+    )
+    mof_router_hidden_dim: int = field(
+        default=256,
+        metadata={"help": "Hidden dim for the MoF-V 'global' router (unused for 'token_linear')."},
+    )
+    mof_base_transformer_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "For mof_enabled: replicate THIS transformer (HF repo id or local dir; subfolder "
+                          "'transformer') into the N experts instead of model_name_or_path."},
+    )
+
     def __post_init__(self):        
         if isinstance(self.master_weight_dtype, str):
             self.master_weight_dtype = dtype_map[self.master_weight_dtype]
@@ -189,6 +230,12 @@ class ModelArguments(ArgABC):
 
         if self.lora_alpha is None:
             self.lora_alpha = 2 * self.lora_rank
+
+        if self.moe_enabled and self.mof_enabled:
+            raise ValueError(
+                "moe_enabled (weight-space MoE) and mof_enabled (velocity-space MoF) are mutually "
+                "exclusive; set exactly one."
+            )
 
         self.resume_path = os.path.expanduser(self.resume_path) if self.resume_path is not None else None
 
