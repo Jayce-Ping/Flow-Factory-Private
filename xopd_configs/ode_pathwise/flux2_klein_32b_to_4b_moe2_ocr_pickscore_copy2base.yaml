@@ -19,8 +19,7 @@ mixed_precision: "bf16"
 data:
   dataset_dir: "dataset/geneval"
   dataset_dirs:
-    - "dataset/ocr"
-    - "dataset/pickscore"
+    - "dataset/ocr"                        # OCR-ONLY mix-train (head-to-head vs single-ocr)
   preprocessing_batch_size: 32
   dataloader_num_workers: 16
   force_reprocess: false
@@ -85,13 +84,13 @@ train:
   kl_beta: 0.0
 
   moe_load_balance_coeff: 0.01
-  source_ratio: {ocr: 1, pickscore: 1}
+  source_ratio: {ocr: 1}                  # OCR-only
 
   resolution: 512
   num_inference_steps: 28
   per_device_batch_size: 1
   group_size: 1
-  unique_sample_num_per_epoch: 128
+  unique_sample_num_per_epoch: 64         # OCR-only = single-ocr baseline
   gradient_step_per_epoch: 1
   num_inner_epochs: 1
   gradient_accumulation_steps: auto
