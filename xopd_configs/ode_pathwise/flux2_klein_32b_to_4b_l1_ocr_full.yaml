@@ -1,9 +1,9 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# FULL-RANK (non-LoRA) single-domain OCR, MLP-ONLY: 4B student distilled from the 32B
-# teacher on OCR prompts. target_modules is restricted to the DOUBLE-stream MLP
-# (ff/ff_context) so this ONE run doubles as (a) Gate A -- does full-rank MLP-only FT
-# break the OCR ceiling LoRA hit (~0.61/0.68 vs teacher 0.82) -- and (b) OCR expert E1
-# for the MoE merge (save_freq>0; losslessly mergeable, shared backbone). eval @ 512px.
+# LoRA-on-MLP single-domain OCR (OCR expert E1): 4B student distilled from the 32B teacher
+# on OCR prompts. LoRA (rank 64, alpha 128) on the DOUBLE-stream MLP (ff/ff_context) only --
+# faster + more expressive than full-rank@1e-5 (which converged too slowly). The saved LoRA
+# adapter is merged to full MLP weights on load (from_expert_checkpoints -> merge_and_unload),
+# so it is still losslessly mergeable into the MoE expert bank. eval @ 512px.
 # Cross-FAMILY distillation: teacher and student share the VAE / latent space
 # (AutoencoderKLFlux2, in_channels=128) but use DIFFERENT text encoders -- dev's
 # Mistral3 (dim 15360) vs klein's Qwen3 (dim 7680). Teacher text embeddings are
@@ -35,12 +35,14 @@ data:
   max_dataset_size: null                  # Truncate dataset size; null = no limit
   sampler_type: "auto"                    # Sampler. Options: auto, distributed_k_repeat, group_contiguous
 
-# ===== Model (student = the small model being trained, FULL finetune) =====
+# ===== Model (student = OCR expert E1, LoRA on the double-stream MLP) =====
 model:
-  finetune_type: "full"                   # full-rank (vs LoRA); restricted to the double-stream MLP below (aligns with ocr/pickscore experts -> lossless MoE merge)
-  target_modules:                         # DOUBLE-stream MLP ONLY (ff/ff_context) -- matches *_ocr_expert / *_pickscore_expert, so this run IS OCR expert E1.
-    - "ff.linear_in"                      # (single-stream MLP is fused with QKV/attn-out in one tensor each and cannot be
-    - "ff.linear_out"                     #  isolated by substrings, so it stays == base and is re-specialized during the MoE mix-train.)
+  finetune_type: "lora"                   # LoRA (faster + more expressive than full-rank@1e-5); merged to full MLP weights on load for the MoE
+  lora_rank: 64                           # expressiveness
+  lora_alpha: 128                         # scale (alpha/r = 2.0)
+  target_modules:                         # DOUBLE-stream MLP ONLY (ff/ff_context) -- PEFT suffix-match; merged delta is losslessly mergeable into the MoE expert bank
+    - "ff.linear_in"
+    - "ff.linear_out"
     - "ff_context.linear_in"
     - "ff_context.linear_out"
   model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"  # Student path (HF repo id or local)
@@ -50,7 +52,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_baseline_l0w0_ocr_full"  # Full-FT single-ocr
+  run_name: "flux2klein_32b_to_4b_l1_ocr_lora_mlp_E1"  # LoRA-on-MLP OCR expert (E1)
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"                      # Checkpoint / log directory
@@ -102,7 +104,7 @@ train:
   gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps
 
   # --- Optimizer ---
-  learning_rate: 1.0e-5                   # Learning rate (lower than LoRA's 1e-4: full-FT moves all 4B params, keep it stable)
+  learning_rate: 1.0e-4                   # LoRA LR (matches the eval-512 LoRA baseline that reached ~0.55; vs full-FT's 1e-5)
   adam_weight_decay: 1.0e-4               # AdamW weight decay
   adam_betas: [0.9, 0.999]               # AdamW betas
   adam_epsilon: 1.0e-8                   # AdamW epsilon

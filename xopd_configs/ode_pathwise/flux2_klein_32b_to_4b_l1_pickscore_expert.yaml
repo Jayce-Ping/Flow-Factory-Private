@@ -1,11 +1,10 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# PICKSCORE EXPERT for the MoE merge ablation. Identical recipe to *_ocr_expert
-# (full-FT restricted to the DOUBLE-stream MLP ff/ff_context) but trained on the PickScore
-# prompt set. Paired with the OCR expert to seed the 2-expert MoE (merge config A).
-#
-# See *_ocr_expert for why only the double-stream MLP is trained (single-stream MLP is
-# fused with attention in one tensor and can't be isolated by target_modules); the merge
-# is therefore lossless MLP-only and the MoE mix-train re-specializes the single stream.
+# PICKSCORE EXPERT (E2) for the MoE merge. LoRA (rank 64, alpha 128) on the DOUBLE-stream
+# MLP (ff/ff_context) only, trained on the PickScore prompt set. Paired with the OCR expert
+# (E1) to seed the 2-expert MoE (merge config A). LoRA converges faster / is more expressive
+# than full-rank@1e-5; the saved adapter is merged to full MLP weights on load
+# (from_expert_checkpoints -> merge_and_unload), so it stays losslessly mergeable into the MoE
+# expert bank (single-stream MLP stays == base and is re-specialized during the mix-train).
 # save_freq>0: consumed by the merge config (moe_expert_paths).
 
 # ===== Environment =====
@@ -27,10 +26,12 @@ data:
   max_dataset_size: null
   sampler_type: "auto"
 
-# ===== Model (student = PickScore expert, full-FT restricted to MoE-able MLP layers) =====
+# ===== Model (student = PickScore expert E2, LoRA on the double-stream MLP) =====
 model:
-  finetune_type: "full"
-  target_modules:                         # DOUBLE-stream MLP ONLY (see header); lossless mergeable
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules:                         # DOUBLE-stream MLP ONLY (see header); PEFT suffix-match; lossless mergeable after merge_and_unload
     - "ff.linear_in"
     - "ff.linear_out"
     - "ff_context.linear_in"
@@ -42,7 +43,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_l1_pickscore_expert"   # PickScore expert (MLP-able) for MoE merge
+  run_name: "flux2klein_32b_to_4b_l1_pickscore_lora_mlp_E2"   # LoRA-on-MLP PickScore expert (E2)
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -86,7 +87,7 @@ train:
   num_inner_epochs: 1
   gradient_accumulation_steps: auto
 
-  learning_rate: 1.0e-5
+  learning_rate: 1.0e-4                   # LoRA LR (vs full-FT's 1e-5); faster convergence
   adam_weight_decay: 1.0e-4
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8

@@ -24,6 +24,7 @@ See the plan ``moe_expert-merge_feasibility`` section 12 for the full spec.
 """
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import torch
@@ -569,7 +570,7 @@ class Flux2MoETransformer2DModel(
         weights match (fail loud otherwise) -> lossless merge; take each expert's MLP.
         ``noise_std`` > 0 adds per-expert Gaussian noise to the extracted MLPs (needed to
         break symmetry when the same checkpoint is passed for multiple experts)."""
-        experts = [Flux2Transformer2DModel.from_pretrained(p, subfolder=subfolder) for p in ckpt_paths]
+        experts = [cls._load_expert_transformer(p, base_path, subfolder) for p in ckpt_paths]
         base = Flux2Transformer2DModel.from_pretrained(base_path, subfolder=subfolder) if base_path else experts[0]
         num_experts = len(experts)
 
@@ -579,6 +580,38 @@ class Flux2MoETransformer2DModel(
         model._load_shared_from_base(base)
         model._load_experts_from_base(base, experts, noise_std=noise_std)
         return model.to(dtype=next(base.parameters()).dtype)
+
+    @staticmethod
+    def _load_expert_transformer(path: str, base_path: Optional[str], subfolder: str) -> "Flux2Transformer2DModel":
+        """Load one expert as a FULL-weight ``Flux2Transformer2DModel``.
+
+        If ``path`` is a PEFT LoRA adapter (``adapter_config.json`` present), merge it onto
+        the frozen shared base (``W' = W + (B@A) * alpha/r`` via PEFT ``merge_and_unload``)
+        so the caller always receives plain full MLP weights (backbone == base, MLP ==
+        base+delta -> ``_assert_backbones_match`` still holds). Otherwise load full weights
+        directly. Handles both the HF layout (weights under ``subfolder``) and Flow-Factory's
+        ``checkpoint-N/`` root layout (``config.json`` / ``adapter_config.json`` in root)."""
+        from ...utils.checkpoint import is_lora_checkpoint
+
+        if is_lora_checkpoint(path):
+            if base_path is None:
+                raise ValueError(
+                    f"Expert checkpoint {path!r} is a LoRA adapter but base_path is None; "
+                    "pass base_path (the frozen shared base) so the adapter can be merged "
+                    "into full weights before building the MoE expert bank."
+                )
+            adapter_dir = (
+                path if os.path.isfile(os.path.join(path, "adapter_config.json"))
+                else os.path.join(path, "transformer")
+            )
+            base_for_merge = Flux2Transformer2DModel.from_pretrained(base_path, subfolder=subfolder)
+            from peft import PeftModel
+
+            return PeftModel.from_pretrained(base_for_merge, adapter_dir).merge_and_unload()
+        # Full weights: Flow-Factory writes config.json in the checkpoint root; HF repos nest under `subfolder`.
+        if os.path.isfile(os.path.join(path, "config.json")):
+            return Flux2Transformer2DModel.from_pretrained(path)
+        return Flux2Transformer2DModel.from_pretrained(path, subfolder=subfolder)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

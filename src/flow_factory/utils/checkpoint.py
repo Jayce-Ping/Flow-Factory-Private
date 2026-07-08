@@ -47,6 +47,21 @@ def mapping_lora_state_dict(
     return new_state_dict
 
 
+def is_lora_checkpoint(path: str) -> bool:
+    """True iff a saved checkpoint directory is a PEFT LoRA adapter (not a full model).
+
+    Flow-Factory's ``_save_lora`` writes ``adapter_config.json`` +
+    ``adapter_model.safetensors`` (``PeftModel.save_pretrained``); a full run writes
+    ``config.json`` + ``diffusion_pytorch_model.safetensors``. We treat the presence of
+    ``adapter_config.json`` (in the directory root or a ``transformer/`` subfolder) as the
+    LoRA signal, matching ``BaseAdapter._detect_checkpoint_type``.
+    """
+    for d in (path, os.path.join(path, "transformer")):
+        if os.path.isfile(os.path.join(d, "adapter_config.json")):
+            return True
+    return False
+
+
 # ================================ Config Inference ================================
 def infer_lora_rank(state_dict: Dict[str, torch.Tensor]) -> int:
     """
