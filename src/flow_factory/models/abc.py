@@ -1147,10 +1147,13 @@ class BaseAdapter(ABC):
                 # This `requires_grad` trick does not work correctly. Don't know why.
                 original_state = {}
                 
-                # Freeze unwanted params
+                # Freeze unwanted params. lora_keys are SUBSTRINGS (e.g. "lora_A") while
+                # `name` is the full param path, so match by substring (strict=False); the old
+                # strict=True exact-match marked nothing -> empty LoRA state dict (the "does not
+                # work correctly" note above).
                 for name, param in model.named_parameters():
                     original_state[name] = param.requires_grad
-                    param.requires_grad = is_param_match_key(name, state_dict_keys)
+                    param.requires_grad = is_param_match_key(name, state_dict_keys, strict=False)
                 
                 options = StateDictOptions(
                     full_state_dict=True,
@@ -1222,9 +1225,34 @@ class BaseAdapter(ABC):
         model: torch.nn.Module,
         save_directory: str,
     ) -> None:
-        """Save LoRA adapter with distributed training support."""        
+        """Save LoRA adapter with distributed training support."""
+        # FSDP-bundle path (XOPD fsdp_shard_teacher): the "transformer" component is a
+        # RoutedComponentProxy over the student PeftModel that lives inside an FSDP-wrapped
+        # ModelBundle. accelerator.unwrap_model cannot see the PeftModel through the proxy, so
+        # gather the LoRA state dict from the bundle FSDP root, strip the "members.<name>."
+        # prefix, and save via the inner PeftModel -> a clean adapter instead of a full-model
+        # fallback (which otherwise writes the entire 13-64GB model every checkpoint).
+        bundle = getattr(self, "_xopd_bundle", None)
+        inner = getattr(model, "inner", None)
+        if bundle is not None and isinstance(inner, PeftModel):
+            root = self.accelerator.unwrap_model(bundle)
+            prefix = None
+            for mname, mmod in getattr(root, "members", {}).items():
+                if mmod is inner:
+                    prefix = f"members.{mname}."
+                    break
+            state_dict = self.get_state_dict(
+                bundle, unwrap=True, state_dict_keys=self.lora_keys, ignore_frozen_params=True,
+            )
+            if prefix:
+                state_dict = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+            if self.accelerator.is_main_process:
+                inner.save_pretrained(save_directory, state_dict=state_dict)
+            self.accelerator.wait_for_everyone()
+            return
+
         unwrapped = self.accelerator.unwrap_model(model)
-        
+
         if not isinstance(unwrapped, PeftModel):
             logger.warning(f"Model is not a PeftModel, falling back to full save.")
             self._save_full_model(
