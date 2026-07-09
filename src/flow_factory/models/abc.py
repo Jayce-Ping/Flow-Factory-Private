@@ -934,6 +934,16 @@ class BaseAdapter(ABC):
 
             model_component = self.get_component(comp)
 
+            # Shared-base multi-adapter models (MoF expert_mode='shared_lora') build their own N
+            # named expert adapters on the single base, instead of one whole-model PEFT wrap.
+            if getattr(getattr(model_component, "config", None), "expert_mode", None) == "shared_lora":
+                model_component.apply_expert_lora(
+                    self.model_args.lora_rank, self.model_args.lora_alpha, modules,
+                )
+                results[comp] = model_component
+                logger.info(f"Applied shared-base multi-adapter LoRA to {comp} (expert_mode=shared_lora)")
+                continue
+
             if isinstance(model_component, PeftModel):
                 # Already a PeftModel, check for existing adapter
                 has_default = "default" in model_component.peft_config
@@ -1262,6 +1272,21 @@ class BaseAdapter(ABC):
         save_directory: str,
     ) -> None:
         """Save LoRA adapter with distributed training support."""
+        # Shared-base multi-adapter MoF (expert_mode='shared_lora'): the trainable state is N LoRA
+        # adapters on ONE base + a fully-trained router. Delegate to the model's own saver (writes
+        # <dir>/expert_e/ adapters + <dir>/mof_router.pt). DDP replicates -> rank 0 has full weights.
+        unwrapped_sl = self.accelerator.unwrap_model(model)
+        unwrapped_sl = getattr(unwrapped_sl, "inner", unwrapped_sl)
+        if getattr(getattr(unwrapped_sl, "config", None), "expert_mode", None) == "shared_lora":
+            if self.accelerator.is_main_process:
+                unwrapped_sl.save_expert_adapters(save_directory)
+                logger.info(
+                    f"Saved shared_lora MoF ({unwrapped_sl.config.num_experts} expert adapters + router) "
+                    f"-> {save_directory}"
+                )
+            self.accelerator.wait_for_everyone()
+            return
+
         # FSDP-bundle path (XOPD fsdp_shard_teacher): the "transformer" component is a
         # RoutedComponentProxy over the student PeftModel that lives inside an FSDP-wrapped
         # ModelBundle. accelerator.unwrap_model cannot see the PeftModel through the proxy, so
@@ -1664,7 +1689,16 @@ class BaseAdapter(ABC):
             )
             
             unwrapped = self.accelerator.unwrap_model(component)
-            
+
+            # Shared-base multi-adapter MoF: N adapters live in <dir>/expert_e/ + router in
+            # <dir>/mof_router.pt (not a single root adapter_config.json). apply_lora already built
+            # the adapter slots -> just reload weights via the model's own loader.
+            unwrapped_sl = getattr(unwrapped, "inner", unwrapped)
+            if getattr(getattr(unwrapped_sl, "config", None), "expert_mode", None) == "shared_lora":
+                unwrapped_sl.load_expert_adapters(comp_path)
+                logger.info(f"Loaded shared_lora MoF adapters + router from {comp_path}")
+                continue
+
             # Auto-detect checkpoint format
             adapter_config_path = os.path.join(comp_path, LORA_ADAPTER_CONFIG_NAME)
             has_config_file = os.path.exists(adapter_config_path)
@@ -1822,6 +1856,11 @@ class BaseAdapter(ABC):
             else [path]
         )
         for check_path in paths_to_check:
+            # Shared-base multi-adapter MoF signature (adapters in subdirs + router file).
+            if os.path.exists(os.path.join(check_path, "mof_router.pt")):
+                if self.accelerator.is_main_process:
+                    logger.info(f"Auto-detected shared_lora MoF checkpoint at {check_path}")
+                return 'lora'
             if os.path.exists(os.path.join(check_path, LORA_ADAPTER_CONFIG_NAME)):
                 if self.accelerator.is_main_process:
                     logger.info(f"Auto-detected LoRA checkpoint at {check_path}")

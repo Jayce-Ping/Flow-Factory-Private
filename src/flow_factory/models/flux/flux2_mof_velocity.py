@@ -89,12 +89,15 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         route_granularity: str = "token",
         router_type: str = "token_linear",
         router_hidden_dim: int = 256,
+        expert_mode: str = "distinct",
     ):
         super().__init__()
         if route_granularity not in ("token", "sample"):
             raise ValueError(f"route_granularity must be 'token' or 'sample', got {route_granularity!r}")
         if router_type not in ("token_linear", "global"):
             raise ValueError(f"router_type must be 'token_linear' or 'global', got {router_type!r}")
+        if expert_mode not in ("distinct", "shared_lora"):
+            raise ValueError(f"expert_mode must be 'distinct' or 'shared_lora', got {expert_mode!r}")
         if num_experts < 1:
             raise ValueError(f"num_experts must be >= 1, got {num_experts}")
         if top_k < 1 or top_k > num_experts:
@@ -103,6 +106,11 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             raise ValueError(
                 "router_type='global' is per-sample only; use route_granularity='sample' "
                 "(or router_type='token_linear' for per-token routing)."
+            )
+        if expert_mode == "shared_lora" and route_granularity != "sample":
+            raise ValueError(
+                "expert_mode='shared_lora' requires route_granularity='sample' (it runs the shared "
+                "base with only the top-k experts' adapters per sample); per-token would run all N."
             )
 
         base_config = dict(
@@ -115,8 +123,17 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         )
         self.inner_dim = num_attention_heads * attention_head_dim
 
-        # N independent full experts.
-        self.experts = nn.ModuleList([Flux2Transformer2DModel(**base_config) for _ in range(num_experts)])
+        # Expert storage. 'distinct': N independent full experts (max capacity; full-FT/noise>0 ok).
+        # 'shared_lora': ONE frozen base + N LoRA adapters (built at apply_expert_lora time); each
+        # expert == base + adapter_e -- identical trainable capacity to 'distinct' when noise_std=0,
+        # but 1 base instead of N (fits mof8 on DDP; only top-k adapters run per sample).
+        if expert_mode == "shared_lora":
+            self.base = Flux2Transformer2DModel(**base_config)
+            self.experts = None
+            self._expert_adapter_names: List[str] = [f"expert_{e}" for e in range(num_experts)]
+        else:
+            self.experts = nn.ModuleList([Flux2Transformer2DModel(**base_config) for _ in range(num_experts)])
+            self.base = None
 
         # Router timestep embedding (own copy so routing is decoupled from any single expert).
         self.router_time_embed = Flux2TimestepGuidanceEmbeddings(
@@ -197,7 +214,12 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             guidance=guidance, joint_attention_kwargs=joint_attention_kwargs, return_dict=False,
         )
 
-        if per_token:
+        # Expert executor seam (pluggable): 'shared_lora' runs 1 base + top-k adapters per sample;
+        # 'distinct' runs N independent experts (token blend = all N; sample = top-k). A future
+        # EP executor plugs in here for distinct experts sharded across ranks.
+        if self.config.expert_mode == "shared_lora":
+            output, topi = self._forward_sample_shared(probs, hidden_states, timestep, expert_kwargs)
+        elif per_token:
             output, topi = self._forward_token(probs, hidden_states, timestep, expert_kwargs)
         else:
             output, topi = self._forward_sample(probs, hidden_states, timestep, expert_kwargs)
@@ -267,20 +289,85 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             out.index_add_(0, idx, we * v_e)
         return out, topi
 
+    def _forward_sample_shared(self, probs, hidden_states, timestep, expert_kwargs):
+        """Shared-base per-sample blend: ONE base + per-expert LoRA adapters; run only the top-k
+        experts each sample routed to by switching ``self.base``'s ACTIVE adapter per expert.
+
+        The whole set_adapter+forward loop runs with the autocast weight-cache DISABLED -- that cache
+        is keyed by ``data_ptr`` and would otherwise serve a previous adapter's stale casted weights
+        across the switch (CLAUDE.md autocast-cache / weight-swap invariant; mirrors
+        ``flux2_klein.use_teacher_transformer``). PEFT ``set_adapter`` also freezes the inactive
+        adapters' grads, so ``set_requires_grad(all, True)`` is re-applied after every switch to keep
+        ALL adapters trainable through the backward. Returns (velocity, topi_or_None)."""
+        n, k = self.config.num_experts, self.config.top_k
+        B = hidden_states.shape[0]
+        names = self._expert_adapter_names
+
+        def _run(e: int, idx: torch.Tensor) -> torch.Tensor:
+            self.base.set_adapter(names[e])              # active = expert e (freezes inactive grads)
+            self.base.set_requires_grad(names, True)     # keep every adapter trainable across the switch
+            kw = dict(expert_kwargs)
+            kw["encoder_hidden_states"] = kw["encoder_hidden_states"].index_select(0, idx)
+            if kw["guidance"] is not None:
+                kw["guidance"] = kw["guidance"].index_select(0, idx)
+            return self.base(
+                hidden_states=hidden_states.index_select(0, idx),
+                timestep=timestep.index_select(0, idx),
+                **kw,
+            )[0]
+
+        prev_cache = torch.is_autocast_cache_enabled()
+        torch.set_autocast_cache_enabled(False)
+        try:
+            if k >= n:
+                out: Optional[torch.Tensor] = None
+                allidx = torch.arange(B, device=hidden_states.device)
+                for e in range(n):
+                    v_e = _run(e, allidx)
+                    we = probs[:, e].view(B, *([1] * (v_e.ndim - 1))).to(v_e.dtype)
+                    out = we * v_e if out is None else out + we * v_e
+                return out, None
+            topw, topi = torch.topk(probs, k, dim=-1)  # (B, k)
+            topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            w_full = torch.zeros_like(probs).scatter_(-1, topi, topw)  # (B, N)
+            out = None
+            for e in range(n):
+                sel = w_full[:, e] > 0
+                if not bool(sel.any()):
+                    continue
+                idx = sel.nonzero(as_tuple=True)[0]
+                v_e = _run(e, idx)
+                if out is None:
+                    out = v_e.new_zeros((B,) + tuple(v_e.shape[1:]))
+                we = w_full[idx, e].view(idx.shape[0], *([1] * (v_e.ndim - 1))).to(v_e.dtype)
+                out.index_add_(0, idx, we * v_e)
+            return out, topi
+        finally:
+            self.base.set_requires_grad(names, True)  # all adapters trainable at backward
+            torch.set_autocast_cache_enabled(prev_cache)
+
     # ------------------------------------------------------------------ passthroughs
+    def _expert_modules(self):
+        """Iterate the underlying expert transformer(s): the N distinct experts, or the single
+        shared base (shared_lora)."""
+        if self.experts is not None:
+            yield from self.experts
+        else:
+            yield self.base
+
     def enable_gradient_checkpointing(self):
-        for expert in self.experts:
-            expert.enable_gradient_checkpointing()
+        for m in self._expert_modules():
+            m.enable_gradient_checkpointing()
 
     def disable_gradient_checkpointing(self):
-        for expert in self.experts:
-            expert.disable_gradient_checkpointing()
+        for m in self._expert_modules():
+            m.disable_gradient_checkpointing()
 
     @contextmanager
     def cache_context(self, name: str):
         """Delegate caching to each expert (no-op if an expert has no cache configured)."""
         with contextlib.ExitStack() as stack:
-            for expert in self.experts:
+            for expert in self._expert_modules():
                 cc = getattr(expert, "cache_context", None)
                 if callable(cc):
                     stack.enter_context(cc(name))
@@ -288,7 +375,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
 
     # ------------------------------------------------------------------ init
     @staticmethod
-    def _mof_config_from_base(base, num_experts, top_k, route_granularity, router_type, router_hidden_dim) -> dict:
+    def _mof_config_from_base(base, num_experts, top_k, route_granularity, router_type,
+                             router_hidden_dim, expert_mode="distinct") -> dict:
         bc = dict(base.config)
         return dict(
             patch_size=bc["patch_size"], in_channels=bc["in_channels"], out_channels=bc.get("out_channels"),
@@ -298,7 +386,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             mlp_ratio=bc["mlp_ratio"], axes_dims_rope=tuple(bc["axes_dims_rope"]), rope_theta=bc["rope_theta"],
             eps=bc["eps"], guidance_embeds=bc.get("guidance_embeds", False),
             num_experts=num_experts, top_k=top_k, route_granularity=route_granularity,
-            router_type=router_type, router_hidden_dim=router_hidden_dim,
+            router_type=router_type, router_hidden_dim=router_hidden_dim, expert_mode=expert_mode,
         )
 
     @classmethod
@@ -311,21 +399,102 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         route_granularity: str = "token",
         router_type: str = "token_linear",
         router_hidden_dim: int = 256,
+        expert_mode: str = "distinct",
     ) -> "Flux2VelocityMoFTransformer2DModel":
-        """Init: replicate the base transformer into ``num_experts`` independent experts (each a
-        verbatim copy of the base, so the ensemble == base at init when the router is uniform).
-        ``noise_std`` > 0 adds per-expert Gaussian noise (symmetry breaking); with LoRA training
-        the gaussian LoRA init already breaks symmetry, so noise defaults to 0."""
-        model = cls(**cls._mof_config_from_base(base, num_experts, top_k, route_granularity, router_type, router_hidden_dim))
+        """Init: replicate the base transformer into the experts (each a verbatim copy of the base,
+        so the ensemble == base at init when the router is uniform).
+
+        ``expert_mode='distinct'``: N independent experts; ``noise_std`` > 0 adds per-expert Gaussian
+        noise (symmetry breaking; with LoRA the gaussian LoRA init already breaks symmetry -> noise
+        defaults to 0). ``expert_mode='shared_lora'``: ONE base (the N experts are base + per-expert
+        LoRA adapter, built later by ``apply_expert_lora``); requires ``noise_std==0`` (the frozen
+        base is shared, so a per-expert frozen perturbation would make the bases distinct)."""
+        if expert_mode == "shared_lora" and noise_std > 0:
+            raise ValueError(
+                "expert_mode='shared_lora' requires noise_std=0: the frozen base is SHARED across "
+                "experts (they differ only by LoRA), so per-expert frozen noise is impossible. Use "
+                "expert_mode='distinct' for genuinely distinct frozen bases."
+            )
+        model = cls(**cls._mof_config_from_base(
+            base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode))
         base_sd = base.state_dict()
         with torch.no_grad():
-            for e in range(num_experts):
-                model.experts[e].load_state_dict(base_sd)
-                if noise_std > 0:
-                    for p in model.experts[e].parameters():
-                        p.add_(torch.randn_like(p) * noise_std)
+            if expert_mode == "shared_lora":
+                model.base.load_state_dict(base_sd)
+            else:
+                for e in range(num_experts):
+                    model.experts[e].load_state_dict(base_sd)
+                    if noise_std > 0:
+                        for p in model.experts[e].parameters():
+                            p.add_(torch.randn_like(p) * noise_std)
             model.router_time_embed.load_state_dict(base.time_guidance_embed.state_dict())
         return model.to(dtype=next(base.parameters()).dtype)
+
+    def apply_expert_lora(self, lora_rank: int, lora_alpha: int, target_modules) -> "PeftModel":
+        """shared_lora: wrap ``self.base`` in PEFT with N named adapters (``expert_0..expert_{N-1}``),
+        each a LoRA over ``target_modules`` (typically 'all-linear'), ALL trainable. The router
+        (``self.router`` + ``self.router_time_embed``) is small -> trained FULLY. Called by the
+        adapter's ``apply_lora`` for a shared_lora MoF (instead of the generic whole-model wrap).
+        Idempotent: no-op if the base is already a PeftModel."""
+        from peft import LoraConfig, PeftModel, get_peft_model
+
+        if self.experts is not None:
+            raise RuntimeError("apply_expert_lora is only valid for expert_mode='shared_lora'.")
+        if isinstance(self.base, PeftModel):
+            self.base.set_requires_grad(self._expert_adapter_names, True)
+        else:
+            cfg = LoraConfig(
+                r=lora_rank, lora_alpha=lora_alpha, init_lora_weights="gaussian",
+                target_modules=target_modules,
+            )
+            names = self._expert_adapter_names
+            self.base = get_peft_model(self.base, cfg, adapter_name=names[0])
+            for nm in names[1:]:
+                self.base.add_adapter(nm, cfg)  # fresh gaussian init per adapter -> distinct experts
+            self.base.set_requires_grad(names, True)  # every adapter trainable (set_adapter froze inactive)
+        # router trained in full precision (tiny; must differentiate experts)
+        self.router.requires_grad_(True)
+        self.router_time_embed.requires_grad_(True)
+        return self.base
+
+    # ------------------------------------------------------------------ shared_lora save/load
+    def save_expert_adapters(self, save_directory: str) -> None:
+        """shared_lora: save the N LoRA adapters (each under ``<dir>/expert_e/``) plus the
+        fully-trained router (``<dir>/mof_router.pt``). Call on the main process only."""
+        import os
+
+        from peft import PeftModel
+
+        if not isinstance(self.base, PeftModel):
+            raise RuntimeError("save_expert_adapters requires apply_expert_lora to have run (base is not a PeftModel).")
+        os.makedirs(save_directory, exist_ok=True)
+        # PEFT saves each non-'default' adapter into <save_directory>/<adapter_name>/.
+        self.base.save_pretrained(save_directory)
+        router_sd = {f"router.{k}": v for k, v in self.router.state_dict().items()}
+        router_sd.update({f"router_time_embed.{k}": v for k, v in self.router_time_embed.state_dict().items()})
+        torch.save(router_sd, os.path.join(save_directory, "mof_router.pt"))
+
+    def load_expert_adapters(self, save_directory: str) -> None:
+        """Inverse of :meth:`save_expert_adapters`: load the N adapters + router into this model
+        (which must already have run ``apply_expert_lora`` so the adapter slots exist)."""
+        import os
+
+        from peft import PeftModel
+
+        if not isinstance(self.base, PeftModel):
+            raise RuntimeError("load_expert_adapters requires apply_expert_lora to have run first.")
+        for name in self._expert_adapter_names:
+            if name in self.base.peft_config:
+                self.base.delete_adapter(name)
+            self.base.load_adapter(os.path.join(save_directory, name), adapter_name=name)
+        self.base.set_requires_grad(self._expert_adapter_names, True)
+        router_sd = torch.load(os.path.join(save_directory, "mof_router.pt"), map_location="cpu")
+        self.router.load_state_dict(
+            {k[len("router."):]: v for k, v in router_sd.items() if k.startswith("router.")}
+        )
+        self.router_time_embed.load_state_dict(
+            {k[len("router_time_embed."):]: v for k, v in router_sd.items() if k.startswith("router_time_embed.")}
+        )
 
     @classmethod
     def from_base_replicated(
@@ -338,14 +507,20 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
     # ------------------------------------------------------------------ split (inverse)
     @torch.no_grad()
     def extract_expert(self, expert_idx: int) -> Flux2Transformer2DModel:
-        """Return expert ``expert_idx`` as a standalone plain ``Flux2Transformer2DModel`` (a deep
-        copy; the router is dropped). Running it is 'every token through expert i'."""
+        """Return expert ``expert_idx`` as a standalone plain ``Flux2Transformer2DModel`` (the router
+        is dropped). 'distinct': a deep copy of that expert. 'shared_lora': the shared base with
+        adapter ``expert_idx`` merged in (``base + adapter_e``)."""
+        import copy
+
         n = self.config.num_experts
         if not (0 <= expert_idx < n):
             raise ValueError(f"expert_idx must be in [0, {n}), got {expert_idx}")
-        import copy
-
-        return copy.deepcopy(self.experts[expert_idx])
+        if self.experts is not None:
+            return copy.deepcopy(self.experts[expert_idx])
+        # shared_lora: merge base + adapter_e into a plain transformer
+        base_copy = copy.deepcopy(self.base)
+        base_copy.set_adapter(self._expert_adapter_names[expert_idx])
+        return base_copy.merge_and_unload()
 
     @torch.no_grad()
     def extract_all_experts(self) -> List[Flux2Transformer2DModel]:

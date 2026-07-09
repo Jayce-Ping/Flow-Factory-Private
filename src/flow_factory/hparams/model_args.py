@@ -214,6 +214,14 @@ class ModelArguments(ArgABC):
                           "the blend) or 'sample' (run only the top-k experts each sample routed to; at "
                           "per_device_batch_size=1 this is exactly top-k forwards)."},
     )
+    mof_expert_mode: Literal['distinct', 'shared_lora'] = field(
+        default='distinct',
+        metadata={"help": "MoF-V expert storage: 'distinct' (N independent full transformers; full-FT or "
+                          "noise_std>0 ok; needs FSDP/EP for large N) or 'shared_lora' (ONE frozen base + N "
+                          "LoRA adapters; each expert = base+adapter_e, identical trainable capacity when "
+                          "noise_std=0 but 1 base instead of N -> fits large N on plain DDP; requires "
+                          "route_granularity='sample', finetune_type='lora', noise_std=0)."},
+    )
     mof_router_type: Literal['token_linear', 'global'] = field(
         default='token_linear',
         metadata={"help": "MoF-V router: 'token_linear' (per-token linear gate on the input latent + timestep) "
