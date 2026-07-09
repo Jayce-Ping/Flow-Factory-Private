@@ -180,15 +180,17 @@ class Flux2KleinAdapter(BaseAdapter):
         # prepare, so LoRA wraps and FSDP/optimizer only ever see the local experts. init_ep_groups
         # is collective (dist.new_group) and every rank runs this build, so the groups line up.
         if getattr(self.model_args, "moe_enable_ep", False):
-            from ...utils.ep import get_ep_rank, get_ep_size, init_ep_groups
+            from ...utils.ep import get_ep_rank, get_ep_size, init_ep_groups, set_ep_backend
 
             init_ep_groups(self.model_args.moe_ep_size)
+            set_ep_backend(getattr(self.model_args, "moe_ep_backend", "nccl"))
             moe.shard_experts_for_ep(ep_rank=get_ep_rank(), ep_size=get_ep_size())
             # expert-DP grad sync (edp_size>1, multi-node) is registered lazily on the first forward,
             # AFTER apply_lora, so it hooks the trainable (LoRA) expert params, not the frozen base.
             logger.info(
                 f"[MoE-EP] experts sharded over ep_size={get_ep_size()} "
-                f"(ep_rank={get_ep_rank()}, local global-ids={moe._ep_local_expert_ids})"
+                f"(ep_rank={get_ep_rank()}, local global-ids={moe._ep_local_expert_ids}, "
+                f"backend={getattr(self.model_args, 'moe_ep_backend', 'nccl')})"
             )
 
         pipeline.transformer = moe

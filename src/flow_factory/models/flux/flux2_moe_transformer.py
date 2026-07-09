@@ -214,7 +214,8 @@ class MoEFeedForward(nn.Module):
             expert_mask, self.num_experts, ep_group
         )
         global_permuted, routing_map, perm_map, org_shape = token_pre_all2all(
-            xf, expert_mask, self.num_experts, input_splits, output_splits, ngt_local, ep_group
+            xf, expert_mask, self.num_experts, input_splits, output_splits, ngt_local,
+            topw_flat, ep_group,
         )
 
         # local per-expert compute: tokens are grouped contiguously by local expert

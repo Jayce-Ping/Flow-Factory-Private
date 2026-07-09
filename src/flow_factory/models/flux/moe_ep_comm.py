@@ -32,6 +32,8 @@ from typing import Optional, Sequence, Union
 import torch
 import torch.distributed as dist
 
+from ...utils.ep import get_ep_backend
+
 
 def _tolist(x: Union[torch.Tensor, Sequence[int]]) -> list:
     if isinstance(x, torch.Tensor):
@@ -154,7 +156,7 @@ def all_to_all(group, input, output_split_size=None, input_split_size=None):
 # ---------------------------------------------------------------------------
 # dispatch / combine (ported from moe_parallel.py, group-gemm removed)
 # ---------------------------------------------------------------------------
-def preprocess(expert_mask: torch.Tensor, num_experts: int, ep_group: dist.ProcessGroup):
+def _nccl_preprocess(expert_mask: torch.Tensor, num_experts: int, ep_group: dist.ProcessGroup):
     """Compute the all-to-all split sizes from the routing map.
 
     Args:
@@ -204,13 +206,14 @@ def preprocess(expert_mask: torch.Tensor, num_experts: int, ep_group: dist.Proce
     )
 
 
-def token_pre_all2all(
+def _nccl_token_pre_all2all(
     hidden_states: torch.Tensor,
     expert_mask: torch.Tensor,
     num_experts: int,
     input_splits,
     output_splits,
     num_global_tokens_per_local_expert: torch.Tensor,
+    routing_weights: Optional[torch.Tensor],  # unused here; NCCL applies the gate in tokens_post_all2all
     ep_group: dist.ProcessGroup,
 ):
     """Permute local tokens by expert, all-to-all to the owning EP rank, then regroup the
@@ -246,7 +249,7 @@ def token_pre_all2all(
     )
 
 
-def tokens_post_all2all(
+def _nccl_tokens_post_all2all(
     expert_outputs: torch.Tensor,
     selected_experts: torch.Tensor,
     num_experts: int,
@@ -259,7 +262,7 @@ def tokens_post_all2all(
     routing_weights: Optional[torch.Tensor],
     ep_group: dist.ProcessGroup,
 ):
-    """Inverse of :func:`token_pre_all2all`: regroup expert outputs back to (source_rank,
+    """Inverse of :func:`_nccl_token_pre_all2all`: regroup expert outputs back to (source_rank,
     local_expert) order, all-to-all home, then unpermute with the top-k gate weights and sum."""
     num_local_experts = num_experts // ep_group.size()
     unpermute_order = _tolist(torch.arange(num_experts).reshape(num_local_experts, -1).T.ravel())
@@ -283,3 +286,48 @@ def tokens_post_all2all(
         routing_weights=weights_idx,
     )
     return unpermute_outputs
+
+
+# ---------------------------------------------------------------------------
+# public API: dispatch to the selected backend ('nccl' | 'deepep')
+# ---------------------------------------------------------------------------
+def preprocess(expert_mask, num_experts, ep_group):
+    if get_ep_backend() == "deepep":
+        from . import moe_ep_deepep as _d
+        return _d.preprocess(expert_mask, num_experts, ep_group)
+    return _nccl_preprocess(expert_mask, num_experts, ep_group)
+
+
+def token_pre_all2all(
+    hidden_states, expert_mask, num_experts, input_splits, output_splits,
+    num_global_tokens_per_local_expert, routing_weights, ep_group,
+):
+    if get_ep_backend() == "deepep":
+        from . import moe_ep_deepep as _d
+        return _d.token_pre_all2all(
+            hidden_states, expert_mask, num_experts, input_splits, output_splits,
+            num_global_tokens_per_local_expert, routing_weights, ep_group,
+        )
+    return _nccl_token_pre_all2all(
+        hidden_states, expert_mask, num_experts, input_splits, output_splits,
+        num_global_tokens_per_local_expert, routing_weights, ep_group,
+    )
+
+
+def tokens_post_all2all(
+    expert_outputs, selected_experts, num_experts, input_splits, output_splits,
+    num_global_tokens_per_local_expert, routing_map, local_input_permutation_mapping,
+    org_hidden_states_shape, routing_weights, ep_group,
+):
+    if get_ep_backend() == "deepep":
+        from . import moe_ep_deepep as _d
+        return _d.tokens_post_all2all(
+            expert_outputs, selected_experts, num_experts, input_splits, output_splits,
+            num_global_tokens_per_local_expert, routing_map, local_input_permutation_mapping,
+            org_hidden_states_shape, routing_weights, ep_group,
+        )
+    return _nccl_tokens_post_all2all(
+        expert_outputs, selected_experts, num_experts, input_splits, output_splits,
+        num_global_tokens_per_local_expert, routing_map, local_input_permutation_mapping,
+        org_hidden_states_shape, routing_weights, ep_group,
+    )

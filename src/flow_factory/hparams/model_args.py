@@ -186,6 +186,12 @@ class ModelArguments(ArgABC):
                           "to keep each EP group inside one node (NVLink all-to-all) and replicate across "
                           "nodes. Ignored unless moe_enable_ep. world_size must be divisible by moe_ep_size."},
     )
+    moe_ep_backend: Literal['nccl', 'deepep'] = field(
+        default='nccl',
+        metadata={"help": "EP all-to-all backend: 'nccl' (all_to_all_single, works in the ff env) or "
+                          "'deepep' (DeepSeek DeepEP intranode NVLink kernels; needs a torch-2.7.x/py3.12 "
+                          "env with the deep_ep package, e.g. ff-new). Ignored unless moe_enable_ep."},
+    )
 
     # --- Velocity-space Mixture-of-Flow (MoF-V; Flux2 Klein only) ---
     mof_enabled: bool = field(

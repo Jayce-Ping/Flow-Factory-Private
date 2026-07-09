@@ -41,6 +41,7 @@ _EP_STATE: dict = {
     "edp_size": 1,
     "edp_rank": 0,
     "edp_group": None,
+    "backend": "nccl",  # 'nccl' (all_to_all_single) or 'deepep' (DeepEP intranode NVLink kernels)
 }
 
 
@@ -123,6 +124,18 @@ def get_edp_group() -> Optional[dist.ProcessGroup]:
 
 def get_edp_size() -> int:
     return int(_EP_STATE["edp_size"])
+
+
+def set_ep_backend(backend: str) -> None:
+    """Select the EP all-to-all backend: 'nccl' (default) or 'deepep'. deep_ep import is deferred to
+    first use, so 'nccl' never requires the deep_ep package."""
+    if backend not in ("nccl", "deepep"):
+        raise ValueError(f"ep backend must be 'nccl' or 'deepep', got {backend!r}")
+    _EP_STATE["backend"] = backend
+
+
+def get_ep_backend() -> str:
+    return _EP_STATE["backend"]
 
 
 def local_expert_indices(num_experts: int) -> list[int]:
