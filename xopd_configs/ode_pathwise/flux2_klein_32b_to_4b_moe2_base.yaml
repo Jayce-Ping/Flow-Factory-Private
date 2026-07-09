@@ -98,7 +98,7 @@ train:
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
 
-  ema_decay: 0.9
+  ema_decay: 0.0
   ema_update_interval: 4
   ema_device: "cuda"
 
