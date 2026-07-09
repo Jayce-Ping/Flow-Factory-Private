@@ -44,7 +44,8 @@ model:
   mof_top_k: 2
   mof_route_granularity: "sample"         # per-sample top-2: run ONLY 2 of 8 experts/sample (the efficient MoF path)
   mof_expert_mode: "shared_lora"          # ONE base + 8 LoRA adapters (expert=base+adapter_e); fits 8 experts on DDP
-  mof_router_type: "global"               # per-sample gate on pooled prompt + timestep (sample granularity)
+  mof_router_type: "global"               # per-sample gate (sample granularity)
+  mof_router_input: "fused_film"          # DEFAULT cheap compromise: prompt backbone + FiLM(timestep)-modulated latent residual (latent path zero-init -> starts == prompt router). Alternatives: prompt|latent|fused_gate|fused_xattn.
   mof_noise_std: 0.0                      # shared base -> per-expert difference is the LoRA (noise must be 0)
 
 # ===== Logging =====

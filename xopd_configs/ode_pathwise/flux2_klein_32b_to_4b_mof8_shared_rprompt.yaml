@@ -1,18 +1,17 @@
-# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert VELOCITY-space MoF student (MoF2 ablation).
-# 2 INDEPENDENT full FLUX.2-klein-base-4B experts (LoRA copies of base); a shared per-SAMPLE
-# global router picks top-1 expert/sample and (at top_k=1) uses its velocity directly; distilled
-# to dev-32B (L1 + load-balance aux). This is the EFFICIENT MoF path: per-sample top-1 runs ONLY
-# 1 of the 2 full-transformer experts each step (~1x student forward), unlike the per-token MoF8
-# which runs all N. Analogue of MoE2 (both top-1 of 2), but MoF blends whole-sample velocities.
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 8-expert VELOCITY-space MoF student (SHARED-BASE).
+# expert_mode='shared_lora': ONE frozen FLUX.2-klein-base-4B + 8 LoRA adapters (expert_e = base +
+# adapter_e). A shared PER-SAMPLE router picks top-2 experts/sample (softmax + renorm) and blends
+# their OUTPUT velocities; distilled to dev-32B (L1 + load-balance aux). Per-sample top-2 runs ONLY
+# 2 of 8 expert forwards/sample (the efficient MoF compute path), and holding ONE base (not 8) keeps
+# params small. At noise_std=0 this is trainable-equivalent to 8 distinct experts.
 #
-# SCALE / MEMORY: 2x4B experts (~13GB, replicated) + 32B teacher (64GB, replicated) ~85GB fits 96G
-# on plain DDP. DDP (not FSDP) is what makes per-sample top-k cheap AND safe: only k experts run,
-# and replicated params need no conditional FSDP all-gather (which would hang across ranks that
-# pick different experts). LoRA (rank 64, 'all-linear') keeps trainable/optimizer tiny.
+# SCALE / MEMORY: 1 base (~8GB) + 8 tiny LoRA adapters + 32B teacher (~64GB, replicated) ~72GB/GPU
+# -> plain DDP (multi_gpu.yaml); NO FSDP shard / all-to-all / PCIe. LoRA (rank 64, 'all-linear'); the
+# router is trained in full. The set_adapter switch loop disables the autocast weight-cache.
 
 # ===== Environment =====
 launcher: "accelerate"
-config_file: config/accelerate_configs/multi_gpu.yaml   # plain DDP (replicate): 2x4B experts (~13GB) + teacher(32B,64GB) ~85GB fits 96G. DDP (not FSDP) is REQUIRED so per-sample top-k can run only k experts without an FSDP conditional-all-gather hang. Launch via run_4node_ddp.sh.
+config_file: config/accelerate_configs/multi_gpu.yaml   # plain DDP (replicate): shared_lora keeps 1 base (~8GB) + 8 tiny LoRA adapters + teacher(32B,64GB) ~72GB fits 96G. DDP (not FSDP) so per-sample top-k runs only k adapters without an FSDP conditional-all-gather hang. Launch via run_4node_ddp.sh.
 num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
@@ -39,18 +38,19 @@ model:
   model_type: "flux2-klein"
   resume_path: null
   resume_type: null
-  # --- MoF-V construction (efficient: per-SAMPLE top-1 -> only 1 of 2 full-transformer experts runs/sample) ---
+  # --- MoF-V construction ---
   mof_enabled: true
-  mof_num_experts: 2
-  mof_top_k: 1
-  mof_route_granularity: "sample"         # per-sample routing: run ONLY the top-1 expert each sample (at bsz=1 -> exactly 1 forward). This is the MoF activation/compute reduction.
+  mof_num_experts: 8
+  mof_top_k: 2
+  mof_route_granularity: "sample"         # per-sample top-2: run ONLY 2 of 8 experts/sample (the efficient MoF path)
+  mof_expert_mode: "shared_lora"          # ONE base + 8 LoRA adapters (expert=base+adapter_e); fits 8 experts on DDP
   mof_router_type: "global"               # per-sample gate (sample granularity)
-  mof_router_input: "prompt"              # route by prompt/domain (explicit; the model-arg default is now fused_film)
-  mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry
+  mof_router_input: "prompt"              # EXAMPLE: route by prompt/task only (trajectory-stable domain anchor)
+  mof_noise_std: 0.0                      # shared base -> per-expert difference is the LoRA (noise must be 0)
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_mof2_base"
+  run_name: "flux2klein_32b_to_4b_mof8_shared_rprompt"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -60,8 +60,8 @@ log:
 # ===== Training (XOPD distill to dev-32B, OCR-only) =====
 train:
   trainer_type: "xopd"
-  fsdp_shard_teacher: false               # DDP: teacher (32B) + both experts replicated per GPU; per-sample top-1 runs 1 expert (find_unused_parameters handles the unrun expert's grad)
-  max_epochs: 500
+  fsdp_shard_teacher: false               # DDP (not FSDP): 1 base + 8 adapters + teacher all replicated per GPU. Per-sample top-2 runs only 2 adapters/sample with NO FSDP conditional all-gather (the shared_lora win over distinct-mof8, which needed FSDP + all-expert forwards). find_unused_parameters handles the non-selected adapters' zero grad.
+  max_epochs: null                        # long run: train until stopped (init = base is a valid flow model; needs many epochs to specialize the 8 experts)
 
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
   teacher_param_device: "cuda"
@@ -108,7 +108,7 @@ train:
   ema_update_interval: 4
   ema_device: "cuda"
 
-  enable_gradient_checkpointing: true     # DDP has no FSDP-side AC -> model-side gradient checkpointing on the (1 active) expert
+  enable_gradient_checkpointing: true     # DDP has no FSDP-side AC -> model-side GC on the (top-k) base+adapter forwards keeps activation ~1x
   offload_samples_to_cpu: false
   seed: 42
 

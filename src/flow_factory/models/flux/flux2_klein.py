@@ -220,6 +220,7 @@ class Flux2KleinAdapter(BaseAdapter):
             router_hidden_dim=self.model_args.mof_router_hidden_dim,
             noise_std=self.model_args.mof_noise_std,
             expert_mode=getattr(self.model_args, "mof_expert_mode", "distinct"),
+            router_input=getattr(self.model_args, "mof_router_input", "prompt"),
         )
         if self.model_args.mof_base_transformer_path:
             mof = Flux2VelocityMoFTransformer2DModel.from_base_replicated(

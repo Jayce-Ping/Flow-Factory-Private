@@ -16,7 +16,10 @@ import torch
 import torch.nn as nn
 from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
 
-from flow_factory.models.flux.flux2_mof_velocity import Flux2VelocityMoFTransformer2DModel
+from flow_factory.models.flux.flux2_mof_velocity import (
+    Flux2VelocityMoFTransformer2DModel,
+    MoFGlobalRouter,
+)
 
 TINY = dict(
     patch_size=1, in_channels=8, num_layers=2, num_single_layers=2,
@@ -32,11 +35,11 @@ def _make_base(seed=0):
     return Flux2Transformer2DModel(**TINY).eval().to(torch.float32)
 
 
-def _build_shared(seed=0):
+def _build_shared(seed=0, router_input="prompt"):
     base = _make_base(seed)
     mof = Flux2VelocityMoFTransformer2DModel.from_base_model(
         base, num_experts=N, top_k=K, route_granularity="sample",
-        router_type="global", expert_mode="shared_lora", noise_std=0.0,
+        router_type="global", expert_mode="shared_lora", noise_std=0.0, router_input=router_input,
     ).eval().to(torch.float32)
     mof.apply_expert_lora(8, 16, "all-linear")
     # PEFT gaussian init leaves lora_B=0 (zero delta); randomize per-adapter so experts differ.
@@ -159,12 +162,76 @@ def test_save_load_roundtrip():
     print(f"[ok] save/load round-trip (N adapters + router restored): max_diff={diff:.2e}")
 
 
+def test_router_input_latent():
+    """Global router with router_input='latent' pools the input latent x_t (d=in_channels) instead of
+    the prompt; forward runs and routing responds to the latent."""
+    mof = _build_shared(router_input="latent")
+    assert mof.config.router_input == "latent"
+    # latent-pool query dim must match the latent channels (not the prompt dim)
+    assert mof.router.query_l.shape[-1] == TINY["in_channels"], mof.router.query_l.shape
+    ins = _inputs()
+    with torch.no_grad():
+        out = mof(**ins)[0]
+    assert torch.isfinite(out).all()
+    # router MLP is zero-init (uniform); perturb it so routing actually depends on its input
+    with torch.no_grad():
+        for p in mof.router.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    # routing changes when the latent changes (different x_t -> different pooled -> different probs)
+    ins2 = dict(ins)
+    ins2["hidden_states"] = ins["hidden_states"] + 3.0 * torch.randn_like(ins["hidden_states"])
+    p1, _ = mof._router_probs(ins["hidden_states"], ins["encoder_hidden_states"],
+                              mof.router_time_embed((ins["timestep"] * 1000).float(), None))
+    p2, _ = mof._router_probs(ins2["hidden_states"], ins2["encoder_hidden_states"],
+                              mof.router_time_embed((ins2["timestep"] * 1000).float(), None))
+    assert (p1 - p2).abs().max().item() > 1e-4, "latent router ignored the latent"
+    print(f"[ok] router_input='latent': pools x_t (d={TINY['in_channels']}), routing responds to latent")
+
+
+def test_all_router_modes_forward():
+    """Every router_input mode builds + forwards to a finite velocity."""
+    for mode in MoFGlobalRouter.MODES:
+        mof = _build_shared(router_input=mode)
+        assert mof.config.router_input == mode
+        with torch.no_grad():
+            out = mof(**_inputs())[0]
+        assert torch.isfinite(out).all(), f"router_input={mode} produced non-finite output"
+        print(f"[ok] router_input={mode}: forward OK {tuple(out.shape)}")
+
+
+def test_fused_latent_zero_init_neutral():
+    """Fused modes zero-init the latent path: after un-zeroing the (otherwise zero-init) MLP head,
+    routing depends ONLY on the prompt (changing the latent does nothing); un-zeroing the latent
+    output then makes routing respond to the latent -- i.e. training starts == prompt router."""
+    ins = _inputs()
+    ins2_h = ins["hidden_states"] + 5.0 * torch.randn_like(ins["hidden_states"])
+    for mode in ("fused_gate", "fused_film", "fused_xattn"):
+        mof = _build_shared(router_input=mode)
+        temb = mof.router_time_embed((ins["timestep"] * 1000).float(), None)
+        with torch.no_grad():
+            for p in mof.router.mlp[-1].parameters():
+                nn.init.normal_(p, std=0.1)  # non-uniform routing (prompt-driven)
+        p1 = mof._router_probs(ins["hidden_states"], ins["encoder_hidden_states"], temb)[0]
+        p2 = mof._router_probs(ins2_h, ins["encoder_hidden_states"], temb)[0]
+        assert (p1 - p2).abs().max().item() < 1e-6, f"{mode}: latent path not neutral at init"
+        lat_out = mof.router.o_proj if mode == "fused_xattn" else mof.router.proj_l
+        with torch.no_grad():
+            for p in lat_out.parameters():
+                nn.init.normal_(p, std=0.2)  # 'train' the latent path
+        p3 = mof._router_probs(ins2_h, ins["encoder_hidden_states"], temb)[0]
+        assert (p1 - p3).abs().max().item() > 1e-4, f"{mode}: latent still ignored after un-zeroing"
+        print(f"[ok] {mode}: latent path zero-init neutral, responsive once trained")
+
+
 def _run_all():
     test_build_and_run()
     test_matches_extracted_expert()
     test_adapter_switch_under_autocast()
     test_backward_all_adapters_trainable()
     test_save_load_roundtrip()
+    test_router_input_latent()
+    test_all_router_modes_forward()
+    test_fused_latent_zero_init_neutral()
     print("\nALL MoF shared_lora TESTS PASSED")
 
 

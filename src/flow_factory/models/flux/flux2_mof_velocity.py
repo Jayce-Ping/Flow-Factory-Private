@@ -47,9 +47,99 @@ from diffusers.models.transformers.transformer_flux2 import (
 )
 from diffusers.utils import logging
 
-from .flux2_moe_transformer import GlobalRouter, TokenLinearRouter
+from .flux2_moe_transformer import TokenLinearRouter
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+class MoFGlobalRouter(nn.Module):
+    """Per-sample global MoF router with selectable input fusion (``router_input``):
+
+    * ``prompt``      : attention-pool the prompt (task/domain routing; stable across the trajectory).
+    * ``latent``      : attention-pool the input latent x_t (image-content routing).
+    * ``fused_gate``  : ``c_p + sigmoid(gate(temb)) * c_l`` -- prompt backbone + a timestep-gated
+      latent residual (the learnable prompt-vs-latent strength is ``g(temb)``: early/high-noise -> 0).
+    * ``fused_film``  : ``c_p + gamma(temb)*c_l + beta(temb)`` -- FiLM-modulated latent (per-dim,
+      by timestep; same family as the transformer's adaLN).
+    * ``fused_xattn`` : ``c_p + g(temb) * xattn(q<-[c_p,temb], kv<-latent)`` -- a prompt(+t)-conditioned,
+      content/spatially-aware readout of the latent, plus a timestep gate.
+
+    All modes: ``logits = MLP([t_proj(temb), c]); softmax``. The MLP head is zero-init -> UNIFORM
+    mixture at start (== the base flow model). For the fused modes the latent-feature output is ALSO
+    zero-init, so training starts identical to the prompt-only router and folds in the latent only as
+    it helps. ``c_p`` (d_prompt) / ``c_l`` (d_latent=in_channels) are attention-pooled to ``d_hidden``."""
+
+    MODES = ("prompt", "latent", "fused_gate", "fused_film", "fused_xattn")
+
+    def __init__(self, num_experts: int, d_prompt: int, d_latent: int, d_time: int,
+                 d_hidden: int = 256, mode: str = "prompt"):
+        super().__init__()
+        if mode not in self.MODES:
+            raise ValueError(f"MoFGlobalRouter mode must be one of {self.MODES}, got {mode!r}")
+        self.mode = mode
+        self.d_prompt, self.d_latent, self.d_hidden = d_prompt, d_latent, d_hidden
+        self.t_proj = nn.Linear(d_time, d_hidden)
+
+        if mode != "latent":  # prompt backbone
+            self.query_p = nn.Parameter(torch.randn(1, 1, d_prompt) * 0.02)
+            self.proj_p = nn.Linear(d_prompt, d_hidden)
+        if mode != "prompt":  # latent path
+            if mode == "fused_xattn":
+                self.q_proj = nn.Linear(2 * d_hidden, d_hidden)
+                self.k_proj = nn.Linear(d_latent, d_hidden)
+                self.v_proj = nn.Linear(d_latent, d_hidden)
+                self.o_proj = nn.Linear(d_hidden, d_hidden)
+                nn.init.zeros_(self.o_proj.weight); nn.init.zeros_(self.o_proj.bias)  # neutral latent at start
+                self.gate = nn.Linear(d_time, d_hidden)
+            else:
+                self.query_l = nn.Parameter(torch.randn(1, 1, d_latent) * 0.02)
+                self.proj_l = nn.Linear(d_latent, d_hidden)
+                if mode in ("fused_gate", "fused_film"):
+                    nn.init.zeros_(self.proj_l.weight); nn.init.zeros_(self.proj_l.bias)  # neutral latent at start
+                if mode == "fused_gate":
+                    self.gate = nn.Linear(d_time, d_hidden)
+                elif mode == "fused_film":
+                    self.film_g = nn.Linear(d_time, d_hidden)
+                    self.film_b = nn.Linear(d_time, d_hidden)
+                    nn.init.zeros_(self.film_b.weight); nn.init.zeros_(self.film_b.bias)
+
+        self.mlp = nn.Sequential(
+            nn.SiLU(), nn.Linear(2 * d_hidden, d_hidden), nn.SiLU(), nn.Linear(d_hidden, num_experts),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)  # uniform mixture at start
+
+    @staticmethod
+    def _attn_pool(query: torch.Tensor, seq: torch.Tensor, d: int) -> torch.Tensor:
+        # query: (1,1,d); seq: (B,L,d) -> attention-pooled (B,d)
+        scores = (query * seq).sum(-1) / (d ** 0.5)  # (B, L)
+        attn = torch.softmax(scores, dim=-1).unsqueeze(-1)  # (B, L, 1)
+        return (attn * seq).sum(dim=1)  # (B, d)
+
+    def forward(self, prompt_embeds: torch.Tensor, hidden_states: torch.Tensor,
+                temb: torch.Tensor) -> torch.Tensor:
+        # prompt_embeds: (B, Lp, d_prompt); hidden_states: (B, Sl, d_latent); temb: (B, d_time) -> (B, N)
+        t = self.t_proj(temb)  # (B, d_hidden)
+        if self.mode == "latent":
+            c = self.proj_l(self._attn_pool(self.query_l, hidden_states, self.d_latent))
+        else:
+            c = self.proj_p(self._attn_pool(self.query_p, prompt_embeds, self.d_prompt))  # c_p
+            if self.mode == "fused_gate":
+                c_l = self.proj_l(self._attn_pool(self.query_l, hidden_states, self.d_latent))
+                c = c + torch.sigmoid(self.gate(temb)) * c_l
+            elif self.mode == "fused_film":
+                c_l = self.proj_l(self._attn_pool(self.query_l, hidden_states, self.d_latent))
+                c = c + self.film_g(temb) * c_l + self.film_b(temb)
+            elif self.mode == "fused_xattn":
+                q = self.q_proj(torch.cat([c, t], dim=-1))  # (B, d_hidden), query from prompt+timestep
+                k = self.k_proj(hidden_states)  # (B, Sl, d_hidden)
+                v = self.v_proj(hidden_states)
+                scores = (q.unsqueeze(1) * k).sum(-1) / (self.d_hidden ** 0.5)  # (B, Sl)
+                attn = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B, Sl, 1)
+                ctx = (attn * v).sum(dim=1)  # (B, d_hidden)
+                c = c + torch.sigmoid(self.gate(temb)) * self.o_proj(ctx)
+        logits = self.mlp(torch.cat([t, c], dim=-1))  # (B, N)
+        return torch.softmax(logits.float(), dim=-1)
 
 
 class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
@@ -89,6 +179,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         route_granularity: str = "token",
         router_type: str = "token_linear",
         router_hidden_dim: int = 256,
+        router_input: str = "prompt",
         expert_mode: str = "distinct",
     ):
         super().__init__()
@@ -96,6 +187,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             raise ValueError(f"route_granularity must be 'token' or 'sample', got {route_granularity!r}")
         if router_type not in ("token_linear", "global"):
             raise ValueError(f"router_type must be 'token_linear' or 'global', got {router_type!r}")
+        if router_input not in MoFGlobalRouter.MODES:
+            raise ValueError(f"router_input must be one of {MoFGlobalRouter.MODES}, got {router_input!r}")
         if expert_mode not in ("distinct", "shared_lora"):
             raise ValueError(f"expert_mode must be 'distinct' or 'shared_lora', got {expert_mode!r}")
         if num_experts < 1:
@@ -145,8 +238,11 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         if router_type == "token_linear":
             self.router = TokenLinearRouter(in_channels, num_experts, self.inner_dim)
         else:
-            self.router = GlobalRouter(
-                num_experts, d_prompt=joint_attention_dim, d_time=self.inner_dim, d_hidden=router_hidden_dim,
+            # Global per-sample router; router_input selects how prompt & input-latent x_t are fused
+            # (prompt | latent | fused_gate | fused_film | fused_xattn). See MoFGlobalRouter.
+            self.router = MoFGlobalRouter(
+                num_experts, d_prompt=joint_attention_dim, d_latent=in_channels,
+                d_time=self.inner_dim, d_hidden=router_hidden_dim, mode=router_input,
             )
 
         self._last_mof_aux: Optional[torch.Tensor] = None
@@ -174,7 +270,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         """Return ``(probs, per_token)``. per_token=True -> probs (B,S,N) for the token blend;
         False -> probs (B,N) for the per-sample blend."""
         if self.config.router_type == "global":
-            return self.router(encoder_hidden_states, temb), False  # (B, N), already softmax
+            # MoFGlobalRouter fuses prompt & input-latent per router_input (prompt/latent/fused_*).
+            return self.router(encoder_hidden_states, hidden_states, temb), False  # (B, N) softmax
         logits = self.router(hidden_states, temb)  # (B, S, N)
         if self.config.route_granularity == "token":
             return torch.softmax(logits.float(), dim=-1), True
@@ -376,7 +473,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
     # ------------------------------------------------------------------ init
     @staticmethod
     def _mof_config_from_base(base, num_experts, top_k, route_granularity, router_type,
-                             router_hidden_dim, expert_mode="distinct") -> dict:
+                             router_hidden_dim, expert_mode="distinct", router_input="prompt") -> dict:
         bc = dict(base.config)
         return dict(
             patch_size=bc["patch_size"], in_channels=bc["in_channels"], out_channels=bc.get("out_channels"),
@@ -387,6 +484,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             eps=bc["eps"], guidance_embeds=bc.get("guidance_embeds", False),
             num_experts=num_experts, top_k=top_k, route_granularity=route_granularity,
             router_type=router_type, router_hidden_dim=router_hidden_dim, expert_mode=expert_mode,
+            router_input=router_input,
         )
 
     @classmethod
@@ -400,6 +498,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         router_type: str = "token_linear",
         router_hidden_dim: int = 256,
         expert_mode: str = "distinct",
+        router_input: str = "prompt",
     ) -> "Flux2VelocityMoFTransformer2DModel":
         """Init: replicate the base transformer into the experts (each a verbatim copy of the base,
         so the ensemble == base at init when the router is uniform).
@@ -416,7 +515,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
                 "expert_mode='distinct' for genuinely distinct frozen bases."
             )
         model = cls(**cls._mof_config_from_base(
-            base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode))
+            base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode, router_input))
         base_sd = base.state_dict()
         with torch.no_grad():
             if expert_mode == "shared_lora":

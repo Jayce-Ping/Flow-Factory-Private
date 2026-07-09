@@ -225,7 +225,17 @@ class ModelArguments(ArgABC):
     mof_router_type: Literal['token_linear', 'global'] = field(
         default='token_linear',
         metadata={"help": "MoF-V router: 'token_linear' (per-token linear gate on the input latent + timestep) "
-                          "or 'global' (per-sample gate on pooled prompt + timestep; route_granularity='sample' only)."},
+                          "or 'global' (per-sample gate on pooled sequence + timestep; route_granularity='sample' only)."},
+    )
+    mof_router_input: Literal['prompt', 'latent', 'fused_gate', 'fused_film', 'fused_xattn'] = field(
+        default='fused_film',
+        metadata={"help": "How the GLOBAL router fuses prompt & input-latent x_t (ignored for "
+                          "router_type='token_linear', which always gates on the latent): "
+                          "'prompt' (task/domain, trajectory-stable), 'latent' (image content; noisy at high t), "
+                          "'fused_gate' (prompt + sigmoid(gate(t))*latent), 'fused_film' (prompt + FiLM(t)-modulated "
+                          "latent; DEFAULT: cheap compromise), 'fused_xattn' (prompt + timestep-gated cross-attention "
+                          "readout of the latent; most expressive). All fused modes zero-init the latent path -> "
+                          "training starts identical to the prompt-only router."},
     )
     mof_noise_std: float = field(
         default=0.0,
