@@ -3,11 +3,12 @@
 # top-2 router; trained via LoRA (rank 64, 'all-linear') on OCR-only, distilled to dev-32B
 # (L1 + Switch/GShard load-balance aux). Same as Experiment 1 but 8 experts, top-2.
 #
-# SCALE / MEMORY: 8-expert MoE (~21B frozen base) + 32B teacher -> does NOT fit ZeRO-2
-# (params replicated). Runs on FSDP2 full-shard of BOTH student+teacher (fsdp_shard_teacher +
-# config/accelerate_configs/fsdp2_prefetch.yaml). Only LoRA adapters + router train, so the
-# optimizer is tiny; top-2 sparse dispatch means only 2 experts compute per token. A single-node
-# (8-GPU) feasibility test decides whether EP/offload is needed (expected to fit under LoRA).
+# SCALE / MEMORY: 8-expert MoE (~21B, too big to replicate) is FSDP2-sharded; the 32B teacher is
+# REPLICATED per GPU (frozen -> forward in no_grad, activations freed; NOT FSDP-wrapped so it needs
+# no per-step all-gather). Sharding the teacher too (the old fsdp_shard_teacher=true / ModelBundle
+# path) all-gathers 32B every step and is the main FSDP slowdown -> disabled here. Student shard
+# (~21B/world) + teacher 64GB replicated + FSDP AC activations ~ fits 96G (student prepared/sharded
+# BEFORE the teacher is loaded, so no pre-shard load spike). Only LoRA + router train (tiny optimizer).
 
 # ===== Environment =====
 launcher: "accelerate"
@@ -58,7 +59,7 @@ log:
 # ===== Training (XOPD distill to dev-32B, OCR-only) =====
 train:
   trainer_type: "xopd"
-  fsdp_shard_teacher: true                # shard the 8-expert MoE + 32B teacher in one ModelBundle FSDP root
+  fsdp_shard_teacher: false               # shard ONLY the student (8-expert MoE) via FSDP2; teacher (32B) replicated per GPU (frozen, inference no_grad) -> NO teacher all-gather each step (the FSDP-teacher-shard slowdown). ~21B student sharded + 64GB teacher replicated ~ fits 96G.
   max_epochs: 500
 
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"

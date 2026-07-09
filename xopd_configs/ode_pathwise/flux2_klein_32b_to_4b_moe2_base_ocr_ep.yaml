@@ -63,7 +63,7 @@ log:
 # ===== Training (XOPD distill to dev-32B, OCR-only) =====
 train:
   trainer_type: "xopd"
-  fsdp_shard_teacher: true                # FSDP full-shard student MoE + 32B teacher (single ModelBundle root)
+  fsdp_shard_teacher: false               # shard ONLY the student (backbone FSDP2, experts EP-owned); teacher (32B) replicated per GPU -> no per-step teacher all-gather (the FSDP-teacher-shard slowdown)
   max_epochs: 500
 
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
