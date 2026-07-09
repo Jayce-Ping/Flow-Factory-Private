@@ -183,10 +183,18 @@ class MoEFeedForward(nn.Module):
         return out.reshape(B, S, dim)
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor, gate_weights: Optional[torch.Tensor] = None):
-        """Returns ``(output, aux_loss)``. token_linear uses sparse top-k dispatch (only the
-        selected experts run) when top_k < num_experts, else a dense weighted sum; the global
-        router is always a dense per-sample soft mix. aux is returned (not stashed) so it
-        survives gradient checkpointing; it is 0 for the global router."""
+        """Returns ``(output, aux_loss)``. DENSE-MASKED combine: EVERY expert is always run and
+        weighted by its gate (top-k renormalized weights, zero off the top-k), so every expert
+        parameter receives a gradient every step on every rank.
+
+        This is REQUIRED for distributed training (DDP / DeepSpeed ZeRO / FSDP). The sparse
+        ``_dispatch`` path (kept below for single-process/inference use) runs only the experts that
+        got tokens, so an expert that received no tokens on a given rank produced NO gradient there
+        while other ranks did -> the gradient all-reduce buckets diverged across ranks (different
+        NumelIn / SeqNum) and NCCL dead-locked (600s collective timeout -> SIGABRT). The dense-masked
+        output is numerically identical to the sparse top-k dispatch (equivalence-tested); the only
+        cost is running all experts' MLPs (fine for small N; large N uses expert parallelism). aux is
+        0 for the global router."""
         if gate_weights is None:
             if self.router is None:
                 raise RuntimeError(
@@ -197,7 +205,8 @@ class MoEFeedForward(nn.Module):
             if self.top_k < self.num_experts:
                 topw, topi = torch.topk(probs, self.top_k, dim=-1)
                 topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-                return self._dispatch(x, topw, topi), self._aux(probs, topi)
+                w = torch.zeros_like(probs).scatter_(-1, topi, topw)  # (B,S,N): renormalized top-k, 0 elsewhere
+                return self._dense(x, w.to(x.dtype)), self._aux(probs, topi)
             return self._dense(x, probs.to(x.dtype)), self._aux(probs, None)
         aux = x.new_zeros(())
         return self._dense(x, gate_weights.to(x.dtype).unsqueeze(1)), aux
