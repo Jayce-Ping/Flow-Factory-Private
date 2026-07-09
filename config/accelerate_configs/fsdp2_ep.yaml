@@ -1,0 +1,40 @@
+# FSDP2 + Expert Parallelism (weight-space MoE) config.
+#
+# Same as fsdp2_prefetch.yaml (full-shard + forward prefetch + all-ranks-build-on-CPU) BUT excludes
+# the MoE expert banks from FSDP sharding via fsdp_ignored_modules. Under EP the experts are
+# EP-OWNED (each rank holds its num_experts/ep_size local experts whole, not sharded) and tokens are
+# all-to-all'd to the owner; the backbone (attn/embeds/norms/router) + 32B teacher stay FSDP-sharded.
+#
+# fsdp_ignored_modules: the regex FULL-matches each expert module name (e.g.
+# 'members.student.transformer_blocks.0.ff.experts.0' or '...single_transformer_blocks.0.attn.moe.experts.0');
+# accelerate collects those modules' parameters (recursively, incl. LoRA adapters) and passes them as
+# `ignored_params` to fully_shard, so they are NOT converted to sharded DTensors.
+#
+# cpu_ram_efficient_loading MUST be false: each rank builds its OWN local experts on CPU (they differ
+# per EP rank). rank0-only loading would leave other ranks' (ignored, non-FSDP-distributed) experts empty.
+# Use with model.fsdp_shard_teacher: true and model.moe_enable_ep: true (moe_ep_size = gpus_per_node).
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+downcast_bf16: 'no'
+fsdp_config:
+  fsdp_version: 2
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_forward_prefetch: true
+  fsdp_offload_params: false
+  fsdp_reshard_after_forward: true
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_activation_checkpointing: true
+  fsdp_sync_module_states: true
+  fsdp_ignored_modules: '.*\.experts\.\d+'
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

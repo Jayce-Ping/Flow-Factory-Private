@@ -1220,6 +1220,42 @@ class BaseAdapter(ABC):
         }
     
     # -------------------------------------------- Save ------------------------------------
+    def _gather_ep_expert_lora_state(self, inner_peft: "PeftModel") -> dict:
+        """Expert-parallel LoRA save helper. Under EP each rank physically holds only its LOCAL
+        experts, whose module indices ``experts.{0..L-1}`` ALIAS different GLOBAL expert ids per rank
+        (rank r owns globals ``[r*L, (r+1)*L)``, ``L = num_experts // ep_size``). The FSDP full state
+        dict on rank 0 therefore only has rank 0's experts, mis-indexed. This reads THIS rank's local
+        expert LoRA tensors directly (they are FSDP-ignored plain tensors, present on every rank),
+        remaps local->global index in the key, and all-gathers across the EP group so rank 0 can write
+        a complete N-expert adapter. Collective: every rank must call it."""
+        import re
+
+        import torch.distributed as dist
+
+        from ..utils.ep import get_ep_group, get_ep_rank, get_ep_size
+
+        ep_size = get_ep_size()
+        n_experts = int(self.model_args.moe_num_experts)
+        local_len = n_experts // ep_size
+        base = get_ep_rank() * local_len
+        pat = re.compile(r"(.*\.experts\.)(\d+)(\..*)")
+        local_state: dict = {}
+        for name, p in inner_peft.named_parameters():
+            if ".experts." not in name or not any(lk in name for lk in self.lora_keys):
+                continue
+            m = pat.match(name)
+            if m is None:
+                continue
+            gkey = f"{m.group(1)}{base + int(m.group(2))}{m.group(3)}"
+            local_state[gkey] = p.detach().to("cpu")
+        gathered = [None] * ep_size
+        dist.all_gather_object(gathered, local_state, group=get_ep_group())
+        merged: dict = {}
+        for d in gathered:
+            if d:
+                merged.update(d)
+        return merged
+
     def _save_lora(
         self,
         model: torch.nn.Module,
@@ -1246,6 +1282,14 @@ class BaseAdapter(ABC):
             )
             if prefix:
                 state_dict = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+            from ..utils.ep import ep_enabled, get_ep_size
+
+            if ep_enabled() and get_ep_size() > 1:
+                # The FSDP gather only has rank 0's (mis-indexed, local) experts; drop them and merge
+                # the globally-indexed expert LoRA gathered from every EP rank (collective).
+                ep_expert_state = self._gather_ep_expert_lora_state(inner)
+                state_dict = {k: v for k, v in state_dict.items() if ".experts." not in k}
+                state_dict.update(ep_expert_state)
             if self.accelerator.is_main_process:
                 inner.save_pretrained(save_directory, state_dict=state_dict)
             self.accelerator.wait_for_everyone()

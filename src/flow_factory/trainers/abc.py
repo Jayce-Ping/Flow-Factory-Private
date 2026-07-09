@@ -329,12 +329,22 @@ class BaseTrainer(ABC):
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""
+        from ..utils.ep import ep_enabled
+
+        optim_kwargs = {}
+        if ep_enabled():
+            # Expert parallelism: the trainable params mix FSDP-sharded DTensor grads (backbone/router)
+            # with EP-owned plain-Tensor grads (local experts). AdamW's fused foreach kernels
+            # (aten._foreach_mul_ etc.) cannot mix DTensor and Tensor in one call, so fall back to the
+            # per-parameter path. The LoRA + router optimizer is tiny, so the perf cost is negligible.
+            optim_kwargs["foreach"] = False
         self.optimizer = torch.optim.AdamW(
             self.adapter.get_trainable_parameters(),
             lr=self.training_args.learning_rate,
             betas=self.training_args.adam_betas,
             weight_decay=self.training_args.adam_weight_decay,
             eps=self.training_args.adam_epsilon,
+            **optim_kwargs,
         )
         return self.optimizer
 

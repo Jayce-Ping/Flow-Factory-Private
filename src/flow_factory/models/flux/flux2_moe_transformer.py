@@ -54,6 +54,9 @@ from diffusers.models.transformers.transformer_flux2 import (
 )
 from diffusers.utils import logging
 
+from ...utils.ep import ep_enabled, get_edp_size, get_ep_group, get_ep_size
+from .moe_ep_comm import preprocess, token_pre_all2all, tokens_post_all2all
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -182,6 +185,54 @@ class MoEFeedForward(nn.Module):
             out.index_add_(0, tok, wf[tok, slot].unsqueeze(-1) * ye)
         return out.reshape(B, S, dim)
 
+    def _ep_forward(self, x: torch.Tensor, topw: torch.Tensor, topi: torch.Tensor) -> torch.Tensor:
+        """Expert-parallel sparse combine: ``self.experts`` holds only this EP rank's
+        ``num_experts // ep_size`` experts; tokens are all-to-all'd to their expert owner,
+        computed locally, then all-to-all'd home and top-k weighted. Bit-for-bit equal to the
+        dense-masked ``_dense`` combine (CPU equivalence-tested); the only difference is which
+        rank runs which expert. ``topw`` are the renormalized top-k weights, ``topi`` the ids."""
+        ep_group = get_ep_group()
+        ep_size = get_ep_size()
+        num_local = self.num_experts // ep_size
+        if len(self.experts) != num_local:
+            raise RuntimeError(
+                f"EP forward expected {num_local} local experts (num_experts={self.num_experts} "
+                f"// ep_size={ep_size}) but this MoE layer holds {len(self.experts)}; the model "
+                "must be built with EP-sharded experts (see from_base_model)."
+            )
+        B, S, dim = x.shape
+        T = B * S
+        xf = x.reshape(T, dim)
+        topi_flat = topi.reshape(T, self.top_k)                      # (T, k) global expert ids
+        topw_flat = topw.reshape(T, self.top_k).to(x.dtype)          # (T, k)
+        # one-hot dispatch mask (N, k, T)
+        expert_mask = torch.nn.functional.one_hot(
+            topi_flat, num_classes=self.num_experts
+        ).permute(2, 1, 0).contiguous()
+
+        input_splits, output_splits, ngt_local, ngts_local = preprocess(
+            expert_mask, self.num_experts, ep_group
+        )
+        global_permuted, routing_map, perm_map, org_shape = token_pre_all2all(
+            xf, expert_mask, self.num_experts, input_splits, output_splits, ngt_local, ep_group
+        )
+
+        # local per-expert compute: tokens are grouped contiguously by local expert
+        counts = ngts_local.tolist()
+        outs = []
+        off = 0
+        for e, expert in enumerate(self.experts):
+            c = int(counts[e])
+            outs.append(expert(global_permuted[off : off + c]))
+            off += c
+        expert_outputs = torch.cat(outs, dim=0) if outs else global_permuted.new_zeros((0, dim))
+
+        combined = tokens_post_all2all(
+            expert_outputs, topi_flat, self.num_experts, input_splits, output_splits,
+            ngt_local, routing_map, perm_map, org_shape, topw_flat, ep_group,
+        )
+        return combined.reshape(B, S, dim)
+
     def forward(self, x: torch.Tensor, temb: torch.Tensor, gate_weights: Optional[torch.Tensor] = None):
         """Returns ``(output, aux_loss)``. DENSE-MASKED combine: EVERY expert is always run and
         weighted by its gate (top-k renormalized weights, zero off the top-k), so every expert
@@ -205,6 +256,10 @@ class MoEFeedForward(nn.Module):
             if self.top_k < self.num_experts:
                 topw, topi = torch.topk(probs, self.top_k, dim=-1)
                 topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                if ep_enabled():
+                    # sparse expert-parallel dispatch (local experts + all-to-all); math-identical
+                    # to the dense-masked path but only runs top_k experts and shards them over EP.
+                    return self._ep_forward(x, topw.to(x.dtype), topi), self._aux(probs, topi)
                 w = torch.zeros_like(probs).scatter_(-1, topi, topw)  # (B,S,N): renormalized top-k, 0 elsewhere
                 return self._dense(x, w.to(x.dtype)), self._aux(probs, topi)
             return self._dense(x, probs.to(x.dtype)), self._aux(probs, None)
@@ -446,12 +501,91 @@ class Flux2MoETransformer2DModel(
 
         self.gradient_checkpointing = False
         self._last_moe_aux: Optional[torch.Tensor] = None
+        self._ep_grad_hooks_registered = False
 
     def moe_aux_loss(self) -> Optional[torch.Tensor]:
         """Mean MoE load-balancing aux loss from the last forward (None if never run;
         ~0 for the global router). Grad-correct under gradient checkpointing because the
         per-layer aux is a returned block output rather than a stashed side-effect."""
         return self._last_moe_aux
+
+    def shard_experts_for_ep(self, ep_rank: int, ep_size: int) -> "Flux2MoETransformer2DModel":
+        """Keep only this EP rank's local experts (global ids ``[ep_rank*L, (ep_rank+1)*L)``,
+        ``L = num_experts // ep_size``) in every MoE layer. The router and ``config.num_experts``
+        stay GLOBAL (routing is over all N experts); only the physical expert banks shrink, so peak
+        VRAM after FSDP prepare holds L (not N) experts per rank.
+
+        Call once after ``from_base_model`` / ``from_expert_checkpoints`` and BEFORE ``apply_lora``
+        + FSDP prepare, so LoRA wraps and the optimizer/FSDP only ever see the local experts.
+        Records the kept global ids on each layer (``local_expert_ids``) for the EP-aware LoRA save.
+        """
+        n = self.config.num_experts
+        if ep_size < 1 or n % ep_size != 0:
+            raise ValueError(f"num_experts ({n}) must be divisible by ep_size ({ep_size}).")
+        if not (0 <= ep_rank < ep_size):
+            raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}.")
+        if getattr(self, "_ep_sharded", False):
+            raise RuntimeError("shard_experts_for_ep already called on this model; it is not idempotent.")
+        L = n // ep_size
+        local_ids = list(range(ep_rank * L, (ep_rank + 1) * L))
+
+        def _shard(moe: "MoEFeedForward"):
+            moe.experts = nn.ModuleList([moe.experts[i] for i in local_ids])
+            moe.local_expert_ids = local_ids
+
+        for block in self.transformer_blocks:
+            _shard(block.ff)
+            _shard(block.ff_context)
+        for block in self.single_transformer_blocks:
+            _shard(block.attn.moe)
+        self._ep_sharded = True
+        self._ep_local_expert_ids = local_ids
+        return self
+
+    def _iter_moe_layers(self):
+        for block in self.transformer_blocks:
+            yield block.ff
+            yield block.ff_context
+        for block in self.single_transformer_blocks:
+            yield block.attn.moe
+
+    def register_ep_grad_sync(self) -> "Flux2MoETransformer2DModel":
+        """Multi-node EP only: when experts are REPLICATED across EP groups (``edp_size > 1``,
+        e.g. one EP group per node), each replica accumulates grads from its own group's tokens.
+        Register a per-parameter grad hook that all-reduces (mean) the local-expert grads over the
+        expert-DP group so the replicas stay in sync. No-op for ``edp_size == 1`` (single-node EP:
+        each expert lives on exactly one rank, so its grad is already complete).
+
+        The hook fires once per backward; with gradient accumulation the summed accumulation of
+        per-microbatch mean-all-reduced grads equals the mean-all-reduce of the summed grad
+        (all-reduce is linear), so this is correct regardless of accumulation steps.
+
+        Called lazily from the first ``forward`` (after ``apply_lora`` + ``prepare``), so it hooks the
+        actual trainable expert params -- the LoRA adapters under LoRA, or the base experts under full
+        fine-tuning. Single-node EP (``edp_size == 1``, e.g. the validation smoke) is a no-op."""
+        import torch.distributed as dist
+
+        from ...utils.ep import get_edp_group, get_edp_size
+
+        edp_size = get_edp_size()
+        if edp_size <= 1:
+            return self  # single-node EP: nothing to sync
+        edp_group = get_edp_group()
+
+        def _hook(grad: torch.Tensor) -> torch.Tensor:
+            g = grad.contiguous()
+            dist.all_reduce(g, op=dist.ReduceOp.SUM, group=edp_group)
+            g.div_(edp_size)
+            return g
+
+        n = 0
+        for moe in self._iter_moe_layers():
+            for p in moe.experts.parameters():
+                if p.requires_grad:
+                    p.register_hook(_hook)
+                    n += 1
+        logger.info(f"[MoE-EP] registered expert-DP grad sync on {n} params (edp_size={edp_size})")
+        return self
 
     def forward(
         self,
@@ -470,6 +604,12 @@ class Flux2MoETransformer2DModel(
     ):
         if kv_cache_mode is not None or num_ref_tokens:
             raise NotImplementedError("Flux2MoETransformer2DModel v1 does not support KV-cache / reference tokens.")
+
+        # Lazily register the expert-DP grad sync on the FIRST forward (after apply_lora, so the
+        # trainable LoRA expert params are hooked). No-op unless EP is on with edp_size>1 (multi-node).
+        if not self._ep_grad_hooks_registered and ep_enabled():
+            self.register_ep_grad_sync()
+            self._ep_grad_hooks_registered = True
 
         num_txt_tokens = encoder_hidden_states.shape[1]
         timestep = timestep.to(hidden_states.dtype) * 1000

@@ -173,6 +173,19 @@ class ModelArguments(ArgABC):
                           "base (lossless merge). Set False when experts were trained on the fused "
                           "single-block projection (single-block attention then drifts and is discarded)."},
     )
+    moe_enable_ep: bool = field(
+        default=False,
+        metadata={"help": "Expert-parallel the MoE: shard the experts over moe_ep_size ranks (intra-node "
+                          "all-to-all dispatch/combine) instead of the dense-masked path that runs every "
+                          "expert on every rank. Requires moe_top_k < moe_num_experts and token_linear "
+                          "routing; moe_num_experts must be divisible by moe_ep_size. Flux2 Klein MoE only."},
+    )
+    moe_ep_size: int = field(
+        default=1,
+        metadata={"help": "Expert-parallel group size (experts per EP group). Set to gpus_per_node (e.g. 8) "
+                          "to keep each EP group inside one node (NVLink all-to-all) and replicate across "
+                          "nodes. Ignored unless moe_enable_ep. world_size must be divisible by moe_ep_size."},
+    )
 
     # --- Velocity-space Mixture-of-Flow (MoF-V; Flux2 Klein only) ---
     mof_enabled: bool = field(
@@ -236,6 +249,29 @@ class ModelArguments(ArgABC):
                 "moe_enabled (weight-space MoE) and mof_enabled (velocity-space MoF) are mutually "
                 "exclusive; set exactly one."
             )
+
+        if self.moe_enable_ep:
+            if not self.moe_enabled:
+                raise ValueError("moe_enable_ep requires moe_enabled=True (expert parallelism is a "
+                                 "weight-space MoE feature).")
+            if self.moe_ep_size < 1:
+                raise ValueError(f"moe_ep_size must be >= 1, got {self.moe_ep_size}.")
+            if self.moe_num_experts % self.moe_ep_size != 0:
+                raise ValueError(
+                    f"moe_num_experts ({self.moe_num_experts}) must be divisible by moe_ep_size "
+                    f"({self.moe_ep_size}) for expert parallelism."
+                )
+            if self.moe_router_type != "token_linear":
+                raise ValueError(
+                    f"moe_enable_ep requires moe_router_type='token_linear' (sparse per-token dispatch); "
+                    f"got {self.moe_router_type!r}. The 'global' router does a dense soft mix over all "
+                    "experts, which has no sparse EP path."
+                )
+            if self.moe_top_k >= self.moe_num_experts:
+                raise ValueError(
+                    f"moe_enable_ep requires moe_top_k < moe_num_experts (sparse routing); got "
+                    f"top_k={self.moe_top_k}, num_experts={self.moe_num_experts}."
+                )
 
         self.resume_path = os.path.expanduser(self.resume_path) if self.resume_path is not None else None
 

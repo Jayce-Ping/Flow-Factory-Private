@@ -289,6 +289,35 @@ class XOPDTrainer(BaseTrainer):
         )
         self._teacher_loaded_early = True
 
+    def _clip_grad_norm_ep_aware(self, params, max_norm):
+        """Grad-norm clipping tolerant of the expert-parallel parameter mix. With EP the trainable
+        params split into FSDP-sharded backbone/router (DTensor grads) and EP-owned local experts
+        (plain Tensor grads); torch's fused ``_foreach_norm`` cannot mix DTensor and Tensor in one
+        call (``aten._foreach_norm got mixed torch.Tensor and DTensor``), so clip the two groups with
+        separate calls -- each to ``max_norm``. This is a per-group heuristic, not a single global
+        norm, which is fine for the stability role of clipping. Returns the FSDP (DTensor) group's
+        grad norm for logging. Without EP (or no clipping), defers to accelerate's clip."""
+        params = [p for p in params if p is not None]
+        from ...utils.ep import ep_enabled
+
+        if not ep_enabled() or not max_norm:
+            return self.accelerator.clip_grad_norm_(params, max_norm)
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            from torch.distributed._tensor import DTensor
+
+        with_grad = [p for p in params if p.grad is not None]
+        dparams = [p for p in with_grad if isinstance(p.grad, DTensor)]
+        lparams = [p for p in with_grad if not isinstance(p.grad, DTensor)]
+        grad_norm = None
+        if dparams:
+            grad_norm = self.accelerator.clip_grad_norm_(dparams, max_norm)
+        if lparams:
+            local_norm = torch.nn.utils.clip_grad_norm_(lparams, max_norm)
+            grad_norm = local_norm if grad_norm is None else grad_norm
+        return grad_norm
+
     def _initialization(self):
         """XOPD initialization. Default path defers to the base (student-only prepare;
         teacher loaded later in ``_init_same_arch_teacher``). The FSDP full-shard OOM
@@ -1272,7 +1301,7 @@ class XOPDTrainer(BaseTrainer):
 
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
-                        grad_norm = self.accelerator.clip_grad_norm_(
+                        grad_norm = self._clip_grad_norm_ep_aware(
                             self.adapter.get_trainable_parameters(),
                             ta.max_grad_norm,
                         )
@@ -1998,7 +2027,7 @@ class XOPDTrainer(BaseTrainer):
 
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
-                        grad_norm = self.accelerator.clip_grad_norm_(
+                        grad_norm = self._clip_grad_norm_ep_aware(
                             self.adapter.get_trainable_parameters(),
                             ta.max_grad_norm,
                         )
@@ -2553,7 +2582,7 @@ class XOPDTrainer(BaseTrainer):
 
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
-                        grad_norm = self.accelerator.clip_grad_norm_(
+                        grad_norm = self._clip_grad_norm_ep_aware(
                             self.adapter.get_trainable_parameters(),
                             self.training_args.max_grad_norm,
                         )

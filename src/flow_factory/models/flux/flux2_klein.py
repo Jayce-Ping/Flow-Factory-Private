@@ -175,6 +175,22 @@ class Flux2KleinAdapter(BaseAdapter):
             raise ValueError(f"unknown moe_init={self.model_args.moe_init!r}; expected 'replicate' or 'experts'")
 
         moe = moe.to(device=base_tf.device, dtype=base_tf.dtype)
+
+        # Expert parallelism: shard the experts to this rank's local slice BEFORE LoRA / freeze /
+        # prepare, so LoRA wraps and FSDP/optimizer only ever see the local experts. init_ep_groups
+        # is collective (dist.new_group) and every rank runs this build, so the groups line up.
+        if getattr(self.model_args, "moe_enable_ep", False):
+            from ...utils.ep import get_ep_rank, get_ep_size, init_ep_groups
+
+            init_ep_groups(self.model_args.moe_ep_size)
+            moe.shard_experts_for_ep(ep_rank=get_ep_rank(), ep_size=get_ep_size())
+            # expert-DP grad sync (edp_size>1, multi-node) is registered lazily on the first forward,
+            # AFTER apply_lora, so it hooks the trainable (LoRA) expert params, not the frozen base.
+            logger.info(
+                f"[MoE-EP] experts sharded over ep_size={get_ep_size()} "
+                f"(ep_rank={get_ep_rank()}, local global-ids={moe._ep_local_expert_ids})"
+            )
+
         pipeline.transformer = moe
         del base_tf
         logger.info(
