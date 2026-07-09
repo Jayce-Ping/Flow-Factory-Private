@@ -254,9 +254,14 @@ class XOPDTrainer(BaseTrainer):
         # transport: teacher velocities already live in the student latent space.
         self.transport = build_transport("identity")
 
-    def _load_same_arch_teacher_transformer(self) -> None:
+    def _load_same_arch_teacher_transformer(self, device=None) -> None:
         """Load the frozen same-arch teacher transformer into the student adapter
-        (validation + device/dtype). Idempotent via ``_teacher_loaded_early``."""
+        (validation + device/dtype). Idempotent via ``_teacher_loaded_early``.
+
+        ``device`` overrides where the teacher is loaded. The FSDP-bundle path passes
+        ``device='cpu'`` so the full teacher is NOT materialized on every rank's GPU before
+        ``accelerator.prepare`` shards it (that pre-shard spike OOMed the 8-expert runs);
+        FSDP then shards the CPU teacher onto GPU incrementally."""
         ta = self.training_args
         if not (
             hasattr(self.adapter, "load_teacher_transformer")
@@ -270,7 +275,8 @@ class XOPDTrainer(BaseTrainer):
                 f"{type(self.adapter).__name__}. For a different teacher "
                 "architecture set teacher_model_type + vae_transport."
             )
-        if ta.teacher_param_device == "cpu":
+        load_device = device if device is not None else self.accelerator.device
+        if device is None and ta.teacher_param_device == "cpu":
             logger.warning(
                 "teacher_param_device='cpu' is not supported for the XOPD teacher "
                 "transformer (per-forward H2D is not implemented); loading the "
@@ -278,7 +284,7 @@ class XOPDTrainer(BaseTrainer):
             )
         self.adapter.load_teacher_transformer(
             ta.teacher_model_name_or_path,
-            device=self.accelerator.device,
+            device=load_device,
             dtype=self.adapter._inference_dtype,
         )
         self._teacher_loaded_early = True
@@ -297,10 +303,11 @@ class XOPDTrainer(BaseTrainer):
         )
         if use_bundle:
             logger.info(
-                "[FSDP-bundle] fsdp_shard_teacher=True (same-arch): load teacher + bundle "
-                "with student BEFORE prepare, so one FSDP root shards both."
+                "[FSDP-bundle] fsdp_shard_teacher=True (same-arch): load teacher on CPU + bundle "
+                "with the (CPU) student BEFORE prepare, so one FSDP root shards both onto GPU "
+                "incrementally (no pre-shard full-teacher GPU spike)."
             )
-            self._load_same_arch_teacher_transformer()
+            self._load_same_arch_teacher_transformer(device="cpu")
             self.adapter.build_xopd_transformer_bundle()
         super()._initialization()
         if use_bundle:

@@ -16,7 +16,7 @@ fsdp_config:
   fsdp_offload_params: false
   fsdp_reshard_after_forward: true       # FULL_SHARD: reshard after forward -> low peak memory (required for the big MoE+teacher bundle; SHARD_GRAD_OP/false would keep ~full model resident and OOM)
   fsdp_state_dict_type: FULL_STATE_DICT
-  fsdp_cpu_ram_efficient_loading: true   # rank-0 CPU load + distribute shards -> avoids per-rank full-model materialization (the N-large load-OOM)
+  fsdp_cpu_ram_efficient_loading: false  # all ranks build the model on CPU (2.2TB RAM); FSDP shards each rank's CPU copy onto GPU incrementally. The pre-shard GPU spike is avoided by loading the teacher on CPU (trainer _load_same_arch_teacher_transformer device='cpu'), not by rank0-meta loading (which our custom MoE/MoF build does not do).
   fsdp_activation_checkpointing: true    # FSDP-side AC (set model enable_gradient_checkpointing: false to avoid double-AC)
   fsdp_sync_module_states: true
 machine_rank: 0
