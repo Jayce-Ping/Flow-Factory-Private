@@ -1,9 +1,9 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# LoRA-on-MLP single-domain OCR (OCR expert E1): 4B student distilled from the 32B teacher
-# on OCR prompts. LoRA (rank 64, alpha 128) on the DOUBLE-stream MLP (ff/ff_context) only --
-# faster + more expressive than full-rank@1e-5 (which converged too slowly). The saved LoRA
-# adapter is merged to full MLP weights on load (from_expert_checkpoints -> merge_and_unload),
-# so it is still losslessly mergeable into the MoE expert bank. eval @ 512px.
+# SINGLE-BASE OCR baseline for the capacity ablation (single 4B vs MoE vs MoF). LoRA (rank 64,
+# alpha 128) on ALL linears (attn + MLP), consistent with the MoE/MoF configs for a fair
+# comparison. 4B student distilled from the 32B teacher on OCR prompts. eval @ 512px.
+# (History: this file used to be the MLP-only "OCR expert E1" merged into the MoE bank; switched
+# to all-linear for the ablation. For the E1 merge path use moe_assert_mlp_only=false.)
 # Cross-FAMILY distillation: teacher and student share the VAE / latent space
 # (AutoencoderKLFlux2, in_channels=128) but use DIFFERENT text encoders -- dev's
 # Mistral3 (dim 15360) vs klein's Qwen3 (dim 7680). Teacher text embeddings are
@@ -40,11 +40,7 @@ model:
   finetune_type: "lora"                   # LoRA (faster + more expressive than full-rank@1e-5); merged to full MLP weights on load for the MoE
   lora_rank: 64                           # expressiveness
   lora_alpha: 128                         # scale (alpha/r = 2.0)
-  target_modules:                         # DOUBLE-stream MLP ONLY (ff/ff_context) -- PEFT suffix-match; merged delta is losslessly mergeable into the MoE expert bank
-    - "ff.linear_in"
-    - "ff.linear_out"
-    - "ff_context.linear_in"
-    - "ff_context.linear_out"
+  target_modules: "all-linear"            # ablation baseline: ALL linears (attn + MLP), consistent with the MoE/MoF configs. NOTE: no longer MLP-only, so this run is NOT a lossless MLP-only E1 for the moe2_base_ocr merge (that merge would need moe_assert_mlp_only=false); the 5-exp ablation uses base-copy MoE/MoF, not the E1 merge.
   model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"  # Student path (HF repo id or local)
   model_type: "flux2-klein"               # Adapter registry key (fixed for klein)
   resume_path: null                       # Checkpoint/LoRA to resume from; null = none

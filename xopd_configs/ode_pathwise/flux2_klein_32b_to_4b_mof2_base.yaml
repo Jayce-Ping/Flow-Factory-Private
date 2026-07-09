@@ -1,18 +1,18 @@
-# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 8-expert VELOCITY-space MoF student (Experiment 4).
-# 8 INDEPENDENT full FLUX.2-klein-base-4B experts (LoRA-adapted copies of base); one shared
-# per-token router picks top-2 experts/token (softmax + renorm) and blends their OUTPUT
-# velocities; distilled to dev-32B (L1 + load-balance aux). Contrast with Experiment 3
-# (weight-space MoE): there top-k gives sparse MLP compute; here per-token routing runs ALL 8
-# expert forwards each step (top-k only sparsifies the blend) -> ~8x student forward.
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert VELOCITY-space MoF student (MoF2 ablation).
+# 2 INDEPENDENT full FLUX.2-klein-base-4B experts (LoRA copies of base); a shared per-SAMPLE
+# global router picks top-1 expert/sample and (at top_k=1) uses its velocity directly; distilled
+# to dev-32B (L1 + load-balance aux). This is the EFFICIENT MoF path: per-sample top-1 runs ONLY
+# 1 of the 2 full-transformer experts each step (~1x student forward), unlike the per-token MoF8
+# which runs all N. Analogue of MoE2 (both top-1 of 2), but MoF blends whole-sample velocities.
 #
-# SCALE / MEMORY: 8x4B experts (frozen base) + 32B teacher (~96B) -> FSDP2 full-shard of both
-# (fsdp_shard_teacher + fsdp2_prefetch.yaml). LoRA (rank 64, 'all-linear') keeps trainable/optimizer
-# tiny. A single-node (8-GPU) feasibility test decides whether offload is needed (token-EP does
-# NOT apply to full-model experts).
+# SCALE / MEMORY: 2x4B experts (~13GB, replicated) + 32B teacher (64GB, replicated) ~85GB fits 96G
+# on plain DDP. DDP (not FSDP) is what makes per-sample top-k cheap AND safe: only k experts run,
+# and replicated params need no conditional FSDP all-gather (which would hang across ranks that
+# pick different experts). LoRA (rank 64, 'all-linear') keeps trainable/optimizer tiny.
 
 # ===== Environment =====
 launcher: "accelerate"
-config_file: config/accelerate_configs/fsdp2_prefetch.yaml
+config_file: config/accelerate_configs/multi_gpu.yaml   # plain DDP (replicate): 2x4B experts (~13GB) + teacher(32B,64GB) ~85GB fits 96G. DDP (not FSDP) is REQUIRED so per-sample top-k can run only k experts without an FSDP conditional-all-gather hang. Launch via run_4node_ddp.sh.
 num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
@@ -39,17 +39,17 @@ model:
   model_type: "flux2-klein"
   resume_path: null
   resume_type: null
-  # --- MoF-V construction ---
+  # --- MoF-V construction (efficient: per-SAMPLE top-1 -> only 1 of 2 full-transformer experts runs/sample) ---
   mof_enabled: true
-  mof_num_experts: 8
-  mof_top_k: 2
-  mof_route_granularity: "token"          # per-token routing (runs all 8 experts; top-k sparsifies the blend)
-  mof_router_type: "token_linear"         # one shared per-token gate on input latent + timestep
+  mof_num_experts: 2
+  mof_top_k: 1
+  mof_route_granularity: "sample"         # per-sample routing: run ONLY the top-1 expert each sample (at bsz=1 -> exactly 1 forward). This is the MoF activation/compute reduction.
+  mof_router_type: "global"               # per-sample gate on pooled prompt + timestep (sample granularity)
   mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_mof8_base"
+  run_name: "flux2klein_32b_to_4b_mof2_base"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -59,7 +59,7 @@ log:
 # ===== Training (XOPD distill to dev-32B, OCR-only) =====
 train:
   trainer_type: "xopd"
-  fsdp_shard_teacher: false               # shard ONLY the 8x4B (~32B) MoF student via FSDP2; teacher (32B) replicated per GPU -> no per-step teacher all-gather. NOTE: route_granularity='token' runs all 8 experts (uniform across ranks -> FSDP-safe) but ~8x forward; the efficient per-sample top-k needs EP-for-MoF (see mof2 for the DDP top-k path).
+  fsdp_shard_teacher: false               # DDP: teacher (32B) + both experts replicated per GPU; per-sample top-1 runs 1 expert (find_unused_parameters handles the unrun expert's grad)
   max_epochs: 500
 
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
@@ -107,7 +107,7 @@ train:
   ema_update_interval: 4
   ema_device: "cuda"
 
-  enable_gradient_checkpointing: false    # FSDP activation checkpointing handles AC (avoid double-AC)
+  enable_gradient_checkpointing: true     # DDP has no FSDP-side AC -> model-side gradient checkpointing on the (1 active) expert
   offload_samples_to_cpu: false
   seed: 42
 
