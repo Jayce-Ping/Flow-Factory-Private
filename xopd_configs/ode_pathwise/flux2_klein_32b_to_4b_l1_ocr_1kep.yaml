@@ -10,11 +10,11 @@
 # precomputed during preprocessing and the 48GB teacher text encoder is offloaded
 # before training; the 64GB teacher transformer stays resident.
 # Non-CFG (teacher_gs = student_gs = 1.0); pure L1 (l0_warmup_epochs=0).
-# SECOND expert (after geneval_enhanced). FULL eval suite on all 6 test sets
-# (geneval_enhanced/ocr/pickscore x gs1/gs4). Teacher-baseline eval SKIPPED here
-# (eval_teacher_at_start: false) — the teacher ceiling was computed once by the FIRST
-# expert (flux2klein_32b_to_4b_l1_geneval_enh_1kep) on the same 6 sets and is overlaid
-# in the comparison HTML. Teacher transformer still loads for L1 supervision.
+# FIRST expert of the three-student capacity study (OCR -> geneval_enhanced -> mixed).
+# FULL eval suite on all 6 test sets (geneval_enhanced/ocr/pickscore x gs1/gs4).
+# Teacher-baseline eval ON here (eval_teacher_at_start: true): this run computes the
+# ONE shared teacher ceiling on all 6 sets; the geneval_enhanced and mixed runs set it
+# false and reuse this ceiling (overlaid in the comparison HTML). Train + eval @ 512px.
 
 # ===== Environment =====
 launcher: "accelerate"                    # Launcher. Options: accelerate
@@ -67,8 +67,8 @@ train:
   teacher_param_device: "cuda"            # Teacher transformer device. Options: cuda (only cuda supported today), cpu
   assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
 
-  # --- Teacher baseline eval: SKIPPED (reuse the FIRST expert's teacher ceiling) ---
-  eval_teacher_at_start: false            # Skip the ~2h teacher-baseline eval at epoch 0; teacher transformer still loads for L1. Teacher ceiling reused from the geneval_enhanced first-expert run (same 6 test sets), overlaid in the comparison HTML.
+  # --- Teacher baseline eval: ON (this is the FIRST expert; establishes the shared teacher ceiling) ---
+  eval_teacher_at_start: true             # Run the teacher-baseline eval once at epoch 0 on all 6 test sets (the ~2h shared ceiling). The geneval_enhanced and mixed runs reuse it with eval_teacher_at_start: false.
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
   teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
@@ -96,8 +96,8 @@ train:
   num_inference_steps: 28                 # L1 student rollout steps (undistilled base models need more steps)
   per_device_batch_size: 1                # Conservative: 32B teacher ~64GB resident + 4B full-FT student. Re-run a batch search once GPUs are free to raise it.
   group_size: 1                           # Group size (XOPD default 1; only >1 if you add grouped REINFORCE)
-  unique_sample_num_per_epoch: 64         # Unique prompts sampled per epoch (= LoRA single-ocr; matched comparison). num_batches_per_epoch = 64/32 = 2.
-  gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps = 2*28 = 56)
+  unique_sample_num_per_epoch: 128        # 128 unique prompts/epoch (batch-geometry default; every domain expert sees 128/epoch for a fair specialist-vs-mixed comparison). num_batches_per_epoch = 128/32 = 4.
+  gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps = 4*28 = 112)
   num_inner_epochs: 1                     # MUST be 1 for XOPD (no rollout reuse); enforced at startup
   gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps
 
@@ -114,7 +114,7 @@ train:
   ema_device: "cuda"                      # EMA storage device. Options: cpu, cuda
 
   # --- Memory / misc ---
-  enable_gradient_checkpointing: false     # On (safe default for full-FT): 4B full-FT student + 64GB teacher; ~77GB/GPU with ZeRO-2, fits 98GB. Flip to false for speed once no-OOM confirmed.
+  enable_gradient_checkpointing: false     # Off for speed: 4B LoRA student + 64GB frozen teacher at 512px fits ZeRO-2 (~85GB/GPU observed). Flip true only if a first-step OOM appears.
   offload_samples_to_cpu: false           # Offload sample tensors to CPU between sample() and optimize() to cut peak VRAM
   seed: 42                                # Random seed
 

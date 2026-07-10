@@ -997,17 +997,53 @@ class XOPDTrainer(BaseTrainer):
             logger.info("XOPD teacher baseline: no test dataloaders; skipping.")
             return
 
+        self._eval_debug_gloo_barrier("teacher_baseline:begin")
         self.adapter.eval()
         logger.info("XOPD: evaluating teacher baseline on all test sets")
         # Batch all test sets into ONE log call so the teacher baseline lands on a
         # single wandb step (step 0), not spread across stepless auto-steps.
         self._eval_log_sink = {}
         for test_set_name in sorted(self.test_dataloaders.keys()):
+            self._eval_debug_gloo_barrier(f"teacher_test_set:{test_set_name}:begin")
+            self._log_eval_dist_debug(test_set_name, "teacher_test_set:begin")
             self._evaluate_teacher_test_set(test_set_name)
+            self._log_eval_dist_debug(test_set_name, "teacher_test_set:end")
         if self.accelerator.is_main_process and self._eval_log_sink:
+            self._log_eval_dist_debug(None, "teacher_wandb_log:begin")
             self.log_data(self._eval_log_sink, step=self.step)
+            self._log_eval_dist_debug(None, "teacher_wandb_log:end")
         self._eval_log_sink = None
+        self._log_eval_dist_debug(None, "teacher_baseline_barrier:begin")
         self.accelerator.wait_for_everyone()
+        self._log_eval_dist_debug(None, "teacher_baseline_barrier:end")
+
+    def _eval_debug_gloo_barrier(self, stage: str) -> None:
+        """Debug-only CPU barrier that cannot consume the NCCL collective stream."""
+        if os.environ.get("FLOW_FACTORY_EVAL_GLOO_BARRIER") != "1":
+            return
+        if self.accelerator.num_processes <= 1:
+            return
+
+        from datetime import timedelta
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "FLOW_FACTORY_EVAL_GLOO_BARRIER=1 requires an initialized "
+                "torch.distributed process group, but dist.is_initialized() is False."
+            )
+        if not hasattr(self, "_eval_debug_gloo_group"):
+            self._log_eval_dist_debug(None, "gloo_group:create_begin", target_stage=stage)
+            self._eval_debug_gloo_group = dist.new_group(backend="gloo")
+            self._log_eval_dist_debug(None, "gloo_group:create_end", target_stage=stage)
+
+        self._log_eval_dist_debug(None, "gloo_barrier:begin", target_stage=stage)
+        dist.monitored_barrier(
+            group=self._eval_debug_gloo_group,
+            timeout=timedelta(minutes=15),
+            wait_all_ranks=True,
+        )
+        self._log_eval_dist_debug(None, "gloo_barrier:end", target_stage=stage)
 
     def _evaluate_teacher_test_set(self, test_set_name: str) -> None:
         """Score the teacher on one test set and cache the reward scalars."""
@@ -1028,12 +1064,19 @@ class XOPDTrainer(BaseTrainer):
         # the student pipeline and route cached teacher embeddings.
         if self._cross_vae:
             with torch.no_grad(), self.autocast():
+                self._log_eval_dist_debug(test_set_name, "teacher_inference:begin")
                 all_samples = self._run_teacher_eval_inference_batches_cross_vae(
                     test_set_name, merged_eval, eval_seed
                 )
-                gathered_rewards = self._gather_eval_rewards()
-                gathered_tags = self._gather_eval_tags(all_samples)
+                self._log_eval_dist_debug(
+                    test_set_name,
+                    "teacher_inference:end",
+                    local_samples=len(all_samples),
+                )
+                gathered_rewards = self._gather_eval_rewards(test_set_name)
+                gathered_tags = self._gather_eval_tags(all_samples, test_set_name)
                 if self.accelerator.is_main_process:
+                    self._log_eval_dist_debug(test_set_name, "teacher_metric_log:begin")
                     self._log_eval_reward_metrics(
                         gathered_rewards, log_pfx, all_samples, gathered_tags=gathered_tags
                     )
@@ -1044,16 +1087,26 @@ class XOPDTrainer(BaseTrainer):
                         self._teacher_baseline_scalars[f"{log_pfx}/reward_{key}_std"] = float(
                             np.std(value)
                         )
+                    self._log_eval_dist_debug(test_set_name, "teacher_metric_log:end")
+            self._log_eval_dist_debug(test_set_name, "teacher_test_set_barrier:begin")
             self.accelerator.wait_for_everyone()
+            self._log_eval_dist_debug(test_set_name, "teacher_test_set_barrier:end")
             return
 
         with torch.no_grad(), self.autocast(), self.adapter.use_teacher_transformer():
+            self._log_eval_dist_debug(test_set_name, "teacher_inference:begin")
             all_samples = self._run_teacher_eval_inference_batches(
                 test_set_name, merged_eval, eval_seed
             )
-            gathered_rewards = self._gather_eval_rewards()
-            gathered_tags = self._gather_eval_tags(all_samples)
+            self._log_eval_dist_debug(
+                test_set_name,
+                "teacher_inference:end",
+                local_samples=len(all_samples),
+            )
+            gathered_rewards = self._gather_eval_rewards(test_set_name)
+            gathered_tags = self._gather_eval_tags(all_samples, test_set_name)
             if self.accelerator.is_main_process:
+                self._log_eval_dist_debug(test_set_name, "teacher_metric_log:begin")
                 self._log_eval_reward_metrics(
                     gathered_rewards, log_pfx, all_samples, gathered_tags=gathered_tags
                 )
@@ -1066,7 +1119,10 @@ class XOPDTrainer(BaseTrainer):
                     self._teacher_baseline_scalars[f"{log_pfx}/reward_{key}_std"] = float(
                         np.std(value)
                     )
+                self._log_eval_dist_debug(test_set_name, "teacher_metric_log:end")
+        self._log_eval_dist_debug(test_set_name, "teacher_test_set_barrier:begin")
         self.accelerator.wait_for_everyone()
+        self._log_eval_dist_debug(test_set_name, "teacher_test_set_barrier:end")
 
     def _run_teacher_eval_inference_batches_cross_vae(
         self,

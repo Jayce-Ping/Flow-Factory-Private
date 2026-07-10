@@ -100,6 +100,33 @@ class BaseTrainer(ABC):
         """Whether to show tqdm progress bars."""
         return self.log_args.verbose and self.accelerator.is_local_main_process
 
+    def _log_eval_dist_debug(
+        self,
+        test_set_name: Optional[str],
+        stage: str,
+        **details: Any,
+    ) -> None:
+        """Emit one rank-aware marker around distributed evaluation stages.
+
+        Env-gated via ``FLOW_FACTORY_EVAL_DEBUG=1`` and OFF by default so production
+        runs stay quiet. Enable it to trace per-rank stage progress when a distributed
+        eval hangs or a single rank exits: the markers pinpoint which collective a rank
+        was entering (inference / reward_finalize / reward_gather / tag_gather / barrier),
+        which is how the cross-node startup-skew + HF-429 desync was localized.
+        """
+        if os.environ.get("FLOW_FACTORY_EVAL_DEBUG") != "1":
+            return
+        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+        logger.warning(
+            "[eval-dist-debug] rank=%d/%d local_rank=%d test_set=%s stage=%s%s",
+            self.accelerator.process_index,
+            self.accelerator.num_processes,
+            self.accelerator.local_process_index,
+            test_set_name or "<unspecified>",
+            stage,
+            f" {detail_text}" if detail_text else "",
+        )
+
     def should_continue_training(self) -> bool:
         """Outer epoch loop: continue unless a finite ``max_epochs`` has been reached."""
         m = self.training_args.max_epochs
@@ -528,8 +555,8 @@ class BaseTrainer(ABC):
 
         with torch.no_grad(), self.autocast(), self._eval_inference_context():
             all_samples = self._run_eval_inference_batches(test_set_name, merged_eval, eval_seed)
-            gathered_rewards = self._gather_eval_rewards()
-            gathered_tags = self._gather_eval_tags(all_samples)
+            gathered_rewards = self._gather_eval_rewards(test_set_name)
+            gathered_tags = self._gather_eval_tags(all_samples, test_set_name)
             if self.accelerator.is_main_process:
                 self._log_eval_reward_metrics(
                     gathered_rewards, log_pfx, all_samples, gathered_tags=gathered_tags
@@ -571,15 +598,47 @@ class BaseTrainer(ABC):
             self.eval_reward_buffer.add_samples(samples)
         return all_samples
 
-    def _gather_eval_rewards(self) -> Dict[str, np.ndarray]:
+    def _gather_eval_rewards(
+        self, test_set_name: Optional[str] = None
+    ) -> Dict[str, np.ndarray]:
+        self._log_eval_dist_debug(
+            test_set_name,
+            "reward_finalize:begin",
+            local_samples=len(self.eval_reward_buffer.all_samples),
+        )
         rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split="pointwise")
+        self._log_eval_dist_debug(
+            test_set_name,
+            "reward_finalize:end",
+            reward_shapes={key: tuple(value.shape) for key, value in rewards.items()},
+        )
         rewards = {
             key: torch.as_tensor(value).to(self.accelerator.device)
             for key, value in rewards.items()
         }
-        return {key: self.accelerator.gather(value).cpu().numpy() for key, value in rewards.items()}
+        gathered_rewards: Dict[str, np.ndarray] = {}
+        for key, value in rewards.items():
+            self._log_eval_dist_debug(
+                test_set_name,
+                "reward_gather:begin",
+                reward=key,
+                local_shape=tuple(value.shape),
+            )
+            gathered = self.accelerator.gather(value).cpu().numpy()
+            gathered_rewards[key] = gathered
+            self._log_eval_dist_debug(
+                test_set_name,
+                "reward_gather:end",
+                reward=key,
+                global_shape=tuple(gathered.shape),
+            )
+        return gathered_rewards
 
-    def _gather_eval_tags(self, all_samples: List[BaseSample]) -> Optional[List[Optional[str]]]:
+    def _gather_eval_tags(
+        self,
+        all_samples: List[BaseSample],
+        test_set_name: Optional[str] = None,
+    ) -> Optional[List[Optional[str]]]:
         """Gather per-sample tags across all ranks for correct per-tag metric aggregation.
 
         In distributed evaluation, each rank only holds a shard of samples.
@@ -602,7 +661,17 @@ class BaseTrainer(ABC):
 
         # Use object-level all_gather for string tags (avoids vocabulary sync issues)
         all_tags_nested = [None] * self.accelerator.num_processes
+        self._log_eval_dist_debug(
+            test_set_name,
+            "tag_gather:begin",
+            local_tags=len(local_tags),
+        )
         dist.all_gather_object(all_tags_nested, local_tags)
+        self._log_eval_dist_debug(
+            test_set_name,
+            "tag_gather:end",
+            per_rank_counts=[len(rank_tags) for rank_tags in all_tags_nested],
+        )
         # Flatten: interleave by rank to match accelerator.gather() tensor ordering.
         # accelerator.gather() concatenates [rank0_tensor, rank1_tensor, ...],
         # but with padding to equal length. DistributedSampler pads the dataset
