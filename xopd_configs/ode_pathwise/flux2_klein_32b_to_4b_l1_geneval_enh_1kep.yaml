@@ -1,19 +1,19 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# SINGLE-BASE OCR baseline for the capacity ablation (single 4B vs MoE vs MoF). LoRA (rank 64,
-# alpha 128) on ALL linears (attn + MLP), consistent with the MoE/MoF configs for a fair
-# comparison. 4B student distilled from the 32B teacher on OCR prompts. eval @ 512px.
-# (History: this file used to be the MLP-only "OCR expert E1" merged into the MoE bank; switched
-# to all-linear for the ablation. For the E1 merge path use moe_assert_mlp_only=false.)
+# GENEVAL_ENHANCED expert — the FIRST of the two single-domain experts (geneval_enhanced + ocr)
+# we train from scratch. LoRA (rank 64, alpha 128) on ALL linears (attn + MLP), consistent with
+# the later MoE/MoF configs for a fair capacity comparison. 4B student distilled from the 32B
+# teacher on geneval_enhanced prompts. eval @ 512px.
+# geneval_enhanced fully REPLACES the old dataset/geneval everywhere going forward (the old
+# geneval was too easy); the "geneval" eval domain here reads dataset/geneval_enhanced.
 # Cross-FAMILY distillation: teacher and student share the VAE / latent space
 # (AutoencoderKLFlux2, in_channels=128) but use DIFFERENT text encoders -- dev's
 # Mistral3 (dim 15360) vs klein's Qwen3 (dim 7680). Teacher text embeddings are
 # precomputed during preprocessing and the 48GB teacher text encoder is offloaded
 # before training; the 64GB teacher transformer stays resident.
 # Non-CFG (teacher_gs = student_gs = 1.0); pure L1 (l0_warmup_epochs=0).
-# Teacher-baseline eval SKIPPED (eval_teacher_at_start: false) — teacher performance
-# is already known from prior runs (uilxegpn/j133yiuk); the shared teacher ceiling
-# is overlaid in the comparison HTML from those runs. Teacher transformer still
-# loads for L1 supervision.
+# FULL eval suite on all 6 test sets (geneval_enhanced/ocr/pickscore x gs1/gs4). As the FIRST
+# expert, eval_teacher_at_start: true computes the teacher ceiling here on all 6 sets; the ocr
+# expert (and later moe/mof) reuse it via eval_teacher_at_start: false.
 
 # ===== Environment =====
 launcher: "accelerate"                    # Launcher. Options: accelerate
@@ -25,7 +25,7 @@ mixed_precision: "bf16"                   # Mixed precision. Options: no, fp16, 
 # ===== Data (prompts only; L0's z0 is teacher-generated) =====
 data:
   dataset_dir: "dataset/geneval_enhanced" # eval/test fallback
-  # --- Training prompt set: OCR only ---
+  # --- Training prompt set: geneval_enhanced only (this is the geneval_enhanced expert) ---
   dataset_dirs:
     - "dataset/geneval_enhanced"
   preprocessing_batch_size: 32            # Batch size for offline teacher text encoding
@@ -35,7 +35,7 @@ data:
   max_dataset_size: null                  # Truncate dataset size; null = no limit
   sampler_type: "auto"                    # Sampler. Options: auto, distributed_k_repeat, group_contiguous
 
-# ===== Model (student = OCR expert E1, LoRA on the double-stream MLP) =====
+# ===== Model (student = geneval_enhanced expert, LoRA on all linears) =====
 model:
   finetune_type: "lora"                   # LoRA (faster + more expressive than full-rank@1e-5); merged to full MLP weights on load for the MoE
   lora_rank: 64                           # expressiveness
@@ -52,7 +52,7 @@ log:
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"  # shared cephfs checkpoint dir
-  save_freq: 50                           # SAVE checkpoints: this run doubles as OCR expert E1 (consumed by MoE merge moe_expert_paths)
+  save_freq: 50                           # SAVE checkpoints: this run is the geneval_enhanced expert (later consumed by the MoE/MoF merge as an expert)
   save_model_only: true                   # Save only model weights (not optimizer/scheduler state)
 
 # ===== Training (XOPD) =====
@@ -66,8 +66,8 @@ train:
   teacher_param_device: "cuda"            # Teacher transformer device. Options: cuda (only cuda supported today), cpu
   assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
 
-  # --- Teacher baseline eval: SKIPPED (reuse prior runs' teacher performance) ---
-  eval_teacher_at_start: true           # Skip the ~2h teacher-baseline eval at epoch 0; teacher transformer still loads for L1. Teacher ceiling overlaid in the comparison HTML from uilxegpn/j133yiuk.
+  # --- Teacher baseline eval: ON (this is the FIRST expert; establishes the teacher ceiling on all 6 test sets) ---
+  eval_teacher_at_start: true             # Run the teacher-baseline eval at epoch 0 on every test set (geneval_enhanced/ocr/pickscore x gs1/gs4). Later experts (ocr, moe/mof) reuse this ceiling with eval_teacher_at_start: false.
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
   teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
@@ -133,9 +133,13 @@ eval:
   guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
   eval_freq: 40                           # Eval every N epochs (raised 20->40: eval is ~43% of walltime; halve the tax)
   seed: 42                                # Eval seed
-  test_sets:                              # geneval-only (enhanced): teacher baseline + student eval on the training domain. ocr/pickscore teacher baselines come from other runs.
+  test_sets:                              # FULL eval suite (every expert evals on every domain): geneval(enhanced)/ocr/pickscore at gs=1.0 (no CFG) and gs=4.0 (CFG). This is the FIRST expert run, so eval_teacher_at_start computes the teacher ceiling here on all 6 sets; later experts reuse it (eval_teacher_at_start: false).
     - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
     - {name: geneval_gs4,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
 
 # ===== Rewards (optional for XOPD; logging only, NOT part of the distillation loss) =====
 rewards:

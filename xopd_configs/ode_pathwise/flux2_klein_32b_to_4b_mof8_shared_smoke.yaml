@@ -18,7 +18,7 @@ mixed_precision: "bf16"
 
 # ===== Data (OCR-only) =====
 data:
-  dataset_dir: "dataset/geneval"
+  dataset_dir: "dataset/geneval_enhanced"
   dataset_dirs:
     - "dataset/ocr"
   preprocessing_batch_size: 32

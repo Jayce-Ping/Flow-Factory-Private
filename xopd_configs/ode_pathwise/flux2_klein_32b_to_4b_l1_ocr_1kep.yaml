@@ -10,10 +10,11 @@
 # precomputed during preprocessing and the 48GB teacher text encoder is offloaded
 # before training; the 64GB teacher transformer stays resident.
 # Non-CFG (teacher_gs = student_gs = 1.0); pure L1 (l0_warmup_epochs=0).
-# Teacher-baseline eval SKIPPED (eval_teacher_at_start: false) — teacher performance
-# is already known from prior runs (uilxegpn/j133yiuk); the shared teacher ceiling
-# is overlaid in the comparison HTML from those runs. Teacher transformer still
-# loads for L1 supervision.
+# SECOND expert (after geneval_enhanced). FULL eval suite on all 6 test sets
+# (geneval_enhanced/ocr/pickscore x gs1/gs4). Teacher-baseline eval SKIPPED here
+# (eval_teacher_at_start: false) — the teacher ceiling was computed once by the FIRST
+# expert (flux2klein_32b_to_4b_l1_geneval_enh_1kep) on the same 6 sets and is overlaid
+# in the comparison HTML. Teacher transformer still loads for L1 supervision.
 
 # ===== Environment =====
 launcher: "accelerate"                    # Launcher. Options: accelerate
@@ -66,8 +67,8 @@ train:
   teacher_param_device: "cuda"            # Teacher transformer device. Options: cuda (only cuda supported today), cpu
   assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
 
-  # --- Teacher baseline eval: SKIPPED (reuse prior runs' teacher performance) ---
-  eval_teacher_at_start: false            # Skip the ~2h teacher-baseline eval at epoch 0; teacher transformer still loads for L1. Teacher ceiling overlaid in the comparison HTML from uilxegpn/j133yiuk.
+  # --- Teacher baseline eval: SKIPPED (reuse the FIRST expert's teacher ceiling) ---
+  eval_teacher_at_start: false            # Skip the ~2h teacher-baseline eval at epoch 0; teacher transformer still loads for L1. Teacher ceiling reused from the geneval_enhanced first-expert run (same 6 test sets), overlaid in the comparison HTML.
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
   teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance

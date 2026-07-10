@@ -19,7 +19,7 @@ mixed_precision: "bf16"
 
 # ===== Data (OCR-only) =====
 data:
-  dataset_dir: "dataset/geneval"
+  dataset_dir: "dataset/geneval_enhanced"
   dataset_dirs:
     - "dataset/ocr"
   preprocessing_batch_size: 32
@@ -128,7 +128,7 @@ eval:
   eval_freq: 40
   seed: 42
   test_sets:
-    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
     - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
     - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
     - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
