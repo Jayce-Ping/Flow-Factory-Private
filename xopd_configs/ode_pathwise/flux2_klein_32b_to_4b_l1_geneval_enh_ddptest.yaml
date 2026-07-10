@@ -30,7 +30,7 @@ data:
     - "dataset/geneval_enhanced"
   preprocessing_batch_size: 32            # Batch size for offline teacher text encoding
   dataloader_num_workers: 16              # DataLoader worker processes
-  force_reprocess: true                   # SYNC: all 4 nodes re-preprocess fresh together (avoids cached-vs-regen desync on worker-2/3). Flip false once caches are consistent across nodes.
+  force_reprocess: true                   # SYNC: all 4 nodes re-preprocess fresh together (avoids the cached-vs-regen desync). Set false again once caches are consistent.
   cache_dir: "~/.cache/flow_factory/datasets"  # Preprocess cache directory (same as mix/LoRA-ocr runs -> ocr cache HIT)
   max_dataset_size: null                  # Truncate dataset size; null = no limit
   sampler_type: "auto"                    # Sampler. Options: auto, distributed_k_repeat, group_contiguous
@@ -48,17 +48,17 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_l1_geneval_enh_1kep"
+  run_name: "geneval_enh_ddptest"
   project: "Flow-Factory-XOPD"            # Logger project name
-  logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
-  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"  # shared cephfs checkpoint dir
-  save_freq: 50                           # SAVE checkpoints: this run doubles as OCR expert E1 (consumed by MoE merge moe_expert_paths)
+  logging_backend: "none"
+  save_dir: "/root/ddptest_ckpt"
+  save_freq: 999
   save_model_only: true                   # Save only model weights (not optimizer/scheduler state)
 
 # ===== Training (XOPD) =====
 train:
   trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
-  max_epochs: 1000                        # overnight long run
+  max_epochs: 5                           # TEST: just probe OOM over a few steps
   fsdp_shard_teacher: false               # DDP: teacher NOT sharded (resident 64GB/GPU); DDP wraps trainable student only
 
   # --- Cross-model teacher ---
@@ -67,7 +67,7 @@ train:
   assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
 
   # --- Teacher baseline eval: SKIPPED (reuse prior runs' teacher performance) ---
-  eval_teacher_at_start: true           # Skip the ~2h teacher-baseline eval at epoch 0; teacher transformer still loads for L1. Teacher ceiling overlaid in the comparison HTML from uilxegpn/j133yiuk.
+  eval_teacher_at_start: false          # TEST: skip teacher eval, go straight to sampling+training
 
   # --- Dual classifier-free guidance (teacher / student independent) ---
   teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
@@ -113,7 +113,7 @@ train:
   ema_device: "cuda"                      # EMA storage device. Options: cpu, cuda
 
   # --- Memory / misc ---
-  enable_gradient_checkpointing: false     # ZeRO-2 @ 512 (proven path): OFF for speed. teacher 64G resident (frozen, not sharded) + ZeRO-2-sharded student optim/grad. If the first training step OOMs -> flip to true.
+  enable_gradient_checkpointing: false     # OOM probe: match the long run exactly (ZeRO-2, 512, no grad-ckpt). Reward models still load (memory-representative); eval RUN skipped for speed.
   offload_samples_to_cpu: false           # Offload sample tensors to CPU between sample() and optimize() to cut peak VRAM
   seed: 42                                # Random seed
 
@@ -131,7 +131,7 @@ eval:
   per_device_batch_size: 1                # Eval batch size
   num_inference_steps: 40                 # Eval steps
   guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
-  eval_freq: 40                           # Eval every N epochs (raised 20->40: eval is ~43% of walltime; halve the tax)
+  eval_freq: 999                          # TEST: no student eval
   seed: 42                                # Eval seed
   test_sets:                              # geneval-only (enhanced): teacher baseline + student eval on the training domain. ocr/pickscore teacher baselines come from other runs.
     - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)

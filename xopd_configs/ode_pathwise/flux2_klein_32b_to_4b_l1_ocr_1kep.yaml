@@ -17,14 +17,14 @@
 
 # ===== Environment =====
 launcher: "accelerate"                    # Launcher. Options: accelerate
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Distributed config; use zero3 if VRAM-limited (64GB teacher + 4B full-FT student)
+config_file: config/deepspeed/deepspeed_zero2.yaml  # ZeRO-2 (proven 4-node multi-node); teacher(64GB) replicated per GPU; ZeRO-2 shards student optim/grad.
 num_processes: 8                          # Number of processes (GPUs); overrides the config file
 main_process_port: 29500                  # Master process port
 mixed_precision: "bf16"                   # Mixed precision. Options: no, fp16, bf16
 
 # ===== Data (prompts only; L0's z0 is teacher-generated) =====
 data:
-  dataset_dir: "dataset/geneval"          # Eval/test fallback (test split is read from here when eval.test_sets omits a dataset_dir).
+  dataset_dir: "dataset/geneval_enhanced" # eval/test fallback
   # --- Training prompt set: OCR only ---
   dataset_dirs:
     - "dataset/ocr"
@@ -48,7 +48,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_l1_ocr_1kep"   # OCR 4B domain expert, 1000-epoch run (tonight). Ckpts: <save_dir>/flux2klein_32b_to_4b_l1_ocr_1kep/checkpoints/
+  run_name: "flux2klein_32b_to_4b_l1_ocr_1kep"
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"  # shared cephfs checkpoint dir
@@ -58,7 +58,8 @@ log:
 # ===== Training (XOPD) =====
 train:
   trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
-  max_epochs: 1000                        # overnight long run (till manual stop / convergence)
+  max_epochs: 1000                        # overnight long run
+  fsdp_shard_teacher: false               # ZeRO-2: teacher NOT sharded (resident 64GB/GPU)
 
   # --- Cross-model teacher ---
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"  # Teacher path; only its transformer (~64GB) is loaded. VAE reused from student; teacher text encoder (Mistral3) is precomputed offline then offloaded
@@ -107,12 +108,12 @@ train:
   max_grad_norm: 1.0                      # Gradient-norm clip threshold
 
   # --- EMA ---
-  ema_decay: 0.9                          # EMA decay (0 disables)
+  ema_decay: 0.0                          # EMA decay (0 disables)
   ema_update_interval: 4                  # EMA update interval (epochs)
   ema_device: "cuda"                      # EMA storage device. Options: cpu, cuda
 
   # --- Memory / misc ---
-  enable_gradient_checkpointing: true     # On (safe default for full-FT): 4B full-FT student + 64GB teacher; ~77GB/GPU with ZeRO-2, fits 98GB. Flip to false for speed once no-OOM confirmed.
+  enable_gradient_checkpointing: false     # On (safe default for full-FT): 4B full-FT student + 64GB teacher; ~77GB/GPU with ZeRO-2, fits 98GB. Flip to false for speed once no-OOM confirmed.
   offload_samples_to_cpu: false           # Offload sample tensors to CPU between sample() and optimize() to cut peak VRAM
   seed: 42                                # Random seed
 
@@ -133,8 +134,8 @@ eval:
   eval_freq: 40                           # Eval every N epochs (raised 20->40: eval is ~43% of walltime; halve the tax)
   seed: 42                                # Eval seed
   test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
-    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # enhanced geneval eval (per decision)
-    - {name: geneval_gs4,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
     - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
     - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
     - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}

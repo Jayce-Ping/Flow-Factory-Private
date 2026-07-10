@@ -7,7 +7,7 @@
 
 # ===== Environment =====
 launcher: "accelerate"
-config_file: config/accelerate_configs/fsdp2_prefetch.yaml   # FSDP full-shard: ZeRO-2 replicates the 38B (MoE+teacher) params -> OOM; FSDP shards them
+config_file: config/deepspeed/deepspeed_zero2.yaml  # ZeRO-2 (proven 4-node multi-node); teacher(64GB) replicated per GPU; ZeRO-2 shards student optim/grad.
 num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
@@ -54,7 +54,7 @@ log:
 # ===== Training (XOPD distill to dev-32B, OCR-only) =====
 train:
   trainer_type: "xopd"
-  fsdp_shard_teacher: true                # FSDP full-shard student MoE + 32B teacher (single ModelBundle root)
+  fsdp_shard_teacher: false               # ZeRO-2: teacher NOT sharded (resident 64GB/GPU)
   max_epochs: 500
 
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"

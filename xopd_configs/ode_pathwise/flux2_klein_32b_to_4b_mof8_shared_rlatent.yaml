@@ -11,7 +11,7 @@
 
 # ===== Environment =====
 launcher: "accelerate"
-config_file: config/accelerate_configs/multi_gpu.yaml   # plain DDP (replicate): shared_lora keeps 1 base (~8GB) + 8 tiny LoRA adapters + teacher(32B,64GB) ~72GB fits 96G. DDP (not FSDP) so per-sample top-k runs only k adapters without an FSDP conditional-all-gather hang. Launch via run_4node_ddp.sh.
+config_file: config/deepspeed/deepspeed_zero2.yaml  # ZeRO-2 (proven 4-node multi-node); teacher(64GB) replicated per GPU; ZeRO-2 shards student optim/grad.
 num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
