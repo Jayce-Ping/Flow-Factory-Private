@@ -969,6 +969,9 @@ class XOPDTrainer(BaseTrainer):
         # separately, spreading eval metrics across stepless auto-incremented steps).
         self._eval_log_sink = {}
         super().evaluate()
+        # Validation D_k on the gs=1.0 sets (held-out transition-matching loss),
+        # written into the same sink so it shares the student/teacher eval step.
+        self._evaluate_validation_d_k()
         if self.accelerator.is_main_process:
             if self._teacher_baseline_scalars:
                 self._eval_log_sink.update(self._teacher_baseline_scalars)
@@ -2454,8 +2457,19 @@ class XOPDTrainer(BaseTrainer):
         batch: Dict[str, Any],
         latents_index_map: torch.Tensor,
         num_timesteps: int,
+        timestep_indices: Optional[List[int]] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """No-grad pre-pass: per-timestep ``D_k`` and cached teacher mean."""
+        """No-grad pre-pass: per-timestep ``D_k`` and cached teacher mean.
+
+        ``timestep_indices`` defaults to the L1 training subset
+        (``self._train_timestep_indices``). Callers that need a different set of
+        trajectory positions (e.g. the eval validation-``D_k`` pass, which walks
+        the FULL eval rollout) pass an explicit list; the returned ``d_list`` /
+        ``mu_teacher_list`` are aligned to that list.
+        """
+        step_indices = (
+            timestep_indices if timestep_indices is not None else self._train_timestep_indices
+        )
         d_list: List[torch.Tensor] = []
         mu_teacher_list: List[torch.Tensor] = []
         device = self.accelerator.device
@@ -2468,7 +2482,7 @@ class XOPDTrainer(BaseTrainer):
             # OWN resident text encoder, so encode the teacher prompts on the fly
             # from the raw prompt strings (constant across timesteps).
             teacher_text_cond = self._build_teacher_text_cond(batch)
-            for timestep_index in self._train_timestep_indices:
+            for timestep_index in step_indices:
                 t = batch["timesteps"][:, timestep_index]
                 t_next = (
                     batch["timesteps"][:, timestep_index + 1]
@@ -2530,6 +2544,106 @@ class XOPDTrainer(BaseTrainer):
                 mu_teacher_list.append(mu_teacher)
 
         return d_list, mu_teacher_list
+
+    # ===================== Eval validation D_k =====================
+    def _evaluate_validation_d_k(self) -> None:
+        """Validation D_k on every guidance_scale==1.0 eval set.
+
+        For each gs=1.0 test set: run a no-grad student rollout with the SAME
+        settings as the eval image generation (``eval.num_inference_steps``,
+        that set's ``guidance_scale``, EMA params) but with ``trajectory_indices``
+        so the full trajectory is stored, then reuse
+        :meth:`_precompute_d_per_timestep` over ALL rollout steps to get the
+        per-timestep Gaussian-transition KL ``D_k``. Per-step means (gathered
+        across ranks) are logged as ``eval/{set}/d_k/{ti}`` and the trajectory
+        mean as ``eval/{set}/d_k_mean`` into the shared ``_eval_log_sink`` so they
+        land on the same wandb step as the student/teacher reward curves.
+
+        This is a validation loss: with reinforce_coef=0 / kl_beta=0 the training
+        L1 loss equals the pathwise ``D_k``, so this mirrors ``train/d_k`` on held-out
+        prompts. Only gs=1.0 sets are scored (matches the no-CFG training transition
+        and the gs=1.0 cached teacher text embeddings).
+        """
+        if not self.test_dataloaders:
+            return
+        device = self.accelerator.device
+        pbs = self.training_args.per_device_batch_size
+
+        for test_set_name in sorted(self.test_dataloaders.keys()):
+            merged_eval = self._merged_eval_args_for_test_set_name(test_set_name)
+            gs = float(getattr(merged_eval, "guidance_scale", 1.0))
+            if abs(gs - 1.0) > 1e-6:
+                continue  # validation D_k is defined only for the no-CFG (gs=1.0) sets
+
+            eval_steps = int(getattr(merged_eval, "num_inference_steps", self.training_args.num_inference_steps))
+            eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
+            step_indices = list(range(eval_steps))
+            traj = compute_trajectory_indices(
+                train_timestep_indices=step_indices,
+                num_inference_steps=eval_steps,
+                include_initial=True,
+            )
+            log_pfx = self._eval_log_prefix(test_set_name)
+
+            with torch.no_grad(), self.autocast(), self._eval_inference_context():
+                # 1) Trajectory-storing student rollout on the eval prompts.
+                rollout_samples: List[BaseSample] = []
+                for batch in tqdm(
+                    self.test_dataloaders[test_set_name],
+                    desc=f"Val D_k [{test_set_name}]",
+                    disable=not self.show_progress_bar,
+                ):
+                    generator = create_generator_by_prompt(batch["prompt"], eval_seed)
+                    inference_kwargs = {
+                        "compute_log_prob": False,
+                        "generator": generator,
+                        "trajectory_indices": traj,
+                        **merged_eval,
+                    }
+                    inference_kwargs.update(**batch)
+                    inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
+                    samples = self.adapter.inference(**inference_kwargs)
+                    stitch_batch_metadata(batch, samples)
+                    rollout_samples.extend(samples)
+
+                # 2) Per-timestep D_k over the full rollout, accumulated per step.
+                per_step_local: List[List[torch.Tensor]] = [[] for _ in step_indices]
+                num_micro = (len(rollout_samples) + pbs - 1) // pbs
+                for j in range(num_micro):
+                    start = j * pbs
+                    end = min(start + pbs, len(rollout_samples))
+                    micro = [rollout_samples[i].to(device) for i in range(start, end)]
+                    mbatch = BaseSample.stack(micro)
+                    lim = mbatch["latent_index_map"]
+                    nt = mbatch["timesteps"].shape[1]
+                    d_list, _ = self._precompute_d_per_timestep(
+                        batch=mbatch,
+                        latents_index_map=lim,
+                        num_timesteps=nt,
+                        timestep_indices=step_indices,
+                    )
+                    for ti, d_k in enumerate(d_list):
+                        per_step_local[ti].append(d_k.detach())
+
+            # 3) Gather each step's per-sample D_k across ranks (collective on ALL
+            #    ranks; DistributedSampler pads the eval shards to equal length so
+            #    the gather aligns, exactly like _gather_eval_rewards).
+            step_means: List[float] = []
+            for ti in step_indices:
+                local = (
+                    torch.cat(per_step_local[ti]).to(device)
+                    if per_step_local[ti]
+                    else torch.zeros(0, device=device)
+                )
+                gathered = self.accelerator.gather(local)
+                step_means.append(float(gathered.float().mean().item()))
+
+            if self.accelerator.is_main_process and self._eval_log_sink is not None:
+                for ti, m in zip(step_indices, step_means):
+                    self._eval_log_sink[f"{log_pfx}/d_k/{ti}"] = m
+                self._eval_log_sink[f"{log_pfx}/d_k_mean"] = float(np.mean(step_means))
+
+            self.accelerator.wait_for_everyone()
 
     def _optimize_train_pass(
         self,
