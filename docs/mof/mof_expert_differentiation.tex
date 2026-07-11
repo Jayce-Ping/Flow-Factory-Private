@@ -1,0 +1,613 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{STSong}
+\setCJKsansfont{STHeiti}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{pifont}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\MoF}{\mathrm{MoF}}
+\newcommand{\base}{\mathrm{base}}
+\newcommand{\stu}{\theta}
+\newcommand{\vbase}{v_{\base}}
+\newcommand{\const}{\mathrm{const}}
+\newcommand{\diag}{\mathrm{diag}}
+\newcommand{\tr}{\mathrm{tr}}
+\newcommand{\softmax}{\mathrm{softmax}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{定义}
+\newtheorem{remark}{注}
+\newtheorem{proposition}{命题}
+\newtheorem{corollary}{推论}
+\newtheorem{lemma}{引理}
+\newtheorem{theorem}{定理}
+\newtheorem{example}{例}
+
+\title{\textbf{MoF Expert 分化：把 Teacher velocity 分解为凸组合子速度场}\\[0.3em]
+\large 一个类 MoE-aux 的分化损失的形式化、可辨识性与``正交 vs.\ 最大夹角''的理论判定}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文形式化一个想法：把 teacher 的 velocity field $V$ 视为可分解的，用 $N$ 个小 expert
+子速度场 $\{v_i\}$ 的\emph{凸组合} $v_\lambda=\sum_i \lambda_i v_i$ 去拟合 $V$，并仿照 MoE 的
+load-balance aux，额外引入一个\emph{分化损失}以逼迫各 expert 相互不同（增大夹角 / 趋于正交）。
+这与现有 MoF 文档不同：\texttt{mof\_notes.tex} / \texttt{mof\_merge\_formulation.tex} 路由的是
+\emph{冻结 teacher} 的 velocity，而本文对应代码中 \emph{可学习 expert} 的
+\texttt{Flux2VelocityMoFTransformer2DModel}（$N$ 个 expert $+$ 一个共享 router，输出凸组合，
+已带 Switch/GShard load-balance aux）。
+
+主要结论：\textbf{(i)} 仅有重建损失时分解\emph{高度欠定}，load-balance 只均衡\emph{使用率}、
+不产生\emph{功能分化}，因此确需一个分化先验——想法方向合理。\textbf{(ii)} 但``夹角越大越好''
+在满尺度 expert（各 $v_i\approx V$，即代码默认从 base 复制的初始化）下是\emph{病态}的：我们给出
+\emph{抵消式范数爆炸引理}——固定凸和 $\sum_i\lambda_i v_i=V$ 时，把两 expert 推成反平行
+($\cos\to-1$) 迫使其范数 $\to\infty$；而\emph{正交} ($\cos=0$) 恰对应有界范数
+$\|v_i\|=\sqrt2\,\|V\|$，是良态的``甜点''。\textbf{(iii)} 满尺度 expert 还共享巨大的 base 分量，
+$\cos(v_i,v_j)\approx1$ 近乎常数，故在\emph{原始} $v_i$ 上算 cosine 几乎无信息；应在\emph{残差 /
+skill 方向} $\delta_i=v_i-\vbase$ 上度量。\textbf{(iv)} 我们证明重建约束 $\sum_i\lambda_i r_i=0$
+下\emph{均值残差} $r_i=v_i-v_\lambda$ 不可能两两正交，但\emph{skill 方向} $\delta_i=v_i-\vbase$
+无此约束、正交可行且有界（正交分解 $\sum_i\|\cdot\|^2$ 守恒），这把用户设想从``凸抵消爆炸''区
+转到``正交分解''区。\textbf{(v)} 给出改进的分化目标（残差空间、方向归一化、正交/去相关而非最大
+夹角、按 router 使用率加权、区分 dense/top-$k$ 路径），并将其挂到与 \texttt{moe\_aux\_loss} 平行
+的 \texttt{mof\_diversity\_loss} / \texttt{mof\_diversity\_coeff}。全文推导自包含，并与正在进行的
+OCR/geneval/mixed 三-student 实验（``容量受限只拟合一个峰''假设）对齐给出实验方向。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{问题定位与记号}
+\label{sec:setup}
+%% ============================================================
+
+\subsection{两种 MoF：路由冻结 teacher vs.\ 学习 expert}
+
+现有 MoF 文档（\texttt{mof\_notes.tex}、\texttt{mof\_merge\_formulation.tex}）研究的是：给定
+$K$ 个\emph{冻结}的 single-reward teacher $\{v^{(k)}\}$，学习一个小的路由 $\lambda$ 取其凸组合
+$v_\lambda=\sum_k\lambda_k v^{(k)}$，再蒸馏进一个 student。那里的 expert 是\emph{给定}的，只学
+$\lambda$。
+
+本文对应\emph{另一条线}，即代码里的 \texttt{Flux2VelocityMoFTransformer2DModel}（velocity-space
+MoF，MoF-V）：$N$ 个\emph{可学习} expert 子网络 $\{v_i\}_{i=1}^N$（distinct 全模型，或
+shared-base $+$ $N$ 个 LoRA adapter）加一个共享 router，前向输出各 expert velocity 的
+\emph{凸组合}
+\begin{equation}
+v_\lambda(x,t,c)=\sum_{i=1}^N \lambda_i(x,t,c)\,v_i(x,t,c),\qquad
+\lambda=\softmax(\text{router logits})\in\Delta^{N-1}.
+\label{eq:mofv}
+\end{equation}
+它作为 XOPD 的 student，用 L1（velocity MSE）向 teacher $V$ 蒸馏；router 的 load-balance aux 经
+\texttt{moe\_aux\_loss()} $\to$ \texttt{collect\_moe\_aux\_loss} $\to$
+\texttt{moe\_load\_balance\_coeff} 加进 loss。用户的问题正是：\emph{能否再加一个类 MoE-aux 的
+损失，逼迫这 $N$ 个可学习 expert 分化？}
+
+\subsection{记号}
+\label{ssec:notation}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\footnotesize
+\begin{tabular}{@{}l@{\quad}p{11cm}@{}}
+\toprule
+\textbf{符号} & \textbf{含义} \\
+\midrule
+$V(x,t,c)$ & teacher velocity field（蒸馏目标，冻结） \\
+$\vbase(x,t,c)$ & base（pretrained）velocity；expert 初始化即其复制 \\
+$N,\ i$ & expert 数量与索引 \\
+$v_i(x,t,c)$ & 第 $i$ 个 expert 的 velocity（可学习） \\
+$\delta_i=v_i-\vbase$ & expert $i$ 的 skill 方向（相对 base 的残差） \\
+$\lambda_i(x,t,c)$ & router 权重，$\lambda\in\Delta^{N-1}$（softmax；可 per-token 或 per-sample） \\
+$v_\lambda=\sum_i\lambda_i v_i$ & student 输出（凸组合） \\
+$r_i=v_i-v_\lambda$ & expert 相对\emph{混合均值}的残差（$\sum_i\lambda_i r_i=0$） \\
+$\langle\cdot,\cdot\rangle,\ \|\cdot\|$ & 在 velocity 张量拉平后的欧氏内积 / 范数 \\
+$\cos(a,b)$ & $\langle a,b\rangle/(\|a\|\,\|b\|)$ \\
+$w_t=b_t^2/(2\bar\sigma_t^2)$ & per-step KL$\to$MSE 的时间权重（见 \texttt{mof\_merge\_formulation.tex}） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{形式化：分解假设、凸组合与三个损失}
+\label{sec:formal}
+%% ============================================================
+
+\subsection{用户的``可分解''假设与其两种读法}
+\label{ssec:decomp}
+
+用户设想``teacher 的 velocity field 可分解 $V=\sum_i v_i$，每个 $v_i$ 是一个 sub-velocity
+field，对应一个 expert''。这里必须先厘清两种\emph{尺度不同}的读法，二者仅差一个归一化，但对后文
+``正交是否合理''的结论截然不同：
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{(A) 满尺度 expert（代码默认）}：每个 $v_i$ 本身是一个\emph{完整}的 velocity field
+（$\|v_i\|\sim\|V\|$），组合是\emph{凸组合} $v_\lambda=\sum_i\lambda_i v_i$，$\sum_i\lambda_i=1$。
+代码中 expert 由 base 复制初始化，故\emph{初始} $v_i\approx\vbase\approx V$。此时 $v_\lambda$ 落在
+$\{v_i\}$ 的凸包内。
+\item \textbf{(B) 加性子速度（用户字面 $V=\sum_i v_i$）}：每个 $v_i$ 是 $V$ 的一\emph{部分}
+（$\|v_i\|\sim\|V\|/N$），组合是\emph{直接求和} $\sum_i v_i$。这与 (A) 通过 $u_i=N v_i,\
+\lambda_i=1/N$ 等价（$\sum_i\lambda_i u_i=\frac1N\sum_i N v_i=\sum_i v_i=V$）。
+\end{itemize}
+
+\begin{remark}[加性求和不是合法 flow，除非归一化]
+\label{rem:sumtoone}
+字面 $V=\sum_i v_i$ 若理解为``student $=\sum_i v_i$、权重全为 $1$''，则 $\sum_i 1=N\neq1$，违反
+sum-to-one。由仿射闭包（\texttt{mof\_notes.tex} Prop.\ 仿射闭包 /
+\texttt{mof\_merge\_formulation.tex} 附录）：只有 $\sum_i\lambda_i=1$ 的仿射组合才与各 teacher
+共享 marginal path；$\sum_i\lambda_i=c\neq1$ 会残留 $(1-c)\partial_t p_t$，等价于把速度场整体
+缩放（一次时间重参数化），把样本推离 marginal。故``加性分解''在部署时必须写成凸/仿射组合
+\eqref{eq:mofv}（权重和为 $1$），\emph{即代码已有的形式}。用户的 $V=\sum_i v_i$ 应读作
+$V=\sum_i\lambda_i(N v_i)$ 型的 (B)，或直接采用 (A)。
+\end{remark}
+
+\subsection{三个损失}
+\label{ssec:losses}
+
+\paragraph{(L1) 重建 / 蒸馏损失（已有）.}
+XOPD 在 student 自身 rollout 的 on-policy 分布 $q_\stu$ 上做 velocity MSE：
+\begin{equation}
+\loss_{\mathrm{dist}}(\Theta)=\E_{(x_t,t,c)\sim q_\stu}\Big[\,w_t\,\big\|v_\lambda(x_t,t,c)-V(x_t,t,c)\big\|^2\Big],
+\label{eq:ldist}
+\end{equation}
+其中 $\Theta$ 含所有 expert 参数与 router 参数。这是唯一\emph{关乎正确性}的项：它只约束
+\emph{凸组合} $v_\lambda$，不约束单个 $v_i$。
+
+\paragraph{(L2) load-balance aux（已有）.}
+Switch/GShard 负载均衡 $\loss_{\mathrm{bal}}=N\sum_i \bar f_i\,\bar P_i$（$\bar P_i$ 平均 router
+概率，$\bar f_i$ 被选中频率），在 uniform 使用率处最小。它\emph{只}均衡各 expert 的\emph{使用率}，
+防止 router 坍缩到单一 expert；\textbf{它不使 expert 的\emph{函数}相互不同}——$N$ 个完全相同的
+expert 也能让 $\loss_{\mathrm{bal}}$ 取最小。
+
+\paragraph{(L3) 分化 aux（本文提议，待定形式）.}
+用户提议的一般形式：以某个``相异度''度量 $\mathcal{D}$ 逼迫 $\{v_i\}$ 相互不同，
+\begin{equation}
+\loss_{\mathrm{div}}(\Theta)=\E\Big[\,\Phi\big(\{v_i(x_t,t,c)\}_{i=1}^N\big)\Big],\qquad
+\loss=\loss_{\mathrm{dist}}+\alpha\,\loss_{\mathrm{bal}}+\beta\,\loss_{\mathrm{div}},
+\label{eq:total}
+\end{equation}
+候选 $\Phi$：$\Phi=\sum_{i<j}\cos(v_i,v_j)$（最小化两两 cosine $=$ 增大夹角），或
+$\Phi=\sum_{i<j}\cos^2$（趋于正交），或 Gram 矩阵去相关。$\S\ref{sec:angle}$--$\ref{sec:design}$
+分析哪种 $\Phi$、在哪个表示上、是否合理。
+
+%% ============================================================
+\section{可辨识性：为什么需要一个分化先验（合理性其一）}
+\label{sec:ident}
+%% ============================================================
+
+\begin{proposition}[分解欠定]
+\label{prop:underdetermined}
+固定 router 权重 $\lambda\in\Delta^{N-1}$（$N\ge2$，至少两个 $\lambda_i>0$）。则在任一点
+$(x,t,c)$，满足重建 $v_\lambda=\sum_i\lambda_i v_i=V$ 的 expert 取值集合是一个仿射子空间
+$\{(v_i):\sum_i\lambda_i v_i=V\}$，维度为 $(N-1)\times d$（$d$ 为 velocity 维度）。特别地，
+$v_1=\dots=v_N=V$（全相同）与任意``分化''的解都在其中，重建损失\eqref{eq:ldist} 对它们\emph{无从
+区分}。
+\end{proposition}
+
+\begin{proof}
+$\sum_i\lambda_i v_i=V$ 是关于 $(v_1,\dots,v_N)\in\R^{Nd}$ 的 $d$ 个线性约束（系数 $\lambda_i$ 不全为
+零），解集为 $Nd-d=(N-1)d$ 维仿射子空间。$v_i\equiv V$ 显然满足。故重建项在整个子空间上取相同
+（最优）值。
+\end{proof}
+
+\begin{remark}[三项损失各自``管''什么]
+\label{rem:whatmanages}
+\leavevmode
+\begin{itemize}[leftmargin=1.5em]
+\item $\loss_{\mathrm{dist}}$ 只钉住\emph{凸组合} $v_\lambda$，在 $(N-1)d$ 维子空间上完全自由
+（命题~\ref{prop:underdetermined}）——\textbf{零分化压力}。
+\item $\loss_{\mathrm{bal}}$ 只钉住\emph{使用率} $\bar P_i\to1/N$，对 expert 的\emph{函数}同样零
+约束（相同 expert 也均衡）。
+\item 于是若想让 expert 成为\emph{不同的函数}（真正的``分工''），必须显式加入一个\emph{选择
+先验}——这正是 $\loss_{\mathrm{div}}$ 的定位。
+\end{itemize}
+因此``加一个类 MoE-aux 的分化损失''这一\emph{方向}是合理且必要的：它在欠定解集中挑一个``分工''
+解，恰如 MoE-aux 在等价路由中挑一个``均衡''解。真正需要斟酌的是\emph{相异度如何定义}
+（$\S\ref{sec:angle}$）与\emph{在哪个表示、如何加权}（$\S\ref{sec:design}$）。
+\end{remark}
+
+\begin{remark}[与 MoE-aux 的\emph{正确}类比]
+\label{rem:moe_analogy}
+MoE 的 load-balance aux 解决的是``router 坍缩''，不是``expert 相同''。在标准稀疏 MoE 里，expert
+之所以\emph{自然分化}，是因为 top-$k$ 路由把\emph{不同输入}送给不同 expert，梯度只经被选中的
+expert 回传——分化由\emph{数据分布 $\times$ 路由}诱导，而非一个显式``推开''损失。这提示两条不同
+机制（$\S\ref{sec:design}$ 展开）：
+\emph{(i) 输出空间去相关}（用户的 $\cos$ 想法，在同一 $(x,t,c)$ 上推开 $v_i$）；
+\emph{(ii) 路由诱导的功能特化}（不同输入用不同 expert，靠 per-input 低熵 $+$ batch 级均衡）。
+后者更贴近 MoE 的``分化''本质，前者是补充。
+\end{remark}
+
+%% ============================================================
+\section{核心推导：``正交''还是``夹角越大越好''？}
+\label{sec:angle}
+%% ============================================================
+
+本节回答用户最关心的问题。结论先行：\textbf{在满尺度 expert（读法 A）上，``夹角越大越好''是病态
+的（范数爆炸）；``正交''才是有界甜点；而更该做的是把度量搬到残差 / skill 方向上。}
+
+\subsection{抵消式范数爆炸引理（两 expert）}
+\label{ssec:blowup}
+
+考虑最简单的两 expert、等权 $\lambda_1=\lambda_2=\tfrac12$ 的情形，重建要求 $v_1+v_2=2V$。写
+$v_1=V+r,\ v_2=V-r$，其中 $r=\tfrac12(v_1-v_2)$ 是分化方向。为得到干净表达，设 $r\perp V$（沿 $V$
+的分量只影响 sum-to-one 归一化、由 $\S\ref{ssec:decomp}$ 处理，真正的``分化''发生在与 $V$ 正交的
+方向上）。
+
+\begin{lemma}[固定凸和下，夹角与范数的刚性关系]
+\label{lem:blowup}
+在上述设定（$v_1+v_2=2V$，$r\perp V$）下，
+\begin{equation}
+\|v_1\|=\|v_2\|=\sqrt{\|V\|^2+\|r\|^2},\qquad
+\cos(v_1,v_2)=\frac{\|V\|^2-\|r\|^2}{\|V\|^2+\|r\|^2}.
+\label{eq:blowup}
+\end{equation}
+于是：$\|r\|\to0\Rightarrow\cos\to+1$（两 expert 重合，\emph{无分化}）；
+$\|r\|=\|V\|\Rightarrow\cos=0$（\emph{正交}），此时 $\|v_i\|=\sqrt2\,\|V\|$\emph{有界}；
+$\|r\|\to\infty\Rightarrow\cos\to-1$（\emph{反平行}，``夹角最大''），此时 $\|v_i\|\to\infty$。
+\end{lemma}
+
+\begin{proof}
+$\langle v_1,v_2\rangle=\langle V+r,V-r\rangle=\|V\|^2-\|r\|^2$（$\langle V,r\rangle$ 项相消）。
+$\|v_{1,2}\|^2=\|V\|^2\pm2\langle V,r\rangle+\|r\|^2=\|V\|^2+\|r\|^2$（用 $r\perp V$）。相除得
+$\cos$。三条极限直接代入。
+\end{proof}
+
+\begin{corollary}[``夹角越大越好''是病态目标]
+\label{cor:pathology}
+若把 $\loss_{\mathrm{div}}$ 取成\emph{最小化} $\cos(v_1,v_2)$（即``增大夹角''）而重建把
+$v_1+v_2$ 钉在 $2V$，则最优驱使 $\cos\to-1$，即 $\|r\|\to\infty$、$\|v_i\|\to\infty$。后果：
+(a) 两个巨大向量近乎相消得到 $V$，是\emph{灾难性抵消}，数值与梯度方差极大；
+(b) 单个 expert 的 velocity 远离数据流形（$\|v_i\|\gg\|V\|$），其单独 rollout 完全失效——
+一旦 top-$k$ 路由某步只用它就崩；(c) ODE 对 velocity 误差按积分放大，巨范数 expert 的微小权重
+扰动即引起大轨迹漂移。故\textbf{不应最大化夹角}。相反，\emph{正交}（$\cos=0$）对应
+$\|r\|=\|V\|$，范数有界，是分化与稳定的折中点。
+\end{corollary}
+
+\begin{remark}[$N$ 个 expert 的推广]
+\label{rem:Nblowup}
+一般地写 $v_i=v_\lambda+r_i$，重建给出加权居中约束 $\sum_i\lambda_i r_i=0$。加权``分散度''
+$\sigma^2\triangleq\sum_i\lambda_i\|r_i\|^2$ 度量分化幅度。同样地，把两两 $\cos$ 推向 $-1$ 需要
+$\sigma^2\to\infty$（残差彼此抵消以维持加权和为零，同时各自范数发散）。因此\emph{分化幅度必须有
+预算}：要么固定 $\sigma$、只优化\emph{方向}分布，要么显式惩罚 $\|r_i\|$（见 $\S\ref{sec:design}$）。
+\end{remark}
+
+\subsection{陷阱一：满尺度 expert 上原始 cosine 几乎无信息（base 主导）}
+\label{ssec:basedom}
+
+代码中 expert 从 base 复制初始化，训练中仍 $v_i=\vbase+\delta_i$，且蒸馏使 $v_\lambda\approx V$
+接近 $\vbase$（同族微调）。故 $v_i$ 的共同分量 $\vbase$ 巨大、residual $\delta_i$ 相对很小
+（LoRA 残差尤甚）。于是
+\begin{equation}
+\cos(v_i,v_j)=\frac{\|\vbase\|^2+\langle\vbase,\delta_i+\delta_j\rangle+\langle\delta_i,\delta_j\rangle}
+{\|\vbase+\delta_i\|\,\|\vbase+\delta_j\|}
+=1-O\!\big(\|\delta\|^2/\|\vbase\|^2\big),
+\end{equation}
+即所有 $\cos(v_i,v_j)\approx1$ 且几乎为常数——\textbf{在原始 $v_i$ 上算 cosine 是一个近乎恒定、
+梯度极弱的信号}，与 \texttt{mof\_per\_set\_analysis.tex} §13 记录的``softmax 均值相减使 LoRA 残差
+$v^{(j)}-\bar v$ 极小、梯度 $\sim10^{-10}$''是同一病根。
+
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=\textbf{修正：把度量搬到 skill 方向}]
+应在\emph{残差 / skill 方向} $\delta_i=v_i-\vbase$（或均值居中 $r_i=v_i-v_\lambda$）上度量相异度，
+而非原始 $v_i$。这既剥离主导的公共 base 分量，又把``分化''直接作用在真正可区分的自由度上。
+\end{tcolorbox}
+
+\subsection{陷阱二：重建约束下``均值残差''不可能两两正交}
+\label{ssec:infeasible}
+
+若在\emph{均值居中}残差 $r_i=v_i-v_\lambda$ 上追求两两正交，会与重建约束冲突：
+
+\begin{proposition}[零加权和禁止互正交]
+\label{prop:infeasible}
+设 $\lambda_i>0$ 且 $\sum_i\lambda_i r_i=0$（重建的必然推论）。若 $\{r_i\}$ 两两正交，则所有
+$r_i=0$。即在重建约束下，非平凡的均值残差\emph{不可能}互正交。
+\end{proposition}
+
+\begin{proof}
+将 $\sum_i\lambda_i r_i=0$ 与 $r_j$ 作内积：$\lambda_j\|r_j\|^2+\sum_{i\neq j}\lambda_i\langle
+r_i,r_j\rangle=0$。若互正交则交叉项为零，得 $\lambda_j\|r_j\|^2=0$，因 $\lambda_j>0$ 故
+$r_j=0$，对每个 $j$ 成立。
+\end{proof}
+
+\begin{remark}[两种残差表示的关键分野]
+\label{rem:two_resid}
+命题~\ref{prop:infeasible} 说明\emph{在哪种残差上做正交}至关重要：
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{均值残差 $r_i=v_i-v_\lambda$}：受 $\sum_i\lambda_i r_i=0$ 约束，\emph{不能}互正交，
+只能求``尽量分散/去相关''的\emph{软}目标；且其加权 Gram 矩阵以 $\lambda$ 为零特征向量（本质负
+相关）。
+\item \textbf{skill 方向 $\delta_i=v_i-\vbase$}：\emph{无}零和约束（$\sum_i\delta_i$ 任意），
+故\emph{可以}互正交，且这正对应用户``把 $V-\vbase$ 分解为正交子技能''的直觉（读法 B 的良态版）：
+$V-\vbase\approx\sum_i\lambda_i\delta_i$，若 $\{\delta_i\}$ 正交则 $\sum_i\|\lambda_i\delta_i\|^2$
+守恒、范数有界（勾股），\emph{没有}引理~\ref{lem:blowup} 的爆炸。
+\end{itemize}
+\textbf{因此推荐在 skill 方向 $\delta_i$ 上做正交/去相关}：它把用户设想从``凸组合抵消爆炸''区
+（满尺度 $v_i$）搬到``正交分解''区（$V-\vbase$ 的正交子技能），既可行、又有界、又剥离 base。
+\end{remark}
+
+\subsection{分化与重建的一阶兼容性（零空间论证）}
+\label{ssec:compat}
+
+一个担忧是：分化会不会\emph{损害}重建？答案是——若把分化梯度限制在重建约束的零空间内，则一阶
+不损害。
+
+\begin{proposition}[零空间兼容]
+\label{prop:nullspace}
+在固定 $(x,t,c)$、固定 $\lambda$ 下，重建 $v_\lambda=\sum_i\lambda_i v_i$ 只依赖 $\{v_i\}$ 的
+$\lambda$-加权和。任何只改变``加权居中残差'' $\{r_i\}$（满足 $\sum_i\lambda_i r_i=0$）而保持
+$v_\lambda$ 不变的更新，都\emph{不改变} $\loss_{\mathrm{dist}}$（严格，非仅一阶）。因此若把
+$\nabla_{v_i}\loss_{\mathrm{div}}$ 投影到零空间 $\{\sum_i\lambda_i g_i=0\}$，分化与重建\emph{正交
+可共存}。
+\end{proposition}
+
+\begin{proof}
+$v_\lambda$ 是 $\{v_i\}$ 的线性泛函，仅取决于 $\sum_i\lambda_i v_i$。在 $\{r_i\}$ 子空间
+（$\sum_i\lambda_i r_i=0$）内移动使 $\sum_i\lambda_i v_i$ 不变，故 $v_\lambda$ 不变，
+$\loss_{\mathrm{dist}}$ 不变。梯度投影即把 $g_i\mapsto g_i-\lambda_i(\sum_j\lambda_j g_j)/
+\sum_j\lambda_j^2$ 型的加权去均值，落入该零空间。
+\end{proof}
+
+\begin{remark}
+命题~\ref{prop:nullspace} 给出实现上的稳健做法：对 $\loss_{\mathrm{div}}$ 的梯度做\emph{加权
+去均值投影}后再叠加，可保证分化不与重建正面冲突（类似 PCGrad 的冲突消解，见
+\texttt{docs/opd/v\_pcgrad\_implementation\_plan.md}）。但注意这只在\emph{同一点、固定 $\lambda$}
+成立；跨 $(x,t,c)$ 与 $\lambda$ 变化的耦合仍需 $\beta$ 调参。
+\end{remark}
+
+\subsection{陷阱三：高维下随机向量近乎正交，先测度量再决定加不加}
+\label{ssec:highdim}
+
+velocity 张量维度 $d$ 极高（$\sim10^5$--$10^6$）。两个\emph{独立随机} skill 方向的期望 cosine
+$\sim1/\sqrt d\approx0$，即\emph{正交几乎自动成立}。这有两层含义：(a) 若训练后测得
+$\{\delta_i\}$ 已近正交（coherence $\max_{i\neq j}|\cos(\delta_i,\delta_j)|$ 已很小），则
+$\loss_{\mathrm{div}}$ 是\emph{无约束力}的冗余项，加了也不产生分化；(b) 真正的问题往往不是
+``不够正交''，而是 $\delta_i$ 幅度太小/方向被 base 与 router 拉平（$\S\ref{ssec:basedom}$）。
+\textbf{因此应先诊断}：训练中监控 $\{\delta_i\}$ 的 Gram/coherence 与各 $\|\delta_i\|$，确认
+分化损失是否\emph{真的} binding，再决定 $\beta$。
+
+%% ============================================================
+\section{改进的分化目标设计}
+\label{sec:design}
+%% ============================================================
+
+综合 $\S\ref{sec:angle}$ 的四条，改进后的分化损失应满足：\emph{(1) 在 skill 方向 $\delta_i$（或
+均值残差 $r_i$）上度量}；\emph{(2) 方向归一化 $+$ 幅度预算，避免范数爆炸}；\emph{(3) 目标是去相关/
+正交而非最大夹角}；\emph{(4) 按 router 使用率加权、并与路由粒度匹配}。
+
+\subsection{方案 D1：skill 方向的去相关（推荐默认）}
+\label{ssec:d1}
+
+对每个训练点，取归一化 skill 方向 $\hat\delta_i=\delta_i/(\|\delta_i\|+\epsilon)$，
+$\delta_i=v_i-\vbase$（$\vbase$ 为冻结 base，代码里即 teacher 之外的 pretrained；shared\_lora 下
+$\delta_i$ 就是 adapter\_$i$ 的输出增量，天然可得）。定义 Gram $G_{ij}=\langle\hat\delta_i,
+\hat\delta_j\rangle$，去相关损失
+\begin{equation}
+\loss_{\mathrm{div}}^{\mathrm{D1}}
+=\underbrace{\frac{1}{N(N-1)}\sum_{i\neq j}\big[\cos(\delta_i,\delta_j)\big]_+^2}_{\text{只惩罚正相关（冗余），不逼反平行}}
+\;+\;\underbrace{\rho\,\frac{1}{N}\sum_i\big(\log\|\delta_i\|-\overline{\log\|\delta\|}\big)^2}_{\text{幅度均衡（防个别爆炸/塌缩），可选}} .
+\label{eq:d1}
+\end{equation}
+要点：\textbf{(i)} 用 $[\cos]_+^2$（hinge 在 $0$）只压\emph{正}相关（冗余重复），\emph{不}奖励负
+相关，从而避开推向反平行的爆炸（推论~\ref{cor:pathology}）；\textbf{(ii)} 归一化使其只管\emph{方向}，
+幅度由重建与幅度均衡项管，杜绝引理~\ref{lem:blowup} 的 $\|r\|\to\infty$；\textbf{(iii)} 在
+$\delta_i$ 上度量剥离 base（$\S\ref{ssec:basedom}$）且正交可行（命题~\ref{prop:infeasible} 的
+规避，注~\ref{rem:two_resid}）。
+
+\subsection{方案 D2：路由诱导的功能特化（更贴近 MoE 本质，建议并用）}
+\label{ssec:d2}
+
+D1 是\emph{输出空间}去相关；但真正的``分工''是不同\emph{输入}用不同 expert。为此在 router 上加
+标准 MoE 特化组合：
+\begin{equation}
+\loss_{\mathrm{div}}^{\mathrm{D2}}
+=\underbrace{\E_{(x,t,c)}\big[H(\lambda(x,t,c))\big]}_{\text{per-input 低熵：单点稀疏路由}}
+\;-\;\underbrace{H\big(\E_{(x,t,c)}[\lambda]\big)}_{\text{batch 级高熵：整体均衡}} ,
+\label{eq:d2}
+\end{equation}
+即``每个输入集中到少数 expert，但整个数据分布把不同输入摊开到不同 expert''。第二项与已有
+load-balance $\loss_{\mathrm{bal}}$ 同向（可复用），第一项是新增的 per-input sharpening。D2 让
+\emph{数据分布 $\times$ 路由}去驱动分化，梯度只经被选中 expert 回传，天然产生特化——与
+$\S\ref{sec:setup}$ 的 top-$k$ 路由和正在跑的 OCR/geneval 专精现象一致。
+
+\subsection{路由粒度的匹配（代码约束）}
+\label{ssec:granularity}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{dense / \texttt{route\_granularity=token}（全 expert 前向）}：所有 $v_i$ 在同一
+$(x,t)$ 都被算出，D1 的同点 Gram 可\emph{免费}获得（见 \texttt{\_forward\_token}）。这是加 D1
+最自然的路径。
+\item \textbf{\texttt{route\_granularity=sample}, \texttt{top\_k}$<N$}：每样本只跑 top-$k$ 个
+expert，\emph{同一点没有全部 $v_i$}，故``同点两两夹角''无法在前向图上取得。此时 D1 应改为
+\emph{跨样本}：对一个 batch 里被路由到不同 expert 的样本，度量 expert 间的\emph{函数}差异（或退
+而用 D2 的路由特化）。\textbf{强推 D2 于此路径}。
+\item \textbf{\texttt{shared\_lora}}：$\delta_i$ 恰为 adapter\_$i$ 的增量，D1 在 $\delta$ 上度量
+尤其干净；但 top-$k$ sample 仍受上一条限制。
+\end{itemize}
+
+\subsection{与最大夹角/正交的最终判定表}
+\label{ssec:verdict}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.35}
+\footnotesize
+\begin{tabular}{@{}p{3.4cm}p{3.2cm}p{6.4cm}@{}}
+\toprule
+\textbf{候选目标} & \textbf{在哪个表示} & \textbf{判定} \\
+\midrule
+最大夹角 $\min\sum\cos v_i v_j$ & 原始 $v_i$（满尺度） & \ding{55} 病态：抵消式范数爆炸（引理~\ref{lem:blowup}、推论~\ref{cor:pathology}） \\
+正交 $\min\sum\cos^2 v_i v_j$ & 原始 $v_i$（满尺度） & \ding{55} 近乎无信息：base 主导 $\cos\approx1$ 常数（$\S\ref{ssec:basedom}$） \\
+互正交（硬约束） & 均值残差 $r_i$ & \ding{55} 不可行：零加权和禁止互正交（命题~\ref{prop:infeasible}） \\
+去相关 $[\cos]_+^2+$归一化 & skill 方向 $\delta_i$ & \ding{51} 良态：剥离 base、正交可行有界、避开反平行（D1） \\
+路由特化（per-input 低熵$+$batch 均衡） & router $\lambda$ & \ding{51} 最贴近 MoE 分化本质、与 top-$k$ 兼容（D2） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tcolorbox}[colback=yellow!5,colframe=yellow!60!black,title=\textbf{对用户问题的直接回答}]
+``让 velocity 之差尽可能大 / 夹角尽可能大 / 越正交越好''——
+\textbf{(1)} 方向是对的（确需分化先验，$\S\ref{sec:ident}$）；
+\textbf{(2)} 但\emph{不要}最大化夹角（反平行会范数爆炸、抵消、off-manifold，推论~\ref{cor:pathology}）；
+\textbf{(3)} \emph{正交}是有界甜点，但\emph{必须}在 skill 方向 $\delta_i=v_i-\vbase$ 上做（原始
+$v_i$ 上 base 主导使 cosine 恒 $\approx1$；均值残差上又被零和约束禁止互正交）；
+\textbf{(4)} 实操上用``只压正相关的去相关 $+$ 方向归一化 $+$ 幅度预算''(D1)，并配合``路由特化''(D2)，
+比裸的``最大夹角''稳健得多。
+\end{tcolorbox}
+
+%% ============================================================
+\section{与代码的衔接}
+\label{sec:code}
+%% ============================================================
+
+现有 load-balance 钩子（可\emph{原样并列}扩展）：
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{Flux2VelocityMoFTransformer2DModel.moe\_aux\_loss()} 返回上一次 forward 的
+load-balance；\texttt{\_forward\_token} 中\emph{所有} $v_i$ 已物化，可在此处顺带计算 D1 的
+$\{\delta_i\}$ Gram，缓存进新字段 \texttt{\_last\_mof\_div}。
+\item 新增 \texttt{mof\_diversity\_loss()} 与适配器 \texttt{collect\_mof\_diversity\_loss}，
+在 XOPD trainer 里与 \texttt{moe\_load\_balance\_coeff} 并列的新配置
+\texttt{mof\_diversity\_coeff}（见 \texttt{trainer.py} L2729--2738 的 aux 叠加处，照抄一段即可）。
+\item $\vbase$ 的获取：distinct 模式需另存一份冻结 base（或用 teacher-replicate 前的 pretrained）；
+shared\_lora 模式下 $\delta_i$ 直接是 adapter\_$i$ 相对冻结 base 的增量，最省事。
+\item 路由粒度按 $\S\ref{ssec:granularity}$：token/dense 路径挂 D1；sample$+$top-$k$ 路径挂 D2。
+\end{itemize}
+
+\begin{remark}[load-balance 与 diversity 正交，二者都要]
+\label{rem:both}
+$\loss_{\mathrm{bal}}$（均衡\emph{使用率}）与 $\loss_{\mathrm{div}}$（分化\emph{函数}）解决不同
+问题：前者防 router 坍缩，后者防 expert 相同。命题~\ref{prop:underdetermined}--注~\ref{rem:whatmanages}
+说明二者\emph{都}不能被 $\loss_{\mathrm{dist}}$ 替代，应同时保留（$\alpha,\beta$ 独立调）。
+\end{remark}
+
+%% ============================================================
+\section{合理性总评、失败模式与实验方向}
+\label{sec:eval}
+%% ============================================================
+
+\subsection{何时有用、何时有害}
+\label{ssec:whenhelp}
+
+分化损失的价值\emph{条件依赖}于 teacher/数据是否具备``互补的可分工结构''（呼应
+\texttt{mof\_notes.tex} 的\emph{temporal complementarity} 与 \texttt{mof\_ood\_guarantee}）：
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{有用}：若 $V$ 在不同 $(t,\text{prompt})$ 区域确有不同``子技能''（如高噪声端布局、
+中段笔画、低噪声端美化；或 OCR/geneval 两域），分化先验帮助 expert 认领不同区域，凸组合更灵活地
+逼近 $V$，并可能减轻单 expert 复刻 teacher hacking 导致的 in-domain 坍缩
+（\texttt{mof\_merge\_formulation.tex} §病理）。
+\item \textbf{有害}：若无此互补结构，强推分化只会在 $(N-1)d$ 维零空间里制造\emph{无用}差异，
+甚至（若误用最大夹角）经范数爆炸损害重建与稳定性。此时 $\beta$ 应 $\to0$。
+\end{itemize}
+
+\subsection{失败模式清单}
+\label{ssec:failure}
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{范数爆炸}（最大夹角 $\times$ 满尺度 expert）：引理~\ref{lem:blowup}；用 D1 的归一化
+$+$ 幅度预算 $+$ hinge 规避。
+\item \textbf{无信息**}（原始 $v_i$ 上 cosine）：base 主导 $\cos\approx1$；改到 $\delta_i$。
+\item \textbf{不可行硬约束}（均值残差互正交）：命题~\ref{prop:infeasible}；改软目标或改到 $\delta_i$。
+\item \textbf{与重建冲突}：未投影的 $\loss_{\mathrm{div}}$ 梯度拉动 $v_\lambda$；用命题~\ref{prop:nullspace}
+的加权去均值投影。
+\item \textbf{冗余项}（高维已近正交）：$\S\ref{ssec:highdim}$；先测 coherence 再决定。
+\item \textbf{与 top-$k$ 不兼容}：sample$+$top-$k$ 下同点无全 $v_i$；改用 D2。
+\item \textbf{分化 $\neq$ 有用}：差异未落在 router 可利用/reward 可辨的方向上；用 D2 让数据驱动，
+并以下游指标验证。
+\end{enumerate}
+
+\subsection{实验方向（与正在进行的三-student 实验对齐）}
+\label{ssec:exp}
+
+正在跑的 OCR $\to$ geneval\_enhanced $\to$ mixed 三个 4B student（同一 teacher、共享 teacher
+baseline）为本文提供\emph{经验锚点}：两个 specialist 就是``天然分化''的 expert，mixed 检验
+``容量受限只拟合一个峰''。据此设计：
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{分化是否 binding（先导诊断）}：在一个 MoF-V（如 \texttt{mof2\_base}，$N{=}2$，
+dense/token）训练中，仅开 $\loss_{\mathrm{dist}}+\loss_{\mathrm{bal}}$，监控 $\{\delta_i\}$ 的
+coherence、$\|\delta_i\|$、router 熵。若已近正交则分化项冗余（$\S\ref{ssec:highdim}$）。
+\item \textbf{表示消融}：$\loss_{\mathrm{div}}$ 分别加在\{原始 $v_i$、均值残差 $r_i$、skill 方向
+$\delta_i$\}上，验证只有 $\delta_i$ 版本既降 coherence 又不伤重建 loss。
+\item \textbf{正交 vs.\ 最大夹角}：对比 $[\cos]_+^2$（D1）与 $\sum\cos$（最大夹角），监控
+$\|v_i\|,\|\delta_i\|$ 与训练稳定性，实测验证引理~\ref{lem:blowup} 的爆炸。
+\item \textbf{$\beta$ 扫描}：$\beta\in\{0,10^{-3},10^{-2},10^{-1}\}$，看 in-domain/OOD 六套 eval
+与 recall（\texttt{mof\_merge\_formulation.tex} Def.\ 坍缩）随分化强度的权衡。
+\item \textbf{D2 路由特化}：在 sample$+$top-$k$（如 \texttt{mof8\_shared}）上开 D2，检查 per-domain
+的 expert 使用率是否分化成``OCR 样本走某几个 expert、geneval 走另几个''，并与两个 specialist 的
+$\delta$ 方向做余弦对齐（学到的 MoF 是否\emph{恢复}了 specialist 的分工）。
+\item \textbf{与 specialist 对齐}：把 $N{=}2$ MoF 的两个 $\delta_i$ 与实验里 OCR-specialist、
+geneval-specialist 的 LoRA 残差方向比对（cosine / 子空间主角），检验分化是否落在``真实可分工''方向
+而非零空间噪声。
+\end{enumerate}
+
+%% ============================================================
+\section{结论}
+\label{sec:concl}
+%% ============================================================
+
+\begin{tcolorbox}[colback=yellow!5,colframe=yellow!60!black,title=\textbf{要点}]
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{方向合理}：重建高度欠定、load-balance 只均衡使用率，故需一个\emph{分化先验}来在等价
+解中挑``分工''解（命题~\ref{prop:underdetermined}、注~\ref{rem:whatmanages}）。
+\item \textbf{不要最大化夹角}：固定凸和下反平行迫使范数爆炸、抵消、off-manifold（引理~\ref{lem:blowup}、
+推论~\ref{cor:pathology}）；\emph{正交}是有界甜点。
+\item \textbf{度量要搬到 skill 方向} $\delta_i=v_i-\vbase$：原始 $v_i$ 被 base 主导（cosine 恒
+$\approx1$），均值残差被零和约束禁止互正交（命题~\ref{prop:infeasible}）；只有 $\delta_i$ 上正交
+既可行又有界，且对应``把 $V-\vbase$ 分解为正交子技能''的良态版本。
+\item \textbf{与重建一阶兼容}：把分化梯度投影到 $\sum_i\lambda_i g_i=0$ 的零空间即不伤重建
+（命题~\ref{prop:nullspace}）。
+\item \textbf{推荐目标}：D1（skill 方向、$[\cos]_+^2$、方向归一化、幅度预算）$+$ D2（路由 per-input
+低熵 $+$ batch 均衡），按路由粒度取舍；挂在与 \texttt{moe\_aux\_loss} 平行的
+\texttt{mof\_diversity\_coeff}。
+\item \textbf{价值条件依赖}：仅当 teacher/数据有互补可分工结构时分化才有益，需以三-student 实验的
+specialist 方向与六套 eval $+$ recall 实测验证，不预设结论。
+\end{enumerate}
+\end{tcolorbox}
+
+%% ============================================================
+\section{与现有文档的关系}
+\label{sec:relation}
+%% ============================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.35}
+\footnotesize
+\begin{tabular}{@{}p{4.8cm}p{8.6cm}@{}}
+\toprule
+\textbf{文档} & \textbf{关系} \\
+\midrule
+\texttt{mof\_notes.tex} &
+凸/仿射组合合法性、sum-to-one（本文注~\ref{rem:sumtoone} 复用）、temporal complementarity（本文
+$\S\ref{ssec:whenhelp}$ 的``何时有用''依据）。 \\
+\texttt{mof\_merge\_formulation.tex} &
+残差形式 $v^{\stu*}=\vbase+\sum\pi_k\delta_k$（本文 skill 方向 $\delta_i$ 的来源）、in-domain
+坍缩/锐化与 precision--recall 判据（本文 $\S\ref{ssec:exp}$ 实验第 4 项）。 \\
+\texttt{mof\_per\_set\_analysis.tex} &
+softmax 均值相减导致 LoRA 残差梯度消失（本文 $\S\ref{ssec:basedom}$ base 主导的同源病理）。 \\
+\texttt{mof\_ood\_guarantee\_analysis.tex} &
+分化能否带来 OOD 增益的条件（本文``分化 $\neq$ 有用''的理论背景）。 \\
+\texttt{docs/opd/v\_pcgrad\_implementation\_plan.md} &
+梯度冲突消解（本文命题~\ref{prop:nullspace} 的零空间投影可复用其 PCGrad 机制）。 \\
+\texttt{flux2\_mof\_velocity.py} &
+本文形式化对应的实现（$N$ expert $+$ 共享 router $+$ 凸组合 $+$ load-balance aux $+$ 路由粒度）。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
