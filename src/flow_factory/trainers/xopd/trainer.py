@@ -2635,6 +2635,14 @@ class XOPDTrainer(BaseTrainer):
                         loss_info["log_prob"].append(log_prob_new.mean().detach())
                     loss_info["reinforce_loss"].append(reinforce_loss.detach())
                     loss_info["loss"].append(loss.detach())
+                    # Per-timestep-index d_k/loss detail (on top of the all-timestep
+                    # averages above). Keyed by the trajectory position so the same
+                    # physical step maps to a stable series even when xopd_train_steps/
+                    # num_xopd_steps subset or re-draw the trained steps; reduce_loss_info
+                    # then averages each key over that step's num_batches_per_epoch samples.
+                    ti = int(timestep_index)
+                    loss_info[f"d_k/{ti}"].append(pathwise_loss.detach())
+                    loss_info[f"loss/{ti}"].append(loss.detach())
 
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
