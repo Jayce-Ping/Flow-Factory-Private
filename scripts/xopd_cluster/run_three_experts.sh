@@ -1,8 +1,20 @@
 #!/bin/bash
-# Sequentially run the three 4B-student XOPD experiments for the capacity study:
-#     Run #1  OCR              (eval_teacher_at_start: true  -> the ONE shared teacher baseline)
-#     Run #2  geneval_enhanced (eval_teacher_at_start: false -> reuses Run #1's ceiling)
-#     Run #3  geneval_enh+ocr mixed 1:1 (eval_teacher_at_start: false)
+# Sequentially run the XOPD capacity + ablation experiments on this 4-node cluster:
+#     Run #1  OCR                     (eval_teacher_at_start: true  -> the ONE shared teacher baseline)
+#     Run #2  geneval_enhanced        (eval_teacher_at_start: false -> reuses Run #1's ceiling)
+#     Run #3  OCR x-space  (full-timestep clean-latent x0 d_k; xopd_dk_space=x)
+#     Run #4  OCR selective (late-timestep v d_k; xopd_train_steps=[21..27], resample_per_batch)
+#
+# NOTE: the geneval_enh+ocr MIXED run is trained on a SEPARATE cluster (parallel), so it is NOT
+# in this chain. Runs #3/#4 are the loss-space / timestep ablations vs the Run #1 OCR specialist:
+#   #1 full-timestep v-MSE  |  #4 late-timestep v-MSE  |  #3 full-timestep x-MSE  (all OCR data).
+#
+# Resuming / handing off (env):
+#   START_AT=<i>     start the chain at CONFIGS index i (skip already-done runs). Default 0.
+#   WAIT_FOR=<sub>   before starting, WAIT (no kill, no keepalive) until an in-flight ff-train whose
+#                    cmdline contains <sub> finishes -- used to hand off from a run another
+#                    orchestrator launched (e.g. resume after the current geneval_enhanced), without
+#                    disturbing it. Requires that run to end with the completion marker.
 #
 # Contract:
 #   * Before each run: stop keepalive, rsync repo (src/config/xopd_configs/scripts) to the 3
@@ -18,12 +30,16 @@
 #
 # Usage:
 #   setsid bash scripts/xopd_cluster/run_three_experts.sh > /root/three_experts.log 2>&1 < /dev/null &
+#   # resume after an in-flight geneval, then run x-mse -> selective:
+#   START_AT=2 WAIT_FOR=flux2_klein_32b_to_4b_l1_geneval_enh_1kep setsid bash ... &
 set -uo pipefail
 REPO=/root/Flow-Factory-Private
 cd "$REPO"
 WORKERS=(28.7.185.215 28.7.185.156 28.7.195.15)
 LAUNCHER=scripts/xopd_cluster/run_4node_xopd.sh
 STALL_SECS=${STALL_SECS:-5400}          # 90 min with no rank0 log write -> hung
+START_AT=${START_AT:-0}                 # CONFIGS index to start at (skip completed runs)
+WAIT_FOR=${WAIT_FOR:-}                  # await an in-flight ff-train (cmdline substring) before starting
 SYNC_PATHS="src config xopd_configs scripts"
 HASH_CMD='cd /root/Flow-Factory-Private && find src config xopd_configs scripts -type f ! -path "*/__pycache__/*" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64'
 
@@ -31,7 +47,8 @@ HASH_CMD='cd /root/Flow-Factory-Private && find src config xopd_configs scripts 
 CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_1kep.yaml:29570"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_geneval_enh_1kep.yaml:29571"
-  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_geneval_enh_ocr_mixed_1kep.yaml:29572"
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_xspace_1kep.yaml:29573"
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml:29574"
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }
@@ -73,6 +90,25 @@ sync_and_verify() {
   return 0
 }
 
+wait_for_running() {  # $1 = ff-train cmdline substring; block (no kill/keepalive) until it is gone
+  local pat="$1" beat=0 age
+  log "WAIT_FOR: awaiting in-flight run matching '$pat' before starting the chain (not killing it)"
+  while pgrep -f "flow_factory.train.*$pat" >/dev/null 2>&1 || pgrep -f "[f]f-train.*$pat" >/dev/null 2>&1; do
+    sleep 120
+    beat=$((beat + 1))
+    if [ $((beat % 15)) -eq 0 ]; then     # ~every 30 min: heartbeat with rank0 log age (hang visibility)
+      age=$([ -f /root/ff_xopd_rank0.log ] && echo $(( $(date +%s) - $(stat -c %Y /root/ff_xopd_rank0.log) )) || echo NA)
+      log "WAIT_FOR: still awaiting '$pat' (rank0 log age=${age}s; not killing -- monitor GPU util if this grows unbounded)"
+    fi
+  done
+  log "WAIT_FOR: '$pat' no longer running"
+  if ! grep -q "Training completed successfully" /root/ff_xopd_rank0.log 2>/dev/null; then
+    log "WAIT_FOR: '$pat' ended WITHOUT a completion marker -> ABORT (investigate before follow-ups)"
+    exit 1
+  fi
+  log "WAIT_FOR: '$pat' completed successfully; proceeding"
+}
+
 watchdog() {  # $1=config ; kills a hung run so the foreground launcher returns
   local cfg="$1" age
   while true; do
@@ -92,13 +128,22 @@ watchdog() {  # $1=config ; kills a hung run so the foreground launcher returns
 # Always leave GPUs busy when the orchestrator exits (success or failure).
 trap 'log "orchestrator exiting -> ensuring keepalive"; kill "${WD:-}" 2>/dev/null || true; start_keepalive' EXIT
 
-log "=== three-expert XOPD chain start (STALL_SECS=$STALL_SECS) ==="
-kill_all_runs                # drop any prior (debug) run
-start_keepalive              # hold GPUs during the first sync
+log "=== XOPD chain start (STALL_SECS=$STALL_SECS, START_AT=$START_AT, WAIT_FOR='${WAIT_FOR:-none}') ==="
+if [ -n "$WAIT_FOR" ]; then
+  wait_for_running "$WAIT_FOR"   # hand off from an in-flight run WITHOUT killing it / touching keepalive
+else
+  kill_all_runs                  # fresh start: drop any prior (debug) run
+fi
+start_keepalive                  # hold GPUs during the first sync (awaited run, if any, is done)
 
-for entry in "${CONFIGS[@]}"; do
+for i in "${!CONFIGS[@]}"; do
+  if [ "$i" -lt "$START_AT" ]; then
+    log "SKIP index $i ($(basename "${CONFIGS[$i]%%:*}" .yaml)) < START_AT=$START_AT"
+    continue
+  fi
+  entry="${CONFIGS[$i]}"
   cfg="${entry%%:*}"; port="${entry##*:}"; name=$(basename "$cfg" .yaml)
-  log "===================== RUN: $name (port $port) ====================="
+  log "===================== RUN [$i]: $name (port $port) ====================="
 
   if ! sync_and_verify; then log "ABORT: sync/verify failed before $name"; exit 1; fi
 
@@ -124,4 +169,4 @@ for entry in "${CONFIGS[@]}"; do
   start_keepalive             # hold GPUs during the next inter-run prep
 done
 
-log "=== ALL THREE RUNS COMPLETED SUCCESSFULLY ==="
+log "=== CHAIN COMPLETED SUCCESSFULLY (from index $START_AT) ==="
