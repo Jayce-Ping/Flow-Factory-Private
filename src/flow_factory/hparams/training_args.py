@@ -2577,6 +2577,22 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    xopd_resample_steps_per_batch: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "L1-ONLY: draw the ``num_xopd_steps`` trained timesteps INDEPENDENTLY per "
+                "micro-batch (from the ``xopd_train_steps`` pool, or the full base list) "
+                "instead of once per epoch. Selective teacher guidance: with "
+                "xopd_train_steps=[last quarter] + num_xopd_steps=k, each micro-batch does "
+                "the (expensive 32B) teacher forward on only k randomly-chosen late steps, "
+                "re-drawn every batch for within-epoch coverage. The count k is FIXED, so "
+                "GAS = num_batches_per_epoch * k and the one-optimizer-step-per-epoch "
+                "invariant is preserved (num_train_timesteps still == k). Requires "
+                "``num_xopd_steps`` to be set."
+            )
+        },
+    )
     xopd_pixel_loss: bool = field(
         default=False,
         metadata={
@@ -2753,6 +2769,13 @@ class XOPDTrainingArguments(TrainingArguments):
                     f"`num_xopd_steps`={self.num_xopd_steps} cannot exceed the candidate pool "
                     f"len(xopd_train_steps)={len(self.xopd_train_steps)}."
                 )
+        if self.xopd_resample_steps_per_batch and self.num_xopd_steps is None:
+            raise ValueError(
+                "`xopd_resample_steps_per_batch=True` requires a fixed `num_xopd_steps` (k): "
+                "per-batch resampling draws exactly k steps each micro-batch so GAS = "
+                "num_batches_per_epoch * k stays fixed (one optimizer step/epoch). "
+                "Got num_xopd_steps=None."
+            )
         # Student guidance drives sampling and the gradient-bearing forward; sync
         # it into the base `guidance_scale` field consumed by adapter.inference.
         self.guidance_scale = self.student_guidance_scale

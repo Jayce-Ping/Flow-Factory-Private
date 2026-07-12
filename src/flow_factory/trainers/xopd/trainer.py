@@ -887,6 +887,39 @@ class XOPDTrainer(BaseTrainer):
             self._xopd_tts_cache_epoch = epoch
         return self._xopd_tts_cache
 
+    @property
+    def _candidate_train_timestep_indices(self) -> List[int]:
+        """Full L1 candidate pool (base indices), BEFORE any num_xopd_steps subsampling.
+
+        For ``xopd_resample_steps_per_batch`` the rollout must store latents for EVERY
+        candidate step (any per-batch draw is served from these), and each micro-batch
+        draws its k steps from this pool. = ``xopd_train_steps`` positions into the base
+        list, else the whole base list.
+        """
+        ta = self.training_args
+        base = self._base_train_timestep_indices
+        if ta.xopd_train_steps:
+            return [base[i] for i in ta.xopd_train_steps]
+        return list(base)
+
+    def _draw_batch_steps(self, batch_idx: int) -> List[int]:
+        """Per-micro-batch random subset of ``num_xopd_steps`` candidate steps (sorted).
+
+        Deterministic in ``(epoch, batch_idx, seed)`` so every rank draws the SAME steps
+        for a given ``batch_idx`` (each rank applies them to its own samples). The count is
+        fixed = ``num_xopd_steps``, so every rank makes exactly ``num_batches * k`` accumulate
+        calls and the GAS / one-optimizer-step-per-epoch boundary stays aligned across ranks.
+        """
+        ta = self.training_args
+        pool = self._candidate_train_timestep_indices
+        k = ta.num_xopd_steps
+        if k is None or k >= len(pool):
+            return list(pool)
+        epoch = int(getattr(self, "epoch", 0))
+        g = torch.Generator().manual_seed(int(ta.seed) + 100003 * epoch + 97 * int(batch_idx))
+        sel = torch.randperm(len(pool), generator=g)[:k].tolist()
+        return [pool[i] for i in sorted(sel)]
+
 
     @property
     def enable_kl_loss(self) -> bool:
@@ -2208,8 +2241,15 @@ class XOPDTrainer(BaseTrainer):
         samples: List[BaseSample] = []
         data_iter = self._make_train_iter()
 
+        # Per-batch selective mode: store latents for EVERY candidate step so each
+        # micro-batch can later draw its own k steps; else store just this epoch's subset.
+        rollout_steps = (
+            self._candidate_train_timestep_indices
+            if self.training_args.xopd_resample_steps_per_batch
+            else self._train_timestep_indices
+        )
         trajectory_indices = compute_trajectory_indices(
-            train_timestep_indices=self._train_timestep_indices,
+            train_timestep_indices=rollout_steps,
             num_inference_steps=self.training_args.num_inference_steps,
         )
 
@@ -2271,10 +2311,20 @@ class XOPDTrainer(BaseTrainer):
             latents_index_map = batch["latent_index_map"]
             num_timesteps = batch["timesteps"].shape[1]
 
+            # Per-batch selective teacher guidance: draw this micro-batch's k steps (fixed
+            # count) so the pre-pass and the grad pass use the SAME steps; None => per-epoch
+            # default (self._train_timestep_indices) inside both callees.
+            batch_steps = (
+                self._draw_batch_steps(batch_idx)
+                if self.training_args.xopd_resample_steps_per_batch
+                else None
+            )
+
             d_list, mu_teacher_list = self._precompute_d_per_timestep(
                 batch=batch,
                 latents_index_map=latents_index_map,
                 num_timesteps=num_timesteps,
+                timestep_indices=batch_steps,
             )
 
             if self.reinforce_coef > 0:
@@ -2293,6 +2343,7 @@ class XOPDTrainer(BaseTrainer):
                 mu_teacher_list=mu_teacher_list,
                 r_per_k=r_per_k,
                 loss_info=loss_info,
+                timestep_indices=batch_steps,
             )
 
     # =============================== L1 helpers ===============================
@@ -2710,14 +2761,23 @@ class XOPDTrainer(BaseTrainer):
         mu_teacher_list: List[torch.Tensor],
         r_per_k: List[torch.Tensor],
         loss_info: Dict[str, List[torch.Tensor]],
+        timestep_indices: Optional[List[int]] = None,
     ) -> Dict[str, List[torch.Tensor]]:
-        """Gradient main pass: per-timestep student forward + loss + backward."""
+        """Gradient main pass: per-timestep student forward + loss + backward.
+
+        ``timestep_indices`` MUST match the list passed to ``_precompute_d_per_timestep``
+        (so ``mu_teacher_list[k_idx]`` aligns with this step); defaults to the per-epoch
+        ``self._train_timestep_indices``.
+        """
         device = self.accelerator.device
+        step_indices = (
+            timestep_indices if timestep_indices is not None else self._train_timestep_indices
+        )
 
         with self.autocast():
             for k_idx, timestep_index in enumerate(
                 tqdm(
-                    self._train_timestep_indices,
+                    step_indices,
                     desc=f"Epoch {self.epoch} Timestep",
                     position=1,
                     leave=False,
