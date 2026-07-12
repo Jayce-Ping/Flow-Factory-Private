@@ -968,6 +968,10 @@ class XOPDTrainer(BaseTrainer):
         # test sets land on the SAME wandb step (previously each test set logged
         # separately, spreading eval metrics across stepless auto-incremented steps).
         self._eval_log_sink = {}
+        # Cache of the trajectory-storing student rollouts done by the reward-eval
+        # pass on the gs=1.0 sets (populated in _run_eval_inference_batches), so the
+        # validation-D_k pass reuses them instead of re-rolling. Cleared at the end.
+        self._eval_rollout_cache = {}
         super().evaluate()
         # Validation D_k on the gs=1.0 sets (held-out transition-matching loss),
         # written into the same sink so it shares the student/teacher eval step.
@@ -978,6 +982,76 @@ class XOPDTrainer(BaseTrainer):
             if self._eval_log_sink:
                 self.log_data(self._eval_log_sink, step=self.step)
         self._eval_log_sink = None
+        self._eval_rollout_cache = None
+
+    def _run_eval_inference_batches(
+        self,
+        test_set_name: str,
+        merged_eval: Any,
+        eval_seed: int,
+    ) -> List[BaseSample]:
+        """XOPD override of the base student eval rollout.
+
+        For the no-CFG (gs=1.0) eval sets we roll out WITH ``trajectory_indices``
+        so the FULL trajectory is stored, and cache the resulting samples
+        (CPU-offloaded) on ``self._eval_rollout_cache`` so
+        :meth:`_evaluate_validation_d_k` reuses this SINGLE rollout for the
+        per-timestep D_k instead of running an identical second rollout. The
+        final image is unchanged by trajectory storage, so the reward metrics are
+        identical to the base path. gs!=1.0 sets keep the base behavior exactly
+        (``trajectory_indices=None``, final image only, no cache).
+
+        The cached samples are moved to CPU on purpose: with 3 gs=1.0 sets scored
+        before the D_k pass runs, keeping every set's full trajectory resident on
+        GPU would spike VRAM; the D_k pass re-uploads one micro-batch at a time
+        (identical to the reward path under ``offload_samples_to_cpu``).
+        """
+        gs = float(getattr(merged_eval, "guidance_scale", 1.0))
+        store_traj = abs(gs - 1.0) <= 1e-6
+        trajectory_indices = None
+        if store_traj:
+            eval_steps = int(
+                getattr(merged_eval, "num_inference_steps", self.training_args.num_inference_steps)
+            )
+            trajectory_indices = compute_trajectory_indices(
+                train_timestep_indices=list(range(eval_steps)),
+                num_inference_steps=eval_steps,
+                include_initial=True,
+            )
+
+        all_samples: List[BaseSample] = []
+        for batch in tqdm(
+            self.test_dataloaders[test_set_name],
+            desc=self._eval_progress_desc(test_set_name),
+            disable=not self.show_progress_bar,
+        ):
+            generator = create_generator_by_prompt(batch["prompt"], eval_seed)
+            inference_kwargs = {
+                "compute_log_prob": False,
+                "generator": generator,
+                "trajectory_indices": trajectory_indices,
+                **merged_eval,
+            }
+            inference_kwargs.update(**batch)
+            inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
+            samples = self.adapter.inference(**inference_kwargs)
+
+            # Stitch dataset metadata onto generated samples for reward routing.
+            stitch_batch_metadata(batch, samples)
+
+            all_samples.extend(samples)
+            self.eval_reward_buffer.add_samples(samples)
+
+        # Cache the trajectory-storing rollout for the validation-D_k reuse. Only
+        # for gs=1.0 sets and only when evaluate() initialized the cache. CPU-offload
+        # to bound VRAM; the reward path (already returned below) and the D_k pass
+        # both move tensors back to device as needed.
+        cache = getattr(self, "_eval_rollout_cache", None)
+        if store_traj and cache is not None:
+            for sample in all_samples:
+                sample.to("cpu")
+            cache[test_set_name] = all_samples
+        return all_samples
 
     def evaluate_teacher_baseline(self) -> None:
         """Evaluate the frozen teacher on every test set (fair student protocol).
@@ -2549,10 +2623,11 @@ class XOPDTrainer(BaseTrainer):
     def _evaluate_validation_d_k(self) -> None:
         """Validation D_k on every guidance_scale==1.0 eval set.
 
-        For each gs=1.0 test set: run a no-grad student rollout with the SAME
-        settings as the eval image generation (``eval.num_inference_steps``,
-        that set's ``guidance_scale``, EMA params) but with ``trajectory_indices``
-        so the full trajectory is stored, then reuse
+        For each gs=1.0 test set: REUSE the trajectory-storing student rollout
+        already produced (and CPU-cached) by the reward-eval pass
+        (:meth:`_run_eval_inference_batches`), which uses the SAME settings
+        (``eval.num_inference_steps``, that set's ``guidance_scale``, EMA params).
+        No second rollout is done here. We then run
         :meth:`_precompute_d_per_timestep` over ALL rollout steps to get the
         per-timestep Gaussian-transition KL ``D_k``. Per-step means (gathered
         across ranks) are logged as ``eval/{set}/d_k/{ti}`` and the trajectory
@@ -2576,37 +2651,19 @@ class XOPDTrainer(BaseTrainer):
                 continue  # validation D_k is defined only for the no-CFG (gs=1.0) sets
 
             eval_steps = int(getattr(merged_eval, "num_inference_steps", self.training_args.num_inference_steps))
-            eval_seed = merged_eval.seed if merged_eval.seed is not None else self.training_args.seed
             step_indices = list(range(eval_steps))
-            traj = compute_trajectory_indices(
-                train_timestep_indices=step_indices,
-                num_inference_steps=eval_steps,
-                include_initial=True,
-            )
             log_pfx = self._eval_log_prefix(test_set_name)
 
-            with torch.no_grad(), self.autocast(), self._eval_inference_context():
-                # 1) Trajectory-storing student rollout on the eval prompts.
-                rollout_samples: List[BaseSample] = []
-                for batch in tqdm(
-                    self.test_dataloaders[test_set_name],
-                    desc=f"Val D_k [{test_set_name}]",
-                    disable=not self.show_progress_bar,
-                ):
-                    generator = create_generator_by_prompt(batch["prompt"], eval_seed)
-                    inference_kwargs = {
-                        "compute_log_prob": False,
-                        "generator": generator,
-                        "trajectory_indices": traj,
-                        **merged_eval,
-                    }
-                    inference_kwargs.update(**batch)
-                    inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
-                    samples = self.adapter.inference(**inference_kwargs)
-                    stitch_batch_metadata(batch, samples)
-                    rollout_samples.extend(samples)
+            # Reuse the trajectory-storing student rollout already produced (and
+            # CPU-cached) by the reward-eval pass; no second rollout. Missing cache
+            # (e.g. gs!=1.0, or reward eval produced no samples) -> skip.
+            cache = getattr(self, "_eval_rollout_cache", None) or {}
+            rollout_samples = cache.pop(test_set_name, None)
+            if not rollout_samples:
+                continue
 
-                # 2) Per-timestep D_k over the full rollout, accumulated per step.
+            with torch.no_grad(), self.autocast(), self._eval_inference_context():
+                # Per-timestep D_k over the full (reused) rollout, accumulated per step.
                 per_step_local: List[List[torch.Tensor]] = [[] for _ in step_indices]
                 num_micro = (len(rollout_samples) + pbs - 1) // pbs
                 for j in range(num_micro):
