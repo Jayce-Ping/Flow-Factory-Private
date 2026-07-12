@@ -101,8 +101,20 @@ class XOPDTrainer(BaseTrainer):
         self.reinforce_horizon = ta.reinforce_horizon
         self.reinforce_future_reduction = ta.reinforce_future_reduction
         self.normalize_d_k = ta.normalize_d_k
+        self.xopd_dk_space = ta.xopd_dk_space
         self.teacher_gs = ta.teacher_guidance_scale
         self.student_gs = ta.student_guidance_scale
+
+        # x-space (clean-latent) d_k recovers x0 from the ODE Euler mean (mu = x_t + v*dt);
+        # that identity only holds under ODE, so require it. See
+        # docs/xopd/x_space_distillation_loss.md.
+        if self.xopd_dk_space == "x" and not self._is_ode:
+            raise ValueError(
+                "XOPD: xopd_dk_space='x' (clean-latent d_k) requires an ODE scheduler "
+                "(the x0 recovery uses mu = x_t + v*dt). Got dynamics_type="
+                f"{self.adapter.scheduler.dynamics_type!r}. Use 'v' for SDE, or set "
+                "scheduler.dynamics_type='ODE'."
+            )
 
         # Fail fast: the REINFORCE trajectory term is well-defined only under a
         # stochastic (SDE) transition. Under ODE the transition is deterministic
@@ -2664,6 +2676,9 @@ class XOPDTrainer(BaseTrainer):
                     std_dev_t=student_out.std_dev_t,
                     dt=student_out.dt,
                     normalize=self.normalize_d_k,
+                    space=self.xopd_dk_space,
+                    latents=latents,
+                    sigma=self._noise_fraction(self.adapter, t),
                 )
                 d_list.append(d_k.detach())
                 mu_teacher_list.append(mu_teacher)
@@ -2830,6 +2845,9 @@ class XOPDTrainer(BaseTrainer):
                             std_dev_t=student_out.std_dev_t,
                             dt=student_out.dt,
                             normalize=self.normalize_d_k,
+                            space=self.xopd_dk_space,
+                            latents=latents,
+                            sigma=self._noise_fraction(self.adapter, t),
                         )
 
                     pathwise_loss = d_k_grad.mean()

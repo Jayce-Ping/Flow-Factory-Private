@@ -2593,6 +2593,20 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    xopd_dk_space: Literal["v", "x"] = field(
+        default="v",
+        metadata={
+            "help": (
+                "L1 per-step distillation loss space. 'v' (default): the current "
+                "transition-mean MSE ``||mu_s - mu_t||^2``. 'x': clean-latent MSE "
+                "``||x0_s - x0_t||^2`` with ``x0 = x_t - sigma*v`` recovered analytically from "
+                "the transition mean (``v = (mu - x_t)/dt``, ODE-exact via ``mu = x_t + v*dt``). "
+                "This equals a ``sigma^2`` per-timestep reweighting of the velocity MSE "
+                "(``d_k^x = (sigma/dt)^2 * d_k^v``), up-weighting high-noise/early steps. "
+                "Requires an ODE scheduler; see docs/xopd/x_space_distillation_loss.md."
+            )
+        },
+    )
     xopd_pixel_loss: bool = field(
         default=False,
         metadata={

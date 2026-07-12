@@ -92,6 +92,28 @@ def build_forward_kwargs(
     return forward_kwargs
 
 
+def _to_clean_x0(
+    mu: torch.Tensor,
+    x_t: torch.Tensor,
+    sigma: torch.Tensor,
+    dt: torch.Tensor,
+) -> torch.Tensor:
+    """Clean latent ``x0 = x_t - sigma * v`` from the ODE Euler transition mean.
+
+    Recovers the velocity from ``mu = x_t + v*dt`` (ODE-exact): ``v = (mu - x_t)/dt``,
+    then ``x0 = x_t - sigma*v``. ``sigma`` and ``dt`` are per-sample; broadcast over the
+    trailing (non-batch) dims of ``mu``. See docs/xopd/x_space_distillation_loss.md.
+    """
+    sig = sigma.float()
+    d = dt.float()
+    while sig.dim() < mu.dim():
+        sig = sig.unsqueeze(-1)
+    while d.dim() < mu.dim():
+        d = d.unsqueeze(-1)
+    v = (mu.float() - x_t.float()) / d
+    return x_t.float() - sig * v
+
+
 def compute_per_step_kl(
     mu_student: torch.Tensor,
     mu_teacher: torch.Tensor,
@@ -99,13 +121,22 @@ def compute_per_step_kl(
     dt: torch.Tensor,
     *,
     normalize: bool,
+    space: str = "v",
+    latents: Optional[torch.Tensor] = None,
+    sigma: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-sample Gaussian transition KL ``D_k`` (optionally sigma-normalized).
+    """Per-sample distillation d_k between student and teacher transition means.
 
-    ``normalize=True``: ``mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` with
-    ``sigma_bar^2 = std_dev_t^2 * (-dt)``. ``normalize=False``: plain
-    ``mean(||mu_s - mu_t||^2)``. Spatial reduction uses ``mean`` over non-batch
-    dims. Under ODE (``std_dev_t ~ 0``) falls back to plain MSE.
+    ``space="v"`` (default): the Gaussian transition-mean term.
+        ``normalize=True``: ``mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` with
+        ``sigma_bar^2 = std_dev_t^2 * (-dt)``. ``normalize=False``: plain
+        ``mean(||mu_s - mu_t||^2)``. Under ODE (``std_dev_t ~ 0``) falls back to plain MSE.
+    ``space="x"``: clean-latent MSE ``mean(||x0_s - x0_t||^2)`` with
+        ``x0 = x_t - sigma*v`` (``v`` recovered from ``mu`` via the ODE Euler mean; requires
+        ``latents`` (= x_t) and ``sigma``). Equals a ``sigma^2`` per-timestep reweighting of
+        the velocity MSE; ``normalize`` is ignored (x-space is a plain x0-MSE).
+
+    Spatial reduction uses ``mean`` over non-batch dims.
     """
     if mu_student.shape != mu_teacher.shape:
         raise ValueError(
@@ -113,6 +144,19 @@ def compute_per_step_kl(
             f"got mu_student.shape={tuple(mu_student.shape)} vs "
             f"mu_teacher.shape={tuple(mu_teacher.shape)}."
         )
+
+    if space == "x":
+        if latents is None or sigma is None:
+            raise ValueError(
+                "compute_per_step_kl(space='x') requires `latents` (x_t) and `sigma`; "
+                f"got latents={'None' if latents is None else 'set'}, "
+                f"sigma={'None' if sigma is None else 'set'}."
+            )
+        x0_s = _to_clean_x0(mu_student, latents, sigma, dt)
+        x0_t = _to_clean_x0(mu_teacher, latents, sigma, dt)
+        return ((x0_s - x0_t) ** 2).mean(dim=tuple(range(1, x0_s.ndim)))
+    if space != "v":
+        raise ValueError(f"space must be 'v' or 'x', got {space!r}.")
 
     diff_sq = (mu_student.float() - mu_teacher.float()) ** 2
     diff_sq = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
