@@ -121,22 +121,25 @@ def compute_per_step_kl(
     dt: torch.Tensor,
     *,
     normalize: bool,
-    space: str = "v",
+    space: str = "xt",
     latents: Optional[torch.Tensor] = None,
     sigma: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-sample distillation d_k between student and teacher transition means.
+    """Per-sample distillation d_k between student and teacher, in one of three spaces.
 
-    ``space="v"`` (default): the Gaussian transition-mean term.
+    All are plain per-sample MSE with a ``mean`` spatial reduction over non-batch dims. Under
+    ODE (``mu = x_t + v*dt`` with x_t shared, so it cancels in the student-teacher diff) they are
+    per-timestep reweightings of the same ``dv = v_s - v_t``: ``MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2``.
+
+    ``space="v"``: raw velocity MSE ``mean(||v_s - v_t||^2)`` with ``v = (mu - x_t)/dt``. Because
+        x_t cancels, this is ``mean(||(mu_s - mu_t)/dt||^2)`` -- only ``dt`` is needed. ``normalize``
+        is ignored. ODE-only (the ``mu = x_t + v*dt`` identity).
+    ``space="x0"``: clean-latent MSE ``mean(||x0_s - x0_t||^2)`` with ``x0 = x_t - sigma*v``
+        (requires ``latents`` (= x_t) and ``sigma``). ``normalize`` is ignored. ODE-only.
+    ``space="xt"`` (default): the transition-mean / next-latent term (the DiffusionOPD default).
         ``normalize=True``: ``mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` with
-        ``sigma_bar^2 = std_dev_t^2 * (-dt)``. ``normalize=False``: plain
-        ``mean(||mu_s - mu_t||^2)``. Under ODE (``std_dev_t ~ 0``) falls back to plain MSE.
-    ``space="x"``: clean-latent MSE ``mean(||x0_s - x0_t||^2)`` with
-        ``x0 = x_t - sigma*v`` (``v`` recovered from ``mu`` via the ODE Euler mean; requires
-        ``latents`` (= x_t) and ``sigma``). Equals a ``sigma^2`` per-timestep reweighting of
-        the velocity MSE; ``normalize`` is ignored (x-space is a plain x0-MSE).
-
-    Spatial reduction uses ``mean`` over non-batch dims.
+        ``sigma_bar^2 = std_dev_t^2 * (-dt)``. ``normalize=False``: plain ``mean(||mu_s - mu_t||^2)``.
+        Under ODE (``std_dev_t ~ 0``) falls back to plain MSE. Works under any dynamics.
     """
     if mu_student.shape != mu_teacher.shape:
         raise ValueError(
@@ -145,18 +148,28 @@ def compute_per_step_kl(
             f"mu_teacher.shape={tuple(mu_teacher.shape)}."
         )
 
-    if space == "x":
+    if space == "v":
+        # Raw velocity MSE. v_s - v_t = (mu_s - mu_t)/dt (ODE-exact; x_t cancels), so only dt is
+        # needed -- no latents/sigma. Equivalent to MSE(xt)/dt^2.
+        d = dt.float()
+        while d.dim() < mu_student.dim():
+            d = d.unsqueeze(-1)
+        diff = (mu_student.float() - mu_teacher.float()) / d
+        return (diff ** 2).mean(dim=tuple(range(1, diff.ndim)))
+
+    if space == "x0":
         if latents is None or sigma is None:
             raise ValueError(
-                "compute_per_step_kl(space='x') requires `latents` (x_t) and `sigma`; "
+                "compute_per_step_kl(space='x0') requires `latents` (x_t) and `sigma`; "
                 f"got latents={'None' if latents is None else 'set'}, "
                 f"sigma={'None' if sigma is None else 'set'}."
             )
         x0_s = _to_clean_x0(mu_student, latents, sigma, dt)
         x0_t = _to_clean_x0(mu_teacher, latents, sigma, dt)
         return ((x0_s - x0_t) ** 2).mean(dim=tuple(range(1, x0_s.ndim)))
-    if space != "v":
-        raise ValueError(f"space must be 'v' or 'x', got {space!r}.")
+
+    if space != "xt":
+        raise ValueError(f"space must be 'v', 'xt' or 'x0', got {space!r}.")
 
     diff_sq = (mu_student.float() - mu_teacher.float()) ** 2
     diff_sq = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))  # (B,)

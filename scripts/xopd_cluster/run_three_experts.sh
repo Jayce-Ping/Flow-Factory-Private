@@ -2,12 +2,14 @@
 # Sequentially run the XOPD capacity + ablation experiments on this 4-node cluster:
 #     Run #1  OCR                     (eval_teacher_at_start: true  -> the ONE shared teacher baseline)
 #     Run #2  geneval_enhanced        (eval_teacher_at_start: false -> reuses Run #1's ceiling)
-#     Run #3  OCR x-space  (full-timestep clean-latent x0 d_k; xopd_dk_space=x)
-#     Run #4  OCR selective (late-timestep v d_k; xopd_train_steps=[21..27], resample_per_batch)
+#     Run #3  OCR x0-space  (full-timestep clean-latent d_k; xopd_dk_space=x0)
+#     Run #4  OCR selective (late-timestep transition-mean d_k; xopd_train_steps=[21..27], resample_per_batch)
+#     Run #5  OCR v-space   (full-timestep raw-velocity d_k; xopd_dk_space=v)
 #
 # NOTE: the geneval_enh+ocr MIXED run is trained on a SEPARATE cluster (parallel), so it is NOT
-# in this chain. Runs #3/#4 are the loss-space / timestep ablations vs the Run #1 OCR specialist:
-#   #1 full-timestep v-MSE  |  #4 late-timestep v-MSE  |  #3 full-timestep x-MSE  (all OCR data).
+# in this chain. Runs #3/#4/#5 are the loss-space / timestep ablations vs the Run #1 OCR specialist
+# (all OCR data, otherwise identical). Loss spaces: MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2, where
+# xt (transition mean / next latent) is the default used by Runs #1/#2/#4.
 #
 # Resuming / handing off (env):
 #   START_AT=<i>     start the chain at CONFIGS index i (skip already-done runs). Default 0.
@@ -49,6 +51,7 @@ CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_geneval_enh_1kep.yaml:29571"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_xspace_1kep.yaml:29573"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml:29574"
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_vmse_1kep.yaml:29575"
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }

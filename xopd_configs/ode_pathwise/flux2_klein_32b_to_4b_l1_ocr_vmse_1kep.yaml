@@ -1,14 +1,15 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# ABLATION: X-SPACE (clean-latent) distillation loss on the OCR specialist. Identical to
-# flux2_klein_32b_to_4b_l1_ocr_1kep.yaml EXCEPT the per-step L1 d_k is computed in CLEAN-LATENT
-# (x0) space instead of transition-mean (v) space: for each timestep convert stu/tea to
-# x0 = x_t - sigma*v and MSE there. This is an ODE-exact sigma^2 per-timestep reweighting of the
-# velocity MSE (d_k^x = (sigma/dt)^2 * d_k^v), up-weighting high-noise/early steps. See
-# docs/xopd/x_space_distillation_loss.md.
-# Three-way comparison (all OCR data, otherwise identical):
-#   (1) full-timestep v-MSE  = flux2_klein_32b_to_4b_l1_ocr_1kep.yaml
-#   (2) late-timestep v-MSE  = flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml
-#   (3) full-timestep x-MSE  = THIS config
+# ABLATION: V-SPACE (raw velocity) distillation loss on the OCR specialist. Identical to
+# flux2_klein_32b_to_4b_l1_ocr_1kep.yaml EXCEPT the per-step L1 d_k is computed on the RAW
+# VELOCITY: for each timestep MSE ||v_s - v_t||^2 with v = (mu - x_t)/dt (x_t cancels ->
+# ||(mu_s - mu_t)/dt||^2). This removes the dt^2 per-timestep weighting that the default
+# transition-mean (xt) loss carries. Loss-space ratio MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2.
+# See docs/xopd/x_space_distillation_loss.md.
+# Four-way comparison (all OCR data, otherwise identical):
+#   (1) full-timestep xt-MSE (transition mean, default) = flux2_klein_32b_to_4b_l1_ocr_1kep.yaml
+#   (2) late-timestep  xt-MSE (selective teacher)        = flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml
+#   (3) full-timestep  x0-MSE (clean latent)             = flux2_klein_32b_to_4b_l1_ocr_xspace_1kep.yaml
+#   (4) full-timestep  v-MSE  (raw velocity)             = THIS config
 # LoRA (rank 64, alpha 128) on ALL linears. Non-CFG (teacher_gs = student_gs = 1.0); pure L1.
 # FULL eval suite on all 6 test sets. Teacher-baseline eval SKIPPED (reuse the OCR specialist's
 # shared ceiling). Train + eval @ 512px.
@@ -46,7 +47,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_l1_ocr_xspace_1kep"
+  run_name: "flux2klein_32b_to_4b_l1_ocr_vmse_1kep"
   project: "Flow-Factory-XOPD"            # Logger project name
   logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"  # shared cephfs checkpoint dir
@@ -74,7 +75,7 @@ train:
   # --- L0: velocity-regression warmup (teacher-generated data) ---
   l0_warmup_epochs: 0                     # Run L0 for the first N epochs, then switch to L1 (0 disables L0)
   l0_num_inference_steps: 50              # Teacher rollout steps when generating z0 targets in L0
-  l0_inner_steps: 4                       # Random-t regression sub-steps per generated z0 batch; MUST be a multiple of num_train_timesteps (else auto-rounded up + warned).
+  l0_inner_steps: 4                       # Random-t regression sub-steps per generated z0 batch; MUST be a multiple of num_train_timesteps (else auto-rounded up + warned). L0 runs l0_inner_steps/num_train_timesteps optimizer steps/epoch; each z0 reused l0_inner_steps times.
   l0_time_sampling: "logit_normal"        # L0 t sampling. Options: logit_normal, uniform
   l0_weighting: "min_snr"                 # L0 loss weight w(t). Options: min_snr, snr, uniform
   l0_snr_gamma: 5.0                       # Min-SNR-gamma clamp (used when l0_weighting=min_snr)
@@ -84,12 +85,12 @@ train:
   reinforce_coef: 0.0                     # REINFORCE trajectory-term coefficient; 0 disables (pure pathwise)
   reinforce_horizon: null                 # Future steps aggregated into R_bar; null = all j > k
   reinforce_future_reduction: "mean"      # R_bar aggregation. Options: sum, mean
-  normalize_d_k: false                    # true: divide D_k by 2*sigma_bar^2; false: plain MSE (x-space is plain x0-MSE regardless)
+  normalize_d_k: false                    # true: divide D_k by 2*sigma_bar^2; false: plain MSE (v-space is plain velocity-MSE regardless)
   kl_type: "x-based"                      # KL anchor type vs base. Options: x-based, v-based (kl_beta=0 -> inactive)
   kl_beta: 0.0                            # KL anchor coefficient; 0 disables
 
-  # --- L1 loss space (this ablation): clean-latent (x0) d_k ---
-  xopd_dk_space: "x0"                     # spaces: 'v'=||v_s-v_t||^2, 'xt'=||mu_s-mu_t||^2 (default, DiffusionOPD), 'x0'=||x0_s-x0_t||^2 (x0=x_t-sigma*v). Ratio 1:dt^2:sigma^2. ODE-only.
+  # --- L1 loss space (this ablation): raw velocity (v) d_k ---
+  xopd_dk_space: "v"                      # spaces: 'v'=||v_s-v_t||^2 (THIS), 'xt'=||mu_s-mu_t||^2 (default, DiffusionOPD), 'x0'=||x0_s-x0_t||^2. Ratio 1:dt^2:sigma^2. ODE-only.
 
   # --- Sampling / batch ---
   resolution: 512                         # Generation resolution (int or [H, W]); klein native is 1024, lower to save memory
@@ -120,7 +121,7 @@ train:
 
 # ===== Scheduler =====
 scheduler:
-  dynamics_type: "ODE"                    # Dynamics. Options: Flow-SDE, Dance-SDE, CPS, ODE (x-space d_k requires ODE)
+  dynamics_type: "ODE"                    # Dynamics. Options: Flow-SDE, Dance-SDE, CPS, ODE (REINFORCE only meaningful under SDE)
   noise_level: 0.0                        # SDE noise level a
   num_sde_steps: null                     # Number of noise-injection steps per training step
   sde_steps: null                         # Candidate noise window (randomly chosen during training); null = auto
@@ -132,7 +133,7 @@ eval:
   per_device_batch_size: 1                # Eval batch size
   num_inference_steps: 40                 # Eval steps
   guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
-  eval_freq: 40                           # Eval every N epochs
+  eval_freq: 40                           # Eval every N epochs (raised 20->40: eval is ~43% of walltime; halve the tax)
   seed: 42                                # Eval seed
   test_sets:                              # geneval / ocr / pickscore, each at gs=1.0 (no CFG) and gs=4.0 (CFG).
     - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
@@ -145,7 +146,7 @@ eval:
 # ===== Rewards (optional for XOPD; logging only, NOT part of the distillation loss) =====
 rewards:
   - name: "geneval"                       # Reward name (referenced by eval_reward_names: [geneval])
-    reward_model: "geneval"               # Reward model type (matches dataset/geneval_enhanced)
+    reward_model: "geneval"               # Reward model type (matches dataset/geneval)
     weight: 1                             # Weight (for multi-reward aggregation)
     batch_size: 64                        # Reward inference batch size
     device: "cuda"                        # Device

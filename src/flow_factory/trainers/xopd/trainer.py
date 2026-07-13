@@ -105,14 +105,14 @@ class XOPDTrainer(BaseTrainer):
         self.teacher_gs = ta.teacher_guidance_scale
         self.student_gs = ta.student_guidance_scale
 
-        # x-space (clean-latent) d_k recovers x0 from the ODE Euler mean (mu = x_t + v*dt);
-        # that identity only holds under ODE, so require it. See
-        # docs/xopd/x_space_distillation_loss.md.
-        if self.xopd_dk_space == "x" and not self._is_ode:
+        # 'v' (raw velocity) and 'x0' (clean-latent) d_k both recover v from the ODE Euler mean
+        # (mu = x_t + v*dt); that identity only holds under ODE, so require it. 'xt' (transition
+        # mean) works under any dynamics. See docs/xopd/x_space_distillation_loss.md.
+        if self.xopd_dk_space in ("v", "x0") and not self._is_ode:
             raise ValueError(
-                "XOPD: xopd_dk_space='x' (clean-latent d_k) requires an ODE scheduler "
-                "(the x0 recovery uses mu = x_t + v*dt). Got dynamics_type="
-                f"{self.adapter.scheduler.dynamics_type!r}. Use 'v' for SDE, or set "
+                f"XOPD: xopd_dk_space={self.xopd_dk_space!r} requires an ODE scheduler "
+                "(it recovers v via mu = x_t + v*dt). Got dynamics_type="
+                f"{self.adapter.scheduler.dynamics_type!r}. Use 'xt' for SDE, or set "
                 "scheduler.dynamics_type='ODE'."
             )
 

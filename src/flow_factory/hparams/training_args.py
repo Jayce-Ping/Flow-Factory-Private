@@ -2593,17 +2593,20 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    xopd_dk_space: Literal["v", "x"] = field(
-        default="v",
+    xopd_dk_space: Literal["v", "xt", "x0"] = field(
+        default="xt",
         metadata={
             "help": (
-                "L1 per-step distillation loss space. 'v' (default): the current "
-                "transition-mean MSE ``||mu_s - mu_t||^2``. 'x': clean-latent MSE "
-                "``||x0_s - x0_t||^2`` with ``x0 = x_t - sigma*v`` recovered analytically from "
-                "the transition mean (``v = (mu - x_t)/dt``, ODE-exact via ``mu = x_t + v*dt``). "
-                "This equals a ``sigma^2`` per-timestep reweighting of the velocity MSE "
-                "(``d_k^x = (sigma/dt)^2 * d_k^v``), up-weighting high-noise/early steps. "
-                "Requires an ODE scheduler; see docs/xopd/x_space_distillation_loss.md."
+                "L1 per-step distillation-loss space (student vs teacher), all plain per-sample "
+                "MSE. Under ODE (``mu = x_t + v*dt``, x_t shared so it cancels in the diff) the "
+                "three differ only by a per-timestep factor on the same ``dv = v_s - v_t``:\n"
+                " 'v'  = ||v_s - v_t||^2               (raw velocity; v = (mu - x_t)/dt). ODE-only.\n"
+                " 'xt' = ||mu_s - mu_t||^2 = dt^2*||dv||^2  (transition mean / next latent; the "
+                "DiffusionOPD default). Any dynamics; honors normalize_d_k (/ 2*sigma_bar^2).\n"
+                " 'x0' = ||x0_s - x0_t||^2 = sigma^2*||dv||^2  (clean latent; x0 = x_t - sigma*v). "
+                "ODE-only.\n"
+                "So MSE(v) : MSE(xt) : MSE(x0) = 1 : dt^2 : sigma^2. See "
+                "docs/xopd/x_space_distillation_loss.md."
             )
         },
     )
