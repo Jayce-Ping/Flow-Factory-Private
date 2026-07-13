@@ -4,7 +4,7 @@
 # (x0) space instead of transition-mean (v) space: for each timestep convert stu/tea to
 # x0 = x_t - sigma*v and MSE there. This is an ODE-exact sigma^2 per-timestep reweighting of the
 # velocity MSE (d_k^x = (sigma/dt)^2 * d_k^v), up-weighting high-noise/early steps. See
-# docs/xopd/x_space_distillation_loss.md.
+# docs/xopd/per_timestep_loss_dominance_theory.tex.
 # Three-way comparison (all OCR data, otherwise identical):
 #   (1) full-timestep v-MSE  = flux2_klein_32b_to_4b_l1_ocr_1kep.yaml
 #   (2) late-timestep v-MSE  = flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml

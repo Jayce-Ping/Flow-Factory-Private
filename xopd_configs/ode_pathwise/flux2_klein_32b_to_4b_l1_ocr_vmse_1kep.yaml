@@ -4,7 +4,7 @@
 # VELOCITY: for each timestep MSE ||v_s - v_t||^2 with v = (mu - x_t)/dt (x_t cancels ->
 # ||(mu_s - mu_t)/dt||^2). This removes the dt^2 per-timestep weighting that the default
 # transition-mean (xt) loss carries. Loss-space ratio MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2.
-# See docs/xopd/x_space_distillation_loss.md.
+# See docs/xopd/per_timestep_loss_dominance_theory.tex.
 # Four-way comparison (all OCR data, otherwise identical):
 #   (1) full-timestep xt-MSE (transition mean, default) = flux2_klein_32b_to_4b_l1_ocr_1kep.yaml
 #   (2) late-timestep  xt-MSE (selective teacher)        = flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml

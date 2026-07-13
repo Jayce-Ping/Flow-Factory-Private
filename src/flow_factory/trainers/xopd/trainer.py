@@ -107,7 +107,7 @@ class XOPDTrainer(BaseTrainer):
 
         # 'v' (raw velocity) and 'x0' (clean-latent) d_k both recover v from the ODE Euler mean
         # (mu = x_t + v*dt); that identity only holds under ODE, so require it. 'xt' (transition
-        # mean) works under any dynamics. See docs/xopd/x_space_distillation_loss.md.
+        # mean) works under any dynamics. See docs/xopd/per_timestep_loss_dominance_theory.tex.
         if self.xopd_dk_space in ("v", "x0") and not self._is_ode:
             raise ValueError(
                 f"XOPD: xopd_dk_space={self.xopd_dk_space!r} requires an ODE scheduler "
@@ -141,8 +141,8 @@ class XOPDTrainer(BaseTrainer):
         # Cache the student velocity signature too (cross-VAE L0 forwards extra
         # conditioning, e.g. pooled embeds for SD3.5 vs latent_ids for FLUX.2).
         if hasattr(self.adapter, "predict_velocity"):
-            self._velocity_param_names, self._velocity_accepts_var_kwargs = (
-                cache_forward_signature(self.adapter.predict_velocity)
+            self._velocity_param_names, self._velocity_accepts_var_kwargs = cache_forward_signature(
+                self.adapter.predict_velocity
             )
         else:
             self._velocity_param_names, self._velocity_accepts_var_kwargs = frozenset(), False
@@ -153,7 +153,7 @@ class XOPDTrainer(BaseTrainer):
         # special case of the generalized cross-VAE path.
         self._cross_vae = ta.teacher_model_type is not None
         self.teacher_adapter = None  # set in cross-VAE mode
-        self.transport = None        # set below
+        self.transport = None  # set below
         # Cross-VAE FLUX teacher packed-latent layout (position ids + spatial size),
         # captured at warm-up and injected into the affine-transport converters.
         self._teacher_latent_ids = None
@@ -551,11 +551,7 @@ class XOPDTrainer(BaseTrainer):
         next to the model checkpoint (main process only). No-op for identity.
         """
         super().save_checkpoint(save_directory, epoch=epoch)
-        if (
-            self._cross_vae
-            and self.transport is not None
-            and self.accelerator.is_main_process
-        ):
+        if self._cross_vae and self.transport is not None and self.accelerator.is_main_process:
             ckpt_dir = save_directory
             if epoch is not None:
                 ckpt_dir = os.path.join(save_directory, f"checkpoint-{epoch}")
@@ -718,6 +714,7 @@ class XOPDTrainer(BaseTrainer):
                 def _hook(_m, _i, out):
                     if self._hsct_capture:
                         self._hsct_hidden[bi] = out[1] if isinstance(out, (tuple, list)) else out
+
                 return _hook
 
             blocks[b].register_forward_hook(_mk(b))
@@ -731,12 +728,14 @@ class XOPDTrainer(BaseTrainer):
         out = []
         for b in self.training_args.hsct_hidden_blocks:
             if b not in self._hsct_hidden:
-                raise RuntimeError(f"HSCT hidden for block {b} not captured; was _hsct_capture set?")
+                raise RuntimeError(
+                    f"HSCT hidden for block {b} not captured; was _hsct_capture set?"
+                )
             h = self._hsct_hidden[b]
             if h.shape[0] == 2 * latent_bs:
                 h = h[latent_bs:]
             B, N, D = h.shape
-            s = int(round(N ** 0.5))
+            s = int(round(N**0.5))
             if s * s != N:
                 raise ValueError(f"non-square token count N={N} at block {b}")
             out.append(h.reshape(B, s, s, D).permute(0, 3, 1, 2).contiguous())
@@ -758,9 +757,7 @@ class XOPDTrainer(BaseTrainer):
             try:
                 from huggingface_hub import snapshot_download
 
-                snap = snapshot_download(
-                    ta.teacher_model_name_or_path, local_files_only=True
-                )
+                snap = snapshot_download(ta.teacher_model_name_or_path, local_files_only=True)
                 if os.path.isdir(os.path.join(snap, "vae")):
                     return None  # teacher repo has its own VAE
             except Exception:
@@ -931,7 +928,6 @@ class XOPDTrainer(BaseTrainer):
         g = torch.Generator().manual_seed(int(ta.seed) + 100003 * epoch + 97 * int(batch_idx))
         sel = torch.randperm(len(pool), generator=g)[:k].tolist()
         return [pool[i] for i in sorted(sel)]
-
 
     @property
     def enable_kl_loss(self) -> bool:
@@ -1147,6 +1143,7 @@ class XOPDTrainer(BaseTrainer):
             return
 
         from datetime import timedelta
+
         import torch.distributed as dist
 
         if not dist.is_initialized():
@@ -1287,7 +1284,6 @@ class XOPDTrainer(BaseTrainer):
             self.eval_reward_buffer.add_samples(samples)
         return all_samples
 
-
     def _run_teacher_eval_inference_batches(
         self,
         test_set_name: str,
@@ -1329,9 +1325,7 @@ class XOPDTrainer(BaseTrainer):
             inference_kwargs["text_ids"] = batch["teacher_text_ids"]
             inference_kwargs.pop("prompt_ids", None)
             if "teacher_negative_prompt_embeds" in batch:
-                inference_kwargs["negative_prompt_embeds"] = batch[
-                    "teacher_negative_prompt_embeds"
-                ]
+                inference_kwargs["negative_prompt_embeds"] = batch["teacher_negative_prompt_embeds"]
                 inference_kwargs["negative_text_ids"] = batch["teacher_negative_text_ids"]
                 inference_kwargs.pop("negative_prompt_ids", None)
             else:
@@ -1575,9 +1569,7 @@ class XOPDTrainer(BaseTrainer):
             if self._teacher_latent_ids is None:
                 t_ids = getattr(teacher_samples[0], "latent_ids", None)
                 if t_ids is not None:
-                    self._capture_teacher_layout(
-                        t_ids if t_ids.dim() == 3 else t_ids.unsqueeze(0)
-                    )
+                    self._capture_teacher_layout(t_ids if t_ids.dim() == 3 else t_ids.unsqueeze(0))
 
             if not use_traj:
                 # Legacy: final clean latent only. z0_S from the teacher's final image.
@@ -1606,9 +1598,7 @@ class XOPDTrainer(BaseTrainer):
             vae_dtype = self.teacher_adapter.pipeline.vae.dtype
             for t in range(num_steps):
                 z_t_T = torch.stack([s.all_latents[t] for s in teacher_samples], dim=0).to(device)
-                t_ids = torch.stack(
-                    [s.latent_ids for s in teacher_samples], dim=0
-                ).to(device)
+                t_ids = torch.stack([s.latent_ids for s in teacher_samples], dim=0).to(device)
                 with torch.no_grad(), self.autocast():
                     imgs_t = self.teacher_adapter.decode_latents(
                         z_t_T.to(vae_dtype), latent_ids=t_ids, output_type="pt"
@@ -1620,9 +1610,7 @@ class XOPDTrainer(BaseTrainer):
                 # noise level of all_latents[t]: timesteps[step_idx] if pre-clean else 0.
                 step_idx = int(idx_map[t]) if idx_map is not None else t
                 t_val = (
-                    float(ts_vals[step_idx])
-                    if (ts_vals is not None and step_idx < T_len)
-                    else 0.0
+                    float(ts_vals[step_idx]) if (ts_vals is not None and step_idx < T_len) else 0.0
                 )
                 # Convert the teacher timestep to the scheduler-agnostic sigma in [0,1].
                 sigma_val = self._noise_fraction(self.teacher_adapter, t_val)
@@ -1664,6 +1652,7 @@ class XOPDTrainer(BaseTrainer):
         collection and the transport fit are unchanged (still cover all noise levels).
         """
         from PIL import Image as _PILImage
+
         from ...logger.formatting import LogImage
 
         try:
@@ -1775,10 +1764,7 @@ class XOPDTrainer(BaseTrainer):
             # an accepted approximation.) sigma is None for the legacy clean-only path.
             if clean_fit_only:
                 clean_eps = 1e-3
-                keep = [
-                    i for i, s in enumerate(sigma_list)
-                    if s is None or float(s) <= clean_eps
-                ]
+                keep = [i for i, s in enumerate(sigma_list) if s is None or float(s) <= clean_eps]
                 if not keep:
                     raise RuntimeError(
                         "transport_clean_fit_only=True but warm-up epoch produced NO "
@@ -1861,8 +1847,10 @@ class XOPDTrainer(BaseTrainer):
         import json as _json
 
         import torchvision.transforms as _TT
-        from PIL import Image as _Image, ImageFile as _ImageFile
-        from torch.utils.data import DataLoader as _DL, Dataset as _DS
+        from PIL import Image as _Image
+        from PIL import ImageFile as _ImageFile
+        from torch.utils.data import DataLoader as _DL
+        from torch.utils.data import Dataset as _DS
         from torch.utils.data.distributed import DistributedSampler as _DSamp
 
         _ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate partial-write corpus PNGs
@@ -1917,17 +1905,30 @@ class XOPDTrainer(BaseTrainer):
             entries = entries[: ta.hsct_coldstart_max_images]
         ds = _Corpus(entries, ta.resolution)
         sampler = (
-            _DSamp(ds, num_replicas=acc.num_processes, rank=acc.process_index, shuffle=True, drop_last=True)
-            if acc.num_processes > 1 else None
+            _DSamp(
+                ds,
+                num_replicas=acc.num_processes,
+                rank=acc.process_index,
+                shuffle=True,
+                drop_last=True,
+            )
+            if acc.num_processes > 1
+            else None
         )
         dl = _DL(
-            ds, batch_size=ta.hsct_coldstart_bs, sampler=sampler,
-            shuffle=(sampler is None), num_workers=8, drop_last=True, pin_memory=True,
+            ds,
+            batch_size=ta.hsct_coldstart_bs,
+            sampler=sampler,
+            shuffle=(sampler is None),
+            num_workers=8,
+            drop_last=True,
+            pin_memory=True,
         )
         if acc.is_main_process:
             _noise_desc = (
                 f"noisy sigma~U(0,{ta.hsct_coldstart_sigma_max})"
-                if ta.hsct_coldstart_noisy else f"clean sigma={sigma}"
+                if ta.hsct_coldstart_noisy
+                else f"clean sigma={sigma}"
             )
             logger.info(
                 f"HSCT cold-start: {len(ds)} imgs, source={ta.hsct_coldstart_source}, "
@@ -1963,8 +1964,11 @@ class XOPDTrainer(BaseTrainer):
                 v_rawS = s_vae.encode(v_imgs.to(s_vae.dtype)).latent_dist.mode().float()
                 v_rawT = t_vae.encode(v_imgs.to(t_vae.dtype)).latent_dist.mode().float()
                 v_pe, _, v_pool, _ = self.adapter.pipeline.encode_prompt(
-                    prompt=v_prompts, prompt_2=v_prompts, prompt_3=v_prompts,
-                    device=device, do_classifier_free_guidance=False,
+                    prompt=v_prompts,
+                    prompt_2=v_prompts,
+                    prompt_3=v_prompts,
+                    device=device,
+                    do_classifier_free_guidance=False,
                 )
             viz_pack = (v_rawS, v_rawT, v_imgs, v_pe, v_pool)
         cs_step = 0
@@ -1977,8 +1981,11 @@ class XOPDTrainer(BaseTrainer):
                     raw_S = s_vae.encode(imgs.to(s_vae.dtype)).latent_dist.mode().float()
                     raw_T = t_vae.encode(imgs.to(t_vae.dtype)).latent_dist.mode().float()
                     enc = self.adapter.pipeline.encode_prompt(
-                        prompt=list(prompts), prompt_2=list(prompts), prompt_3=list(prompts),
-                        device=device, do_classifier_free_guidance=False,
+                        prompt=list(prompts),
+                        prompt_2=list(prompts),
+                        prompt_3=list(prompts),
+                        device=device,
+                        do_classifier_free_guidance=False,
                     )
                     prompt_embeds, _, pooled, _ = enc
                     B = imgs.shape[0]
@@ -2012,16 +2019,22 @@ class XOPDTrainer(BaseTrainer):
                     self._hsct_hidden = {}
                     self._hsct_capture = True
                     transformer(
-                        hidden_states=z_tf.to(transformer.dtype), timestep=ts,
+                        hidden_states=z_tf.to(transformer.dtype),
+                        timestep=ts,
                         encoder_hidden_states=prompt_embeds.to(transformer.dtype),
-                        pooled_projections=pooled.to(transformer.dtype), return_dict=False,
+                        pooled_projections=pooled.to(transformer.dtype),
+                        return_dict=False,
                     )
                     self._hsct_capture = False
                     h_list = self._hsct_h_list(B)
                 # P fits the CLEAN linear map (raw_T<-raw_S, exact pushforward); Q learns the
                 # (noisy) inverse. So pass clean raw for P, noisy q_in/q_tgt for Q.
                 q_mse, p_mse = self.transport.coldstart_step(
-                    q_tgt_T, q_in_S, h_list, raw_T_clean=raw_T, raw_S_clean=raw_S,
+                    q_tgt_T,
+                    q_in_S,
+                    h_list,
+                    raw_T_clean=raw_T,
+                    raw_S_clean=raw_S,
                     inner_steps=ta.hsct_coldstart_inner_steps,
                     distributed=acc.num_processes > 1,
                 )
@@ -2033,7 +2046,10 @@ class XOPDTrainer(BaseTrainer):
                     if self.logger is not None:
                         # Cold-start metrics on their OWN x-axis "cold-start/step"
                         # (separate from the L1 training "step" axis).
-                        data = {"cold-start/hsct_q_lat_mse": q_mse, "cold-start/hsct_p_lat_mse": p_mse}
+                        data = {
+                            "cold-start/hsct_q_lat_mse": q_mse,
+                            "cold-start/hsct_p_lat_mse": p_mse,
+                        }
                         if cs_step % 200 == 0 and viz_pack is not None:
                             _vS, _vT, _vI, _vpe, _vpool = viz_pack
                             data["cold-start/hsct_inverse_recon"] = self._hsct_recon_images(
@@ -2048,6 +2064,7 @@ class XOPDTrainer(BaseTrainer):
         # broadcast rank0 (insurance) + freeze
         if acc.num_processes > 1:
             import torch.distributed as dist
+
             for p in self.transport.parameters():
                 dist.broadcast(p.data, src=0)
             for buf in self.transport.buffers():
@@ -2059,8 +2076,9 @@ class XOPDTrainer(BaseTrainer):
         if acc.is_main_process:
             logger.info("HSCT cold-start complete; transport frozen for L1.")
 
-    def _hsct_recon_images(self, raw_S, raw_T, imgs, prompt_embeds, pooled,
-                           max_n=16, noisy_sigma=0.6):
+    def _hsct_recon_images(
+        self, raw_S, raw_T, imgs, prompt_embeds, pooled, max_n=16, noisy_sigma=0.6
+    ):
         """wandb gallery of per-sample tiles. Each tile stacks 3 rows:
           row0 = original image (constant anchor)
           row1 = teacher-decode(Q(z_S, h_S))   -- the transport reconstruction
@@ -2072,6 +2090,7 @@ class XOPDTrainer(BaseTrainer):
         eyeball how the transport behaves against BOTH clean and noised teacher targets
         (the noisy latents it will actually see during L1). Returns LogImage."""
         from PIL import Image as _Image
+
         from ...logger.formatting import LogImage
 
         transformer = self.adapter.pipeline.transformer
@@ -2083,11 +2102,10 @@ class XOPDTrainer(BaseTrainer):
         # degradation-vs-noise curve (answers "to what noise level does Q still hold up").
         noisy_levels = (
             torch.linspace(noisy_sigma / n_noisy, noisy_sigma, n_noisy, device=raw_S.device)
-            if n_noisy > 0 else torch.empty(0, device=raw_S.device)
+            if n_noisy > 0
+            else torch.empty(0, device=raw_S.device)
         )
-        sig = torch.cat(
-            [torch.zeros(n_clean, device=raw_S.device), noisy_levels]
-        ).view(-1, 1, 1, 1)
+        sig = torch.cat([torch.zeros(n_clean, device=raw_S.device), noisy_levels]).view(-1, 1, 1, 1)
         with torch.no_grad(), self.autocast():
             # FM-noise student in scaled space to match the L1 rollout (transport helper).
             q_in, z_tf = self.transport.noise_student_scaled(raw_S[:n], sig)
@@ -2095,19 +2113,25 @@ class XOPDTrainer(BaseTrainer):
             self._hsct_hidden = {}
             self._hsct_capture = True
             transformer(
-                hidden_states=z_tf.to(transformer.dtype), timestep=ts,
+                hidden_states=z_tf.to(transformer.dtype),
+                timestep=ts,
                 encoder_hidden_states=prompt_embeds[:n].to(transformer.dtype),
-                pooled_projections=pooled[:n].to(transformer.dtype), return_dict=False,
+                pooled_projections=pooled[:n].to(transformer.dtype),
+                return_dict=False,
             )
             self._hsct_capture = False
             h_list = self._hsct_h_list(n)
             qd = self.transport.Q.base.weight.dtype
             zq = self.transport.Q(q_in.to(qd), [h.to(qd) for h in h_list])
+
             # chunked teacher decode: a single decode of all tiles can OOM at large n.
             def _dec(z):
-                outs = [t_vae.decode(z[j:j + 4].to(t_vae.dtype)).sample
-                        for j in range(0, z.shape[0], 4)]
+                outs = [
+                    t_vae.decode(z[j : j + 4].to(t_vae.dtype)).sample
+                    for j in range(0, z.shape[0], 4)
+                ]
                 return torch.cat(outs, 0)
+
             x_inv = _dec(zq)
             # z_T TARGET: clean for clean tiles, BN-packed-space noised for noisy tiles ->
             # "half clean-latent-as-target, half noised-latent-as-target".
@@ -2115,10 +2139,18 @@ class XOPDTrainer(BaseTrainer):
             x_gt = _dec(tgt_T)
 
         def to_pil(t):
-            a = ((t.float().clamp(-1, 1) + 1) / 2 * 255).round().byte().cpu().permute(1, 2, 0).numpy()
+            a = (
+                ((t.float().clamp(-1, 1) + 1) / 2 * 255)
+                .round()
+                .byte()
+                .cpu()
+                .permute(1, 2, 0)
+                .numpy()
+            )
             return _Image.fromarray(a)
 
         from PIL import ImageDraw as _ImageDraw
+
         out = []
         for i in range(n):
             rows = [to_pil(imgs[i]), to_pil(x_inv[i]), to_pil(x_gt[i])]
@@ -2130,7 +2162,9 @@ class XOPDTrainer(BaseTrainer):
             # burned-in per-row labels: row0 is the (always clean) ORIGINAL image, row1 is
             # Q's reconstruction, row2 is the z_T TARGET (clean or noised). Makes it obvious
             # that the clean top row is the source, not the target.
-            tgt_lab = "z_T target: clean" if is_clean else f"z_T target: noised s={float(sig[i]):.2f}"
+            tgt_lab = (
+                "z_T target: clean" if is_clean else f"z_T target: noised s={float(sig[i]):.2f}"
+            )
             row_labels = ["original (source)", "Q-recon", tgt_lab]
             draw = _ImageDraw.Draw(tile)
             for r, lab in enumerate(row_labels):
@@ -2138,7 +2172,10 @@ class XOPDTrainer(BaseTrainer):
                 draw.rectangle([0, y, 9 + 6 * len(lab), y + 15], fill=(0, 0, 0))
                 draw.text((3, y + 3), lab, fill=(255, 255, 0))
             out.append(
-                LogImage(tile, caption=f"s{i} [{'clean' if is_clean else f'noised s={float(sig[i]):.2f}'}]")
+                LogImage(
+                    tile,
+                    caption=f"s{i} [{'clean' if is_clean else f'noised s={float(sig[i]):.2f}'}]",
+                )
             )
         return out
 
@@ -2480,9 +2517,7 @@ class XOPDTrainer(BaseTrainer):
             tkw = filter_kwargs(self.teacher_adapter.forward, **tkw)
             out = self.teacher_adapter.forward(**tkw)
             if out.next_latents_mean is None:
-                raise RuntimeError(
-                    "Cross-VAE teacher forward did not return `next_latents_mean`."
-                )
+                raise RuntimeError("Cross-VAE teacher forward did not return `next_latents_mean`.")
             return out.next_latents_mean.detach()
 
         return query_teacher_mean
@@ -2652,8 +2687,7 @@ class XOPDTrainer(BaseTrainer):
                     )
 
                 student_hidden = (
-                    self._hsct_h_list(forward_kwargs["latents"].shape[0])
-                    if self._is_hsct else None
+                    self._hsct_h_list(forward_kwargs["latents"].shape[0]) if self._is_hsct else None
                 )
                 if self._pixel_loss:
                     # PIXEL-space target: cache the teacher next state decoded by D_T (detached).
@@ -2716,7 +2750,9 @@ class XOPDTrainer(BaseTrainer):
             if abs(gs - 1.0) > 1e-6:
                 continue  # validation D_k is defined only for the no-CFG (gs=1.0) sets
 
-            eval_steps = int(getattr(merged_eval, "num_inference_steps", self.training_args.num_inference_steps))
+            eval_steps = int(
+                getattr(merged_eval, "num_inference_steps", self.training_args.num_inference_steps)
+            )
             step_indices = list(range(eval_steps))
             log_pfx = self._eval_log_prefix(test_set_name)
 
@@ -2835,8 +2871,10 @@ class XOPDTrainer(BaseTrainer):
                         # is unbiased with NO base-point/displacement correction (unlike raw
                         # latent), and never pays P's ~0.24 image-irrelevant floor.
                         student_px = self._decode_student_pixels(student_out.next_latents_mean)
-                        d_k_grad = (student_px.float() - mu_teacher.float()).abs().mean(
-                            dim=tuple(range(1, student_px.ndim))
+                        d_k_grad = (
+                            (student_px.float() - mu_teacher.float())
+                            .abs()
+                            .mean(dim=tuple(range(1, student_px.ndim)))
                         )
                     else:
                         d_k_grad = compute_per_step_kl(

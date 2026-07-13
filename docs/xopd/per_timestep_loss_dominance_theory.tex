@@ -1,0 +1,457 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{listings}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\dt}{\Delta t}
+\newcommand{\dk}{d_k}
+
+\newtheorem*{remark*}{Remark}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=4pt,
+}
+
+\title{\textbf{Why late timesteps dominate the XOPD per-step loss}\\[0.3em]
+\large A flow-matching account of the \texttt{d\_k} blow-up, artifact vs.\ signal,
+and the \texttt{xopd\_dk\_space} reweighting}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Theory companion to the empirical observation
+\texttt{docs/xopd/progress/2026-07-12-per-timestep-dk-dominance.md} (last quarter of steps
+$\approx 81\%$ of $\sum_k \dk$, final step $\approx 40\%$); the implemented remedy is
+\texttt{train.xopd\_dk\_space="x0"} (clean-latent loss, \S\ref{sec:impl}). Relevant
+code: \texttt{compute\_per\_step\_kl} in
+\texttt{src/flow\_factory/trainers/xopd/common.py}, called by
+\texttt{\_precompute\_d\_per\_timestep} / \texttt{\_optimize\_train\_pass} in
+\texttt{src/flow\_factory/trainers/xopd/trainer.py}.
+
+This note defines three per-step MSE losses ($L_{xt}$, $L_v$, $L_{x_0}$), their exact conversion
+on the FLUX.2-klein 28-step grid, and why the default $L_{xt}$ (config \texttt{"xt"}) dominates late
+timesteps. Companion data: \S\ref{sec:schedule}--\S\ref{sec:empirical}.
+\end{abstract}
+
+\tableofcontents
+
+%% ============================================================
+\section{Three per-step MSE losses and their exact conversion}
+\label{sec:three-losses}
+%% ============================================================
+
+XOPD compares student and teacher on the \emph{same} on-policy rollout state $x_t$ at step
+index~$k$; only their predictions differ. Under rectified-flow interpolation
+($x_t=(1-\sigma)z_0+\sigma\varepsilon$, $\sigma=t/1000$) and ODE Euler stepping
+($\mu=x_t+v\,\dt$, $\dt=\sigma^{\mathrm{sched}}_{k+1}-\sigma^{\mathrm{sched}}_k<0$), there are
+three equivalent MSE targets (config \texttt{xopd\_dk\_space}, default \texttt{"xt"}):
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}clll@{}}
+\toprule
+\textbf{knob} & \textbf{loss} & \textbf{formula} & \textbf{note} \\
+\midrule
+\texttt{xt} & $L_{xt}$ & $\norm{\mu_s-\mu_t}^2$ & transition mean / next latent (default) \\
+\texttt{v} & $L_v$ & $\norm{v_s-v_t}^2$ & raw velocity MSE; ODE-only \\
+\texttt{x0} & $L_{x_0}$ & $\norm{z_{0,s}-z_{0,t}}^2$ & clean-latent MSE; ODE-only \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Ratio.} $\mathrm{MSE}(v):\mathrm{MSE}(xt):\mathrm{MSE}(x0) = 1:\dt^2:\sigma^2$.
+
+Here $\mu$ is the one-step transition mean ($x_{t+\dt}$ under ODE), $v$ the model velocity
+(\texttt{noise\_pred}), and $z_0=x_t-\sigma v$ the analytically recovered clean latent. Because
+$x_t$ cancels:
+\begin{align}
+\mu_s-\mu_t &= \dt\,(v_s-v_t),
+\label{eq:mu-v}\\
+z_{0,s}-z_{0,t} &= -\sigma\,(v_s-v_t),
+\label{eq:x0-v}\\
+\Rightarrow\quad
+L_{xt} &= \dt^2\,L_v,
+\label{eq:mu-v-sq}\\
+L_{x_0} &= \sigma^2\,L_v,
+\label{eq:x0-v-sq}\\
+L_{x_0} &= \Big(\tfrac{\sigma}{\dt}\Big)^2 L_{xt},
+\label{eq:x0-mu}\\
+L_v &= \Big(\tfrac{\dt}{\sigma}\Big)^2 L_{x_0}.
+\label{eq:v-x0}
+\end{align}
+All four identities are \emph{exact} on the discrete ODE grid (no approximation). The conversion
+factors depend \emph{only} on $(\sigma_k,\dt_k)$ at step~$k$; they do not require equal errors
+across steps --- they convert \emph{the same} underlying $(v_s-v_t)$ disagreement between spaces.
+
+\paragraph{Conversion matrix (multiply to go from column loss to row loss).}
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}l|ccc@{}}
+ & $\to L_{xt}$ & $\to L_v$ & $\to L_{x_0}$ \\
+\midrule
+from $L_{xt}$ & $1$ & $\dt^{-2}$ & $(\sigma/\dt)^2$ \\
+from $L_v$ & $\dt^2$ & $1$ & $\sigma^2$ \\
+from $L_{x_0}$ & $(\dt/\sigma)^2$ & $\sigma^{-2}$ & $1$ \\
+\end{tabular}
+\end{center}
+
+\paragraph{What each loss implicitly weights (if you sum $\sum_k L_{\{\cdot\},k}$ with coefficient~$1$).}
+Fix the \emph{underlying} velocity disagreement $L_{v,k}$ at step~$k$:
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{$L_{xt}$ (default):} step~$k$ contributes $\dt_k^2 L_{v,k}$ --- late steps have larger
+$\lvert\dt_k\rvert$ and dominate (\S\ref{sec:schedule}, col.~``\%$L_{xt}$'').
+\item \textbf{$L_v$ (\texttt{xopd\_dk\_space="v"}):} step~$k$ contributes $L_{v,k}$ directly --- the
+native FM velocity target; under the fixed 28-step grid the per-step $\dt_k$ vary only modestly so
+this is close to uniform (\S\ref{sec:empirical}).
+\item \textbf{$L_{x_0}$ (\texttt{xopd\_dk\_space="x0"}):} step~$k$ contributes $\sigma_k^2 L_{v,k}$ ---
+early high-noise steps ($\sigma\approx1$) dominate (col.~``pct $L_{x_0}$'').
+\end{itemize}
+Alternatively, fix $L_{x_0,k}$ (equal clean-latent disagreement): $L_{xt,k}=(\dt_k/\sigma_k)^2
+L_{x_0,k}$, which is the ``$(\dt/\sigma)^2$ blow-up'' narrative (\S\ref{sec:causes}).
+
+%% ============================================================
+\section{The key identity (legacy shorthand)}
+\label{sec:identity}
+%% ============================================================
+
+With \texttt{normalize\_d\_k=false}, the logged \texttt{train/d\_k/\{ti\}} is $L_{xt}$ (not $L_v$).
+Combining \eqref{eq:mu-v-sq}--\eqref{eq:v-x0}:
+\[
+L_{xt} = \dt^2 L_v = \Big(\tfrac{\dt}{\sigma}\Big)^2 L_{x_0}.
+\]
+So the default loss is clean-latent disagreement multiplied by the implicit per-step weight
+$(\dt/\sigma)^2$ (\S\ref{sec:three-losses}). The $x$-space knob sets $L_{x_0}$ directly and removes
+that factor (\S\ref{sec:impl}).
+
+%% ============================================================
+\section{Concrete schedule: official FLUX.2-klein @ 28 steps}
+\label{sec:schedule}
+%% ============================================================
+
+We reproduce the \emph{exact} denoising grid used in XOPD training
+(\texttt{num\_inference\_steps=28}, 512$\times$512) by loading the default scheduler from the
+official HuggingFace repo and calling the same \texttt{retrieve\_timesteps} path as
+\texttt{Flux2KleinPipeline} (shifted flow-matching sigmas with
+\texttt{image\_seq\_len=1024}, $\mu=1.859$):
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\footnotesize,frame=none]
+FlowMatchEulerDiscreteScheduler.from_pretrained(
+    "black-forest-labs/FLUX.2-klein-base-4B", subfolder="scheduler")
+# sigmas = linspace(1, 1/28, 28); mu = compute_empirical_mu(1024, 28)
+\end{lstlisting}
+Repro script: \texttt{.scratch/flux2\_klein\_scheduler\_timesteps.py} (uv venv
+\texttt{/Users/bowenping/.venvs/flux2-klein-scheduler}, \texttt{diffusers==0.39.0}).
+
+\paragraph{Notation at step index \texttt{ti}.}
+\texttt{ti=0} is the noisiest state; \texttt{ti=27} is the last denoising step before $\sigma=0$.
+The scheduler returns a \emph{timestep} $t_k\in[0,1000]$ and a \emph{shifted flow sigma}
+$\sigma^{\mathrm{sched}}_k\in[0,1]$. XOPD's clean-latent recovery uses the repo's FM fraction
+$\sigma_k=t_k/1000$ (\texttt{\_noise\_fraction}, \texttt{flow\_match\_sigma}). The ODE step size is
+$\Delta t_k=\sigma^{\mathrm{sched}}_{k+1}-\sigma^{\mathrm{sched}}_k<0$ (from
+\texttt{scheduler.step}). On this grid $\sigma_k\approx\sigma^{\mathrm{sched}}_k$ to machine
+precision.
+
+\paragraph{Per-step conversion factors on the 28-step grid.}
+Table~\ref{tab:klein28-summary} lists representative steps; Table~\ref{tab:klein28-full}
+(auto-generated, \texttt{docs/xopd/flux2\_klein\_28step\_loss\_scales.tex}) gives all 28 rows.
+Repro: \texttt{.scratch/flux2\_klein\_scheduler\_timesteps.py}.
+
+\begin{table}[ht]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}rrrrrrrrr@{}}
+\toprule
+\texttt{ti} & $t$ & $\sigma$ & $\Delta t$
+ & $\frac{L_{xt}}{L_v}=\dt^2$ & $\frac{L_{x_0}}{L_v}=\sigma^2$ & $\frac{L_{x_0}}{L_{xt}}$
+ & pct $L_{xt}$ & pct $L_{x_0}$ \\
+\midrule
+ 0 & 1000.0 & 1.0000 & $-$0.00574 & $3.3{\times}10^{-5}$ & 1.000 & $3.0{\times}10^{4}$ & 0.04\% & 5.28\% \\
+ 7 &  950.6 & 0.9506 & $-$0.00929 & $8.6{\times}10^{-5}$ & 0.904 & $1.0{\times}10^{4}$ & 0.10\% & 4.77\% \\
+13 &  881.0 & 0.8810 & $-$0.01584 & $2.5{\times}10^{-4}$ & 0.776 & $3.1{\times}10^{3}$ & 0.28\% & 4.10\% \\
+21 &  681.5 & 0.6815 & $-$0.04505 & $2.0{\times}10^{-3}$ & 0.464 & $2.3{\times}10^{2}$ & 2.27\% & 2.45\% \\
+24 &  516.8 & 0.5168 & $-$0.08175 & $6.7{\times}10^{-3}$ & 0.267 & 40.0 & 7.47\% & 1.41\% \\
+25 &  435.1 & 0.4351 & $-$0.10456 & $1.1{\times}10^{-2}$ & 0.189 & 17.3 & 12.21\% & 1.00\% \\
+26 &  330.5 & 0.3305 & $-$0.13847 & $1.9{\times}10^{-2}$ & 0.109 & 5.70 & 21.42\% & 0.58\% \\
+27 &  192.1 & 0.1921 & $-$0.19206 & $3.7{\times}10^{-2}$ & 0.037 & 1.00 & 41.21\% & 0.19\% \\
+\bottomrule
+\end{tabular}
+\caption{FLUX.2-klein-base-4B, \texttt{num\_inference\_steps=28}, 512px. Columns 5--7:
+exact factors from \eqref{eq:mu-v-sq}--\eqref{eq:x0-mu}. ``\%$L_{xt}$'' (``\%$L_{x_0}$''): share
+of $\sum_k L_{xt,k}$ (resp.\ $\sum_k L_{x_0,k}$) if $L_{v,k}\equiv$ const across steps.}
+\label{tab:klein28-summary}
+\end{table}
+
+\input{flux2_klein_28step_loss_scales.tex}
+
+\paragraph{Reading the numbers.}
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{At \texttt{ti=27}, all three losses coincide in scale.} $\lvert\dt_{27}\rvert\approx
+\sigma_{27}$, so $\dt_{27}^2=\sigma_{27}^2\approx0.037$ and $L_{xt}=L_{x_0}=L_v$ for the \emph{same}
+velocity gap.
+\item \textbf{Default $L_{xt}$ dominance $\approx$ flat $L_v$.} If $\norm{v_s-v_t}^2$ were identical
+at every step, $\sum_k L_{xt,k}$ puts $\mathbf{41\%}$ on \texttt{ti=27} (col.~``\%$L_{xt}$'').
+The mixed XOPD run observes $\mathbf{40\%}$ on \texttt{ti=27} --- the logged curve matches
+\emph{roughly constant velocity error} amplified only by $\dt_k^2$, not the stronger
+$(\dt_k/\sigma_k)^2$ factor (which would give $\mathbf{77\%}$ if $L_{x_0,k}$ were constant).
+\item \textbf{$L_{x_0}$ up-weights early steps.} With flat $L_v$, high-noise steps each take
+$\sim5\%$ of $\sum L_{x_0}$ while \texttt{ti=27} takes only $\mathbf{0.19\%}$. Setting
+\texttt{xopd\_dk\_space="x0"} switches to this allocation.
+\item \textbf{Cross-step ratios (same $L_v$).} $L_{xt,27}/L_{xt,13}=(\dt_{27}/\dt_{13})^2
+\approx\mathbf{148\times}$; $L_{x_0,0}/L_{x_0,27}=\sigma_0^2/\sigma_{27}^2\approx\mathbf{27\times}$.
+\item \textbf{``Late step'' $\neq$ $\sigma\to0$.} The last rollout step has $t=192$ ($\sigma=0.19$),
+not $t\approx0$. Dominance comes from the discrete grid's large $\lvert\dt_k\rvert$ at the end.
+\end{itemize}
+
+%% ============================================================
+\section{Empirical distribution: mixed run, converted from measured $L_{xt}$}
+\label{sec:empirical}
+%% ============================================================
+
+Wandb run \texttt{4cnkluwk} (mixed geneval+OCR, \texttt{xopd\_dk\_space=xt},
+\texttt{normalize\_d\_k=false}) logs $L_{xt,k}$ directly
+(\S\ref{sec:causes}). Under ODE we convert each step to the \emph{hypothetical} $L_v$ and $L_{x_0}$
+that would have been logged with the same underlying velocity gap:
+\[
+L_{v,k}=\frac{L_{xt,k}}{\dt_k^2},\qquad
+L_{x_0,k}=\Big(\frac{\sigma_k}{\dt_k}\Big)^2 L_{xt,k}.
+\]
+Table~\ref{tab:empirical-converted} uses \texttt{mean\_tail} from
+\texttt{progress/2026-07-12-per-timestep-dk-dominance.md} and the official 28-step
+$(\sigma_k,\dt_k)$ from \S\ref{sec:schedule}.
+
+\begin{table}[ht]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{aggregate} & \textbf{$L_{xt}$ (meas.)} & \textbf{$L_v$ (conv.)} & \textbf{$L_{x_0}$ (conv.)} \\
+\midrule
+top-1 (\texttt{ti=27}) & 40.2\% & 0.5\% & 0.02\% \\
+top-7 (\texttt{ti=21--27}, last 1/4) & 81.0\% & 3.1\% & 0.9\% \\
+high-noise half (\texttt{ti=0--13}) & 12.2\% & 91.5\% & 95.2\% \\
+low-noise half (\texttt{ti=14--27}) & 87.8\% & 8.5\% & 4.8\% \\
+\bottomrule
+\end{tabular}
+\caption{Share of $\sum_k L_{\{\cdot\},k}$ (\texttt{mean\_tail}) in each loss space. $L_{xt}$ is
+measured; $L_v$ and $L_{x_0}$ are ODE-exact conversions using the FLUX.2-klein 28-step grid.}
+\label{tab:empirical-converted}
+\end{table}
+
+\paragraph{Reading.}
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Late dominance is specific to $L_{xt}$.} The observed 40\%/81\% concentration on late
+steps \emph{disappears} under conversion to $L_v$ (early half $\mathbf{92\%}$) or $L_{x_0}$
+($\mathbf{95\%}$): the logged curve is dominated by $\dt_k^2$, while the underlying velocity gap
+is larger at high noise.
+\item \textbf{$L_v$ is nearly flat in absolute scale} after conversion ($L_{v,0}\approx1.26$ vs.\
+$L_{v,27}\approx0.056$, only $\mathbf{0.5\%}$ of the sum on \texttt{ti=27}), consistent with
+Cause~A (\S\ref{ssec:causeA}).
+\item \textbf{Ablation implication.} \texttt{xopd\_dk\_space="v"} removes the $\dt_k^2$ rescaling
+and should redistribute gradient toward high-noise steps; \texttt{"x0"} applies $\sigma_k^2$ and
+amplifies that further.
+\end{itemize}
+
+%% ============================================================
+\section{Implementation: the \texttt{xopd\_dk\_space} knob}
+\label{sec:impl}
+%% ============================================================
+
+\textbf{Knob.} \texttt{train.xopd\_dk\_space} $\in\{\texttt{v},\texttt{xt},\texttt{x0}\}$ (default
+\texttt{xt}). See \texttt{compute\_per\_step\_kl} in \texttt{xopd/common.py}; \texttt{v} and
+\texttt{x0} require ODE (\texttt{XOPDTrainer.\_\_init\_\_} guard).
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\footnotesize
+\begin{tabular}{@{}p{1.6cm}p{5.8cm}p{3.8cm}@{}}
+\toprule
+\textbf{knob} & \textbf{per-step loss} & \textbf{relation to $L_v$} \\
+\midrule
+\texttt{xt} & $L_{xt}=\norm{\mu_s-\mu_t}^2$ & $L_{xt}=\dt^2 L_v$ \\
+\texttt{v} & $L_v=\norm{v_s-v_t}^2$ & identity \\
+\texttt{x0} & $L_{x_0}=\norm{z_{0,s}-z_{0,t}}^2$ & $L_{x_0}=\sigma^2 L_v$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Since $x_t$ cancels, $L_{x_0}=(\sigma/\dt)^2 L_{xt}$ (\eqref{eq:x0-mu}). \texttt{normalize\_d\_k}
+applies only to \texttt{xt}; \texttt{v}/\texttt{x0} ignore it.
+
+\textbf{No extra cost.} \texttt{x0} recovers $z_0$ analytically from $\mu$; \texttt{v} uses
+$(\mu_s-\mu_t)/\dt$. \textbf{Logging.} \texttt{train/d\_k/\{ti\}} values are in the selected space;
+compare \emph{shapes} across spaces, not raw magnitudes (\S\ref{sec:empirical}).
+
+%% ============================================================
+\section{Two causes of the dominance: separate the artifact from the signal}
+\label{sec:causes}
+%% ============================================================
+
+\subsection{Cause A --- $\dt_k^2$ amplification in $L_{xt}$ (a parameterization artifact)}
+\label{ssec:causeA}
+
+The default loss is $L_{xt}=\dt^2 L_v$ (\eqref{eq:mu-v-sq}), not velocity MSE. Summing
+$\sum_k L_{xt,k}$ with unit weight therefore applies a per-step factor $\dt_k^2$ to the underlying
+velocity gap. Late rollout steps have larger $\lvert\dt_k\rvert$ (Table~\ref{tab:klein28-summary}),
+so \textbf{$L_{xt}$ over-represents late steps even if $L_v$ were flat}.
+
+Quantitative check on the FLUX.2-klein 28-step grid (\S\ref{sec:schedule}):
+\begin{itemize}[leftmargin=1.5em]
+\item If $L_{v,k}\equiv$ const: $\sum_k L_{xt,k}$ puts $\mathbf{41\%}$ on \texttt{ti=27}
+(col.~``\%$L_{xt}$''). The mixed XOPD run observes $\mathbf{40\%}$ on \texttt{ti=27} for logged
+$L_{xt}$ --- the curve matches \emph{roughly constant velocity error} $\times\,\dt_k^2$, not a
+separate ``mystery'' effect.
+\item If instead $L_{x_0,k}\equiv$ const: $L_{xt,k}=(\dt_k/\sigma_k)^2 L_{x_0,k}$ would put
+$\mathbf{77\%}$ on \texttt{ti=27}. The observed $\mathbf{50\times}$ ratio $L_{\mu,27}/L_{\mu,13}$
+is \emph{between} the flat-$L_v$ prediction ($\sim148\times$ from $\dt$ ratio alone, before
+$L_v$ shrinkage) and the flat-$L_{x_0}$ prediction ($\sim3100\times$), because both the metric
+\emph{and} the actual $L_v$ vary with~$k$.
+\item Switching to $L_{x_0}$ (\texttt{xopd\_dk\_space="x0"}) replaces the $\dt_k^2$ weighting with
+$\sigma_k^2$ (col.~``\%$L_{x_0}$''), up-weighting high-noise structure steps.
+\end{itemize}
+This parallels diffusion training, where $\varepsilon$-prediction MSE needs SNR reweighting to avoid
+low-noise dominance; here the analogue of ``native'' FM regression is $L_v$, not $L_{xt}$.
+
+\subsection{Cause B --- genuine difficulty near the data manifold (a real signal)}
+\label{ssec:causeB}
+
+Near clean, the posterior $\E[z_0\mid x_t]$ sharpens, the velocity field's spatial Jacobian
+(Lipschitz constant) grows $\sim 1/\sigma$, and the target encodes sharp, high-frequency, multimodal
+detail. Under \texttt{normalize\_d\_k=false} the latent scale is also largest at clean. This part of
+the late-step cost is \textbf{real} and tied to final-image quality.
+
+\subsection{The U-shape}
+\label{ssec:ushape}
+
+The observation doc's minimum at ti$\approx12$--$13$ and mild high-noise bump at ti$=0$ follow from
+$L_{xt}=\dt^2 L_v$ with $L_v$ largest at high noise: early steps have small $\dt^2$ but large $L_v$;
+late steps have large $\dt^2$ but shrinking $L_v$; the minimum is where these cross.
+
+\begin{tcolorbox}[colback=red!5,colframe=red!50!black,title=\textbf{Corollary: \texttt{normalize\_d\_k=true} makes it worse, not better}]
+\texttt{normalize\_d\_k=true} divides by $2\bar\sigma^2=2\,\mathrm{std\_dev}_t^2\,\lvert\dt\rvert$,
+and $\bar\sigma\to0$ toward clean, stacking a \emph{second} amplification on top of $1/\sigma^2$.
+This is why transition-KL objectives (DanceGRPO/DDPO-style) intrinsically favor the low-noise
+region. \textbf{To equalize timesteps you must go the opposite way.}
+\end{tcolorbox}
+
+%% ============================================================
+\section{XOPD-specific reading (large teacher)}
+\label{sec:xopd}
+%% ============================================================
+
+``XOPD benefits more because the teacher is larger'' is correct, but the benefit lives in
+\textbf{Cause B}, not A:
+\begin{itemize}[leftmargin=1.5em]
+\item The 32B$\to$4B teacher's advantage (fine detail, texture, aesthetics) concentrates in the
+\emph{low-noise} steps, where on-policy $x_t$ is already near the student's final sample --- the most
+valuable place for a big teacher to ``polish''.
+\item Structural/semantic correctness (geneval count/position, OCR) is decided at \emph{high-noise}
+steps.
+\end{itemize}
+So ``large teacher'' does \textbf{not} imply ``train only late steps''. It implies ``the late-step
+Cause-B component is worth keeping --- but do not mistake the Cause-A amplification for that value.''
+
+%% ============================================================
+\section{Unified view: every proposal is a choice of per-step weight $w_k$}
+\label{sec:unified}
+%% ============================================================
+
+All proposals choose how to weight the three losses (or an equivalent $L_v$) across steps:
+$\mathcal{L}=\sum_k w_k L_{\{xt,v,x_0\},k}$.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\footnotesize
+\begin{tabular}{@{}p{3.6cm}p{4.5cm}p{5.0cm}@{}}
+\toprule
+\textbf{direction} & \textbf{loss / weight on $L_v$} & \textbf{effect} \\
+\midrule
+default & $L_{xt}$, $w_k=1$ $\Rightarrow$ $w_k L_v=\dt_k^2$ & late-step dominance (41\% on ti=27 if $L_v$ flat) \\
+1. late-only (DanceOPD) & $L_{xt}$ on $\sigma_k<\tau$ only & polish; drops structure learning \\
+2a. $L_{x_0}$ (implemented) & $L_{x_0}$, $w_k=1$ $\Rightarrow$ $w_k L_v=\sigma_k^2$ & up-weights high-noise steps \\
+2b. $L_v$ (implemented) & \texttt{xopd\_dk\_space="v"} & native FM velocity MSE \\
+2c. EMA balance & $L_{xt} / \mathrm{EMA}(L_{xt})$ & flattens logged scale; may suppress Cause B \\
+3. endpoint-sensitivity & weight $\propto\partial z_0/\partial v_k$ & 2a is first-order proxy \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Evaluation}
+\label{ssec:eval}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{Direction 1 (late-only)} trains $L_{xt}$ on a late window only; same $\dt_k^2$ factor
+within the window. Drops high-noise steps where $L_{x_0}$ (hence structure) matters most.
+\item \textbf{Direction 2a ($L_{x_0}$)} replaces $\dt_k^2$ with $\sigma_k^2$ on the shared $L_v$.
+\textbf{Direction 2b ($L_v$)} removes the $\dt_k^2$ factor entirely (\S\ref{sec:empirical}).
+\textbf{Do not use \texttt{normalize\_d\_k=true}} to equalize (\S\ref{ssec:ushape}).
+\item \textbf{Direction 3 (sensitivity)} idealizes weighting $L_v$ by endpoint Jacobian; $L_{x_0}$
+is a good first-order proxy.
+\end{itemize}
+
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=\textbf{Recommendation}]
+Compare \texttt{xopd\_dk\_space} $\in\{\texttt{xt},\texttt{v},\texttt{x0}\}$ on OCR
+(\S\ref{sec:experiment}): default \texttt{xt} vs.\ velocity \texttt{v} vs.\ clean-latent
+\texttt{x0}, plus late-only \texttt{xt} (direction~1).
+\end{tcolorbox}
+
+%% ============================================================
+\section{Disambiguating experiment (artifact vs.\ signal)}
+\label{sec:experiment}
+%% ============================================================
+
+The ablation in \texttt{docs/xopd/progress/2026-07-12-ablation-relay.md} (all on OCR, otherwise
+identical) is exactly the test:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\footnotesize
+\begin{tabular}{@{}p{3.4cm}p{6.6cm}p{2.6cm}@{}}
+\toprule
+\textbf{variant} & \textbf{config} & \textbf{reads} \\
+\midrule
+full-timestep xt-MSE & \texttt{flux2\_klein\_32b\_to\_4b\_l1\_ocr\_1kep.yaml} & default (\texttt{xt}) \\
+late-timestep xt-MSE & \texttt{flux2\_klein\_32b\_to\_4b\_l1\_ocr\_selective\_teacher\_1kep.yaml} & direction 1 \\
+full-timestep x0-MSE & \texttt{flux2\_klein\_32b\_to\_4b\_l1\_ocr\_xspace\_1kep.yaml} & direction 2a \\
+full-timestep v-MSE & \texttt{flux2\_klein\_32b\_to\_4b\_l1\_ocr\_vmse\_1kep.yaml} & direction 2b \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Interpretation:
+\begin{itemize}[leftmargin=1.5em]
+\item If \texttt{x0} or \texttt{v} \textbf{improves} high-noise-half learning and structure metrics
+\emph{without} degrading clean-end detail $\to$ the original \texttt{xt} dominance was mostly
+\textbf{Cause A (artifact)}; reweighting is a net win.
+\item If \texttt{x0}/\texttt{v} \textbf{hurts} clean-end detail with insufficient structure gains
+$\to$ the late-step \textbf{Cause B (real value)} dominates; consider soft late-window \texttt{xt}.
+\end{itemize}
+
+\begin{remark*}
+Logged \texttt{train/d\_k/\{ti\}} magnitudes differ across \texttt{v}/\texttt{xt}/\texttt{x0}; compare
+per-timestep \emph{shape} and downstream eval (\S\ref{sec:empirical}), not raw values across spaces.
+\end{remark*}
+
+\end{document}

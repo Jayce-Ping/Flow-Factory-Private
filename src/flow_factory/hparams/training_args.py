@@ -622,7 +622,7 @@ class GRPOTrainingArguments(TrainingArguments):
         default="none",
         metadata={
             "help": "Policy loss variant. 'none'=standard GRPO clipping, 'clip'=PPO clipping (alias), "
-                    "'kl'=KL-only mask, 'kl_adv'=DPPO (KL-advantage masking)."
+            "'kl'=KL-only mask, 'kl_adv'=DPPO (KL-advantage masking)."
         },
     )
     kl_mask_threshold: float = field(
@@ -650,7 +650,6 @@ class GRPOTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"Invalid mask_type: {self.mask_type}. Valid options are: ['kl', 'kl_adv', 'clip', 'none']."
             )
-
 
     def get_num_train_timesteps(self, args: Any) -> int:
         return args.scheduler_args.num_sde_steps
@@ -964,9 +963,7 @@ class MoFBaseTrainingArguments(TrainingArguments):
     )
     mixing_d_time: int = field(
         default=256,
-        metadata={
-            "help": "Sinusoidal time-embedding dim for routers. Ignored for 'lut'."
-        },
+        metadata={"help": "Sinusoidal time-embedding dim for routers. Ignored for 'lut'."},
     )
 
     # ---- Per-set reward ----
@@ -1044,9 +1041,7 @@ class MoFBaseTrainingArguments(TrainingArguments):
     )
     timestep_range: Union[float, Tuple[float, float]] = field(
         default=0.9,
-        metadata={
-            "help": "Fraction range along denoise axis 1000->0; maps to scheduler times."
-        },
+        metadata={"help": "Fraction range along denoise axis 1000->0; maps to scheduler times."},
     )
 
     # ---- Optional KL (anchor to base model) ----
@@ -1096,9 +1091,7 @@ class MoFBaseTrainingArguments(TrainingArguments):
         # as a read-only compatibility mirror (True iff mode == 'softmax').
         valid_normalization = ["softmax", "affine", "none"]
         if self.weight_normalization is None:
-            self.weight_normalization = (
-                "softmax" if self.normalize_weights else "none"
-            )
+            self.weight_normalization = "softmax" if self.normalize_weights else "none"
         elif self.weight_normalization not in valid_normalization:
             raise ValueError(
                 f"Invalid weight_normalization: {self.weight_normalization!r}. "
@@ -1152,9 +1145,7 @@ class MoFBaseTrainingArguments(TrainingArguments):
                 f"logits are used as weights without the /τ scaling."
             )
         if self.weight_sum_penalty < 0:
-            raise ValueError(
-                f"weight_sum_penalty must be >= 0, got {self.weight_sum_penalty}."
-            )
+            raise ValueError(f"weight_sum_penalty must be >= 0, got {self.weight_sum_penalty}.")
         if self.weight_sum_penalty > 0 and self.weight_normalization != "none":
             logger.warning(
                 f"weight_sum_penalty={self.weight_sum_penalty} is a no-op with "
@@ -1172,9 +1163,7 @@ class MoFBaseTrainingArguments(TrainingArguments):
         if self.weight_clamp_range is not None:
             lo, hi = float(self.weight_clamp_range[0]), float(self.weight_clamp_range[1])
             if not lo < hi:
-                raise ValueError(
-                    f"weight_clamp_range must satisfy low < high, got ({lo}, {hi})."
-                )
+                raise ValueError(f"weight_clamp_range must satisfy low < high, got ({lo}, {hi}).")
             self.weight_clamp_range = (lo, hi)
             if self.weight_normalization == "softmax":
                 logger.warning(
@@ -1214,9 +1203,7 @@ class MoFNFTTrainingArguments(MoFBaseTrainingArguments):
         if self.nft_beta <= 0:
             raise ValueError(f"nft_beta must be > 0, got {self.nft_beta}.")
         if self.kl_type not in ["v-based"]:
-            raise ValueError(
-                f"MoF-NFT only supports kl_type='v-based', got {self.kl_type!r}."
-            )
+            raise ValueError(f"MoF-NFT only supports kl_type='v-based', got {self.kl_type!r}.")
 
 
 @dataclass
@@ -1295,9 +1282,7 @@ class MoFKLMinTrainingArguments(MoFBaseTrainingArguments):
     def __post_init__(self):
         super().__post_init__()
         if self.klmin_entropy_coeff < 0:
-            raise ValueError(
-                f"klmin_entropy_coeff must be >= 0, got {self.klmin_entropy_coeff!r}."
-            )
+            raise ValueError(f"klmin_entropy_coeff must be >= 0, got {self.klmin_entropy_coeff!r}.")
         if self.klmin_entropy_coeff > 0 and self.weight_normalization != "softmax":
             raise ValueError(
                 "klmin_entropy_coeff>0 requires weight_normalization='softmax' "
@@ -1314,9 +1299,7 @@ class MoFKLMinTrainingArguments(MoFBaseTrainingArguments):
                 f"{self.klmin_uniform_anchor_coeff!r}."
             )
         if self.kl_type not in ["v-based"]:
-            raise ValueError(
-                f"MoF-KLMin only supports kl_type='v-based', got {self.kl_type!r}."
-            )
+            raise ValueError(f"MoF-KLMin only supports kl_type='v-based', got {self.kl_type!r}.")
 
 
 @dataclass
@@ -1334,7 +1317,7 @@ class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
         default=False,
         metadata={
             "help": "GRPO requires on-policy sampling (current logits = sampling logits) "
-                    "so that ratio = exp(new_log_prob - old_log_prob) = 1 at iteration start."
+            "so that ratio = exp(new_log_prob - old_log_prob) = 1 at iteration start."
         },
     )
 
@@ -1347,7 +1330,7 @@ class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
         default="none",
         metadata={
             "help": "Policy loss masking variant. "
-                    "'none'=standard clipping, 'kl_adv'=DPPO-style masking."
+            "'none'=standard clipping, 'kl_adv'=DPPO-style masking."
         },
     )
     kl_mask_threshold: float = field(
@@ -1358,7 +1341,7 @@ class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
         default=True,
         metadata={
             "help": "Scale KL denominator with transition sigma (compute_transition_sigma). "
-                    "When True, kl = diff² / (2σ²); when False, kl = diff² (unit variance)."
+            "When True, kl = diff² / (2σ²); when False, kl = diff² (unit variance)."
         },
     )
     # Override kl_type to support x-based (needed for masking KL computation)
@@ -1381,14 +1364,11 @@ class MoFGRPOTrainingArguments(MoFBaseTrainingArguments):
                 f"Invalid mask_type: {self.mask_type}. Valid: ['kl', 'kl_adv', 'clip', 'none']."
             )
         if self.kl_type not in ["v-based", "x-based"]:
-            raise ValueError(
-                f"Invalid kl_type: {self.kl_type}. Valid: ['v-based', 'x-based']."
-            )
+            raise ValueError(f"Invalid kl_type: {self.kl_type}. Valid: ['v-based', 'x-based'].")
 
     def get_num_train_timesteps(self, args: Any) -> int:
         """GRPO loops over scheduler.train_timesteps."""
         return args.scheduler_args.num_sde_steps
-
 
 
 @dataclass
@@ -2213,8 +2193,20 @@ class XOPDTrainingArguments(TrainingArguments):
         },
     )
     vae_transport: Literal[
-        "identity", "pixel", "linear", "whitening", "adaln",
-        "conv", "conv_linear", "m5", "conv_nl", "nonlinear", "aligned", "hsct", "flow", "mlp"
+        "identity",
+        "pixel",
+        "linear",
+        "whitening",
+        "adaln",
+        "conv",
+        "conv_linear",
+        "m5",
+        "conv_nl",
+        "nonlinear",
+        "aligned",
+        "hsct",
+        "flow",
+        "mlp",
     ] = field(
         default="identity",
         metadata={
@@ -2380,7 +2372,9 @@ class XOPDTrainingArguments(TrainingArguments):
     )
     hsct_q_inject: Literal["concat", "wsum", "deepstack"] = field(
         default="deepstack",
-        metadata={"help": "How multi-layer student hidden states enter Q (deepstack=per-layer residual)."},
+        metadata={
+            "help": "How multi-layer student hidden states enter Q (deepstack=per-layer residual)."
+        },
     )
     hsct_hidden_blocks: List[int] = field(
         default_factory=lambda: [5, 11, 17, 23],
@@ -2388,49 +2382,70 @@ class XOPDTrainingArguments(TrainingArguments):
     )
     hsct_h_proj: int = field(default=256, metadata={"help": "HSCT hidden projection dim."})
     hsct_q_hidden: int = field(default=256, metadata={"help": "HSCT conv-Q hidden width."})
-    hsct_q_depth: int = field(default=4, metadata={"help": "HSCT Q depth (conv stages / dit blocks)."})
-    hsct_dit_dim: int = field(default=384, metadata={"help": "HSCT dit-Q token dim (offline best: 512)."})
-    hsct_dit_heads: int = field(default=6, metadata={"help": "HSCT dit-Q attention heads (offline best: 8)."})
+    hsct_q_depth: int = field(
+        default=4, metadata={"help": "HSCT Q depth (conv stages / dit blocks)."}
+    )
+    hsct_dit_dim: int = field(
+        default=384, metadata={"help": "HSCT dit-Q token dim (offline best: 512)."}
+    )
+    hsct_dit_heads: int = field(
+        default=6, metadata={"help": "HSCT dit-Q attention heads (offline best: 8)."}
+    )
     hsct_coldstart_source: Literal["offline_corpus", "online_gen"] = field(
         default="offline_corpus",
-        metadata={"help": "Cold-start data: read offline corpus from disk, or teacher-generate online."},
+        metadata={
+            "help": "Cold-start data: read offline corpus from disk, or teacher-generate online."
+        },
     )
     hsct_coldstart_corpus: str = field(
         default="/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/vae_align_corpus_big",
-        metadata={"help": "Offline corpus dir (rank_*/*.png) for HSCT cold-start (offline_corpus mode)."},
+        metadata={
+            "help": "Offline corpus dir (rank_*/*.png) for HSCT cold-start (offline_corpus mode)."
+        },
     )
     hsct_coldstart_epochs: int = field(
-        default=3, metadata={"help": "HSCT cold-start passes over the cold-start data."},
+        default=3,
+        metadata={"help": "HSCT cold-start passes over the cold-start data."},
     )
     hsct_coldstart_bs: int = field(
-        default=4, metadata={"help": "HSCT cold-start per-device batch size (images)."},
+        default=4,
+        metadata={"help": "HSCT cold-start per-device batch size (images)."},
     )
     hsct_coldstart_inner_steps: int = field(
-        default=1, metadata={"help": "Q optimizer steps per cold-start batch."},
+        default=1,
+        metadata={"help": "Q optimizer steps per cold-start batch."},
     )
     hsct_coldstart_max_images: int = field(
-        default=0, metadata={"help": "Cap unique cold-start images (0=all). For data-scaling/budget."},
+        default=0,
+        metadata={"help": "Cap unique cold-start images (0=all). For data-scaling/budget."},
     )
     hsct_coldstart_sigma: float = field(
         default=0.0,
-        metadata={"help": "Noise fraction for cold-start h_S/z_S (0=clean, per offline; raise to train noisy)."},
+        metadata={
+            "help": "Noise fraction for cold-start h_S/z_S (0=clean, per offline; raise to train noisy)."
+        },
     )
     hsct_coldstart_noisy: bool = field(
         default=False,
-        metadata={"help": "Cold-start Q on NOISY latents: per-sample sigma~U(0,sigma_max), independent "
-                  "FM noise on Q input (noisy z_S) AND target (noisy z_T), h_S at the noisy state. "
-                  "Fixes the clean->noisy generalization collapse in L1."},
+        metadata={
+            "help": "Cold-start Q on NOISY latents: per-sample sigma~U(0,sigma_max), independent "
+            "FM noise on Q input (noisy z_S) AND target (noisy z_T), h_S at the noisy state. "
+            "Fixes the clean->noisy generalization collapse in L1."
+        },
     )
     hsct_coldstart_sigma_max: float = field(
         default=1.0,
-        metadata={"help": "Upper bound of the per-sample noise fraction when hsct_coldstart_noisy=True."},
+        metadata={
+            "help": "Upper bound of the per-sample noise fraction when hsct_coldstart_noisy=True."
+        },
     )
     hsct_coldstart_gs: List[float] = field(
         default_factory=lambda: [1.0, 4.0],
         metadata={"help": "Guidance scales mixed for online_gen cold-start image collection."},
     )
     hsct_coldstart_lr: float = field(
-        default=1.0e-4, metadata={"help": "HSCT cold-start Q learning rate."},
+        default=1.0e-4,
+        metadata={"help": "HSCT cold-start Q learning rate."},
     )
 
     # ---- M9 conditional-flow inverse (vae_transport='flow') ----
@@ -2441,11 +2456,14 @@ class XOPDTrainingArguments(TrainingArguments):
         metadata={"help": "Number of conditional affine-coupling blocks in the flow Q."},
     )
     flow_hidden: int = field(
-        default=256, metadata={"help": "Hidden width of each coupling block's conv net."},
+        default=256,
+        metadata={"help": "Hidden width of each coupling block's conv net."},
     )
     flow_cond_proj: int = field(
         default=256,
-        metadata={"help": "Channels of the fused conditioning tensor c=fuse(z_S,h_S) fed to the flow."},
+        metadata={
+            "help": "Channels of the fused conditioning tensor c=fuse(z_S,h_S) fed to the flow."
+        },
     )
     flow_query_mode: Literal["mode", "sample", "mean_k"] = field(
         default="mode",
@@ -2458,7 +2476,8 @@ class XOPDTrainingArguments(TrainingArguments):
         },
     )
     flow_num_samples: int = field(
-        default=4, metadata={"help": "K for flow_query_mode='mean_k' (ignored otherwise)."},
+        default=4,
+        metadata={"help": "K for flow_query_mode='mean_k' (ignored otherwise)."},
     )
 
     # ---- Dual classifier-free guidance ----
@@ -2520,11 +2539,15 @@ class XOPDTrainingArguments(TrainingArguments):
     # ---- L1: on-policy transition matching (semantics mirror OPD) ----
     pathwise_coef: float = field(
         default=1.0,
-        metadata={"help": "Coefficient on the per-step Gaussian KL D_k (transition mean matching)."},
+        metadata={
+            "help": "Coefficient on the per-step Gaussian KL D_k (transition mean matching)."
+        },
     )
     reinforce_coef: float = field(
         default=0.0,
-        metadata={"help": "Coefficient on the REINFORCE trajectory term. 0 disables it (pure pathwise)."},
+        metadata={
+            "help": "Coefficient on the REINFORCE trajectory term. 0 disables it (pure pathwise)."
+        },
     )
     reinforce_horizon: Optional[int] = field(
         default=None,
@@ -2606,7 +2629,7 @@ class XOPDTrainingArguments(TrainingArguments):
                 " 'x0' = ||x0_s - x0_t||^2 = sigma^2*||dv||^2  (clean latent; x0 = x_t - sigma*v). "
                 "ODE-only.\n"
                 "So MSE(v) : MSE(xt) : MSE(x0) = 1 : dt^2 : sigma^2. See "
-                "docs/xopd/x_space_distillation_loss.md."
+                "docs/xopd/per_timestep_loss_dominance_theory.tex."
             )
         },
     )
@@ -2679,10 +2702,20 @@ class XOPDTrainingArguments(TrainingArguments):
                     "vae_transport (e.g. 'hsct', 'linear', 'conv', 'm5', 'adaln', "
                     "'whitening', 'pixel'); got vae_transport='identity'."
                 )
-            if self.vae_transport in (
-                "linear", "whitening", "adaln", "conv", "conv_linear",
-                "m5", "conv_nl", "nonlinear"
-            ) and self.transport_warmup_batches <= 0:
+            if (
+                self.vae_transport
+                in (
+                    "linear",
+                    "whitening",
+                    "adaln",
+                    "conv",
+                    "conv_linear",
+                    "m5",
+                    "conv_nl",
+                    "nonlinear",
+                )
+                and self.transport_warmup_batches <= 0
+            ):
                 raise ValueError(
                     f"vae_transport={self.vae_transport!r} requires "
                     "transport_warmup_batches > 0 to fit/warm-up the transport; "
@@ -2839,32 +2872,40 @@ class XPDMTrainingArguments(XOPDTrainingArguments):
 
     rollout_ratio: float = field(
         default=1.0,
-        metadata={"help": (
-            "On-policy image source = student:teacher fraction. 1.0=pure student rollout "
-            "(on-policy w.r.t. student output), 0.0=pure teacher rollout, 0.5=1:1 mix. "
-            "Ablation axis."
-        )},
+        metadata={
+            "help": (
+                "On-policy image source = student:teacher fraction. 1.0=pure student rollout "
+                "(on-policy w.r.t. student output), 0.0=pure teacher rollout, 0.5=1:1 mix. "
+                "Ablation axis."
+            )
+        },
     )
     pdm_match_space: str = field(
         default="latent",
-        metadata={"help": (
-            "Where to compare the two one-step x0 predictions: 'latent' (SAME-VAE only -> "
-            "cheaper, exact denoiser matching in the shared latent, needs identical VAE) or "
-            "'pixel' (CROSS-VAE -> decode both with each model's own decoder, MSE in [0,1] "
-            "pixels)."
-        )},
+        metadata={
+            "help": (
+                "Where to compare the two one-step x0 predictions: 'latent' (SAME-VAE only -> "
+                "cheaper, exact denoiser matching in the shared latent, needs identical VAE) or "
+                "'pixel' (CROSS-VAE -> decode both with each model's own decoder, MSE in [0,1] "
+                "pixels)."
+            )
+        },
     )
     pdm_num_inference_steps: int = field(
-        default=28, metadata={"help": "Rollout steps to generate the on-policy image x."},
+        default=28,
+        metadata={"help": "Rollout steps to generate the on-policy image x."},
     )
     pdm_inner_steps: int = field(
-        default=4, metadata={"help": "Denoiser-matching optimizer micro-steps per rolled batch."},
+        default=4,
+        metadata={"help": "Denoiser-matching optimizer micro-steps per rolled batch."},
     )
     pdm_sigma_min: float = field(
-        default=0.0, metadata={"help": "Lower clamp on sigma=t/1000 for t sampling (skip VAE-floor region)."},
+        default=0.0,
+        metadata={"help": "Lower clamp on sigma=t/1000 for t sampling (skip VAE-floor region)."},
     )
     pdm_sigma_max: float = field(
-        default=1.0, metadata={"help": "Upper clamp on sigma=t/1000 for t sampling."},
+        default=1.0,
+        metadata={"help": "Upper clamp on sigma=t/1000 for t sampling."},
     )
 
     def __post_init__(self):
@@ -2919,7 +2960,9 @@ class MoFDistillTrainingArguments(TrainingArguments):
     # ---- MoF checkpoint ----
     mof_checkpoint: str = field(
         default="",
-        metadata={"help": "Path to MoF checkpoint (directory containing mof_state.pt, or file path)."},
+        metadata={
+            "help": "Path to MoF checkpoint (directory containing mof_state.pt, or file path)."
+        },
     )
     mof_temperature: float = field(
         default=1.0,
@@ -2944,11 +2987,11 @@ class MoFDistillTrainingArguments(TrainingArguments):
     )
 
     # ---- Router mode settings ----
-    mof_module_type: Literal[
-        "lut", "lut_simple", "time_router", "adaln_router", "mlp_router"
-    ] = field(
-        default="lut",
-        metadata={"help": "Type of mixing module in MoF checkpoint."},
+    mof_module_type: Literal["lut", "lut_simple", "time_router", "adaln_router", "mlp_router"] = (
+        field(
+            default="lut",
+            metadata={"help": "Type of mixing module in MoF checkpoint."},
+        )
     )
     mof_d_pool: Optional[int] = field(
         default=None,
@@ -2988,7 +3031,7 @@ class MoFDistillTrainingArguments(TrainingArguments):
         default=True,
         metadata={
             "help": "Evaluate each teacher and base model on all test sets at epoch 0 "
-                    "before training begins. Establishes baselines for comparison."
+            "before training begins. Establishes baselines for comparison."
         },
     )
     source_ratio: Optional[Dict[str, float]] = field(
@@ -3016,6 +3059,7 @@ class MoFDistillTrainingArguments(TrainingArguments):
         # Resolve teachers (same logic as MoFBase)
         if self.teachers is not None:
             from .training_args import TeacherConfig
+
             coerced = []
             for item in self.teachers:
                 if isinstance(item, dict):
@@ -3453,9 +3497,7 @@ class EnsembleEvalTrainingArguments(TrainingArguments):
                 f"got ensemble_blend_mode={self.ensemble_blend_mode!r}."
             )
         if self.pcgrad_eps <= 0:
-            raise ValueError(
-                f"pcgrad_eps must be > 0, got pcgrad_eps={self.pcgrad_eps}."
-            )
+            raise ValueError(f"pcgrad_eps must be > 0, got pcgrad_eps={self.pcgrad_eps}.")
         if not (0.0 < self.ties_density <= 1.0):
             raise ValueError(
                 f"ties_density must be in (0, 1], got ties_density={self.ties_density}."

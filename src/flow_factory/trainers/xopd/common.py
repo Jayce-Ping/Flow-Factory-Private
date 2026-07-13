@@ -102,7 +102,7 @@ def _to_clean_x0(
 
     Recovers the velocity from ``mu = x_t + v*dt`` (ODE-exact): ``v = (mu - x_t)/dt``,
     then ``x0 = x_t - sigma*v``. ``sigma`` and ``dt`` are per-sample; broadcast over the
-    trailing (non-batch) dims of ``mu``. See docs/xopd/x_space_distillation_loss.md.
+    trailing (non-batch) dims of ``mu``. See docs/xopd/per_timestep_loss_dominance_theory.tex.
     """
     sig = sigma.float()
     d = dt.float()
@@ -155,7 +155,7 @@ def compute_per_step_kl(
         while d.dim() < mu_student.dim():
             d = d.unsqueeze(-1)
         diff = (mu_student.float() - mu_teacher.float()) / d
-        return (diff ** 2).mean(dim=tuple(range(1, diff.ndim)))
+        return (diff**2).mean(dim=tuple(range(1, diff.ndim)))
 
     if space == "x0":
         if latents is None or sigma is None:
@@ -395,8 +395,7 @@ def interleaved_source_iter(
             pattern.extend([name] * int(count))
         if not pattern:
             raise ValueError(
-                "sum(source_ratio.values()) == 0 — at least one source "
-                "must have weight > 0"
+                "sum(source_ratio.values()) == 0 — at least one source " "must have weight > 0"
             )
 
     iters = {name: iter(dl) for name, dl in dataloaders_by_source.items()}
@@ -443,9 +442,7 @@ def validate_source_ratio(
         return
     period = int(sum(source_ratio.values()))
     if period == 0:
-        raise ValueError(
-            "source_ratio sum is 0 — at least one source must have weight > 0"
-        )
+        raise ValueError("source_ratio sum is 0 — at least one source must have weight > 0")
     if num_batches_per_epoch % period != 0:
         raise ValueError(
             f"num_batches_per_epoch ({num_batches_per_epoch}) must be divisible "
