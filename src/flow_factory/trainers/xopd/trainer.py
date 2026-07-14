@@ -77,6 +77,12 @@ from .common import (
     validate_l1_one_step_per_epoch,
     validate_source_ratio,
 )
+from .router_coldstart import (
+    alignment_metrics,
+    balanced_spherical_kmeans,
+    coldstart_router,
+    pool_prompt_embeds,
+)
 from .transport import AdaLNTransport, build_transport
 
 logger = setup_logger(__name__)
@@ -941,6 +947,192 @@ class XOPDTrainer(BaseTrainer):
         return keys
 
     # =============================== Main loop ===============================
+    def _maybe_coldstart_mof_router(self) -> None:
+        """Cluster-based one-hot cold-start of the MoF-V global router (data-parallel).
+
+        UNSUPERVISED: cluster the train ``prompt_embeds`` into ``mof_num_experts``
+        groups (balanced spherical k-means) and cold-start the router (router-only
+        CE to the cluster labels) so each expert binds a distinct prompt cluster
+        from the start. Dataset source labels are NEVER used as targets/features
+        (only post-hoc ARI/purity). Bypasses the DeepSpeed/DDP engine (plain torch
+        AdamW on the router params + manual grad all_reduce); cleans grads after.
+        """
+        import json
+        import torch.distributed as dist
+
+        if not getattr(self.model_args, "mof_router_coldstart", False):
+            return
+        mof = self.adapter._unwrap(self.adapter.transformer)
+        if hasattr(mof, "_orig_mod"):  # torch.compile
+            mof = mof._orig_mod
+        if not hasattr(mof, "router") or getattr(mof.config, "router_type", None) != "global":
+            raise RuntimeError(
+                "mof_router_coldstart=True but the student is not a MoF-V with a 'global' router "
+                f"(got {type(mof).__name__}, router_type={getattr(mof.config, 'router_type', None)!r})."
+            )
+
+        acc = self.accelerator
+        device = acc.device
+        world_size = acc.num_processes
+        rank = acc.process_index
+        is_main = acc.is_main_process
+        ma = self.model_args
+        n_clusters = int(mof.config.num_experts)
+        logger.info(
+            "[mof-coldstart] start: experts=%d balanced=%s max_samples=%d steps=%d (world=%d)",
+            n_clusters, ma.mof_cluster_balanced, ma.mof_cluster_max_samples,
+            ma.mof_router_coldstart_steps, world_size,
+        )
+
+        # --- (a) gather this rank's shard of train prompts from the cache ---
+        if self.train_dataloaders_by_source:
+            datasets = {src: dl.dataset for src, dl in self.train_dataloaders_by_source.items()}
+        elif self.dataloader is not None:
+            src0 = os.path.basename(str(self.config.data_args.dataset_dir))
+            datasets = {src0: self.dataloader.dataset}
+        else:
+            raise RuntimeError("mof_router_coldstart requires a train dataloader/dataset.")
+
+        per_rank = max(1, ma.mof_cluster_max_samples // world_size)
+        entries: List[Tuple[str, Any, int]] = []
+        for src, ds in datasets.items():
+            for i in range(rank, len(ds), world_size):
+                entries.append((src, ds, i))
+        eg = torch.Generator().manual_seed(int(self.training_args.seed) + 7 * rank)
+        sel = torch.randperm(len(entries), generator=eg)[:per_rank].tolist()
+
+        pad_id = getattr(self.adapter.pipeline.tokenizer, "pad_token_id", None)
+        seq_list: List[torch.Tensor] = []
+        pooled_list: List[torch.Tensor] = []
+        sources_local: List[str] = []
+        for j in sel:
+            src, ds, i = entries[j]
+            sample = ds[i]
+            pe = sample["prompt_embeds"]  # (L, D)
+            if not isinstance(pe, torch.Tensor):
+                raise TypeError(f"prompt_embeds for source {src!r} idx {i} is {type(pe).__name__}, expected Tensor.")
+            pe = pe.detach()
+            pids = sample.get("prompt_ids", None)
+            mask = None
+            if pad_id is not None and isinstance(pids, torch.Tensor):
+                mask = (pids != pad_id).unsqueeze(0)  # (1, L)
+            pooled = pool_prompt_embeds(pe.unsqueeze(0).float(), mask)[0]  # (D,)
+            seq_list.append(pe.to(torch.float16).cpu())
+            pooled_list.append(pooled.cpu())
+            sources_local.append(src)
+        if not pooled_list:
+            raise RuntimeError(f"[mof-coldstart] rank {rank} gathered 0 prompts; check the train cache.")
+        prompt_seq_local = torch.stack(seq_list, dim=0)   # (m, L, D) fp16 CPU
+        pooled_local = torch.stack(pooled_list, dim=0)    # (m, D) fp32 CPU
+
+        # --- gather pooled embeds (+ sources) across ranks ---
+        if world_size > 1:
+            gathered_pooled: List[Any] = [None] * world_size
+            gathered_src: List[Any] = [None] * world_size
+            dist.all_gather_object(gathered_pooled, pooled_local)
+            dist.all_gather_object(gathered_src, sources_local)
+            counts = [int(g.shape[0]) for g in gathered_pooled]
+            X_all = torch.cat([g.to(device) for g in gathered_pooled], dim=0)
+            sources_all = [s for chunk in gathered_src for s in chunk]
+            offset = sum(counts[:rank])
+        else:
+            counts = [pooled_local.shape[0]]
+            X_all = pooled_local.to(device)
+            sources_all = list(sources_local)
+            offset = 0
+        total_m = X_all.shape[0]
+
+        # --- (b) rank0 clusters -> labels_all; broadcast; each rank slices its block ---
+        labels_all = torch.zeros(total_m, dtype=torch.long, device=device)
+        metrics = None
+        if is_main:
+            lab, _ = balanced_spherical_kmeans(
+                X_all, n_clusters,
+                balanced=ma.mof_cluster_balanced,
+                pca_dim=ma.mof_cluster_pca_dim,
+                seed=int(self.training_args.seed),
+            )
+            labels_all = lab.to(device)
+            metrics = alignment_metrics(labels_all, sources_all)
+            logger.info(
+                "[mof-coldstart] clustering done: sizes=%s ARI=%.4f purity=%.4f (vs sources %s) "
+                "-- source labels are DIAGNOSTIC ONLY (not used for clustering/CE)",
+                metrics["cluster_sizes"], metrics["ari"], metrics["purity"], metrics["sources"],
+            )
+        if world_size > 1:
+            dist.broadcast(labels_all, src=0)
+        labels_local = labels_all[offset:offset + prompt_seq_local.shape[0]].to("cpu")
+
+        # --- (c) data-parallel router cold-start (bypasses DeepSpeed/DDP engine) ---
+        router = mof.router
+        router_time_embed = mof.router_time_embed
+        params = [p for p in list(router.parameters()) + list(router_time_embed.parameters())]
+        for p in params:
+            p.requires_grad_(True)
+        rdtype = next(router.parameters()).dtype
+        in_ch = int(mof.config.in_channels)
+        guidance_embeds = bool(getattr(mof.config, "guidance_embeds", False))
+        student_gs = float(self.student_gs)
+        tgen = torch.Generator(device=device).manual_seed(int(self.training_args.seed) + 13 * rank)
+
+        def router_forward_fn(pe_batch: torch.Tensor) -> torch.Tensor:
+            b = pe_batch.shape[0]
+            pe_batch = pe_batch.to(device=device, dtype=rdtype)
+            t = torch.rand(b, device=device, generator=tgen)
+            ts = (t * 1000).to(rdtype)
+            g = (
+                torch.full((b,), student_gs * 1000, device=device, dtype=rdtype)
+                if guidance_embeds else None
+            )
+            temb = router_time_embed(ts, g)
+            dummy_latent = torch.zeros(b, 1, in_ch, device=device, dtype=rdtype)
+            return router(pe_batch, dummy_latent, temb)  # (b, N) softmax fp32
+
+        log_f = None
+        default_path = os.path.join(
+            os.path.expanduser(str(self.log_args.save_dir)),
+            f"mof_router_coldstart_{self.log_args.run_name}.jsonl",
+        )
+        log_path = ma.mof_router_coldstart_log_path or default_path
+        if is_main:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            log_f = open(log_path, "a")
+
+        def log_cb(step: int, ce: float, acc_v: float, maxprob: float) -> None:
+            if not is_main:
+                return
+            logger.info(
+                "[mof-coldstart] step=%d ce=%.4f acc=%.4f maxprob=%.4f", step, ce, acc_v, maxprob
+            )
+            log_f.write(json.dumps({"step": step, "ce": ce, "acc": acc_v, "maxprob": maxprob}) + "\n")
+            log_f.flush()
+
+        coldstart_router(
+            router_forward_fn, params, prompt_seq_local, labels_local,
+            steps=ma.mof_router_coldstart_steps, lr=ma.mof_router_coldstart_lr,
+            batch_size=ma.mof_router_coldstart_batch, world_size=world_size, device=device,
+            log_every=ma.mof_router_coldstart_log_every, log_cb=log_cb,
+            seed=int(self.training_args.seed),
+        )
+
+        # --- (d) sync router replicas, clear grads, log summary ---
+        if world_size > 1:
+            for p in params:
+                dist.broadcast(p.data, src=0)
+        for p in self.adapter.transformer.parameters():
+            p.grad = None
+        if is_main and log_f is not None:
+            summary = {"event": "summary", "steps": ma.mof_router_coldstart_steps}
+            if metrics is not None:
+                summary.update({
+                    "ari": metrics["ari"], "purity": metrics["purity"],
+                    "cluster_sizes": metrics["cluster_sizes"], "sources": metrics["sources"],
+                })
+            log_f.write(json.dumps(summary) + "\n")
+            log_f.close()
+        acc.wait_for_everyone()
+        logger.info("[mof-coldstart] done; router cold-started to %d prompt clusters.", n_clusters)
+
     def start(self):
         """Single-run training loop with L0 -> L1 stage switching on ``epoch``."""
         if self.epoch == 0 and self.training_args.eval_teacher_at_start:
@@ -957,6 +1149,10 @@ class XOPDTrainer(BaseTrainer):
                 self._coldstart_hsct()  # M8: train linear-P + deepstack-Q on corpus h_S
             else:
                 self._warmup_transport()
+
+        # Cluster-based one-hot cold-start of the MoF-V router (once, epoch 0).
+        if self.epoch == 0:
+            self._maybe_coldstart_mof_router()
 
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)

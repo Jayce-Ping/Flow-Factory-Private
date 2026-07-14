@@ -251,6 +251,53 @@ class ModelArguments(ArgABC):
         metadata={"help": "For mof_enabled: replicate THIS transformer (HF repo id or local dir; subfolder "
                           "'transformer') into the N experts instead of model_name_or_path."},
     )
+    # --- Cluster-based router cold-start (MoF-V 'global' router only) ---
+    mof_router_coldstart: bool = field(
+        default=False,
+        metadata={"help": "Before training, UNSUPERVISED-cluster the train prompt_embeds into mof_num_experts "
+                          "groups (balanced spherical k-means) and cold-start the GLOBAL router (router-only CE "
+                          "to the cluster one-hot) so each expert binds a distinct prompt cluster. Purely "
+                          "prompt-embed driven: dataset source labels are NEVER used as targets/features (only "
+                          "post-hoc ARI/purity diagnostics). Requires mof_enabled + mof_router_type='global'."},
+    )
+    mof_router_coldstart_steps: int = field(
+        default=300,
+        metadata={"help": "Router-only cold-start optimizer steps (data-parallel across ranks). Ignored unless "
+                          "mof_router_coldstart."},
+    )
+    mof_router_coldstart_lr: float = field(
+        default=1e-3,
+        metadata={"help": "AdamW lr for the router cold-start (router params only)."},
+    )
+    mof_router_coldstart_batch: int = field(
+        default=64,
+        metadata={"help": "Per-rank minibatch (number of prompts) per cold-start step."},
+    )
+    mof_router_coldstart_log_every: int = field(
+        default=10,
+        metadata={"help": "Log cold-start CE/accuracy/one-hot-sharpness every N steps (console + a dedicated "
+                          "jsonl; NOT wandb)."},
+    )
+    mof_router_coldstart_log_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Dedicated router cold-start loss file (jsonl). None -> auto "
+                          "'<log.save_dir>/mof_router_coldstart_<run_name>.jsonl'. Never logged to wandb."},
+    )
+    mof_cluster_max_samples: int = field(
+        default=4096,
+        metadata={"help": "Cap on the number of train prompts pooled+gathered for k-means (speed). Ignored "
+                          "unless mof_router_coldstart."},
+    )
+    mof_cluster_balanced: bool = field(
+        default=True,
+        metadata={"help": "Balanced spherical k-means (equal-ish cluster sizes) so no expert is starved at init; "
+                          "matches the load-balance aux. False = plain spherical k-means."},
+    )
+    mof_cluster_pca_dim: int = field(
+        default=256,
+        metadata={"help": "Reduce pooled prompt embeds to this dim (PCA) before k-means for speed/robustness; "
+                          "0 disables PCA."},
+    )
 
     def __post_init__(self):        
         if isinstance(self.master_weight_dtype, str):
@@ -273,6 +320,22 @@ class ModelArguments(ArgABC):
                 "moe_enabled (weight-space MoE) and mof_enabled (velocity-space MoF) are mutually "
                 "exclusive; set exactly one."
             )
+
+        if self.mof_router_coldstart:
+            if not self.mof_enabled:
+                raise ValueError(
+                    "mof_router_coldstart requires mof_enabled=True (it cold-starts the MoF-V router)."
+                )
+            if self.mof_router_type != "global":
+                raise ValueError(
+                    "mof_router_coldstart requires mof_router_type='global' (the cold-start trains the "
+                    f"global per-sample router on pooled prompt embeds); got {self.mof_router_type!r}."
+                )
+            if self.mof_cluster_max_samples < self.mof_num_experts:
+                raise ValueError(
+                    f"mof_cluster_max_samples ({self.mof_cluster_max_samples}) must be >= mof_num_experts "
+                    f"({self.mof_num_experts})."
+                )
 
         if self.moe_enable_ep:
             if not self.moe_enabled:

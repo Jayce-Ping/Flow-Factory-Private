@@ -1,0 +1,159 @@
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert VELOCITY-space MoF student (SHARED-BASE),
+# with a CLUSTER-BASED ROUTER COLD-START (asymmetric init to seed expert differentiation).
+#
+# expert_mode='shared_lora': ONE frozen FLUX.2-klein-base-4B + 2 LoRA adapters (expert_e = base +
+# adapter_e). A shared PER-SAMPLE GLOBAL router (router_input='prompt') picks top-1 expert/sample.
+# BEFORE training, mof_router_coldstart runs an UNSUPERVISED balanced spherical k-means over the
+# train prompt_embeds (N=2 clusters) and cold-starts the router (router-only CE to the cluster
+# one-hot) so each expert binds a distinct prompt cluster from the start -- breaking the uniform-
+# router symmetry that otherwise leaves shared_lora experts identical. Dataset source labels
+# (geneval/ocr) are NEVER used for clustering/CE; whether the 2 natural clusters recover the 2
+# domains is measured post-hoc (ARI/purity in the cold-start log), not assumed.
+#
+# Cold-start is data-parallel across ranks (bypasses the DeepSpeed engine: router-only torch AdamW
+# + manual grad all_reduce), then broadcasts the router. Its CE/accuracy is logged to the training
+# log + a dedicated jsonl (<save_dir>/mof_router_coldstart_<run_name>.jsonl); NOT to wandb.
+#
+# START-POINT experiment: geneval_enhanced + ocr 1:1, 512px, ZeRO-2. Reuses the existing per-source
+# preprocessing caches.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml  # ZeRO-2 (proven 4-node multi-node); teacher(64GB) replicated per GPU; ZeRO-2 shards student optim/grad.
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (geneval_enhanced + ocr, equal 1:1) =====
+data:
+  dataset_dir: "dataset/geneval_enhanced"   # eval/test fallback
+  dataset_dirs:
+    - "dataset/geneval_enhanced"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false                    # reuse the per-source caches built by the specialist runs
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (2-expert velocity MoF; shared-base LoRA; per-sample top-1; cluster router cold-start) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all-linear"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+  # --- MoF-V construction ---
+  mof_enabled: true
+  mof_num_experts: 2
+  mof_top_k: 1                              # each sample routed to its (cold-started) domain expert
+  mof_route_granularity: "sample"           # per-sample: run only the top-1 expert/sample
+  mof_expert_mode: "shared_lora"            # ONE base + 2 LoRA adapters (expert=base+adapter_e)
+  mof_router_type: "global"                 # per-sample gate (sample granularity)
+  mof_router_input: "prompt"                # pure task/domain routing (trajectory-stable); matches the cluster cold-start
+  mof_noise_std: 0.0                        # shared base -> per-expert difference is the LoRA (noise must be 0)
+  # --- Cluster-based router cold-start (unsupervised; source labels are diagnostic only) ---
+  mof_router_coldstart: true
+  mof_router_coldstart_steps: 300
+  mof_router_coldstart_lr: 1.0e-3
+  mof_router_coldstart_batch: 64
+  mof_router_coldstart_log_every: 10        # console + dedicated jsonl (NOT wandb)
+  mof_cluster_max_samples: 4096
+  mof_cluster_balanced: true                # equal-ish cluster sizes so neither expert is starved at init
+  mof_cluster_pca_dim: 256
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_mof2_shared_clusterinit"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 50
+  save_model_only: true
+
+# ===== Training (XOPD distill to dev-32B, geneval_enhanced + ocr 1:1) =====
+train:
+  trainer_type: "xopd"
+  fsdp_shard_teacher: false                 # DDP: 1 base + 2 adapters + teacher replicated per GPU
+  max_epochs: 1000
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false              # reuse the OCR first-run teacher ceiling (same 6 sets)
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  moe_load_balance_coeff: 0.01              # reused for the MoF router load-balance aux (kept on during training)
+  source_ratio: {geneval_enhanced: 1, ocr: 1}
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 128          # 64/source; num_batches_per_epoch = 128/32 = 4
+  gradient_step_per_epoch: 1                # auto GAS = 4 * 28 = 112 -> one optimizer step/epoch
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.0
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: true       # DDP has no FSDP-side AC -> model-side GC keeps activation ~1x
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (eval @ 512 on both domains + pickscore) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 40
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (logging only; not part of the XOPD loss) =====
+rewards:
+  - {name: "geneval", reward_model: "geneval", weight: 1, batch_size: 64, device: "cuda", dtype: float32, async_reward: false}
+  - {name: "pick_score", reward_model: "PickScore", batch_size: 64, device: "cuda", dtype: bfloat16, async_reward: false}
+  - {name: "ocr", reward_model: "ocr", batch_size: 64, device: "cpu", dtype: float32, async_reward: false}
