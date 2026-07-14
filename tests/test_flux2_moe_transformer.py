@@ -239,6 +239,91 @@ def test_sparse_dispatch_equals_dense():
         print(f"[ok] sparse dispatch == dense (top_k={k}, max_diff={d:.2e})")
 
 
+def test_global_router_topk_matches_base():
+    """Global router with top_k < num_experts and IDENTICAL experts (noise=0) must reproduce base:
+    any per-sample top-k convex blend of identical MLPs equals the single base MLP at every layer.
+    Exercises the new global top-k dense-masked path (non-EP)."""
+    base = _make_base()
+    ins = _inputs()
+    out_base = _fwd(base, ins)
+    for k in (1, 2):
+        moe = Flux2MoETransformer2DModel.from_base_model(
+            base, num_experts=4, noise_std=0.0, top_k=k, router_type="global").eval()
+        d = _max_diff(out_base, _fwd(moe, ins))
+        assert d < ATOL, f"global top_k={k} identical experts: max_diff={d:.3e}"
+        print(f"[ok] global router top_k={k} (identical experts) == base: max_diff={d:.2e}")
+
+
+def test_global_topk_ff_dense_masked_equals_manual():
+    """The global top-k branch (non-EP dense-masked) must equal a manual per-sample top-k blend
+    of the selected experts -- i.e. top_k is a real knob for the global router, not ignored."""
+    import torch.nn as nn
+    from diffusers.models.transformers.transformer_flux2 import Flux2FeedForward
+    from flow_factory.models.flux.flux2_moe_transformer import MoEFeedForward
+
+    dim, N, k = 32, 4, 2
+    torch.manual_seed(5)
+    experts = nn.ModuleList([Flux2FeedForward(dim, dim, mult=3.0, bias=False) for _ in range(N)])
+    for e in experts:  # distinct experts so the top-k selection actually matters
+        nn.init.normal_(e.linear_in.weight, std=0.1)
+        nn.init.normal_(e.linear_out.weight, std=0.1)
+    ff = MoEFeedForward(experts, N, k, router=None).eval()  # global: no per-layer router
+    B, S = 3, 10
+    x = torch.randn(B, S, dim)
+    temb = torch.randn(B, dim)
+    gate = torch.softmax(torch.randn(B, N), dim=-1)  # (B, N) per-sample gate
+    with torch.no_grad():
+        out, aux = ff(x, temb, gate)
+        topw, topi = torch.topk(gate, k, dim=-1)
+        topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        ref = torch.zeros_like(x)
+        for b in range(B):
+            for slot in range(k):
+                e = int(topi[b, slot].item())
+                ref[b] += topw[b, slot] * experts[e](x[b : b + 1])[0]
+    d = (out - ref).abs().max().item()
+    assert d < 1e-5, f"global top-k dense-masked != manual per-sample blend: {d:.3e}"
+    assert aux.item() > 0, f"global top-k aux should be > 0, got {aux.item()}"
+    print(f"[ok] global top-k FF dense-masked == manual (max_diff={d:.2e}, aux={aux.item():.3f})")
+
+
+def test_global_topk_aux_and_backprop():
+    """Global top-k must produce a positive per-sample load-balance aux and backprop into both the
+    model-level global_router and the experts."""
+    base = _make_base()
+    moe = Flux2MoETransformer2DModel.from_base_model(
+        base, num_experts=4, noise_std=0.02, top_k=2, router_type="global").train()
+    ins = _inputs()
+    out = moe(**ins)[0]
+    aux = moe.moe_aux_loss()
+    assert aux is not None and aux.ndim == 0 and torch.isfinite(aux), f"aux invalid: {aux}"
+    assert aux.item() > 0, f"global top-k aux should be positive, got {aux.item()}"
+    (out.float().pow(2).mean() + aux).backward()
+    grouter_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for n, p in moe.named_parameters() if "global_router" in n
+    )
+    expert_grad = any(p.grad is not None for n, p in moe.named_parameters() if ".experts." in n)
+    assert grouter_grad, "global_router received no gradient (aux/top-k not in graph?)"
+    assert expert_grad, "experts received no gradient"
+    print(f"[ok] global top-k aux={aux.item():.3f}; backprop reaches global_router & experts")
+
+
+def test_global_extract_expert_matches_base():
+    """extract_expert is router-agnostic: on a global-router MoE (noise=0) every extracted expert
+    must still rebuild the base (state_dict + forward), preserving the 'N base models' decomposition."""
+    base = _make_base()
+    ins = _inputs()
+    out_base = _fwd(base, ins)
+    moe = Flux2MoETransformer2DModel.from_base_model(
+        base, num_experts=3, noise_std=0.0, top_k=2, router_type="global").eval()
+    for i in range(3):
+        ext = moe.extract_expert(i).eval().to(torch.float32)
+        fd = _max_diff(out_base, _fwd(ext, ins))
+        assert fd < ATOL, f"global extract_expert({i}) forward != base: {fd:.3e}"
+    print(f"[ok] global-router extract_expert recovers base for all experts (fwd < {ATOL})")
+
+
 def test_from_expert_checkpoints_noise_breaks_symmetry():
     """Variant C's mechanism: same checkpoint for both experts + noise_std -> the two
     experts must differ (else the router can't specialize them)."""
@@ -258,6 +343,10 @@ def _run_all():
     test_token_linear_topk1_matches_base()
     test_token_linear_topk_full_matches_base()
     test_global_router_matches_base()
+    test_global_router_topk_matches_base()
+    test_global_topk_ff_dense_masked_equals_manual()
+    test_global_topk_aux_and_backprop()
+    test_global_extract_expert_matches_base()
     test_save_load_roundtrip()
     test_noise_changes_output()
     test_from_expert_checkpoints_identical()

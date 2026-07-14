@@ -1,0 +1,152 @@
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 8-expert WEIGHT-SPACE MoE student, GLOBAL ROUTER + EP.
+# Intermediate architecture between weight-space MoE and velocity-space MoF: a SINGLE model-level
+# per-sample global router (pooled prompt + timestep) is shared across ALL MoE layers, so every
+# sample selects the SAME top-2 experts at every layer (MoF-like sample routing) instead of the
+# per-token/per-layer choice of the token_linear router (flux2_klein_32b_to_4b_moe8_ep.yaml).
+#
+# The top-2 selection is sparse + expert-parallel: each of the 8 intra-node ranks OWNS one expert
+# (moe_ep_size=8), tokens of a sample are all-to-all'd to their owner (NCCL), only that expert
+# computes them. Backbone (attn/embeds) + the global router + 32B teacher stay FSDP2-sharded; the
+# experts are excluded from FSDP (fsdp2_ep.yaml fsdp_ignored_modules) -> EP-owned, not sharded.
+#
+# MoF decomposition preserved: extract_expert(e) rebuilds shared backbone + expert e's per-layer
+# MLPs into a standalone valid Flux2Transformer2DModel (run this OFFLINE on the merged checkpoint,
+# not on the live EP-sharded model, which only holds its local experts).
+#
+# NOTE (load balance): per-sample routing sends ALL tokens of a sample to the same 2 experts, so at
+# small per_device_batch_size some EP ranks may be idle within a step (inherent to sample routing;
+# same as MoF-V sample mode). Larger effective batch (per_device_batch_size / group_size) balances
+# expert load across the EP group.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/accelerate_configs/fsdp2_prefetch.yaml   # FSDP2 prefetch; student backbone+router sharded, experts EP-owned, teacher replicated
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (OCR-only) =====
+data:
+  dataset_dir: "dataset/geneval_enhanced"
+  dataset_dirs:
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (8-expert MoE; copy-8 from base; GLOBAL router top-2; LoRA rank 64 / all-linear; EP=8) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all-linear"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+  # --- MoE construction ---
+  moe_enabled: true
+  moe_init: "replicate"
+  moe_num_experts: 8
+  moe_top_k: 2                            # per-sample top-2: same 2 experts at every layer (< num_experts -> sparse/EP)
+  moe_router_type: "global"              # single model-level per-sample gate (pooled prompt + timestep), shared across layers
+  moe_router_hidden_dim: 256             # hidden dim of the global router MLP
+  moe_noise_std: 0.02                    # break expert symmetry at copy-8 init
+  # --- Expert parallelism (intra-node: 8 experts over 8 ranks) ---
+  moe_enable_ep: true
+  moe_ep_size: 8
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_moe8_global_ep"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 50
+  save_model_only: true
+
+# ===== Training (XOPD distill to dev-32B, OCR-only) =====
+train:
+  trainer_type: "xopd"
+  fsdp_shard_teacher: false               # shard ONLY the student (backbone+router FSDP2, experts EP-owned); teacher (32B) replicated per GPU
+  max_epochs: 500
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  moe_load_balance_coeff: 0.01            # per-sample Switch load balance over the 8 experts; set 0.0 to allow domain specialization (MoF-like collapse)
+  source_ratio: {ocr: 1}
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.0
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false    # FSDP activation checkpointing handles AC (avoid double-AC)
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (eval @ 512 on all 3 domains) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 40
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (logging only; not part of the XOPD loss) =====
+rewards:
+  - {name: "geneval", reward_model: "geneval", weight: 1, batch_size: 64, device: "cuda", dtype: float32, async_reward: false}
+  - {name: "pick_score", reward_model: "PickScore", batch_size: 64, device: "cuda", dtype: bfloat16, async_reward: false}
+  - {name: "ocr", reward_model: "ocr", batch_size: 64, device: "cpu", dtype: float32, async_reward: false}

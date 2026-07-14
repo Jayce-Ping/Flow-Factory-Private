@@ -17,8 +17,17 @@ identical to that base (validated by the bit-for-bit unit test).
 Two routers (orthogonal to the two init paths):
   * ``token_linear`` (LLM-style, default): a per-MoE-layer ``nn.Linear(dim -> N)`` on the
     token hidden state plus a timestep term. No hidden layer.
-  * ``global``: one per-sample weight vector from (pooled prompt, timestep), shared across
-    all MoE layers (follows the MoF router design).
+  * ``global``: one model-level per-sample weight vector from (pooled prompt, timestep), shared
+    across all MoE layers (follows the MoF router design). With ``top_k < num_experts`` it selects
+    the SAME top-k experts for every token of a sample and at every layer (MoF-like sample routing),
+    so the sparse top-k dispatch and expert parallelism (all-to-all) apply exactly as for
+    ``token_linear``. With ``top_k == num_experts`` it degenerates to a dense soft-mix.
+
+Both routers preserve the "N base models" decomposition: :meth:`extract_expert` rebuilds the shared
+backbone + expert e's per-layer MLPs into a standalone valid ``Flux2Transformer2DModel``. Note the
+MoE mixes MLP outputs PER LAYER (``h_{l+1} = h_l + sum_e w_e * MLP_e^l(h_l)`` with a shared residual
+stream), which is NOT the same as MoF's whole-model velocity blend (``sum_e w_e * Model_e(x)``);
+only the structural decomposition into N valid sub-models is preserved.
 
 See the plan ``moe_expert-merge_feasibility`` section 12 for the full spec.
 """
@@ -245,8 +254,15 @@ class MoEFeedForward(nn.Module):
         while other ranks did -> the gradient all-reduce buckets diverged across ranks (different
         NumelIn / SeqNum) and NCCL dead-locked (600s collective timeout -> SIGABRT). The dense-masked
         output is numerically identical to the sparse top-k dispatch (equivalence-tested); the only
-        cost is running all experts' MLPs (fine for small N; large N uses expert parallelism). aux is
-        0 for the global router."""
+        cost is running all experts' MLPs (fine for small N; large N uses expert parallelism).
+
+        Two routing sources:
+          * ``gate_weights is None`` (``token_linear``): this layer owns its per-token router.
+          * ``gate_weights`` provided (``global``): one model-level per-sample gate ``(B, N)``,
+            identical at every MoE layer. With ``top_k < num_experts`` the SAME top-k experts are
+            selected for every token of a sample and at every layer (MoF-like sample routing), and
+            the sparse EP / dense-masked paths are taken exactly as for ``token_linear``. With
+            ``top_k == num_experts`` it degenerates to a dense soft-mix over all experts (no EP)."""
         if gate_weights is None:
             if self.router is None:
                 raise RuntimeError(
@@ -264,8 +280,25 @@ class MoEFeedForward(nn.Module):
                 w = torch.zeros_like(probs).scatter_(-1, topi, topw)  # (B,S,N): renormalized top-k, 0 elsewhere
                 return self._dense(x, w.to(x.dtype)), self._aux(probs, topi)
             return self._dense(x, probs.to(x.dtype)), self._aux(probs, None)
-        aux = x.new_zeros(())
-        return self._dense(x, gate_weights.to(x.dtype).unsqueeze(1)), aux
+
+        # global router: gate_weights is the model-level per-sample gate (B, N), already softmax'd.
+        if self.top_k < self.num_experts:
+            topw, topi = torch.topk(gate_weights, self.top_k, dim=-1)  # (B, k)
+            topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            aux = self._aux(gate_weights, topi)  # per-sample Switch load balance over N experts
+            if ep_enabled():
+                # Broadcast the per-sample top-k selection to every token, then reuse the sparse EP
+                # dispatch (all tokens of a sample share the same k global expert ids).
+                B, S = x.shape[0], x.shape[1]
+                topi_tok = topi.unsqueeze(1).expand(B, S, self.top_k).contiguous()
+                topw_tok = topw.unsqueeze(1).expand(B, S, self.top_k).to(x.dtype).contiguous()
+                return self._ep_forward(x, topw_tok, topi_tok), aux
+            # non-EP: dense-masked (all experts run, zero off top-k) -> DDP/FSDP-safe and
+            # numerically identical to the EP path (equivalence-tested).
+            w = torch.zeros_like(gate_weights).scatter_(-1, topi, topw)  # (B, N)
+            return self._dense(x, w.to(x.dtype).unsqueeze(1)), aux
+        # top_k == num_experts: dense soft-mix over all experts (no sparsity, no EP).
+        return self._dense(x, gate_weights.to(x.dtype).unsqueeze(1)), x.new_zeros(())
 
 
 def _make_router(router_type: str, dim: int, num_experts: int, d_time: int) -> Optional[nn.Module]:
@@ -453,11 +486,6 @@ class Flux2MoETransformer2DModel(
             raise ValueError(f"router_type must be 'token_linear' or 'global', got {router_type!r}")
         if top_k < 1 or top_k > num_experts:
             raise ValueError(f"top_k must be in [1, num_experts={num_experts}], got {top_k}")
-        if router_type == "global" and top_k < num_experts:
-            logger.warning(
-                "router_type='global' does dense soft mixing over all %d experts; "
-                "top_k=%d is ignored.", num_experts, top_k,
-            )
 
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
@@ -505,9 +533,10 @@ class Flux2MoETransformer2DModel(
         self._ep_grad_hooks_registered = False
 
     def moe_aux_loss(self) -> Optional[torch.Tensor]:
-        """Mean MoE load-balancing aux loss from the last forward (None if never run;
-        ~0 for the global router). Grad-correct under gradient checkpointing because the
-        per-layer aux is a returned block output rather than a stashed side-effect."""
+        """Mean MoE load-balancing aux loss from the last forward (None if never run). Non-zero for
+        token_linear top-k and for global top-k (per-sample Switch load balance over the N experts);
+        ~0 only for a dense soft-mix (top_k == num_experts). Grad-correct under gradient
+        checkpointing: the per-layer aux is a returned block output, not a stashed side-effect."""
         return self._last_moe_aux
 
     def shard_experts_for_ep(self, ep_rank: int, ep_size: int) -> "Flux2MoETransformer2DModel":

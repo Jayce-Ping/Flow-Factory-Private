@@ -136,12 +136,17 @@ class ModelArguments(ArgABC):
     )
     moe_top_k: int = field(
         default=1,
-        metadata={"help": "Experts activated per token (top-k). Ignored unless moe_enabled."},
+        metadata={"help": "Experts activated per routing unit (top-k). 'token_linear' selects per token; "
+                          "'global' selects per sample (same k experts at every layer). top_k < num_experts "
+                          "enables the sparse / EP path; top_k == num_experts is a dense soft-mix. Ignored "
+                          "unless moe_enabled."},
     )
     moe_router_type: Literal['token_linear', 'global'] = field(
         default='token_linear',
         metadata={"help": "MoE router: 'token_linear' (LLM-style per-token linear gate on the hidden "
-                          "state + timestep term) or 'global' (per-sample gate over prompt+timestep)."},
+                          "state + timestep term) or 'global' (single model-level per-sample gate over "
+                          "prompt+timestep, shared across all MoE layers; MoF-like sample routing). Both "
+                          "support top-k sparsity + expert parallelism (moe_enable_ep)."},
     )
     moe_init: Literal['replicate', 'experts'] = field(
         default='replicate',
@@ -177,8 +182,9 @@ class ModelArguments(ArgABC):
         default=False,
         metadata={"help": "Expert-parallel the MoE: shard the experts over moe_ep_size ranks (intra-node "
                           "all-to-all dispatch/combine) instead of the dense-masked path that runs every "
-                          "expert on every rank. Requires moe_top_k < moe_num_experts and token_linear "
-                          "routing; moe_num_experts must be divisible by moe_ep_size. Flux2 Klein MoE only."},
+                          "expert on every rank. Requires moe_top_k < moe_num_experts and router_type in "
+                          "('token_linear', 'global'); moe_num_experts must be divisible by moe_ep_size. "
+                          "Flux2 Klein MoE only."},
     )
     moe_ep_size: int = field(
         default=1,
@@ -348,16 +354,20 @@ class ModelArguments(ArgABC):
                     f"moe_num_experts ({self.moe_num_experts}) must be divisible by moe_ep_size "
                     f"({self.moe_ep_size}) for expert parallelism."
                 )
-            if self.moe_router_type != "token_linear":
+            # Both routers support the sparse EP path: 'token_linear' dispatches each token to its
+            # top-k experts; 'global' selects the same top-k experts per sample (identical at every
+            # layer) and dispatches every token of that sample to them. Either way top_k < N is
+            # required so the routing is sparse (top_k == N is a dense soft-mix with no EP path).
+            if self.moe_router_type not in ("token_linear", "global"):
                 raise ValueError(
-                    f"moe_enable_ep requires moe_router_type='token_linear' (sparse per-token dispatch); "
-                    f"got {self.moe_router_type!r}. The 'global' router does a dense soft mix over all "
-                    "experts, which has no sparse EP path."
+                    f"moe_enable_ep requires moe_router_type in ('token_linear', 'global'); "
+                    f"got {self.moe_router_type!r}."
                 )
             if self.moe_top_k >= self.moe_num_experts:
                 raise ValueError(
                     f"moe_enable_ep requires moe_top_k < moe_num_experts (sparse routing); got "
-                    f"top_k={self.moe_top_k}, num_experts={self.moe_num_experts}."
+                    f"top_k={self.moe_top_k}, num_experts={self.moe_num_experts}. The 'global' router "
+                    f"with top_k == num_experts is a dense soft-mix over all experts (no EP path)."
                 )
 
         self.resume_path = os.path.expanduser(self.resume_path) if self.resume_path is not None else None

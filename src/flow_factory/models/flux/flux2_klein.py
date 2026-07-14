@@ -190,6 +190,7 @@ class Flux2KleinAdapter(BaseAdapter):
             logger.info(
                 f"[MoE-EP] experts sharded over ep_size={get_ep_size()} "
                 f"(ep_rank={get_ep_rank()}, local global-ids={moe._ep_local_expert_ids}, "
+                f"router={moe.config.router_type}, top_k={moe.config.top_k}, "
                 f"backend={getattr(self.model_args, 'moe_ep_backend', 'nccl')})"
             )
 
