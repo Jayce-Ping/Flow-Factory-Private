@@ -6,6 +6,8 @@
 \usepackage{array}
 \usepackage{enumitem}
 \usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
 \usepackage{xcolor}
 \usepackage{tcolorbox}
 \usepackage{listings}
@@ -18,6 +20,8 @@
 \newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
 \newcommand{\dt}{\Delta t}
 \newcommand{\dk}{d_k}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
 
 \newtheorem*{remark*}{Remark}
 
@@ -43,16 +47,17 @@ and the \texttt{xopd\_dk\_space} reweighting}
 \begin{abstract}
 Theory companion to the empirical observation
 \texttt{docs/xopd/progress/2026-07-12-per-timestep-dk-dominance.md} (last quarter of steps
-$\approx 81\%$ of $\sum_k \dk$, final step $\approx 40\%$); the implemented remedy is
+$\approx 87\%$ of $\sum_k \dk$, final step $\approx 46\%$ at \texttt{mean\_tail}); the implemented remedy is
 \texttt{train.xopd\_dk\_space="x0"} (clean-latent loss, \S\ref{sec:impl}). Relevant
 code: \texttt{compute\_per\_step\_kl} in
 \texttt{src/flow\_factory/trainers/xopd/common.py}, called by
 \texttt{\_precompute\_d\_per\_timestep} / \texttt{\_optimize\_train\_pass} in
 \texttt{src/flow\_factory/trainers/xopd/trainer.py}.
 
-This note defines three per-step MSE losses ($L_{xt}$, $L_v$, $L_{x_0}$), their exact conversion
-on the FLUX.2-klein 28-step grid, and why the default $L_{xt}$ (config \texttt{"xt"}) dominates late
-timesteps. Companion data: \S\ref{sec:schedule}--\S\ref{sec:empirical}.
+This note defines three implemented per-step MSE knobs ($L_{xt}$, $L_v$, $L_{x_0}$) plus the
+Gaussian transition KL $L_{\mathrm{KL}}$ (DanceOPD theory, \S\ref{ssec:danceopd-kl}), their exact
+conversion on the FLUX.2-klein 28-step grid, and why the default $L_{xt}$ (config \texttt{"xt"})
+dominates late timesteps. Companion data: \S\ref{sec:schedule}--\S\ref{sec:empirical}.
 \end{abstract}
 
 \tableofcontents
@@ -131,6 +136,64 @@ early high-noise steps ($\sigma\approx1$) dominate (col.~``pct $L_{x_0}$'').
 \end{itemize}
 Alternatively, fix $L_{x_0,k}$ (equal clean-latent disagreement): $L_{xt,k}=(\dt_k/\sigma_k)^2
 L_{x_0,k}$, which is the ``$(\dt/\sigma)^2$ blow-up'' narrative (\S\ref{sec:causes}).
+
+\subsection{Fourth form: Gaussian transition KL (DanceOPD / DiffusionOPD theory)}
+\label{ssec:danceopd-kl}
+
+The three knobs above are \emph{unweighted} per-step MSE targets. A separate, widely used objective
+is the \textbf{same-variance Gaussian transition KL} between teacher and student one-step
+distributions. Under a local model $p(\cdot\mid x_t)=\N(\mu,\,\sigma_t^2 I)$ with shared
+covariance~$\sigma_t^2$ (DanceOPD Appendix~7.1; DiffusionOPD pathwise term), and
+$\mu=x_t+v\,\dt$:
+\begin{equation}
+\boxed{
+L_{\mathrm{KL},k}
+=\KL\!\bigl(p_m(\cdot\mid x_t)\,\big\|\,p_\theta(\cdot\mid x_t)\bigr)
+=\frac{\dt_k^2}{2\sigma_k^2}\,\norm{v_s-v_t}^2
+=\frac{L_{xt,k}}{2\sigma_k^2}.
+}
+\label{eq:danceopd-kl}
+\end{equation}
+This is \textbf{not} equal to any of $\{L_{xt},L_v,L_{x_0}\}$ with unit coefficient; it is a
+\emph{fourth} reweighting of the same underlying velocity gap. Exact conversions (same
+$(v_s-v_t)$ at step~$k$):
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}l|cccc@{}}
+ & $\to L_{xt}$ & $\to L_v$ & $\to L_{x_0}$ & $\to L_{\mathrm{KL}}$ \\
+\midrule
+from $L_{\mathrm{KL}}$ & $2\sigma^2$ & $2\sigma^2/\dt^2$ & $2\sigma^4/\dt^2$ & $1$ \\
+from $L_{xt}$ & $1$ & $\dt^{-2}$ & $(\sigma/\dt)^2$ & $(2\sigma^2)^{-1}$ \\
+from $L_v$ & $\dt^2$ & $1$ & $\sigma^2$ & $\dt^2/(2\sigma^2)$ \\
+from $L_{x_0}$ & $(\dt/\sigma)^2$ & $\sigma^{-2}$ & $1$ & $\dt^2/(2\sigma^4)$ \\
+\end{tabular}
+\end{center}
+\textbf{Implicit weight on $L_v$.} Summing $\sum_k L_{\mathrm{KL},k}$ with coefficient~$1$ applies
+$w_k^{\mathrm{KL}}=\dt_k^2/(2\sigma_k^2)$ to the underlying $L_{v,k}$ --- \emph{between} the
+$L_{xt}$ weight ($\dt_k^2$) and the $L_{x_0}$ weight ($\sigma_k^2$): early high-noise steps are
+down-weighted by $1/\sigma_k^2$ relative to $L_{xt}$, but late steps with small~$\sigma_k$ still
+\emph{amplify} $1/\sigma_k^2$ enough that $L_{\mathrm{KL}}$ is \textbf{more} late-heavy than
+$L_{xt}$ under flat~$L_v$ (Figure~\ref{fig:theoretical-shares}: $\mathbf{77\%}$ vs.\ $\mathbf{41\%}$
+on \texttt{ti=27}).
+
+\paragraph{DanceOPD vs.\ our \texttt{normalize\_d\_k}.}
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{DanceOPD training default} is \emph{plain} $L_v=\norm{v_s-v_t}^2$ at a single
+semantic-side low-$t$ query --- \eqref{eq:danceopd-kl} is the \emph{theoretical} KL identity; their
+ablations report plain MSE beats KL-$\bar\sigma^2$ / Min-SNR reweightings
+(\texttt{docs/mof/danceopd\_comparison.md}).
+\item \textbf{Our \texttt{normalize\_d\_k=true}} (only in \texttt{space="xt"}) divides transition
+mean MSE by $2\bar\sigma_k^2=2\,\mathrm{std\_dev}_t^2\,\lvert\dt_k\rvert$ (SDE Appendix~B
+$\bar\sigma$), \emph{not} by $2\sigma_k^2$ with FM fraction~$\sigma_k=t_k/1000$. Under ODE
+($\mathrm{std\_dev}_t\approx0$) it falls back to plain $L_{xt}$. So \eqref{eq:danceopd-kl} is
+\textbf{conceptually related} to normalized transition KL but \textbf{not implemented} as a separate
+knob; it differs from $L_{\mathrm{KL}}$ unless one identifies $\bar\sigma$ with~$\sigma_k$ and uses
+SDE dynamics.
+\item \textbf{Ratio to $L_{xt}$:} $L_{\mathrm{KL},k}/L_{xt,k}=1/(2\sigma_k^2)$. On the FLUX.2-klein
+grid this \emph{increases} late-step share vs.\ plain $L_{xt}$ (77\% vs.\ 41\% on \texttt{ti=27}
+under flat~$L_v$), because $\sigma_k\to0$ faster than $\dt_k^2$ shrinks toward the end.
+\end{itemize}
 
 %% ============================================================
 \section{The key identity (legacy shorthand)}
@@ -213,7 +276,7 @@ of $\sum_k L_{xt,k}$ (resp.\ $\sum_k L_{x_0,k}$) if $L_{v,k}\equiv$ const across
 velocity gap.
 \item \textbf{Default $L_{xt}$ dominance $\approx$ flat $L_v$.} If $\norm{v_s-v_t}^2$ were identical
 at every step, $\sum_k L_{xt,k}$ puts $\mathbf{41\%}$ on \texttt{ti=27} (col.~``\%$L_{xt}$'').
-The mixed XOPD run observes $\mathbf{40\%}$ on \texttt{ti=27} --- the logged curve matches
+The mixed XOPD run observes $\mathbf{46\%}$ on \texttt{ti=27} at \texttt{mean\_tail} --- the logged curve matches
 \emph{roughly constant velocity error} amplified only by $\dt_k^2$, not the stronger
 $(\dt_k/\sigma_k)^2$ factor (which would give $\mathbf{77\%}$ if $L_{x_0,k}$ were constant).
 \item \textbf{$L_{x_0}$ up-weights early steps.} With flat $L_v$, high-noise steps each take
@@ -225,22 +288,64 @@ $\sim5\%$ of $\sum L_{x_0}$ while \texttt{ti=27} takes only $\mathbf{0.19\%}$. S
 not $t\approx0$. Dominance comes from the discrete grid's large $\lvert\dt_k\rvert$ at the end.
 \end{itemize}
 
+\paragraph{Implicit per-step shares (flat $L_v$).}
+Figure~\ref{fig:theoretical-shares} plots the normalized share of $\sum_k L_{\{\cdot\},k}$ at each
+\texttt{ti} when the underlying velocity gap is identical at every step
+($L_{v,k}\equiv const$). Blue/red/green: the three implemented MSE knobs ($L_{xt}$, $L_v$,
+$L_{x_0}$); orange: the Gaussian transition KL $L_{\mathrm{KL}}=\dt^2 L_v/(2\sigma^2)$
+(\S\ref{ssec:danceopd-kl}). Its weight $\dt_k^2/(2\sigma_k^2)$ is \emph{more} late-heavy than
+$L_{xt}$ alone under flat~$L_v$.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{figures/theoretical_loss_share_flat_lv.pdf}
+\caption{Theoretical per-\texttt{ti} shares under flat-$L_v$. Four curves: $L_{xt}$, $L_v$,
+$L_{x_0}$, and DanceOPD/DiffusionOPD transition KL $L_{\mathrm{KL}}=\dt^2/(2\sigma^2)\cdot L_v$.
+$L_{\mathrm{KL}}$ (orange) is \textbf{more} late-concentrated than $L_{xt}$ (77\% vs.\ 41\% on
+\texttt{ti=27}) because $1/\sigma_k^2$ diverges as $\sigma_k\to0$.}
+\label{fig:theoretical-shares}
+\end{figure}
+
 %% ============================================================
 \section{Empirical distribution: mixed run, converted from measured $L_{xt}$}
 \label{sec:empirical}
 %% ============================================================
 
-Wandb run \texttt{4cnkluwk} (mixed geneval+OCR, \texttt{xopd\_dk\_space=xt},
-\texttt{normalize\_d\_k=false}) logs $L_{xt,k}$ directly
-(\S\ref{sec:causes}). Under ODE we convert each step to the \emph{hypothetical} $L_v$ and $L_{x_0}$
-that would have been logged with the same underlying velocity gap:
+We pull \texttt{train/d\_k/\{ti\}} from two W\&B runs in project \texttt{Flow-Factory-XOPD},
+both with \texttt{xopd\_dk\_space=xt} and \texttt{normalize\_d\_k=false}:
+\texttt{4cnkluwk} (mixed geneval+OCR 1:1) and \texttt{51ueyo7w} (geneval\_enhanced specialist).
+Under ODE we convert each step to the \emph{hypothetical} $L_v$ and $L_{x_0}$ that would have been
+logged with the same underlying velocity gap:
 \[
 L_{v,k}=\frac{L_{xt,k}}{\dt_k^2},\qquad
-L_{x_0,k}=\Big(\frac{\sigma_k}{\dt_k}\Big)^2 L_{xt,k}.
+L_{x_0,k}=\Big(\frac{\sigma_k}{\dt_k}\Big)^2 L_{xt,k},\qquad
+L_{\mathrm{KL},k}=\frac{L_{xt,k}}{2\sigma_k^2}.
 \]
-Table~\ref{tab:empirical-converted} uses \texttt{mean\_tail} from
-\texttt{progress/2026-07-12-per-timestep-dk-dominance.md} and the official 28-step
-$(\sigma_k,\dt_k)$ from \S\ref{sec:schedule}.
+\textbf{Windows.} \emph{initial} = mean of the first 4 logged optimizer steps ($\approx$ first 4
+epochs); \emph{mean\_tail} = mean of the last 30\% of logged steps. Figures are generated by
+\texttt{.scratch/plot\_per\_timestep\_loss\_dominance.py} (repro: pull W\&B, then plot).
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{figures/empirical_loss_share_comparison.pdf}
+\caption{Empirical per-\texttt{ti} shares in each loss space. Top row: mixed run
+(\texttt{4cnkluwk}); bottom row: geneval\_enh specialist (\texttt{51ueyo7w}). Left: initial window;
+right: \texttt{mean\_tail}. Orange: converted $L_{\mathrm{KL}}=L_{xt}/(2\sigma_k^2)$
+(\S\ref{ssec:danceopd-kl}). Late dominance is strongest in $L_{\mathrm{KL}}$, absent in $L_v$/$L_{x_0}$.}
+\label{fig:empirical-shares}
+\end{figure}
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\textwidth]{figures/empirical_lxt_scale_comparison.pdf}
+\caption{Top row: measured $L_{xt,k}$ (log-$y$); bottom row: converted
+$L_{\mathrm{KL},k}=L_{xt,k}/(2\sigma_k^2)$. Both runs show the $L_{xt}$ U-shape; $L_{\mathrm{KL}}$
+is even more concentrated on late \texttt{ti} because of the $1/\sigma_k^2$ factor.}
+\label{fig:empirical-lxt-scale}
+\end{figure}
+
+Table~\ref{tab:empirical-converted} summarizes the mixed run \texttt{mean\_tail} aggregates; values
+match Figure~\ref{fig:empirical-shares} (top-right panel).
 
 \begin{table}[ht]
 \centering
@@ -250,30 +355,56 @@ $(\sigma_k,\dt_k)$ from \S\ref{sec:schedule}.
 \toprule
 \textbf{aggregate} & \textbf{$L_{xt}$ (meas.)} & \textbf{$L_v$ (conv.)} & \textbf{$L_{x_0}$ (conv.)} \\
 \midrule
-top-1 (\texttt{ti=27}) & 40.2\% & 0.5\% & 0.02\% \\
-top-7 (\texttt{ti=21--27}, last 1/4) & 81.0\% & 3.1\% & 0.9\% \\
-high-noise half (\texttt{ti=0--13}) & 12.2\% & 91.5\% & 95.2\% \\
-low-noise half (\texttt{ti=14--27}) & 87.8\% & 8.5\% & 4.8\% \\
+top-1 (\texttt{ti=27}) & 45.6\% & 0.5\% & 0.02\% \\
+top-7 (\texttt{ti=21--27}, last 1/4) & 87.3\% & 3.4\% & 0.9\% \\
+high-noise half (\texttt{ti=0--13}) & 6.9\% & 85.9\% & 92.1\% \\
+low-noise half (\texttt{ti=14--27}) & 93.1\% & 14.1\% & 7.9\% \\
 \bottomrule
 \end{tabular}
-\caption{Share of $\sum_k L_{\{\cdot\},k}$ (\texttt{mean\_tail}) in each loss space. $L_{xt}$ is
-measured; $L_v$ and $L_{x_0}$ are ODE-exact conversions using the FLUX.2-klein 28-step grid.}
+\caption{Share of $\sum_k L_{\{\cdot\},k}$ (\texttt{mean\_tail}, mixed run \texttt{4cnkluwk},
+250 logged steps) in each loss space. $L_{xt}$ is measured; $L_v$ and $L_{x_0}$ are ODE-exact
+conversions. Geneval\_enh specialist initial window: \texttt{ti=27} $\mathbf{42\%}$,
+\texttt{ti=21--27} $\mathbf{79\%}$ (\texttt{51ueyo7w}).}
 \label{tab:empirical-converted}
 \end{table}
 
 \paragraph{Reading.}
 \begin{itemize}[leftmargin=1.5em]
-\item \textbf{Late dominance is specific to $L_{xt}$.} The observed 40\%/81\% concentration on late
-steps \emph{disappears} under conversion to $L_v$ (early half $\mathbf{92\%}$) or $L_{x_0}$
-($\mathbf{95\%}$): the logged curve is dominated by $\dt_k^2$, while the underlying velocity gap
-is larger at high noise.
-\item \textbf{$L_v$ is nearly flat in absolute scale} after conversion ($L_{v,0}\approx1.26$ vs.\
-$L_{v,27}\approx0.056$, only $\mathbf{0.5\%}$ of the sum on \texttt{ti=27}), consistent with
-Cause~A (\S\ref{ssec:causeA}).
+\item \textbf{Late dominance is specific to $L_{xt}$.} Mixed \texttt{mean\_tail} puts
+$\mathbf{46\%}$ on \texttt{ti=27} and $\mathbf{87\%}$ on the last quarter for $L_{xt}$; converted
+$L_v$ and $L_{x_0}$ put $\mathbf{86\%}$/$\mathbf{92\%}$ on the high-noise half
+(\texttt{ti=0--13}). The logged curve is dominated by $\dt_k^2$, while the underlying velocity gap
+is larger at high noise (Figure~\ref{fig:empirical-shares}).
+\item \textbf{Initial $\approx$ theoretical flat-$L_v$ prediction.} Geneval\_enh at epoch~0--3 already
+shows $\mathbf{42\%}$ on \texttt{ti=27} for $L_{xt}$, close to the $\mathbf{41\%}$ from
+Figure~\ref{fig:theoretical-shares} --- the dominance is largely a metric artifact, not something
+training must ``learn'' first.
+\item \textbf{$L_v$ is nearly flat in absolute scale} after conversion (only $\mathbf{0.5\%}$ of the
+sum on \texttt{ti=27}), consistent with Cause~A (\S\ref{ssec:causeA}).
 \item \textbf{Ablation implication.} \texttt{xopd\_dk\_space="v"} removes the $\dt_k^2$ rescaling
 and should redistribute gradient toward high-noise steps; \texttt{"x0"} applies $\sigma_k^2$ and
 amplifies that further.
 \end{itemize}
+
+\subsection{Training dynamics: does $L_{xt}$ late dominance change over epochs?}
+\label{sec:training-dynamics}
+
+Figure~\ref{fig:training-evolution} tracks the $L_{xt}$ and converted $L_{\mathrm{KL}}$ shares at
+\texttt{ti=27}, the last quarter (\texttt{ti=21--27}), and the high-noise half (\texttt{ti=0--13},
+$L_{xt}$ only) across logged optimizer steps (one step $\approx$ one epoch under XOPD). Both runs
+start with high late-step $L_{xt}$ share ($\sim$40\% on \texttt{ti=27}) while $L_{\mathrm{KL}}$
+is higher still ($\sim$70--80\%); both remain stable as training progresses. Bottom panel: gap
+$L_{\mathrm{KL}}-L_{xt}$ at \texttt{ti=27} (percentage points), showing the extra late weight from
+$1/(2\sigma_k^2)$.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/lxt_share_training_evolution.pdf}
+\caption{$L_{xt}$ (run color) vs.\ converted $L_{\mathrm{KL}}$ (orange, same line style per run) per-timestep
+share vs.\ epoch. Mixed (\texttt{4cnkluwk}, solid) and geneval\_enh (\texttt{51ueyo7w}, dashed).
+Bottom: $\Delta$ ti=27 share ($L_{\mathrm{KL}}-L_{xt}$).}
+\label{fig:training-evolution}
+\end{figure}
 
 %% ============================================================
 \section{Implementation: the \texttt{xopd\_dk\_space} knob}
@@ -320,7 +451,7 @@ so \textbf{$L_{xt}$ over-represents late steps even if $L_v$ were flat}.
 Quantitative check on the FLUX.2-klein 28-step grid (\S\ref{sec:schedule}):
 \begin{itemize}[leftmargin=1.5em]
 \item If $L_{v,k}\equiv$ const: $\sum_k L_{xt,k}$ puts $\mathbf{41\%}$ on \texttt{ti=27}
-(col.~``\%$L_{xt}$''). The mixed XOPD run observes $\mathbf{40\%}$ on \texttt{ti=27} for logged
+(col.~``\%$L_{xt}$''). The mixed XOPD run observes $\mathbf{46\%}$ on \texttt{ti=27} for logged
 $L_{xt}$ --- the curve matches \emph{roughly constant velocity error} $\times\,\dt_k^2$, not a
 separate ``mystery'' effect.
 \item If instead $L_{x_0,k}\equiv$ const: $L_{xt,k}=(\dt_k/\sigma_k)^2 L_{x_0,k}$ would put
@@ -378,8 +509,8 @@ Cause-B component is worth keeping --- but do not mistake the Cause-A amplificat
 \label{sec:unified}
 %% ============================================================
 
-All proposals choose how to weight the three losses (or an equivalent $L_v$) across steps:
-$\mathcal{L}=\sum_k w_k L_{\{xt,v,x_0\},k}$.
+All proposals choose how to weight the underlying velocity gap $L_{v,k}$ across steps:
+$\mathcal{L}=\sum_k w_k L_{v,k}$ (equivalently $\sum_k w'_k L_{\{\mathrm{xt},v,x_0,\mathrm{KL}\},k}$).
 
 \begin{center}
 \renewcommand{\arraystretch}{1.3}
@@ -389,7 +520,8 @@ $\mathcal{L}=\sum_k w_k L_{\{xt,v,x_0\},k}$.
 \textbf{direction} & \textbf{loss / weight on $L_v$} & \textbf{effect} \\
 \midrule
 default & $L_{xt}$, $w_k=1$ $\Rightarrow$ $w_k L_v=\dt_k^2$ & late-step dominance (41\% on ti=27 if $L_v$ flat) \\
-1. late-only (DanceOPD) & $L_{xt}$ on $\sigma_k<\tau$ only & polish; drops structure learning \\
+transition KL (theory) & $L_{\mathrm{KL}}$, $w_k=\dt_k^2/(2\sigma_k^2)$ & stronger late dominance than $L_{xt}$ (77\% on ti=27); DanceOPD trains plain $L_v$ instead \\
+1. late-only (DanceOPD) & $L_{xt}$ or $L_v$ on $\sigma_k<\tau$ only & polish; drops structure learning \\
 2a. $L_{x_0}$ (implemented) & $L_{x_0}$, $w_k=1$ $\Rightarrow$ $w_k L_v=\sigma_k^2$ & up-weights high-noise steps \\
 2b. $L_v$ (implemented) & \texttt{xopd\_dk\_space="v"} & native FM velocity MSE \\
 2c. EMA balance & $L_{xt} / \mathrm{EMA}(L_{xt})$ & flattens logged scale; may suppress Cause B \\
