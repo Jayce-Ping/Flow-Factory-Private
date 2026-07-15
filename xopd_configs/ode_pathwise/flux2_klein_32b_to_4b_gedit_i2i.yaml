@@ -1,0 +1,173 @@
+# Cross-OPD (XOPD) I2I: FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
+# Train on GEditBench-v2 edit instructions (image + prompt). Loss is still XOPD L1
+# (teacher velocity matching); rational_rewards_edit is EVAL-ONLY.
+#
+# Shared-VAE assumption (assume_shared_vae_text_encoder: true): student-encoded
+# image_latents are reused for the teacher forward. Cross-VAE I2I re-encode is out
+# of scope for this config.
+#
+# Requires: dataset/geditbench_v2 built via dataset/geditbench_v2/download.sh
+# For rational_rewards_edit eval: start vLLM with scripts/start_vllm_rational_reward.sh
+# and point api_base_url / vlm_model below at RationalRewards-8B-Edit.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (I2I: prompt + source image) =====
+data:
+  dataset_dir: "dataset/geditbench_v2"
+  dataset_dirs:
+    - "dataset/geditbench_v2"
+  preprocessing_batch_size: 8           # I2I encode includes VAE; keep modest
+  dataloader_num_workers: 8
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (student) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_gedit_i2i"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+# ===== Training (XOPD) =====
+train:
+  trainer_type: "xopd"
+  max_epochs: 500
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  # Shared VAE / latent space with klein; text encoder differs (precomputed offline).
+  # I2I image_latents encoded by the student VAE are reused for teacher forwards.
+  assume_shared_vae_text_encoder: true
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  resolution: 512
+  condition_image_size: [512, 512]      # Max condition image resolution for encode_image
+  num_inference_steps: 28
+  per_device_batch_size: 1              # Required for Flux2 I2I (also safe for mixed T2I+I2I)
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (OCR-single suite + GEditBench I2I @ gs=1.0/4.0) =====
+eval:
+  resolution: 1024                        # Match OCR-single eval
+  condition_image_size: [512, 512]        # I2I condition size (gedit test_sets only)
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 20
+  seed: 42
+  test_sets:                              # Same as l1_ocr.yaml, plus geditbench gs1/gs4.
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,       split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval,       split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,           split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,           split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore,     split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore,     split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+    - {name: gedit_gs1,     dataset_dir: dataset/geditbench_v2, split: test, guidance_scale: 1.0, eval_reward_names: [geditbench]}
+    - {name: gedit_gs4,     dataset_dir: dataset/geditbench_v2, split: test, guidance_scale: 4.0, eval_reward_names: [geditbench]}
+
+# ===== Rewards (eval / logging only; NOT in the XOPD loss) =====
+rewards:
+  # GEdit-Bench official metric (VIEScore: SC / PQ / Overall via VLM-as-Judge).
+  # Reward returned = Overall = sqrt(SC*PQ) on the native 0-10 scale.
+  # vlm_model: Qwen3-VL (the official GEditBench-v2 judges are Qwen3-VL based; PVC-Judge
+  # is a Qwen3-VL-8B-Instruct LoRA). Serve over vLLM (OpenAI-compatible) at api_base_url.
+  # Set vlm_model to gpt-4o/gpt-4.1 to reproduce the closed-source judge instead.
+  - name: "geditbench"
+    reward_model: "geditbench"
+    batch_size: 8
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    api_base_url: "http://127.0.0.1:8000/v1"
+    api_key: "EMPTY"
+    vlm_model: "Qwen3-VL-8B-Instruct"
+    metric: "overall"          # Options: overall (sqrt(SC*PQ)), sc, pq
+    normalize: false           # false: native 0-10 (== official G_O); true: /10 -> [0,1]
+    max_concurrent: 8
+    max_retries: 3
+    timeout: 300
+    temperature: 0.0
+    max_tokens: 1024
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cpu"
+    dtype: float32
+    async_reward: false

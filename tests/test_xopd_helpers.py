@@ -22,6 +22,7 @@ from flow_factory.hparams.training_args import XOPDTrainingArguments
 from flow_factory.trainers.xopd.common import (
     align_l0_inner_steps,
     compute_per_step_kl,
+    extract_i2i_condition_kwargs,
     interleaved_source_iter,
     l0_loss_weight,
     reverse_cumulative,
@@ -274,6 +275,57 @@ class TestXOPDValidateSourceRatio(unittest.TestCase):
                 num_batches_per_epoch=6,
                 train_dataloaders_by_source={"a": [], "b": []},
             )
+
+
+class TestExtractI2IConditionKwargs(unittest.TestCase):
+    def test_t2i_batch_returns_empty(self) -> None:
+        out = extract_i2i_condition_kwargs({"prompt": ["a cat"]}, prefer_latents=True)
+        self.assertEqual(out, {})
+
+    def test_prefer_latents_keeps_cached_latents(self) -> None:
+        latents = torch.zeros(1, 4, 8)
+        ids = torch.zeros(1, 4, 3)
+        cond = [[torch.zeros(3, 8, 8)]]
+        out = extract_i2i_condition_kwargs(
+            {
+                "image_latents": latents,
+                "image_latent_ids": ids,
+                "condition_images": cond,
+                "images": "should_not_appear_when_prefer_latents",
+            },
+            prefer_latents=True,
+        )
+        self.assertIs(out["image_latents"], latents)
+        self.assertIs(out["image_latent_ids"], ids)
+        self.assertIs(out["condition_images"], cond)
+        self.assertNotIn("images", out)
+
+    def test_prefer_pixels_omits_student_latents(self) -> None:
+        latents = torch.zeros(1, 4, 8)
+        cond = [[torch.zeros(3, 8, 8)]]
+        out = extract_i2i_condition_kwargs(
+            {
+                "image_latents": latents,
+                "image_latent_ids": torch.zeros(1, 4, 3),
+                "condition_images": cond,
+            },
+            prefer_latents=False,
+        )
+        self.assertNotIn("image_latents", out)
+        self.assertNotIn("image_latent_ids", out)
+        self.assertIs(out["images"], cond)
+
+    def test_prefer_pixels_uses_raw_images_when_present(self) -> None:
+        raw = [["raw.png"]]
+        out = extract_i2i_condition_kwargs(
+            {"images": raw, "condition_images": [[torch.zeros(3, 2, 2)]]},
+            prefer_latents=False,
+        )
+        self.assertEqual(out["images"], raw)
+
+    def test_non_dict_raises(self) -> None:
+        with self.assertRaises(TypeError):
+            extract_i2i_condition_kwargs(["not", "a", "dict"])  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

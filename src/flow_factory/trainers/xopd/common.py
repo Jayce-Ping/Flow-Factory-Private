@@ -337,6 +337,70 @@ def align_l0_inner_steps(
     return math.ceil(l0_inner_steps / d) * d
 
 
+# Optional I2I condition keys that may be present on preprocessed batches.
+# Missing / None is normal for T2I samples in mixed T2I+I2I training (bsz=1).
+I2I_LATENT_KEYS: Tuple[str, ...] = ("image_latents", "image_latent_ids")
+I2I_PIXEL_KEYS: Tuple[str, ...] = ("images", "condition_images")
+
+
+def extract_i2i_condition_kwargs(
+    batch: Dict[str, Any],
+    *,
+    prefer_latents: bool = True,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    """Collect optional image-condition kwargs from a batch (T2I-safe).
+
+    Skips missing / ``None`` keys so mixed T2I+I2I training with
+    ``per_device_batch_size=1`` does not crash on text-only batches.
+
+    Args:
+        batch: Preprocessed dataloader batch (may lack image fields).
+        prefer_latents: If True (shared-VAE / student path), forward cached
+            ``image_latents`` / ``image_latent_ids`` when present, plus
+            ``condition_images`` for sample metadata / rewards. If False
+            (independent teacher with a possibly different VAE), pass pixel
+            condition as ``images`` so the callee can re-encode, and omit
+            student ``image_latents``.
+        device: Optional device to move tensor values onto.
+
+    Returns:
+        Dict of non-None I2I kwargs suitable for ``filter_kwargs`` / inference /
+        ``predict_velocity``. Empty when the batch is T2I-only.
+    """
+    if not isinstance(batch, dict):
+        raise TypeError(
+            f"expected dict for batch, got {type(batch).__name__}: {batch!r}"
+        )
+
+    out: Dict[str, Any] = {}
+
+    def _maybe_to_device(value: Any) -> Any:
+        if device is None or not torch.is_tensor(value):
+            return value
+        return value.to(device)
+
+    if prefer_latents:
+        for key in (*I2I_LATENT_KEYS, "condition_images"):
+            if key not in batch:
+                continue
+            value = batch[key]
+            if value is None:
+                continue
+            out[key] = _maybe_to_device(value)
+        return out
+
+    # Cross-VAE / independent teacher: prefer pixel inputs so the teacher VAE
+    # re-encodes. Do not forward student image_latents (wrong latent space).
+    if batch.get("images") is not None:
+        out["images"] = batch["images"]
+    elif batch.get("condition_images") is not None:
+        # Preprocess caches resized tensors as condition_images; reuse as the
+        # encode_image input (Flux2 adapters accept tensor batches).
+        out["images"] = batch["condition_images"]
+    return out
+
+
 def interleaved_source_iter(
     dataloaders_by_source: Dict[str, Any],
     source_ratio: Optional[Dict[str, float]] = None,

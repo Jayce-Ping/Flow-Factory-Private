@@ -71,6 +71,7 @@ from .common import (
     build_forward_kwargs,
     cache_forward_signature,
     compute_per_step_kl,
+    extract_i2i_condition_kwargs,
     interleaved_source_iter,
     l0_loss_weight,
     reverse_cumulative,
@@ -1472,7 +1473,12 @@ class XOPDTrainer(BaseTrainer):
                 "compute_log_prob": False,
                 "generator": generator,
                 "trajectory_indices": None,
+                # I2I: pass pixel condition so the independent teacher VAE
+                # re-encodes. T2I batches omit these keys (safe no-op).
+                **extract_i2i_condition_kwargs(batch, prefer_latents=False),
             }
+            if getattr(merged_eval, "condition_image_size", None) is not None:
+                infer_kwargs["condition_image_size"] = merged_eval.condition_image_size
             infer_kwargs = filter_kwargs(self.teacher_adapter.inference, **infer_kwargs)
             samples = self.teacher_adapter.inference(**infer_kwargs)
             stitch_batch_metadata(batch, samples)
@@ -1633,6 +1639,12 @@ class XOPDTrainer(BaseTrainer):
                     eps = torch.randn_like(z0)
                     z_t = (1.0 - sigma_b) * z0 + sigma_b * eps
 
+                    # Shared-VAE I2I: reuse student-encoded image_latents for both
+                    # teacher and student velocity (plan: assume_shared_vae). T2I
+                    # batches yield an empty dict.
+                    i2i_kwargs = extract_i2i_condition_kwargs(
+                        prompt_batch, prefer_latents=True, device=device
+                    )
                     with self.autocast():
                         with torch.no_grad(), self.adapter.use_teacher_transformer():
                             v_teacher = self.adapter.predict_velocity(
@@ -1644,6 +1656,11 @@ class XOPDTrainer(BaseTrainer):
                                 negative_prompt_embeds=teacher_neg_embeds,
                                 negative_text_ids=teacher_neg_text_ids,
                                 guidance_scale=self.teacher_gs,
+                                **{
+                                    k: v
+                                    for k, v in i2i_kwargs.items()
+                                    if k in ("image_latents", "image_latent_ids")
+                                },
                             )
                         v_student = self.adapter.predict_velocity(
                             t=t,
@@ -1654,6 +1671,11 @@ class XOPDTrainer(BaseTrainer):
                             negative_prompt_embeds=student_neg_embeds,
                             negative_text_ids=student_neg_text_ids,
                             guidance_scale=self.student_gs,
+                            **{
+                                k: v
+                                for k, v in i2i_kwargs.items()
+                                if k in ("image_latents", "image_latent_ids")
+                            },
                         )
 
                     w = l0_loss_weight(sigma, ta.l0_weighting, ta.l0_snr_gamma)  # (B,)
@@ -1719,6 +1741,9 @@ class XOPDTrainer(BaseTrainer):
             "guidance_scale": self.teacher_gs,
             "num_inference_steps": ta.l0_num_inference_steps,
             "compute_log_prob": False,
+            # I2I: independent teacher must see the condition image. Prefer
+            # pixels (re-encode with teacher VAE); T2I batches skip cleanly.
+            **extract_i2i_condition_kwargs(prompt_batch, prefer_latents=False),
         }
         infer_kwargs = filter_kwargs(self.teacher_adapter.inference, **infer_kwargs)
         with torch.no_grad(), self.autocast():
@@ -2470,6 +2495,9 @@ class XOPDTrainer(BaseTrainer):
             "text_ids": batch.get("text_ids"),
             "latent_ids": batch.get("latent_ids"),
             "negative_text_ids": batch.get("negative_text_ids"),
+            # I2I (shared VAE): optional; omitted on T2I batches.
+            "image_latents": batch.get("image_latents"),
+            "image_latent_ids": batch.get("image_latent_ids"),
         }
         out = {}
         for k, v in candidates.items():
