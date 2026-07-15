@@ -143,9 +143,18 @@ rewards:
   - name: "geditbench"
     reward_model: "geditbench"
     batch_size: 8
-    device: "cuda"
+    device: "cuda"             # Keep on CUDA even though the judge is HTTP-only: with async_reward
+                               # the RewardBuffer only creates a reward CUDA stream + waits on the
+                               # sampling sync_event when device is CUDA, which guarantees the worker
+                               # thread reads fully-copied sample images. (No real GPU compute here.)
     dtype: bfloat16
-    async_reward: false
+    # async_reward: overlap the VLM-judge HTTP round-trips with image generation. The
+    # RewardBuffer dispatches each finished batch to a ThreadPoolExecutor as samples
+    # arrive (training rollout AND eval), so judge latency hides behind the next batch's
+    # generation. num_workers = how many judge BATCHES run concurrently; effective request
+    # concurrency = num_workers * max_concurrent (per-call semaphore) = 4 * 8 = 32 in-flight.
+    async_reward: true
+    num_workers: 4
     api_base_url: "http://28.7.195.15:8000/v1"   # dedicated vLLM judge node (worker3); training nodes reach it over bond1
     api_key: "EMPTY"
     vlm_model: "Qwen3-VL-8B-Instruct"
