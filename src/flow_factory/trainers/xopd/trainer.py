@@ -1314,11 +1314,27 @@ class XOPDTrainer(BaseTrainer):
 
         self._eval_debug_gloo_barrier("teacher_baseline:begin")
         self.adapter.eval()
-        logger.info("XOPD: evaluating teacher baseline on all test sets")
+        # Only baseline the teacher on test sets flagged eval_teacher=True (default).
+        # OOD/off-domain sets (e.g. geneval/ocr/pickscore during an I2I gedit run) set
+        # eval_teacher=false to skip the expensive 32B-teacher generation there; the
+        # STUDENT is still evaluated on them every eval to track OOD drift. All ranks
+        # derive the same set from config, so the collective structure stays aligned.
+        teacher_test_sets = [
+            name
+            for name in sorted(self.test_dataloaders.keys())
+            if getattr(self._test_sets_by_name.get(name), "eval_teacher", True)
+        ]
+        skipped = sorted(set(self.test_dataloaders.keys()) - set(teacher_test_sets))
+        logger.info(
+            "XOPD: evaluating teacher baseline on %s (eval_teacher=true); "
+            "skipping %s (eval_teacher=false)",
+            teacher_test_sets,
+            skipped or "none",
+        )
         # Batch all test sets into ONE log call so the teacher baseline lands on a
         # single wandb step (step 0), not spread across stepless auto-steps.
         self._eval_log_sink = {}
-        for test_set_name in sorted(self.test_dataloaders.keys()):
+        for test_set_name in teacher_test_sets:
             self._eval_debug_gloo_barrier(f"teacher_test_set:{test_set_name}:begin")
             self._log_eval_dist_debug(test_set_name, "teacher_test_set:begin")
             self._evaluate_teacher_test_set(test_set_name)
@@ -2880,10 +2896,13 @@ class XOPDTrainer(BaseTrainer):
             teacher_text_cond = self._build_teacher_text_cond(batch)
             for timestep_index in step_indices:
                 t = batch["timesteps"][:, timestep_index]
+                # Final timestep has no successor -> t_next=0. Must stay BATCHED
+                # (shape [B], like t): the I2I ragged fallback in the adapter
+                # indexes t_next[idx], which raises on a 0-dim scalar.
                 t_next = (
                     batch["timesteps"][:, timestep_index + 1]
                     if timestep_index + 1 < num_timesteps
-                    else torch.tensor(0, device=device)
+                    else torch.zeros_like(t)
                 )
                 latents = batch["all_latents"][:, latents_index_map[timestep_index]]
                 next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
@@ -3061,10 +3080,13 @@ class XOPDTrainer(BaseTrainer):
             ):
                 with self.accelerator.accumulate(*self.adapter.trainable_components):
                     t = batch["timesteps"][:, timestep_index]
+                    # Final timestep -> t_next=0, kept BATCHED (shape [B], like t):
+                    # the I2I ragged fallback indexes t_next[idx] and a 0-dim
+                    # scalar raises IndexError.
                     t_next = (
                         batch["timesteps"][:, timestep_index + 1]
                         if timestep_index + 1 < num_timesteps
-                        else torch.tensor(0, device=device)
+                        else torch.zeros_like(t)
                     )
                     latents = batch["all_latents"][:, latents_index_map[timestep_index]]
                     next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]

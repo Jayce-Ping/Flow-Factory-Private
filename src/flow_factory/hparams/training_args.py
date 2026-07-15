@@ -88,6 +88,17 @@ class TestSetArguments(ArgABC):
             )
         },
     )
+    eval_teacher: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether the teacher baseline (``eval_teacher_at_start``) is computed on this "
+                "test set. Set false for OOD/off-domain sets (e.g. geneval/ocr/pickscore during "
+                "an I2I gedit run) to skip the expensive teacher generation there while still "
+                "tracking the STUDENT on them over training. Default true (in-domain baseline)."
+            )
+        },
+    )
 
     def __post_init__(self) -> None:
         self.name = _sanitize_test_set_name(self.name)

@@ -232,8 +232,14 @@ class GEditBenchRewardModel(PointwiseRewardModel):
         self.metric = metric
         self.normalize = bool(ek.get("normalize", False))
 
-        self.client = AsyncOpenAI(base_url=self.api_base_url, api_key=self.api_key)
-        self.semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+        # NOTE: the AsyncOpenAI httpx client and the asyncio.Semaphore bind to the
+        # event loop that first touches them. __call__ uses asyncio.run(), which
+        # creates a FRESH loop per batch, so these MUST be created inside the
+        # coroutine (see _async_score_batch) — creating them here binds them to the
+        # first batch's loop and every later batch raises "bound to a different
+        # event loop". Created lazily per-loop instead.
+        self.client: Optional[AsyncOpenAI] = None
+        self.semaphore: Optional[asyncio.Semaphore] = None
 
     @torch.no_grad()
     def __call__(
@@ -281,10 +287,22 @@ class GEditBenchRewardModel(PointwiseRewardModel):
         sources: Sequence[Image.Image],
         edited: Sequence[Image.Image],
     ) -> List[Tuple[float, float, float]]:
-        tasks = [
-            self._score_single(p, s, e) for p, s, e in zip(prompts, sources, edited)
-        ]
-        return list(await asyncio.gather(*tasks))
+        from openai import AsyncOpenAI
+
+        # Bind the client + semaphore to THIS event loop (asyncio.run creates a
+        # fresh loop per __call__). Reusing loop-bound resources across loops
+        # raises "bound to a different event loop"; recreating per batch is safe
+        # because asyncio.run() calls are sequential.
+        self.semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+        async with AsyncOpenAI(
+            base_url=self.api_base_url, api_key=self.api_key
+        ) as client:
+            self.client = client
+            tasks = [
+                self._score_single(p, s, e)
+                for p, s, e in zip(prompts, sources, edited)
+            ]
+            return list(await asyncio.gather(*tasks))
 
     async def _score_single(
         self, prompt: str, source: Image.Image, edited: Image.Image

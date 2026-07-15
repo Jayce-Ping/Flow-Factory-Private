@@ -119,13 +119,17 @@ eval:
   guidance_scale: 1.0
   eval_freq: 20
   seed: 42
+  # OOD/off-domain T2I sets (geneval/ocr/pickscore) set eval_teacher:false -> the STUDENT is
+  # still scored on them every eval (to observe OOD drift as we distill I2I), but the expensive
+  # 32B-teacher baseline generation is skipped there. Only the in-domain gedit sets get a teacher
+  # ceiling line (eval_teacher defaults true).
   test_sets:                              # Same as l1_ocr.yaml, plus geditbench gs1/gs4.
-    - {name: geneval_gs1,   dataset_dir: dataset/geneval,       split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
-    - {name: geneval_gs4,   dataset_dir: dataset/geneval,       split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}
-    - {name: ocr_gs1,       dataset_dir: dataset/ocr,           split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
-    - {name: ocr_gs4,       dataset_dir: dataset/ocr,           split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
-    - {name: pickscore_gs1, dataset_dir: dataset/pickscore,     split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
-    - {name: pickscore_gs4, dataset_dir: dataset/pickscore,     split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,       split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score], eval_teacher: false}
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval,       split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score], eval_teacher: false}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,           split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score], eval_teacher: false}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,           split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score], eval_teacher: false}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore,     split: test, guidance_scale: 1.0, eval_reward_names: [pick_score], eval_teacher: false}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore,     split: test, guidance_scale: 4.0, eval_reward_names: [pick_score], eval_teacher: false}
     - {name: gedit_gs1,     dataset_dir: dataset/geditbench_v2, split: test, guidance_scale: 1.0, eval_reward_names: [geditbench]}
     - {name: gedit_gs4,     dataset_dir: dataset/geditbench_v2, split: test, guidance_scale: 4.0, eval_reward_names: [geditbench]}
 
@@ -142,7 +146,7 @@ rewards:
     device: "cuda"
     dtype: bfloat16
     async_reward: false
-    api_base_url: "http://127.0.0.1:8000/v1"
+    api_base_url: "http://28.7.195.15:8000/v1"   # dedicated vLLM judge node (worker3); training nodes reach it over bond1
     api_key: "EMPTY"
     vlm_model: "Qwen3-VL-8B-Instruct"
     metric: "overall"          # Options: overall (sqrt(SC*PQ)), sc, pq

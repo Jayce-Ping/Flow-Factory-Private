@@ -1,7 +1,10 @@
 #!/bin/bash
-# Canonical 4-node x 8-GPU XOPD launcher (Flow-Factory-Private, 28.7.193.116 + 3 workers).
+# Canonical multi-node x 8-GPU XOPD launcher (Flow-Factory-Private, 28.7.193.116 + N workers).
+# Defaults to the 4-node cluster; set XOPD_WORKERS to run on a subset (e.g. a 2-node run that
+# frees a node for a vLLM judge + a node for keepalive). NUM_MACHINES is derived from the worker
+# list, so the config's num_processes is overridden to NUM_MACHINES * 8 via the env below.
 #
-# Foreground/blocking: launches ranks 1-3 on the workers (ssh, one backgrounded ff-train per
+# Foreground/blocking: launches ranks 1..N-1 on the workers (ssh, one backgrounded ff-train per
 # node) and rank 0 locally in the FOREGROUND, so a caller (scripts/xopd_cluster/run_three_experts.sh)
 # can wait on it and read the exit code. On exit/interrupt it kills the ff-train procs for THIS
 # config on every node so the next run starts from a clean slate.
@@ -12,6 +15,7 @@
 #
 # Usage:
 #   MASTER_PORT=29570 bash scripts/xopd_cluster/run_4node_xopd.sh <config.yaml> [extra ff-train args...]
+#   XOPD_WORKERS="28.7.185.215" MASTER_PORT=29600 bash scripts/xopd_cluster/run_4node_xopd.sh <cfg>  # 2-node
 #
 # Env knobs (defaults in parens):
 #   MASTER_IP (28.7.193.116)  MASTER_PORT (29540)
@@ -25,7 +29,11 @@ EXTRA="$*"
 
 MASTER_IP=${MASTER_IP:-28.7.193.116}
 MASTER_PORT=${MASTER_PORT:-29540}
-WORKERS=(28.7.185.215 28.7.185.156 28.7.195.15)   # ranks 1,2,3
+# Worker IPs (ranks 1..N-1). Override with XOPD_WORKERS to run on fewer/more nodes,
+# e.g. XOPD_WORKERS="28.7.185.215" -> 2-node run (node0 rank0 + this worker rank1),
+# leaving the other nodes free for a vLLM judge / keepalive. NUM_MACHINES is derived.
+read -r -a WORKERS <<< "${XOPD_WORKERS:-28.7.185.215 28.7.185.156 28.7.195.15}"
+NUM_MACHINES=$((1 + ${#WORKERS[@]}))
 
 NCCL_DEBUG_LEVEL=${NCCL_DEBUG:-WARN}
 GLOO_BARRIER=${FLOW_FACTORY_EVAL_GLOO_BARRIER:-1}
@@ -35,6 +43,11 @@ EVAL_DEBUG=${FLOW_FACTORY_EVAL_DEBUG:-1}
 # no other shell refs inside, so nothing else is accidentally interpolated.
 read -r -d '' COMMON <<EOF || true
 export http_proxy=http://star-proxy.oa.com:3128 https_proxy=http://star-proxy.oa.com:3128
+# Never route intra-cluster traffic through the external proxy: the GEditBench eval reward's
+# OpenAI/httpx client must reach the vLLM judge (a bond1 IP, e.g. 28.7.195.15:8000) DIRECTLY,
+# otherwise every request is proxied to star-proxy and fails (that reward -> nan / eval hang).
+export no_proxy="localhost,127.0.0.1,28.7.195.15,28.7.193.116,28.7.185.215,28.7.185.156"
+export NO_PROXY="\$no_proxy"
 source /opt/conda/etc/profile.d/conda.sh; conda activate ff
 unset PYTHONPATH
 export PYTHONPYCACHEPREFIX=/tmp/ffpyc
@@ -56,7 +69,7 @@ sleep 2
 cd /root/Flow-Factory-Private
 EOF
 
-LAUNCH_ENV="export MASTER_IP=$MASTER_IP MASTER_PORT=$MASTER_PORT NUM_MACHINES=4 GPUS_PER_NODE=8"
+LAUNCH_ENV="export MASTER_IP=$MASTER_IP MASTER_PORT=$MASTER_PORT NUM_MACHINES=$NUM_MACHINES GPUS_PER_NODE=8"
 
 cleanup() {
   echo ">>> [launcher] cleanup: killing ff-train for '$CONFIG' on all nodes"
@@ -69,7 +82,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo ">>> [launcher] config=$CONFIG master=$MASTER_IP:$MASTER_PORT nccl_debug=$NCCL_DEBUG_LEVEL gloo_barrier=$GLOO_BARRIER eval_debug=$EVAL_DEBUG"
+echo ">>> [launcher] config=$CONFIG num_machines=$NUM_MACHINES workers=(${WORKERS[*]}) master=$MASTER_IP:$MASTER_PORT nccl_debug=$NCCL_DEBUG_LEVEL gloo_barrier=$GLOO_BARRIER eval_debug=$EVAL_DEBUG"
 rank=1
 for ip in "${WORKERS[@]}"; do
   echo ">>> [launcher] rank $rank on $ip"
