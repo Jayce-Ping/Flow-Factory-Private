@@ -3,13 +3,15 @@
 # flux2_klein_32b_to_4b_l1_ocr_1kep.yaml EXCEPT the per-step L1 d_k is computed on the RAW
 # VELOCITY: for each timestep MSE ||v_s - v_t||^2 with v = (mu - x_t)/dt (x_t cancels ->
 # ||(mu_s - mu_t)/dt||^2). This removes the dt^2 per-timestep weighting that the default
-# transition-mean (xt) loss carries. Loss-space ratio MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2.
-# See docs/xopd/per_timestep_loss_dominance_theory.tex.
-# Four-way comparison (all OCR data, otherwise identical):
+# transition-mean (xt) loss carries (xt last-step dominance). Empirically MSE(v) >> MSE(xt).
+# Loss-space ratio MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2. See
+# docs/xopd/progress/2026-07-16-loss-space-ablation-plan.md and
+# docs/xopd/per_timestep_loss_dominance_theory.tex.
+# Loss-space peers (all OCR data, otherwise identical):
 #   (1) full-timestep xt-MSE (transition mean, default) = flux2_klein_32b_to_4b_l1_ocr_1kep.yaml
-#   (2) late-timestep  xt-MSE (selective teacher)        = flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml
-#   (3) full-timestep  x0-MSE (clean latent)             = flux2_klein_32b_to_4b_l1_ocr_xspace_1kep.yaml
-#   (4) full-timestep  v-MSE  (raw velocity)             = THIS config
+#   (2) full-timestep v-MSE  (raw velocity)             = THIS config
+#   (3) full-timestep x0-MSE (clean latent)             = flux2_klein_32b_to_4b_l1_ocr_xspace_1kep.yaml
+# Selective is DEFERRED until (2) vs (3); do not chain selective on xt after this run.
 # LoRA (rank 64, alpha 128) on ALL linears. Non-CFG (teacher_gs = student_gs = 1.0); pure L1.
 # FULL eval suite on all 6 test sets. Teacher-baseline eval SKIPPED (reuse the OCR specialist's
 # shared ceiling). Train + eval @ 512px.

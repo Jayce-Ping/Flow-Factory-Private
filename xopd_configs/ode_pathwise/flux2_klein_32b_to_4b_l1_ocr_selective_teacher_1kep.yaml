@@ -1,16 +1,23 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# ABLATION: SELECTIVE TEACHER GUIDANCE on the OCR specialist. Identical to
-# flux2_klein_32b_to_4b_l1_ocr_1kep.yaml EXCEPT the L1 loss only forwards the (expensive
-# 32B) teacher on a few LATE timesteps: per micro-batch (pbs=1 -> per sample) randomly pick
+# ABLATION: SELECTIVE TEACHER GUIDANCE on the OCR specialist. Identical to the chosen
+# full-trajectory OCR loss-space run EXCEPT the L1 loss only forwards the (expensive 32B)
+# teacher on a few LATE timesteps: per micro-batch (pbs=1 -> per sample) randomly pick
 # num_xopd_steps of the last-quarter steps (21..27) and do teacher+student forward only there.
-# Motivation (docs/xopd/progress/2026-07-12-per-timestep-dk-dominance.md): the last 1/4 steps
-# carry ~81% of the d_k signal, so late-only teacher guidance should approach the full OCR
-# specialist at a fraction of the teacher-forward cost. k is FIXED, so GAS = num_batches * k
-# and the one-optimizer-step-per-epoch invariant holds.
+#
+# DEFERRED (2026-07-16): do NOT run this on xt-MSE. Empirically MSE(v) >> MSE(xt) (xt last-step
+# dominance). Next ablate MSE(x0) vs MSE(v); then fork THIS template with xopd_dk_space set to
+# the winner before launching selective. See
+# docs/xopd/progress/2026-07-16-loss-space-ablation-plan.md.
+# Current file still defaults to xt-space (no xopd_dk_space override) — update before use.
+#
+# Motivation (docs/xopd/progress/2026-07-12-per-timestep-dk-dominance.md): under xt-MSE the last
+# 1/4 steps carry ~81% of the d_k signal; late-only teacher may still matter under v/x0 but the
+# loss space must be chosen first. k is FIXED, so GAS = num_batches * k and the
+# one-optimizer-step-per-epoch invariant holds.
 # LoRA (rank 64, alpha 128) on ALL linears. Non-CFG (teacher_gs = student_gs = 1.0); pure L1.
 # FULL eval suite on all 6 test sets (geneval_enhanced/ocr/pickscore x gs1/gs4). Teacher-baseline
 # eval SKIPPED here (eval_teacher_at_start: false): reuse the OCR specialist run's shared ceiling.
-# Train + eval @ 512px. Compare against the full-trajectory OCR specialist (flux2klein_32b_to_4b_l1_ocr_1kep).
+# Train + eval @ 512px.
 
 # ===== Environment =====
 launcher: "accelerate"                    # Launcher. Options: accelerate

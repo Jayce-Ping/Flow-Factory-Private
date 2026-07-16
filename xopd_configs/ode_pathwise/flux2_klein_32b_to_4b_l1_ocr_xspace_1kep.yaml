@@ -1,14 +1,16 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
-# ABLATION: X-SPACE (clean-latent) distillation loss on the OCR specialist. Identical to
-# flux2_klein_32b_to_4b_l1_ocr_1kep.yaml EXCEPT the per-step L1 d_k is computed in CLEAN-LATENT
-# (x0) space instead of transition-mean (v) space: for each timestep convert stu/tea to
-# x0 = x_t - sigma*v and MSE there. This is an ODE-exact sigma^2 per-timestep reweighting of the
-# velocity MSE (d_k^x = (sigma/dt)^2 * d_k^v), up-weighting high-noise/early steps. See
+# ABLATION: X0-SPACE (clean-latent) distillation loss on the OCR specialist. Identical to
+# flux2_klein_32b_to_4b_l1_ocr_vmse_1kep.yaml EXCEPT d_k is MSE ||x0_s-x0_t||^2 with
+# x0 = x_t - sigma*v (ODE-exact sigma^2 reweighting of v-MSE; amplifies early/high-noise steps).
+# Plan (2026-07-16): MSE(v) >> MSE(xt) empirically (xt last-step dominance). Next ablate MSE(x0)
+# vs MSE(v); ONLY THEN pick the winner for selective training. See
+# docs/xopd/progress/2026-07-16-loss-space-ablation-plan.md and
 # docs/xopd/per_timestep_loss_dominance_theory.tex.
-# Three-way comparison (all OCR data, otherwise identical):
-#   (1) full-timestep v-MSE  = flux2_klein_32b_to_4b_l1_ocr_1kep.yaml
-#   (2) late-timestep v-MSE  = flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml
-#   (3) full-timestep x-MSE  = THIS config
+# Loss-space peers (all OCR data, otherwise identical):
+#   (1) full-timestep xt-MSE (default, last-step dominated) = flux2_klein_32b_to_4b_l1_ocr_1kep.yaml
+#   (2) full-timestep v-MSE  (raw velocity)                = flux2_klein_32b_to_4b_l1_ocr_vmse_1kep.yaml
+#   (3) full-timestep x0-MSE (clean latent)                = THIS config
+# Selective (late-timestep) is DEFERRED until (2) vs (3) picks a winner.
 # LoRA (rank 64, alpha 128) on ALL linears. Non-CFG (teacher_gs = student_gs = 1.0); pure L1.
 # FULL eval suite on all 6 test sets. Teacher-baseline eval SKIPPED (reuse the OCR specialist's
 # shared ceiling). Train + eval @ 512px.

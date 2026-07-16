@@ -2,21 +2,22 @@
 # Sequentially run the XOPD capacity + ablation experiments on this 4-node cluster:
 #     Run #1  OCR                     (eval_teacher_at_start: true  -> the ONE shared teacher baseline)
 #     Run #2  geneval_enhanced        (eval_teacher_at_start: false -> reuses Run #1's ceiling)
-#     Run #3  OCR x0-space  (full-timestep clean-latent d_k; xopd_dk_space=x0)
-#     Run #4  OCR selective (late-timestep transition-mean d_k; xopd_train_steps=[21..27], resample_per_batch)
+#     Run #3  OCR x0-space  (full-timestep clean-latent d_k; xopd_dk_space=x0)  -- prefer OTHER cluster
+#     Run #4  OCR selective (late-timestep; DEFERRED until v vs x0 picks winner)
 #     Run #5  OCR v-space   (full-timestep raw-velocity d_k; xopd_dk_space=v)
 #
-# NOTE: the geneval_enh+ocr MIXED run is trained on a SEPARATE cluster (parallel), so it is NOT
-# in this chain. Runs #3/#4/#5 are the loss-space / timestep ablations vs the Run #1 OCR specialist
-# (all OCR data, otherwise identical). Loss spaces: MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2, where
-# xt (transition mean / next latent) is the default used by Runs #1/#2/#4.
+# Plan (2026-07-16): MSE(v) >> MSE(xt) (xt last-step dominance). Next ablate MSE(x0) vs MSE(v);
+# selective ONLY after that. Prefer launching Run #3 (xspace) on an idle second cluster in parallel
+# with this cluster's Run #5 (vmse). See docs/xopd/progress/2026-07-16-loss-space-ablation-plan.md.
+# NOTE: MIXED trains on a SEPARATE cluster and is NOT in this chain. Loss spaces:
+# MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2 (xt is default for Runs #1/#2/#4 until #4 is re-forked).
 #
 # Resuming / handing off (env):
 #   START_AT=<i>     start the chain at CONFIGS index i (skip already-done runs). Default 0.
+#   STOP_AT=<i>      last CONFIGS index to run (inclusive); empty = run to the end.
 #   WAIT_FOR=<sub>   before starting, WAIT (no kill, no keepalive) until an in-flight ff-train whose
 #                    cmdline contains <sub> finishes -- used to hand off from a run another
-#                    orchestrator launched (e.g. resume after the current geneval_enhanced), without
-#                    disturbing it. Requires that run to end with the completion marker.
+#                    orchestrator launched, without disturbing it. Requires completion marker.
 #
 # Contract:
 #   * Before each run: stop keepalive, rsync repo (src/config/xopd_configs/scripts) to the 3
@@ -32,10 +33,10 @@
 #
 # Usage:
 #   setsid bash scripts/xopd_cluster/run_three_experts.sh > /root/three_experts.log 2>&1 < /dev/null &
-#   # resume after an in-flight geneval, then run x-mse -> selective:
-#   START_AT=2 WAIT_FOR=flux2_klein_32b_to_4b_l1_geneval_enh_1kep setsid bash ... &
-#   # hand off AFTER an in-flight vmse (idx 4) completes, then run ONLY xspace(2) -> selective(3):
-#   START_AT=2 STOP_AT=3 WAIT_FOR=flux2_klein_32b_to_4b_l1_ocr_vmse_1kep setsid bash ... &
+#   # this cluster: only vmse (idx 4), already in flight via START_AT=4
+#   START_AT=4 STOP_AT=4 setsid bash ... &
+#   # other / idle cluster: only x0-MSE (idx 2) — DO NOT chain selective yet
+#   START_AT=2 STOP_AT=2 setsid bash ... &
 set -uo pipefail
 REPO=/root/Flow-Factory-Private
 cd "$REPO"

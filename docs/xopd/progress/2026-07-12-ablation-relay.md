@@ -20,11 +20,11 @@ Loss-space / timestep ablations vs the OCR specialist (all OCR data, otherwise i
 Theory: [`../per_timestep_loss_dominance_theory.tex`](../per_timestep_loss_dominance_theory.tex).
 
 ## Auto-relay on THIS cluster ([run_three_experts.sh](../../scripts/xopd_cluster/run_three_experts.sh))
-Sequence: OCR (done) -> geneval_enhanced (running) -> **OCR x0-MSE** -> **OCR selective late-xt** -> **OCR v-MSE**.
-The MIXED run is dropped from this chain (it trains on a separate cluster in parallel).
+**Superseded 2026-07-16** — see [`2026-07-16-loss-space-ablation-plan.md`](2026-07-16-loss-space-ablation-plan.md).
 
-Live hand-off (2026-07-12): the original orchestrator (chain ending in mixed) was replaced while
-geneval_enhanced was mid-run. The new orchestrator uses `WAIT_FOR=<geneval config>` to block
-(without killing geneval or touching keepalive) until geneval finishes, then `START_AT=2` runs the
-x0-MSE, selective, and v-MSE ablations. `WAIT_FOR` requires the awaited run to end with the completion
-marker (else abort). Each ablation reuses the OCR run's teacher ceiling (eval_teacher_at_start=false).
+Revised order: OCR (done) -> geneval_enhanced (done) -> **OCR v-MSE** (this cluster) in parallel with
+**OCR x0-MSE** (idle / other cluster). **Selective is deferred** until v vs x0 picks a winner
+(do not auto-chain selective on xt after vmse).
+
+Historical (2026-07-12): chain was OCR -> geneval_enhanced -> x0-MSE -> selective late-xt -> v-MSE;
+that selective-on-xt step is cancelled.
