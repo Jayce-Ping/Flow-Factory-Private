@@ -50,6 +50,11 @@ export no_proxy="localhost,127.0.0.1,28.7.195.15,28.7.193.116,28.7.185.215,28.7.
 export NO_PROXY="\$no_proxy"
 source /opt/conda/etc/profile.d/conda.sh; conda activate ff
 unset PYTHONPATH
+# Defensive: a launching shell with CUDA_VISIBLE_DEVICES="" (empty) makes torch see 0 GPUs on
+# rank0 (accelerate passes it through), so node0's ranks never build a CUDA context and the
+# 32-rank NCCL rendezvous DEADLOCKS (workers use fresh ssh sessions and are unaffected). Clear it
+# so every rank sees all 8 local GPUs and binds by LOCAL_RANK.
+unset CUDA_VISIBLE_DEVICES
 export PYTHONPYCACHEPREFIX=/tmp/ffpyc
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0

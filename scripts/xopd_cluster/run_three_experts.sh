@@ -34,6 +34,8 @@
 #   setsid bash scripts/xopd_cluster/run_three_experts.sh > /root/three_experts.log 2>&1 < /dev/null &
 #   # resume after an in-flight geneval, then run x-mse -> selective:
 #   START_AT=2 WAIT_FOR=flux2_klein_32b_to_4b_l1_geneval_enh_1kep setsid bash ... &
+#   # hand off AFTER an in-flight vmse (idx 4) completes, then run ONLY xspace(2) -> selective(3):
+#   START_AT=2 STOP_AT=3 WAIT_FOR=flux2_klein_32b_to_4b_l1_ocr_vmse_1kep setsid bash ... &
 set -uo pipefail
 REPO=/root/Flow-Factory-Private
 cd "$REPO"
@@ -41,6 +43,9 @@ WORKERS=(28.7.185.215 28.7.185.156 28.7.195.15)
 LAUNCHER=scripts/xopd_cluster/run_4node_xopd.sh
 STALL_SECS=${STALL_SECS:-5400}          # 90 min with no rank0 log write -> hung
 START_AT=${START_AT:-0}                 # CONFIGS index to start at (skip completed runs)
+STOP_AT=${STOP_AT:-}                    # LAST CONFIGS index to run (inclusive); empty = run to the end.
+                                        # Use with START_AT to run a contiguous sub-range, e.g.
+                                        # START_AT=2 STOP_AT=3 runs only indices 2,3 (skips a trailing run).
 WAIT_FOR=${WAIT_FOR:-}                  # await an in-flight ff-train (cmdline substring) before starting
 SYNC_PATHS="src config xopd_configs scripts"
 HASH_CMD='cd /root/Flow-Factory-Private && find src config xopd_configs scripts -type f ! -path "*/__pycache__/*" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64'
@@ -143,6 +148,10 @@ for i in "${!CONFIGS[@]}"; do
   if [ "$i" -lt "$START_AT" ]; then
     log "SKIP index $i ($(basename "${CONFIGS[$i]%%:*}" .yaml)) < START_AT=$START_AT"
     continue
+  fi
+  if [ -n "$STOP_AT" ] && [ "$i" -gt "$STOP_AT" ]; then
+    log "STOP: index $i > STOP_AT=$STOP_AT -> chain sub-range done"
+    break
   fi
   entry="${CONFIGS[$i]}"
   cfg="${entry%%:*}"; port="${entry##*:}"; name=$(basename "$cfg" .yaml)
