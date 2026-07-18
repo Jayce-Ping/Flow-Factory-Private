@@ -897,11 +897,41 @@ class XOPDTrainer(BaseTrainer):
         epoch = getattr(self, "epoch", 0)
         if getattr(self, "_xopd_tts_cache_epoch", None) != epoch:
             g = torch.Generator().manual_seed(int(epoch) + int(ta.seed))
-            sel = torch.randperm(len(pool), generator=g)[: ta.num_xopd_steps]
-            sel = sorted(sel.tolist())  # ascending trajectory order
+            if ta.xopd_step_sampling == "stratified":
+                sel = self._stratified_pool_indices(len(pool), ta.num_xopd_steps, g)
+            else:
+                sel = sorted(
+                    torch.randperm(len(pool), generator=g)[: ta.num_xopd_steps].tolist()
+                )  # ascending trajectory order
             self._xopd_tts_cache = [pool[i] for i in sel]
             self._xopd_tts_cache_epoch = epoch
         return self._xopd_tts_cache
+
+    @staticmethod
+    def _stratified_pool_indices(n_pool: int, k: int, generator) -> List[int]:
+        """Split ``range(n_pool)`` into k contiguous equal segments and pick one random
+        index per segment (ascending). Guarantees one step from each k-quantile of the
+        trajectory (e.g. n_pool=28, k=4 -> one index from each of [0,7) [7,14) [14,21)
+        [21,28)). Boundaries via ``round(i*n_pool/k)`` so uneven splits differ by <=1.
+        """
+        if not isinstance(k, int) or k < 1:
+            raise ValueError(f"stratified sampling: k must be a positive int, got {k!r}.")
+        if k > n_pool:
+            raise ValueError(
+                f"stratified sampling: k={k} cannot exceed pool size n_pool={n_pool} "
+                "(need at least one candidate step per segment)."
+            )
+        bounds = [round(i * n_pool / k) for i in range(k + 1)]
+        out: List[int] = []
+        for j in range(k):
+            lo, hi = bounds[j], bounds[j + 1]
+            if hi <= lo:
+                raise ValueError(
+                    f"stratified sampling: empty segment {j} ([{lo},{hi})) for "
+                    f"n_pool={n_pool}, k={k}."
+                )
+            out.append(int(torch.randint(lo, hi, (1,), generator=generator).item()))
+        return out  # already ascending (segments are contiguous & ascending)
 
     @property
     def _candidate_train_timestep_indices(self) -> List[int]:
@@ -933,8 +963,11 @@ class XOPDTrainer(BaseTrainer):
             return list(pool)
         epoch = int(getattr(self, "epoch", 0))
         g = torch.Generator().manual_seed(int(ta.seed) + 100003 * epoch + 97 * int(batch_idx))
-        sel = torch.randperm(len(pool), generator=g)[:k].tolist()
-        return [pool[i] for i in sorted(sel)]
+        if ta.xopd_step_sampling == "stratified":
+            sel = self._stratified_pool_indices(len(pool), k, g)
+        else:
+            sel = sorted(torch.randperm(len(pool), generator=g)[:k].tolist())
+        return [pool[i] for i in sel]
 
     @property
     def enable_kl_loss(self) -> bool:

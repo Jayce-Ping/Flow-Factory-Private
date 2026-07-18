@@ -2627,6 +2627,23 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    xopd_step_sampling: Literal["uniform", "stratified"] = field(
+        default="uniform",
+        metadata={
+            "help": (
+                "L1-ONLY: how the ``num_xopd_steps`` (=k) trained timesteps are drawn from "
+                "the candidate pool (``xopd_train_steps`` positions, or the full base list).\n"
+                " 'uniform' (default) => k steps drawn uniformly at random from the whole pool "
+                "(legacy behavior; a draw can cluster in one region).\n"
+                " 'stratified' => split the pool into k CONTIGUOUS equal segments (quantiles of "
+                "the trajectory) and pick exactly ONE random step per segment, guaranteeing one "
+                "step from each k-quantile every draw (e.g. pool=range(28), k=4 => one random "
+                "step from each of [0,7) [7,14) [14,21) [21,28)). Applies to both the per-epoch "
+                "subset and (with xopd_resample_steps_per_batch) the per-micro-batch draw. "
+                "Requires ``num_xopd_steps`` <= pool size (validated)."
+            )
+        },
+    )
     xopd_dk_space: Literal["v", "xt", "x0"] = field(
         default="xt",
         metadata={
@@ -2836,6 +2853,12 @@ class XOPDTrainingArguments(TrainingArguments):
                 "per-batch resampling draws exactly k steps each micro-batch so GAS = "
                 "num_batches_per_epoch * k stays fixed (one optimizer step/epoch). "
                 "Got num_xopd_steps=None."
+            )
+        if self.xopd_step_sampling == "stratified" and self.num_xopd_steps is None:
+            raise ValueError(
+                "`xopd_step_sampling='stratified'` requires a fixed `num_xopd_steps` (k): "
+                "the pool is split into exactly k contiguous quantile segments, one random "
+                "step per segment. Got num_xopd_steps=None."
             )
         # Student guidance drives sampling and the gradient-bearing forward; sync
         # it into the base `guidance_scale` field consumed by adapter.inference.
