@@ -220,6 +220,16 @@ class ModelArguments(ArgABC):
                           "the blend) or 'sample' (run only the top-k experts each sample routed to; at "
                           "per_device_batch_size=1 this is exactly top-k forwards)."},
     )
+    mof_dense_exec: bool = field(
+        default=False,
+        metadata={"help": "MoF-V FSDP-safe execution for route_granularity='sample' with top_k<num_experts: run "
+                          "EVERY expert on ALL samples each step (uniform all-gather across ranks) and blend by the "
+                          "top-k renormalized weights (top_k=1 -> hard one-hot per sample). Preserves per-sample "
+                          "top-k SELECTION semantics + load-balance aux while avoiding the divergent FSDP "
+                          "collective that the default sparse path (which skips experts no local sample routed to) "
+                          "would deadlock on when the experts are FSDP-sharded. Costs N/top_k x the forward compute. "
+                          "Leave False for plain DDP (replicated experts) where the sparse path is safe and cheaper."},
+    )
     mof_expert_mode: Literal['distinct', 'shared_lora'] = field(
         default='distinct',
         metadata={"help": "MoF-V expert storage: 'distinct' (N independent full transformers; full-FT or "

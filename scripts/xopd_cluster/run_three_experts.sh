@@ -37,6 +37,11 @@
 #   START_AT=4 STOP_AT=4 setsid bash ... &
 #   # other / idle cluster: only x0-MSE (idx 2) — DO NOT chain selective yet
 #   START_AT=2 STOP_AT=2 setsid bash ... &
+#   # RELAY the MoF2-FSDP run (idx 5) AFTER the in-flight strat4 run finishes (waits for its
+#   # "Training completed successfully" marker; does NOT kill it):
+#   WAIT_FOR=strat4 START_AT=5 STOP_AT=5 setsid bash scripts/xopd_cluster/run_three_experts.sh \
+#     > /root/mof2_fsdp_relay.log 2>&1 < /dev/null &
+#   # (Run #5 = MoF 2xbase, geneval+ocr MIX, FSDP HYBRID_SHARD student + replicated 32B teacher, full-timestep MSE(v).)
 set -uo pipefail
 REPO=/root/Flow-Factory-Private
 cd "$REPO"
@@ -58,6 +63,7 @@ CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_xspace_1kep.yaml:29573"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml:29574"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_vmse_1kep.yaml:29575"
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_1kep.yaml:29585"
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }

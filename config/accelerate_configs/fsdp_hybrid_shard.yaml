@@ -1,0 +1,26 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+downcast_bf16: 'no'
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_offload_params: false
+  # HYBRID_SHARD: shard the (FSDP-prepared) student WITHIN each node (across its 8 GPUs) and
+  # REPLICATE across nodes. FSDP1 auto-builds the intra-node shard group (= gpus_per_node) and
+  # the inter-node replicate group from the launch topology (ranks assigned node-contiguously by
+  # machine_rank), so no explicit device mesh is needed. Only the module passed to
+  # accelerator.prepare (the MoF student) is sharded; the XOPD teacher is loaded separately and
+  # NOT prepared, so it stays one-per-GPU (replicated), as intended.
+  fsdp_sharding_strategy: HYBRID_SHARD
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: false  # false: let every rank load frozen weights (teacher/text-encoder) for preprocessing
+  fsdp_activation_checkpointing: true     # ON (safety): dense_exec runs BOTH experts each step and LoRA does NOT reduce ACTIVATION memory
+                                          # (grad flows through the frozen base to the adapter inputs), so AC caps activation peak next to the
+                                          # 64GB replicated teacher. Keep model-side enable_gradient_checkpointing: false to avoid double-wrapping.
+machine_rank: 0
+num_machines: 1
+num_processes: 8
+mixed_precision: bf16
