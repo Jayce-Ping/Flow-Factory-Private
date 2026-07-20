@@ -56,6 +56,10 @@ unset PYTHONPATH
 # so every rank sees all 8 local GPUs and binds by LOCAL_RANK.
 unset CUDA_VISIBLE_DEVICES
 export PYTHONPYCACHEPREFIX=/tmp/ffpyc
+# OOM mitigation (2026-07-20): MoF-2 FSDP run OOM'd in epoch-1 backward (94.54/95 GiB used, only
+# 484 MiB short with 1.76 GiB reserved-but-unallocated = allocator fragmentation). expandable_segments
+# reclaims that fragmentation so the borderline peak fits. Applies to rank0 (eval "\$COMMON") + workers.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_GID_INDEX=3 NCCL_IB_SL=3 NCCL_IB_TC=160

@@ -63,6 +63,10 @@ model:
   mof_router_input: "prompt"              # route by prompt/domain (drives per-domain expert specialization)
   mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry
   mof_dense_exec: true                    # FSDP-safe: run EVERY expert on ALL samples (uniform all-gather), keep top-1 one-hot weights + aux
+  # --- torch.compile (per-block in-place nn.Module.compile: keeps block class -> FSDP per-block wrap, and state_dict keys -> LoRA save/load unchanged) ---
+  compile_teacher: true                   # compile frozen 32B teacher (no-grad/not-saved) -> speed up sampling / teacher-mean precompute
+  compile_student: true                   # compile each MoF expert's blocks -> speed up train forward/backward (dense_exec's static expert loop is compile-friendly)
+  compile_mode: "default"                 # 'default' (safe); avoid 'reduce-overhead' here (CUDA graphs use MORE memory next to the replicated teacher)
 
 # ===== Logging =====
 log:
@@ -130,7 +134,7 @@ train:
 
   enable_gradient_checkpointing: false    # model-side AC OFF to avoid double-wrapping; AC is done FSDP-side
                                           # (fsdp_activation_checkpointing: true) as a safety margin (dense_exec runs both experts each step).
-  offload_samples_to_cpu: false
+  offload_samples_to_cpu: true            # OOM mitigation (2026-07-20): keep the 28-step sampled trajectory on CPU during the train pass -> frees GPU headroom next to the replicated 32B teacher
   seed: 42
 
 # ===== Scheduler =====

@@ -128,6 +128,7 @@ class Flux2KleinAdapter(BaseAdapter):
             )
         self._maybe_build_moe_transformer(pipeline)
         self._maybe_build_mof_transformer(pipeline)
+        self._maybe_compile_student(pipeline)
         return pipeline
 
     def _maybe_build_moe_transformer(self, pipeline: Flux2KleinPipeline) -> None:
@@ -239,6 +240,49 @@ class Flux2KleinAdapter(BaseAdapter):
             f"(num_experts={mof.config.num_experts}, top_k={mof.config.top_k}, "
             f"granularity={mof.config.route_granularity}, router={mof.config.router_type})"
         )
+
+    @staticmethod
+    def _region_compile_blocks(module: torch.nn.Module, mode: str, tag: str) -> int:
+        """In-place ``torch.compile`` every transformer block of ``module`` via
+        ``nn.Module.compile`` (NOT ``torch.compile(module)``): this compiles each block's
+        forward WITHOUT wrapping it in an ``OptimizedModule``, so the block's CLASS is unchanged
+        (FSDP ``TRANSFORMER_BASED_WRAP`` still shards per block) and its ``state_dict`` keys are
+        unchanged (no ``_orig_mod`` prefix -> LoRA save/load and component-swap stay valid).
+        Compile is lazy, so the first forward traces the post-LoRA / post-FSDP graph."""
+        n = 0
+        for attr in ("transformer_blocks", "single_transformer_blocks"):
+            blocks = getattr(module, attr, None)
+            if blocks is None:
+                continue
+            for blk in blocks:
+                blk.compile(mode=mode, dynamic=False)
+                n += 1
+        if n:
+            logger.info(
+                f"[torch.compile] {tag}: region-compiled {n} transformer blocks "
+                f"(mode={mode}, dynamic=False, in-place)."
+            )
+        return n
+
+    def _maybe_compile_student(self, pipeline: Flux2KleinPipeline) -> None:
+        """Region-compile the trainable student transformer blocks when ``model_args.compile_student``.
+        Runs BEFORE LoRA / ``accelerator.prepare``; in-place block compile keeps FSDP per-block
+        wrapping and LoRA checkpoint keys intact. For MoF-V every expert (distinct) or the shared
+        base (shared_lora) is compiled; otherwise the plain student transformer is compiled."""
+        if not getattr(self.model_args, "compile_student", False):
+            return
+        mode = getattr(self.model_args, "compile_mode", "default")
+        tf = pipeline.transformer
+        experts = getattr(tf, "experts", None)
+        total = 0
+        if experts is not None:  # MoF-V distinct: N independent transformers
+            for i, ex in enumerate(experts):
+                total += self._region_compile_blocks(ex, mode, f"student-expert{i}")
+        elif getattr(tf, "base", None) is not None:  # MoF-V shared_lora: one base + adapters
+            total += self._region_compile_blocks(tf.base, mode, "student-base")
+        else:  # plain (non-MoF) student
+            total += self._region_compile_blocks(tf, mode, "student")
+        logger.info(f"[torch.compile] student: {total} transformer blocks compiled (mode={mode}).")
 
     def collect_moe_aux_loss(self) -> Optional[torch.Tensor]:
         """MoE / MoF load-balancing aux loss from the last student forward, or None if the
@@ -1591,6 +1635,16 @@ class Flux2KleinAdapter(BaseAdapter):
         teacher.requires_grad_(False)
         teacher.eval()
         teacher.to(device)
+
+        # Optional torch.compile of the frozen teacher (inference-only / no-grad, NOT saved).
+        # Per-block in-place compile keeps the module class + state_dict keys unchanged, so the
+        # use_teacher_transformer() component-swap and the FSDP-bundle path stay valid. Pure
+        # speedup for the sampling / teacher-mean precompute phase; no memory saving (no-grad
+        # stores no activations). Compiles lazily on first forward.
+        if getattr(self.model_args, "compile_teacher", False):
+            mode = getattr(self.model_args, "compile_mode", "default")
+            self._region_compile_blocks(teacher, mode, "teacher")
+
         self._teacher_transformer = teacher
 
         logger.info(

@@ -230,6 +230,29 @@ class ModelArguments(ArgABC):
                           "would deadlock on when the experts are FSDP-sharded. Costs N/top_k x the forward compute. "
                           "Leave False for plain DDP (replicated experts) where the sparse path is safe and cheaper."},
     )
+    # ---- torch.compile (region compile of transformer blocks; in-place nn.Module.compile) ----
+    compile_teacher: bool = field(
+        default=False,
+        metadata={"help": "torch.compile the frozen XOPD teacher transformer (per-block, in-place nn.Module.compile). "
+                          "Teacher is inference-only/no-grad and NOT saved, so this is low-risk pure speedup for the "
+                          "sampling / teacher-mean precompute phase. In-place compile keeps the module class + "
+                          "state_dict keys unchanged (no _orig_mod), so component-swap and checkpointing are unaffected."},
+    )
+    compile_student: bool = field(
+        default=False,
+        metadata={"help": "torch.compile the trainable student transformer blocks (per-block, in-place "
+                          "nn.Module.compile). In-place compile leaves each block's CLASS unchanged so FSDP "
+                          "TRANSFORMER_BASED_WRAP still shards per block, and leaves state_dict keys unchanged "
+                          "(no _orig_mod) so LoRA save/load is unaffected. For MoF-V every expert's blocks are "
+                          "compiled. dense_exec's static per-expert loop is compile-friendly; sparse routing is not."},
+    )
+    compile_mode: str = field(
+        default="default",
+        metadata={"help": "torch.compile mode for compile_teacher/compile_student: 'default', 'reduce-overhead' "
+                          "(CUDA graphs; faster but MORE memory + fixed shapes), or 'max-autotune'. Compiled with "
+                          "dynamic=False (static T2I @512 shapes); fullgraph=False to tolerate diffusers cache_context "
+                          "and the MoF Python expert loop graph breaks."},
+    )
     mof_expert_mode: Literal['distinct', 'shared_lora'] = field(
         default='distinct',
         metadata={"help": "MoF-V expert storage: 'distinct' (N independent full transformers; full-FT or "
