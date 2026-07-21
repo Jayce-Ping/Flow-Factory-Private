@@ -6,11 +6,13 @@
 #      nodes). Only the accelerator.prepare'd student is sharded.
 #   2. Teacher stays ONE-per-GPU (fsdp_shard_teacher: false -> loaded separately, NOT prepared, so
 #      NOT sharded). This is the "teacher replicated, student sharded" split the user asked for.
-#   3. mof_dense_exec: true -- REQUIRED under FSDP. per-sample top-1 routing normally runs only the
-#      routed expert per rank; with sharded experts that issues DIVERGENT all-gathers across ranks
-#      (rank A gathers expert0, rank B gathers expert1) -> NCCL DEADLOCK. dense_exec runs EVERY
-#      expert on ALL samples (uniform all-gather) but keeps the top-1 one-hot weighting + load-balance
-#      aux, so per-sample top-1 SELECTION/specialization is preserved (cost: 2x student forward).
+#   3. mof_dense_exec + mof_soft_blend: true -- REQUIRED under FSDP. per-sample top-1 routing normally
+#      runs only the routed expert per rank; with sharded experts that issues DIVERGENT all-gathers
+#      across ranks -> NCCL DEADLOCK. Both flags run EVERY expert on ALL samples (uniform all-gather).
+#      soft_blend blends by the FULL softmax (out = sum_e P_e * v_e) instead of a hard top-1 one-hot:
+#      the argmax is non-differentiable, so hard top-1 gave the router head ZERO main-loss gradient
+#      (it stayed uniform 0.5/0.5 -> experts never specialized). Soft blend makes routing DIFFERENTIABLE
+#      so the distillation loss can drive per-domain specialization (cost: 2x student forward).
 #   4. d_k loss = MSE(v) on ALL timesteps (xopd_dk_space: v; no xopd_train_steps/num_xopd_steps).
 #   5. MIXED data: source_ratio 1:1 over {geneval_enhanced, ocr} with unique_sample_num_per_epoch=256
 #      -> 128 prompts/domain/epoch (SAME per-domain exposure as each specialist run and the plain
@@ -62,7 +64,11 @@ model:
   mof_router_type: "global"               # per-sample gate
   mof_router_input: "prompt"              # route by prompt/domain (drives per-domain expert specialization)
   mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry
-  mof_dense_exec: true                    # FSDP-safe: run EVERY expert on ALL samples (uniform all-gather), keep top-1 one-hot weights + aux
+  mof_dense_exec: true                    # FSDP-safe: run EVERY expert on ALL samples (uniform all-gather)
+  mof_soft_blend: true                    # DIFFERENTIABLE router: blend experts by FULL softmax (out=sum_e P_e*v_e) instead of hard top-1
+                                          # one-hot. The argmax is non-differentiable -> with hard top-1 the main loss gives the router head
+                                          # ZERO gradient (router stays uniform 0.5/0.5, experts never specialize). Soft blend lets the main
+                                          # loss push per-domain specialization; runs all experts (uniform -> FSDP-safe, same graph as dense_exec).
   # --- torch.compile (per-block in-place nn.Module.compile: keeps block class -> FSDP per-block wrap, and state_dict keys -> LoRA save/load unchanged) ---
   compile_teacher: true                   # compile frozen 32B teacher (no-grad/not-saved) -> speed up sampling / teacher-mean precompute
   compile_student: true                   # compile each MoF expert's blocks -> speed up train forward/backward (dense_exec's static expert loop is compile-friendly)
@@ -70,7 +76,7 @@ model:
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_mof2_mix_fsdp_vmse_1kep"
+  run_name: "flux2klein_32b_to_4b_mof2_mix_fsdp_vmse_soft_1kep"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"

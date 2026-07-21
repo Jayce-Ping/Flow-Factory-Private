@@ -182,6 +182,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         router_input: str = "prompt",
         expert_mode: str = "distinct",
         dense_exec: bool = False,
+        soft_blend: bool = False,
     ):
         super().__init__()
         if route_granularity not in ("token", "sample"):
@@ -369,6 +370,21 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
                 **kw,
             )[0]
 
+        if getattr(self.config, "soft_blend", False):
+            # DIFFERENTIABLE routing: blend EVERY expert by the FULL softmax weights
+            # (out = sum_e P_e * v_e), so the router head receives gradient from the MAIN loss
+            # (the hard top-k argmax below is non-differentiable -> router would never move).
+            # Every expert runs on ALL samples (uniform all-gather) -> FSDP-safe, identical graph
+            # to dense_exec. The top-1 argmax is still returned for the load-balance aux + logging.
+            out: Optional[torch.Tensor] = None
+            allidx = torch.arange(B, device=hidden_states.device)
+            for e in range(n):
+                v_e = _run(e, allidx)
+                we = probs[:, e].view(B, *([1] * (v_e.ndim - 1))).to(v_e.dtype)
+                out = we * v_e if out is None else out + we * v_e
+            topi = torch.topk(probs, k, dim=-1)[1]
+            return out, topi
+
         if k >= n:
             out: Optional[torch.Tensor] = None
             allidx = torch.arange(B, device=hidden_states.device)
@@ -495,7 +511,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _mof_config_from_base(base, num_experts, top_k, route_granularity, router_type,
                              router_hidden_dim, expert_mode="distinct", router_input="prompt",
-                             dense_exec=False) -> dict:
+                             dense_exec=False, soft_blend=False) -> dict:
         bc = dict(base.config)
         return dict(
             patch_size=bc["patch_size"], in_channels=bc["in_channels"], out_channels=bc.get("out_channels"),
@@ -506,7 +522,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             eps=bc["eps"], guidance_embeds=bc.get("guidance_embeds", False),
             num_experts=num_experts, top_k=top_k, route_granularity=route_granularity,
             router_type=router_type, router_hidden_dim=router_hidden_dim, expert_mode=expert_mode,
-            router_input=router_input, dense_exec=dense_exec,
+            router_input=router_input, dense_exec=dense_exec, soft_blend=soft_blend,
         )
 
     @classmethod
@@ -522,6 +538,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         expert_mode: str = "distinct",
         router_input: str = "prompt",
         dense_exec: bool = False,
+        soft_blend: bool = False,
     ) -> "Flux2VelocityMoFTransformer2DModel":
         """Init: replicate the base transformer into the experts (each a verbatim copy of the base,
         so the ensemble == base at init when the router is uniform).
@@ -539,7 +556,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             )
         model = cls(**cls._mof_config_from_base(
             base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode,
-            router_input, dense_exec))
+            router_input, dense_exec, soft_blend))
         base_sd = base.state_dict()
         with torch.no_grad():
             if expert_mode == "shared_lora":

@@ -230,6 +230,17 @@ class ModelArguments(ArgABC):
                           "would deadlock on when the experts are FSDP-sharded. Costs N/top_k x the forward compute. "
                           "Leave False for plain DDP (replicated experts) where the sparse path is safe and cheaper."},
     )
+    mof_soft_blend: bool = field(
+        default=False,
+        metadata={"help": "MoF-V DIFFERENTIABLE routing: blend ALL experts by the FULL router softmax "
+                          "weights (out = sum_e P_e * v_e) instead of the hard top-k one-hot. Makes the router "
+                          "receive gradient from the MAIN distillation loss (the hard top-k argmax is "
+                          "non-differentiable -> the router logit head never moves -> experts never "
+                          "specialize / one expert stays dead). Runs every expert on all samples (uniform "
+                          "-> FSDP-safe, same graph/activation cost as dense_exec's 0*v masking, so ~no extra "
+                          "memory). Overrides top_k for the blend; the top-1 argmax is still logged and used "
+                          "for the load-balance aux. Recommended with mof_dense_exec for FSDP-sharded experts."},
+    )
     # ---- torch.compile (region compile of transformer blocks; in-place nn.Module.compile) ----
     compile_teacher: bool = field(
         default=False,

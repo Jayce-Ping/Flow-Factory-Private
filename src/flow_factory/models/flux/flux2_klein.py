@@ -224,6 +224,7 @@ class Flux2KleinAdapter(BaseAdapter):
             expert_mode=getattr(self.model_args, "mof_expert_mode", "distinct"),
             router_input=getattr(self.model_args, "mof_router_input", "prompt"),
             dense_exec=getattr(self.model_args, "mof_dense_exec", False),
+            soft_blend=getattr(self.model_args, "mof_soft_blend", False),
         )
         if self.model_args.mof_base_transformer_path:
             mof = Flux2VelocityMoFTransformer2DModel.from_base_replicated(
@@ -238,7 +239,8 @@ class Flux2KleinAdapter(BaseAdapter):
         logger.info(
             f"[MoF-V] student transformer -> Flux2VelocityMoFTransformer2DModel "
             f"(num_experts={mof.config.num_experts}, top_k={mof.config.top_k}, "
-            f"granularity={mof.config.route_granularity}, router={mof.config.router_type})"
+            f"granularity={mof.config.route_granularity}, router={mof.config.router_type}, "
+            f"dense_exec={mof.config.dense_exec}, soft_blend={getattr(mof.config, 'soft_blend', False)})"
         )
 
     @staticmethod
