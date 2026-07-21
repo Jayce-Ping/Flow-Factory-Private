@@ -64,6 +64,7 @@ CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_selective_teacher_1kep.yaml:29574"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_vmse_1kep.yaml:29575"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_1kep.yaml:29585"
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_soft_nolb_1kep.yaml:29586"
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }
