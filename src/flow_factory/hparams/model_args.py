@@ -241,6 +241,31 @@ class ModelArguments(ArgABC):
                           "memory). Overrides top_k for the blend; the top-1 argmax is still logged and used "
                           "for the load-balance aux. Recommended with mof_dense_exec for FSDP-sharded experts."},
     )
+    mof_topk_sparse: bool = field(
+        default=False,
+        metadata={"help": "MoF-V modern-MoE routing: SELECTIVE (sparse) expert activation that is STILL "
+                          "differentiable AND FSDP-deadlock-free. Every rank loops over ALL experts in the "
+                          "same order (uniform FSDP param all-gather -> no divergent-collective deadlock), but "
+                          "each expert only computes the samples ROUTED to it (index_select -> ~top_k/N x the "
+                          "FLOPs + activation memory of dense_exec/soft_blend; a rank with 0 routed samples for "
+                          "an expert still invokes it on 1 zero-weight dummy so the all-gather stays uniform). "
+                          "The gate is differentiable: top_k>=2 renormalizes the selected gates (Mixtral-style, "
+                          "both/all in (0,1) -> router gets main-loss gradient); top_k==1 uses a STRAIGHT-THROUGH "
+                          "one-hot (forward weight=1.0 -> correct velocity scale; backward gradient flows through "
+                          "the softmax gate -> router still trains). Preferred over soft_blend when N>top_k (real "
+                          "sparse specialization); with N==2,top_k==1 it mainly halves compute vs soft_blend. "
+                          "Takes precedence over soft_blend/dense_exec."},
+    )
+    mof_gate_fn: str = field(
+        default="softmax",
+        metadata={"help": "MoF-V router gate function: 'softmax' (coupled experts compete, gates sum to 1 "
+                          "-> convex velocity blend; the classic MoF) or 'sigmoid' (DeepSeek-V3-style INDEPENDENT "
+                          "per-expert gate in (0,1) that does NOT sum to 1). With 'sigmoid' + topk_sparse the "
+                          "selected gate value is used DIRECTLY as the blend weight (no renorm / no straight-through), "
+                          "so routing is naturally differentiable and the output velocity magnitude is FREE -- kept in "
+                          "range by MSE(v) self-regularization + optional router_z_loss / weight-sum penalty instead of "
+                          "a hard sum-to-1. 'softmax' keeps the old normalized behavior (STE for top-1, renorm for top-k)."},
+    )
     # ---- torch.compile (region compile of transformer blocks; in-place nn.Module.compile) ----
     compile_teacher: bool = field(
         default=False,

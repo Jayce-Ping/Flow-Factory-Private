@@ -64,8 +64,9 @@ class MoFGlobalRouter(nn.Module):
     * ``fused_xattn`` : ``c_p + g(temb) * xattn(q<-[c_p,temb], kv<-latent)`` -- a prompt(+t)-conditioned,
       content/spatially-aware readout of the latent, plus a timestep gate.
 
-    All modes: ``logits = MLP([t_proj(temb), c]); softmax``. The MLP head is zero-init -> UNIFORM
-    mixture at start (== the base flow model). For the fused modes the latent-feature output is ALSO
+    All modes return RAW ``logits = MLP([t_proj(temb), c])`` (the caller applies softmax or sigmoid
+    per ``gate_fn``). The MLP head is zero-init -> UNIFORM softmax / 0.5 sigmoid at start (== the base
+    flow model). For the fused modes the latent-feature output is ALSO
     zero-init, so training starts identical to the prompt-only router and folds in the latent only as
     it helps. ``c_p`` (d_prompt) / ``c_l`` (d_latent=in_channels) are attention-pooled to ``d_hidden``."""
 
@@ -138,8 +139,8 @@ class MoFGlobalRouter(nn.Module):
                 attn = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B, Sl, 1)
                 ctx = (attn * v).sum(dim=1)  # (B, d_hidden)
                 c = c + torch.sigmoid(self.gate(temb)) * self.o_proj(ctx)
-        logits = self.mlp(torch.cat([t, c], dim=-1))  # (B, N)
-        return torch.softmax(logits.float(), dim=-1)
+        logits = self.mlp(torch.cat([t, c], dim=-1))  # (B, N) RAW logits (gate fn applied by caller)
+        return logits
 
 
 class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
@@ -183,10 +184,14 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         expert_mode: str = "distinct",
         dense_exec: bool = False,
         soft_blend: bool = False,
+        topk_sparse: bool = False,
+        gate_fn: str = "softmax",
     ):
         super().__init__()
         if route_granularity not in ("token", "sample"):
             raise ValueError(f"route_granularity must be 'token' or 'sample', got {route_granularity!r}")
+        if gate_fn not in ("softmax", "sigmoid"):
+            raise ValueError(f"gate_fn must be 'softmax' or 'sigmoid', got {gate_fn!r}")
         if router_type not in ("token_linear", "global"):
             raise ValueError(f"router_type must be 'token_linear' or 'global', got {router_type!r}")
         if router_input not in MoFGlobalRouter.MODES:
@@ -248,6 +253,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             )
 
         self._last_mof_aux: Optional[torch.Tensor] = None
+        self._last_router_z_loss: Optional[torch.Tensor] = None
+        self._last_weight_sum_penalty: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ aux / router
     def moe_aux_loss(self) -> Optional[torch.Tensor]:
@@ -256,29 +263,64 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         + ``moe_load_balance_coeff`` hook."""
         return self._last_mof_aux
 
-    def _load_balance_aux(self, probs: torch.Tensor, topi: Optional[torch.Tensor]) -> torch.Tensor:
-        """Switch/GShard load balance ``N * sum_e f_e * P_e`` (min at uniform). ``probs`` is
+    def router_z_loss(self) -> Optional[torch.Tensor]:
+        """Mean router z-loss ``logsumexp_e(logits)^2`` from the last forward (ST-MoE): penalizes
+        large router logits -> bounded, stable gates. Scaled by ``router_z_loss_coeff``."""
+        return self._last_router_z_loss
+
+    def weight_sum_penalty(self) -> Optional[torch.Tensor]:
+        """Mean soft sum-to-1 penalty ``(sum_e w_e - 1)^2`` over the SELECTED top-k gate weights
+        from the last forward. Soft replacement for the hard convex constraint (keeps the blended
+        velocity magnitude near the teacher scale). Scaled by ``mof_weight_sum_penalty_coeff``."""
+        return self._last_weight_sum_penalty
+
+    def _gate(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply the configured gate function to raw router logits (last dim = experts).
+        'softmax' -> coupled, sums to 1 (convex); 'sigmoid' -> independent per-expert in (0,1)."""
+        if getattr(self.config, "gate_fn", "softmax") == "sigmoid":
+            return torch.sigmoid(logits.float())
+        return torch.softmax(logits.float(), dim=-1)
+
+    def _load_balance_aux(self, gates: torch.Tensor, topi: Optional[torch.Tensor]) -> torch.Tensor:
+        """Switch/GShard load balance ``N * sum_e f_e * P_e`` (min at uniform). ``gates`` is
         (..., N); ``topi`` is (..., k) of selected experts or None (dense -> constant, no grad).
-        Works for per-token (B,S,N)+(B,S,k) and per-sample (B,N)+(B,k)."""
+        Works for per-token (B,S,N)+(B,S,k) and per-sample (B,N)+(B,k). Non-softmax (sigmoid)
+        gates are renormalized to a distribution first so P_e is a proper mean probability."""
         n = self.config.num_experts
-        me = probs.reshape(-1, n).mean(dim=0)  # P_e (mean router prob)
+        dist = gates / gates.sum(dim=-1, keepdim=True).clamp_min(1e-9)  # -> distribution (softmax: no-op)
+        me = dist.reshape(-1, n).mean(dim=0)  # P_e (mean router prob)
         if topi is None:
-            ce = probs.new_ones(n)
+            ce = dist.new_ones(n)
         else:
-            ce = torch.zeros_like(probs).scatter_(-1, topi, 1.0).reshape(-1, n).mean(dim=0)  # f_e
+            ce = torch.zeros_like(dist).scatter_(-1, topi, 1.0).reshape(-1, n).mean(dim=0)  # f_e
         return n * (me * ce).sum()
 
+    def _router_z_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        """ST-MoE router z-loss: mean over samples/tokens of ``logsumexp_e(logits)^2``."""
+        return torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+
+    def _weight_sum_penalty(self, gates: torch.Tensor) -> torch.Tensor:
+        """Soft sum-to-1 penalty on the ACTUAL blend weights = the top-k selected gates:
+        mean ``(sum_{e in topk} w_e - 1)^2``. For softmax top-k the selected sum <= 1; for sigmoid
+        it is free -> this pulls the per-sample total weight (hence velocity scale) toward 1."""
+        k = self.config.top_k
+        used = torch.topk(gates, k, dim=-1).values.sum(dim=-1)  # (...,)
+        return (used - 1.0).pow(2).mean()
+
     def _router_probs(self, hidden_states, encoder_hidden_states, temb):
-        """Return ``(probs, per_token)``. per_token=True -> probs (B,S,N) for the token blend;
-        False -> probs (B,N) for the per-sample blend."""
+        """Return ``(gates, logits, per_token)``. ``gates`` are the blend/selection weights after the
+        gate fn (softmax|sigmoid); ``logits`` are the RAW router logits (for the z-loss). per_token=True
+        -> (B,S,N); False -> (B,N)."""
         if self.config.router_type == "global":
             # MoFGlobalRouter fuses prompt & input-latent per router_input (prompt/latent/fused_*).
-            return self.router(encoder_hidden_states, hidden_states, temb), False  # (B, N) softmax
-        logits = self.router(hidden_states, temb)  # (B, S, N)
+            logits = self.router(encoder_hidden_states, hidden_states, temb)  # (B, N) raw
+            return self._gate(logits), logits, False
+        logits = self.router(hidden_states, temb)  # (B, S, N) raw
         if self.config.route_granularity == "token":
-            return torch.softmax(logits.float(), dim=-1), True
+            return self._gate(logits), logits, True
         # sample granularity with a token_linear router: mean-pool the per-token logits.
-        return torch.softmax(logits.float().mean(dim=1), dim=-1), False
+        logits = logits.float().mean(dim=1)  # (B, N)
+        return self._gate(logits), logits, False
 
     # ------------------------------------------------------------------ forward
     def forward(
@@ -306,7 +348,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         g = guidance.to(hidden_states.dtype) * 1000 if guidance is not None else None
         temb = self.router_time_embed(ts, g)  # (B, inner_dim)
 
-        probs, per_token = self._router_probs(hidden_states, encoder_hidden_states, temb)
+        probs, logits, per_token = self._router_probs(hidden_states, encoder_hidden_states, temb)
 
         expert_kwargs = dict(
             encoder_hidden_states=encoder_hidden_states, img_ids=img_ids, txt_ids=txt_ids,
@@ -324,6 +366,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             output, topi = self._forward_sample(probs, hidden_states, timestep, expert_kwargs)
 
         self._last_mof_aux = self._load_balance_aux(probs, topi)
+        self._last_router_z_loss = self._router_z_loss(logits)
+        self._last_weight_sum_penalty = self._weight_sum_penalty(probs)
 
         if not return_dict:
             return (output,)
@@ -350,12 +394,14 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         """Per-sample blend: run only the top-k experts each sample routed to (dense over the
         batch when top_k == num_experts). Returns (velocity, topi_or_None).
 
-        ``dense_exec`` (config): when top_k < num_experts, run EVERY expert on ALL samples
-        (uniform execution across ranks) and blend by the top-k renormalized weights instead of
-        skipping experts no local sample routed to. This keeps the per-sample top-k SELECTION
-        (top_k=1 -> hard one-hot; load-balance aux unchanged) but makes the all-gather pattern
-        identical on every rank, which is REQUIRED when the experts are FSDP-sharded (the sparse
-        path issues divergent collectives -> NCCL deadlock). Costs N/top_k x the forward."""
+        Routing modes (config, checked in this order):
+          * ``topk_sparse``: modern-MoE SELECTIVE activation -- loop all experts (uniform FSDP
+            all-gather, no deadlock) but compute only each expert's routed samples (sparse FLOPs);
+            differentiable gate (Mixtral renorm for k>=2, straight-through one-hot for k==1).
+          * ``soft_blend``: dense over ALL experts by the full softmax (differentiable, k=N cost).
+          * ``dense_exec``: run EVERY expert on ALL samples but weight by the HARD top-k one-hot
+            (top_k=1 -> non-differentiable router; uniform all-gather -> FSDP-safe; N/top_k x cost).
+          * else (plain DDP): sparse per-rank compute -- FSDP-UNSAFE (divergent collectives)."""
         n, k = self.config.num_experts, self.config.top_k
         B = hidden_states.shape[0]
 
@@ -369,6 +415,45 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
                 timestep=timestep.index_select(0, idx),
                 **kw,
             )[0]
+
+        if getattr(self.config, "topk_sparse", False):
+            # MODERN-MoE selective activation: SPARSE compute + DIFFERENTIABLE gate + FSDP-safe.
+            # Every rank loops over ALL experts in the same order -> uniform FSDP param all-gather
+            # (no divergent-collective deadlock); the all-gather is keyed on the expert MODULE, not
+            # the batch, so feeding each expert only its ROUTED samples (or a 0-weight dummy) is safe.
+            topw, topi = torch.topk(probs, k, dim=-1)  # (B, k) differentiable gate values
+            if getattr(self.config, "gate_fn", "softmax") == "sigmoid":
+                # Independent sigmoid gates: use the selected gate value DIRECTLY as the blend weight
+                # (no renorm / no straight-through). Naturally differentiable; the free velocity
+                # magnitude is regularized by MSE(v) + optional router_z_loss / weight-sum penalty.
+                gate = topw
+            elif k > 1:
+                # Mixtral: renormalize the selected softmax gates -> sum to 1 (convex velocity blend),
+                # each in (0,1) so the router gets main-loss gradient through them.
+                gate = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            else:
+                # Switch top-1 softmax in velocity space: a single weight forced to sum=1 would be a
+                # CONSTANT 1.0 (dead gradient, the original bug). Straight-through instead: forward
+                # weight=1.0 (correct velocity scale), backward gradient flows through the gate topw.
+                gate = topw + (1.0 - topw).detach()
+            w_full = torch.zeros_like(probs).scatter_(-1, topi, gate)  # (B, N) sparse, differentiable
+
+            out: Optional[torch.Tensor] = None
+            for e in range(n):
+                idx = (w_full[:, e] > 0).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    # No local sample routed to expert e: STILL invoke it (uniform all-gather) on a
+                    # single throwaway sample weighted exactly 0 -> no contribution / zero grad.
+                    idx = torch.zeros(1, dtype=torch.long, device=hidden_states.device)
+                    we = w_full.new_zeros(1)
+                else:
+                    we = w_full[idx, e]
+                v_e = _run(e, idx)
+                if out is None:
+                    out = v_e.new_zeros((B,) + tuple(v_e.shape[1:]))
+                we_b = we.view(idx.shape[0], *([1] * (v_e.ndim - 1))).to(v_e.dtype)
+                out.index_add_(0, idx, we_b * v_e)
+            return out, topi
 
         if getattr(self.config, "soft_blend", False):
             # DIFFERENTIABLE routing: blend EVERY expert by the FULL softmax weights
@@ -511,7 +596,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _mof_config_from_base(base, num_experts, top_k, route_granularity, router_type,
                              router_hidden_dim, expert_mode="distinct", router_input="prompt",
-                             dense_exec=False, soft_blend=False) -> dict:
+                             dense_exec=False, soft_blend=False, topk_sparse=False,
+                             gate_fn="softmax") -> dict:
         bc = dict(base.config)
         return dict(
             patch_size=bc["patch_size"], in_channels=bc["in_channels"], out_channels=bc.get("out_channels"),
@@ -523,6 +609,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             num_experts=num_experts, top_k=top_k, route_granularity=route_granularity,
             router_type=router_type, router_hidden_dim=router_hidden_dim, expert_mode=expert_mode,
             router_input=router_input, dense_exec=dense_exec, soft_blend=soft_blend,
+            topk_sparse=topk_sparse, gate_fn=gate_fn,
         )
 
     @classmethod
@@ -539,6 +626,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         router_input: str = "prompt",
         dense_exec: bool = False,
         soft_blend: bool = False,
+        topk_sparse: bool = False,
+        gate_fn: str = "softmax",
     ) -> "Flux2VelocityMoFTransformer2DModel":
         """Init: replicate the base transformer into the experts (each a verbatim copy of the base,
         so the ensemble == base at init when the router is uniform).
@@ -556,7 +645,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             )
         model = cls(**cls._mof_config_from_base(
             base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode,
-            router_input, dense_exec, soft_blend))
+            router_input, dense_exec, soft_blend, topk_sparse, gate_fn))
         base_sd = base.state_dict()
         with torch.no_grad():
             if expert_mode == "shared_lora":

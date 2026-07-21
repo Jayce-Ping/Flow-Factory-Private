@@ -1,0 +1,171 @@
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert VELOCITY-space MoF student, FSDP HYBRID_SHARD,
+# MIXED geneval_enhanced + ocr training. MODERN-MoE router variant of ..._mof2_mix_fsdp_vmse_1kep.yaml:
+# replaces the softmax convex blend with INDEPENDENT SIGMOID gating + top-1 SPARSE activation.
+# Deltas vs the soft_blend run:
+#   1. mof_gate_fn: sigmoid -- each expert gets an INDEPENDENT gate sigma(logit_e) in (0,1); the gates
+#      do NOT sum to 1. Removes the hard convex constraint (DeepSeek-V3-style gating).
+#   2. mof_topk_sparse: true -- SELECTIVE activation: every rank loops all experts (uniform FSDP
+#      all-gather -> no NCCL deadlock) but only COMPUTES each expert's routed samples (index_select;
+#      a 0-routed rank still invokes the expert on 1 zero-weight dummy to keep the all-gather uniform).
+#      With sigmoid the selected gate value is used DIRECTLY as the blend weight -> naturally
+#      differentiable (router trains from the main loss), and ~top_k/N x the FLOPs/activation of
+#      soft_blend (N=2/top-1 -> ~half the student forward + less activation memory).
+#   3. Velocity magnitude is now FREE (weights need not sum to 1). It is regularized by:
+#        - MSE(v) itself (matching the teacher velocity already supervises the blend magnitude), plus
+#        - router_z_loss (logsumexp^2, bounds the router logits), and
+#        - mof_weight_sum_penalty (soft (sum_e w_e - 1)^2 over the selected gates).
+#      All three are independent knobs (any -> 0 disables it); set both aux coeffs to 0 for a
+#      pure MSE(v)-only-regularized run.
+#   4. Load-balance aux code is KEPT but DISABLED (moe_load_balance_coeff: 0.0) for this run.
+#   5. Everything else (FSDP HYBRID_SHARD student + replicated 32B teacher, full-timestep MSE(v),
+#      1:1 geneval_enhanced+ocr mix @ 256/epoch, torch.compile, AC FSDP-side) matches the soft run
+#      so the router change is the only variable.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/accelerate_configs/fsdp_hybrid_shard.yaml  # FSDP HYBRID_SHARD student; teacher replicated (loaded separately)
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (MIXED: geneval_enhanced + ocr; basename = source name for source_ratio) =====
+data:
+  dataset_dir: "dataset/geneval_enhanced" # eval/test fallback
+  dataset_dirs:
+    - "dataset/geneval_enhanced"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (2-expert velocity MoF; copy-2 from base; per-sample top-1 global router; LoRA rank 64) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all-linear"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+  # --- MoF-V construction (per-SAMPLE top-1 global router; SIGMOID gate + topk_sparse selective activation) ---
+  mof_enabled: true
+  mof_num_experts: 2
+  mof_top_k: 1
+  mof_route_granularity: "sample"         # per-sample routing (top-1 selection)
+  mof_router_type: "global"               # per-sample gate
+  mof_router_input: "prompt"              # route by prompt/domain (drives per-domain expert specialization)
+  mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry
+  mof_gate_fn: "sigmoid"                  # INDEPENDENT per-expert gate in (0,1); gates do NOT sum to 1 (free velocity magnitude)
+  mof_topk_sparse: true                   # SELECTIVE activation: loop all experts (uniform all-gather, FSDP-safe) but compute only routed samples
+  mof_dense_exec: true                    # kept as the FSDP-safety marker; topk_sparse takes precedence (also uniform all-gather)
+  mof_soft_blend: false                   # off: topk_sparse (sparse) instead of the dense softmax blend
+  # --- torch.compile (per-block in-place nn.Module.compile: keeps block class -> FSDP per-block wrap, and state_dict keys -> LoRA save/load unchanged) ---
+  compile_teacher: true                   # compile frozen 32B teacher (no-grad/not-saved) -> speed up sampling / teacher-mean precompute
+  compile_student: true                   # compile each MoF expert's blocks -> speed up train forward/backward
+  compile_mode: "default"                 # 'default' (safe); avoid 'reduce-overhead' here (CUDA graphs use MORE memory next to the replicated teacher)
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_1kep"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 50
+  save_model_only: true
+
+# ===== Training (XOPD distill to dev-32B, geneval_enhanced+ocr mix, full-timestep MSE(v)) =====
+train:
+  trainer_type: "xopd"
+  fsdp_shard_teacher: false               # teacher (32B) loaded SEPARATELY + replicated per GPU (NOT in the FSDP bundle); only the student is sharded
+  max_epochs: 1000
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false            # reuse the shared teacher ceiling from the OCR specialist run
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  reinforce_horizon: null
+  reinforce_future_reduction: "mean"
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  # --- L1 loss space: full-trajectory raw-velocity MSE ---
+  xopd_dk_space: "v"                       # MSE ||v_s - v_t||^2 on ALL 28 steps (no xopd_train_steps / num_xopd_steps)
+
+  # --- MoF router regularizers (modern-MoE; replace the hard sum-to-1) ---
+  moe_load_balance_coeff: 0.0             # Switch load-balance aux: code KEPT but DISABLED for this run
+  router_z_loss_coeff: 1.0e-3             # ST-MoE z-loss: bound the router logits (prevent gate explosion)
+  mof_weight_sum_penalty_coeff: 1.0e-2    # soft (sum_e w_e - 1)^2 over selected gates: keep blended velocity magnitude ~1
+  # --- Multi-source sampling ratio (equal 1:1 over geneval_enhanced + ocr) ---
+  source_ratio: {geneval_enhanced: 1, ocr: 1}   # period=2 must tile unique_sample_num_per_epoch
+
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 256        # 1:1 over 2 sources -> 128 prompts/domain/epoch (matches specialists + plain mixed run). num_batches_per_epoch = 256/(32*1) = 8
+  gradient_step_per_epoch: 1              # one optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps = 8 * 28 = 224)
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.0
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false    # model-side AC OFF to avoid double-wrapping; AC is done FSDP-side
+                                          # (fsdp_activation_checkpointing: true) as a safety margin.
+  offload_samples_to_cpu: true            # OOM mitigation: keep the 28-step sampled trajectory on CPU during the train pass -> frees GPU headroom next to the replicated 32B teacher
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (eval @ 512 on all 3 domains) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 40
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (logging only; not part of the XOPD loss) =====
+rewards:
+  - {name: "geneval", reward_model: "geneval", weight: 1, batch_size: 64, device: "cuda", dtype: float32, async_reward: false}
+  - {name: "pick_score", reward_model: "PickScore", batch_size: 64, device: "cuda", dtype: bfloat16, async_reward: false}
+  - {name: "ocr", reward_model: "ocr", batch_size: 64, device: "cpu", dtype: float32, async_reward: false}

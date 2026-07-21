@@ -3189,6 +3189,24 @@ class XOPDTrainer(BaseTrainer):
                             loss = loss + moe_coef * moe_aux
                             loss_info["moe_aux"].append(moe_aux.detach())
 
+                    # MoF router regularizers (velocity-MoF only; no-ops when coeff==0 or the student
+                    # is not a MoF). z-loss bounds the router logits; weight-sum penalty is the soft
+                    # replacement for the hard sum-to-1 (keeps the blended velocity magnitude ~1).
+                    z_coef = getattr(self.training_args, "router_z_loss_coeff", 0.0)
+                    collect_z = getattr(self.adapter, "collect_router_z_loss", None)
+                    if z_coef > 0 and collect_z is not None:
+                        z = collect_z()
+                        if z is not None:
+                            loss = loss + z_coef * z
+                            loss_info["router_z"].append(z.detach())
+                    wsum_coef = getattr(self.training_args, "mof_weight_sum_penalty_coeff", 0.0)
+                    collect_wsum = getattr(self.adapter, "collect_weight_sum_penalty", None)
+                    if wsum_coef > 0 and collect_wsum is not None:
+                        wsum = collect_wsum()
+                        if wsum is not None:
+                            loss = loss + wsum_coef * wsum
+                            loss_info["w_sum_pen"].append(wsum.detach())
+
                     if self.enable_kl_loss:
                         kl_div, kl_loss = self._compute_kl_anchor(student_out, forward_kwargs)
                         loss = loss + kl_loss

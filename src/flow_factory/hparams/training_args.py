@@ -363,6 +363,30 @@ class TrainingArguments(ArgABC):
             )
         },
     )
+    router_z_loss_coeff: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Coefficient for the MoE/MoF router z-loss (ST-MoE): mean over samples of "
+                "logsumexp_e(router_logits)^2. Penalizes large router logits -> keeps the gate "
+                "numerically stable and bounded (the standard 'prevent explosion' regularizer when "
+                "the gates are NOT normalized to sum to 1, e.g. sigmoid gating). Typical ~1e-3; "
+                "0 disables (default)."
+            )
+        },
+    )
+    mof_weight_sum_penalty_coeff: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Coefficient for the MoF-V soft sum-to-1 penalty: mean over samples of "
+                "(sum_e w_e - 1)^2 over the SELECTED top-k gate weights. A soft replacement for the "
+                "hard convex constraint -- lets the per-sample total blend weight drift (independent "
+                "sigmoid gates) but keeps the blended VELOCITY magnitude near the teacher's scale. "
+                "0 disables (default; then MSE(v) alone regularizes the magnitude)."
+            )
+        },
+    )
     ddp_find_unused_parameters: bool = field(
         default=True,
         metadata={

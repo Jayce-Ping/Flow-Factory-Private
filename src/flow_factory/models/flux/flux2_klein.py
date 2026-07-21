@@ -225,6 +225,8 @@ class Flux2KleinAdapter(BaseAdapter):
             router_input=getattr(self.model_args, "mof_router_input", "prompt"),
             dense_exec=getattr(self.model_args, "mof_dense_exec", False),
             soft_blend=getattr(self.model_args, "mof_soft_blend", False),
+            topk_sparse=getattr(self.model_args, "mof_topk_sparse", False),
+            gate_fn=getattr(self.model_args, "mof_gate_fn", "softmax"),
         )
         if self.model_args.mof_base_transformer_path:
             mof = Flux2VelocityMoFTransformer2DModel.from_base_replicated(
@@ -240,7 +242,9 @@ class Flux2KleinAdapter(BaseAdapter):
             f"[MoF-V] student transformer -> Flux2VelocityMoFTransformer2DModel "
             f"(num_experts={mof.config.num_experts}, top_k={mof.config.top_k}, "
             f"granularity={mof.config.route_granularity}, router={mof.config.router_type}, "
-            f"dense_exec={mof.config.dense_exec}, soft_blend={getattr(mof.config, 'soft_blend', False)})"
+            f"dense_exec={mof.config.dense_exec}, soft_blend={getattr(mof.config, 'soft_blend', False)}, "
+            f"topk_sparse={getattr(mof.config, 'topk_sparse', False)}, "
+            f"gate_fn={getattr(mof.config, 'gate_fn', 'softmax')})"
         )
 
     @staticmethod
@@ -295,6 +299,25 @@ class Flux2KleinAdapter(BaseAdapter):
             tf = tf._orig_mod
         fn = getattr(tf, "moe_aux_loss", None)
         return fn() if callable(fn) else None
+
+    def _collect_router_term(self, method: str) -> Optional[torch.Tensor]:
+        """Shared accessor for the MoF router aux scalars (z-loss / weight-sum penalty) from the
+        last student forward; None if the student is not a velocity MoF."""
+        tf = self._unwrap(self.transformer)
+        if hasattr(tf, "_orig_mod"):  # torch.compile
+            tf = tf._orig_mod
+        fn = getattr(tf, method, None)
+        return fn() if callable(fn) else None
+
+    def collect_router_z_loss(self) -> Optional[torch.Tensor]:
+        """MoF router z-loss from the last student forward (ST-MoE logsumexp^2), or None.
+        Consumed by the XOPD trainer, scaled by ``training_args.router_z_loss_coeff``."""
+        return self._collect_router_term("router_z_loss")
+
+    def collect_weight_sum_penalty(self) -> Optional[torch.Tensor]:
+        """MoF soft sum-to-1 penalty from the last student forward, or None. Consumed by the XOPD
+        trainer, scaled by ``training_args.mof_weight_sum_penalty_coeff``."""
+        return self._collect_router_term("weight_sum_penalty")
 
     @property
     def default_target_modules(self) -> List[str]:
