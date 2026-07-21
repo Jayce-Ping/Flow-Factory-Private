@@ -1,21 +1,22 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert VELOCITY-space MoF student, FSDP HYBRID_SHARD,
-# MIXED geneval_enhanced + ocr training. MODERN-MoE router: SHARED-LoRA experts + INDEPENDENT SIGMOID
+# MIXED geneval_enhanced + ocr training. MODERN-MoE router: DISTINCT 2x4B experts + INDEPENDENT SIGMOID
 # gating + top-1 SPARSE activation + small-random router init. Design:
-#   1. mof_expert_mode: shared_lora -- ONE frozen 4B base + 2 LoRA adapters (expert_0/expert_1),
-#      switched per sample. Half the base params of distinct 2x4B (cheaper), experts differ ONLY by LoRA.
+#   1. mof_expert_mode: distinct -- 2 INDEPENDENT full 4B bases (frozen copies) + per-expert LoRA;
+#      8B student -> FSDP HYBRID_SHARD (shard intra-node, replicate inter-node). Teacher replicated.
 #   2. mof_gate_fn: sigmoid -- INDEPENDENT gate sigma(logit_e) in (0,1); gates do NOT sum to 1 (the hard
 #      convex constraint is REMOVED). Velocity magnitude is FREE, regularized by MSE(v) ALONE for now
 #      (router_z_loss / weight-sum penalty coeffs start at 0; z-loss = logit stabilizer NOT anti-collapse).
-#   3. mof_topk_sparse: true -- SELECTIVE activation: every rank loops all adapters (uniform base
-#      all-gather -> no NCCL deadlock) but computes only each adapter's routed samples (a 0-routed rank
-#      still invokes the base on 1 zero-weight dummy to keep the gather count uniform). sigmoid -> the
+#   3. mof_topk_sparse: true -- SELECTIVE activation: every rank loops all experts (uniform FSDP
+#      all-gather -> no NCCL deadlock) but computes only each expert's routed samples (a 0-routed rank
+#      still invokes the expert on 1 zero-weight dummy to keep the gather count uniform). sigmoid -> the
 #      selected gate value is the blend weight DIRECTLY (differentiable; router trains from the main loss).
+#      ~top_k/N x the FLOPs/activation of dense_exec/soft_blend (N=2/top-1 -> ~half the student forward).
 #   4. mof_router_init: normal (std 0.02) -- per-expert logits DIFFER at init so top-1 activates BOTH
 #      experts from step 0 (dead-expert-at-init prevention; the zero-init head would tie -> collapse to e0).
 #   5. Anti-COLLAPSE (one expert taking over DURING training) is NOT engaged (moe_load_balance_coeff: 0);
 #      watch per-expert usage and enable the load-balance aux (~0.01) only if it collapses.
-#   6. compile_student OFF (torch.compile may not guard on PEFT set_adapter across the adapter switch);
-#      compile_teacher stays ON. Everything else (FSDP student + replicated 32B teacher, full-timestep
+#   6. torch.compile ON (compile_teacher + compile_student; distinct experts compile per-block, no
+#      adapter-switch issue). Everything else (FSDP student + replicated 32B teacher, full-timestep
 #      MSE(v), 1:1 geneval+ocr @ 256/epoch, AC FSDP-side) matches the soft run so routing is the variable.
 
 # ===== Environment =====
@@ -48,29 +49,29 @@ model:
   model_type: "flux2-klein"
   resume_path: null
   resume_type: null
-  # --- MoF-V construction (SHARED-LoRA: 1 base + 2 adapters; per-SAMPLE top-1 global router; SIGMOID gate + topk_sparse) ---
+  # --- MoF-V construction (DISTINCT 2x4B experts; per-SAMPLE top-1 global router; SIGMOID gate + topk_sparse) ---
   mof_enabled: true
   mof_num_experts: 2
   mof_top_k: 1
-  mof_expert_mode: "shared_lora"          # ONE frozen 4B base + 2 LoRA adapters (expert_0/expert_1); experts differ ONLY by LoRA (needs noise_std=0)
-  mof_route_granularity: "sample"         # per-sample routing (top-1 selection); required by shared_lora
+  mof_expert_mode: "distinct"             # 2 INDEPENDENT full 4B bases (frozen copies) + per-expert LoRA (8B student -> FSDP)
+  mof_route_granularity: "sample"         # per-sample routing (top-1 selection)
   mof_router_type: "global"               # per-sample gate
   mof_router_input: "prompt"              # route by prompt/domain (drives per-domain expert specialization)
   mof_router_init: "normal"               # small-Gaussian router head -> per-expert logits DIFFER at init -> top-1 activates BOTH experts (no dead-expert-at-init)
   mof_router_init_std: 0.02
-  mof_noise_std: 0.0                      # required by shared_lora (shared frozen base); LoRA lora_B zero-init -> experts identical until routed gradient diverges them
+  mof_noise_std: 0.0                      # experts start as identical base copies; LoRA lora_B zero-init -> they diverge as routed gradients differ per domain
   mof_gate_fn: "sigmoid"                  # INDEPENDENT per-expert gate in (0,1); gates do NOT sum to 1 (free velocity magnitude)
-  mof_topk_sparse: true                   # SELECTIVE activation: loop all adapters (uniform base all-gather, FSDP-safe) but compute only routed samples
+  mof_topk_sparse: true                   # SELECTIVE activation: loop all experts (uniform all-gather, FSDP-safe) but compute only routed samples
   mof_dense_exec: true                    # FSDP-safety marker; topk_sparse takes precedence (also uniform)
   mof_soft_blend: false                   # off: sparse top-k instead of dense blend
-  # --- torch.compile ---
-  compile_teacher: true                   # compile frozen 32B teacher (no-grad/not-saved) -> speed up sampling / teacher-mean precompute
-  compile_student: false                  # OFF for shared_lora: torch.compile may not guard on PEFT set_adapter -> stale/ recompiled graph across adapter switches
+  # --- torch.compile (per-block in-place nn.Module.compile) ---
+  compile_teacher: true                   # compile frozen 32B teacher -> speed up sampling / teacher-mean precompute
+  compile_student: true                   # compile each distinct expert's blocks -> speed up train forward/backward
   compile_mode: "default"
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_shared_1kep"
+  run_name: "flux2klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_1kep"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
