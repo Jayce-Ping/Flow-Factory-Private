@@ -1,0 +1,254 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\Fc}{\mathcal{F}_C}
+\newcommand{\uvec}{\bm{u}}
+\newcommand{\xvec}{\bm{x}}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem*{remark*}{Remark}
+
+\title{\textbf{Mixture-of-Flow velocity decomposition:}\\[0.3em]
+\large capacity ceiling vs.\ optimization gap, the posterior-responsibility form of a
+multi-domain teacher velocity, and when a MoF can be split into valid sub-flows}
+\author{Flow Factory}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We formalize the Mixture-of-Flow (MoF) student for cross-model on-policy distillation (XOPD): a set
+of full flow-matching experts whose output velocities are blended by a router. We prove that the
+marginal velocity of a \emph{mixture-of-domains} teacher is \emph{exactly} a posterior-responsibility
+weighted convex combination of the per-domain velocities (Thm.~\ref{thm:posterior}), which pins down
+the ``correct'' functional form of a MoF student and explains why a sum-to-one (convex) gate makes
+every expert an individually valid flow. We then resolve an apparent paradox
+(\enquote{$\text{big}\!\to\!\text{MoF}\!\to\!\text{single}$ beats $\text{big}\!\to\!\text{single}$})
+by separating the \emph{representational ceiling} (capacity-bound, path-independent) from the
+\emph{optimization gap} (path-dependent). Finally we state when a mixture with fixed \emph{activated}
+capacity can exceed a single model of the same activated capacity, and contrast MoF with classic
+(FFN-level) MoE. Companion progress note:
+\texttt{docs/xopd/progress/2026-07-21-mof-velocity-decomposition.md}.
+\end{abstract}
+
+\section{Setup and notation}
+Flow matching learns a time-dependent velocity field $\uvec_t:\R^d\to\R^d$, $t\in[0,1]$, whose ODE
+$\dot\xvec_t=\uvec_t(\xvec_t)$ transports a base density $p_0$ (noise) to the data density $p_1$. For a
+probability path $(p_t)$ induced by a coupling with per-sample conditional velocity
+$\uvec_t(\xvec\mid z)$ (where $z$ is the data-side latent/condition), the \emph{marginal} velocity is a
+conditional expectation
+\begin{equation}\label{eq:marginal}
+  \uvec_t(\xvec)=\E\!\left[\dot\xvec_t \,\middle|\, \xvec_t=\xvec\right]
+             =\int \uvec_t(\xvec\mid z)\, p_t(z\mid \xvec)\,\mathrm{d}z .
+\end{equation}
+The map ``target $\mapsto$ marginal velocity'' is \textbf{linear} (it is an expectation); this is the
+single structural fact behind everything below.
+
+\begin{definition}[Valid flow]
+A field $\uvec_t$ is a \emph{valid flow} for a path $(p_t)$ if it satisfies the continuity equation
+$\partial_t p_t + \nabla\!\cdot(p_t\,\uvec_t)=0$ with boundary $p_0=$ noise, $p_1=$ data; equivalently
+it is the marginal velocity \eqref{eq:marginal} of some coupling reaching $p_1$.
+\end{definition}
+
+\section{The teacher velocity of a multi-domain mixture is a posterior-weighted convex blend}
+
+Let the data be a mixture over $N$ domains (e.g.\ \texttt{geneval}, \texttt{ocr}),
+$q=\sum_{e=1}^N \lambda_e\, q_e$, $\lambda_e>0$, $\sum_e\lambda_e=1$, each domain $e$ inducing its own
+path $p_t^{(e)}$ and valid flow $\uvec_t^{(e)}$.
+
+\begin{theorem}[Posterior-responsibility decomposition]\label{thm:posterior}
+The marginal velocity of the mixture teacher is
+\begin{equation}\label{eq:posterior}
+  \uvec_t(\xvec)=\sum_{e=1}^N \pi_e(\xvec,t)\,\uvec_t^{(e)}(\xvec),
+  \qquad
+  \pi_e(\xvec,t)=\frac{\lambda_e\, p_t^{(e)}(\xvec)}{\sum_{e'}\lambda_{e'}\, p_t^{(e')}(\xvec)},
+\end{equation}
+where $\pi_e(\xvec,t)\ge 0$ and $\sum_e \pi_e(\xvec,t)=1$ is the Bayes posterior that $\xvec_t$ was
+produced by domain $e$.
+\end{theorem}
+
+\begin{proof}
+The mixture path density is $p_t(\xvec)=\sum_e \lambda_e p_t^{(e)}(\xvec)$. Introduce the domain
+indicator $E$ with $P(E=e)=\lambda_e$. By the tower rule applied to \eqref{eq:marginal},
+\[
+  \uvec_t(\xvec)=\E[\dot\xvec_t\mid \xvec_t=\xvec]
+  =\sum_e P(E=e\mid \xvec_t=\xvec)\,\E[\dot\xvec_t\mid \xvec_t=\xvec, E=e].
+\]
+The inner conditional expectation is by definition the per-domain marginal velocity
+$\uvec_t^{(e)}(\xvec)$, and Bayes' rule gives
+$P(E=e\mid \xvec_t=\xvec)=\lambda_e p_t^{(e)}(\xvec)/\sum_{e'}\lambda_{e'}p_t^{(e')}(\xvec)=\pi_e(\xvec,t)$.
+\end{proof}
+
+\begin{corollary}[Correct MoF form]\label{cor:form}
+A per-sample MoF with $N$ experts, softmax (sum-to-one) gate $w_e(\xvec,t)$ and blend
+$\hat\uvec_t=\sum_e w_e\,\hat\uvec_t^{(e)}$ can represent the multi-domain teacher \emph{exactly} in the
+infinite-capacity limit, by matching $\hat\uvec^{(e)}\!\to\!\uvec^{(e)}$ (per-domain flow) and
+$w_e\!\to\!\pi_e$ (posterior). Hence the convex constraint $\sum_e w_e=1$ is not a heuristic: it is the
+structural form of \eqref{eq:posterior}.
+\end{corollary}
+
+\begin{remark*}
+Eq.~\eqref{eq:posterior} is a \emph{convex} combination with input-dependent weights. The intuition
+``a velocity field is a sum of simpler velocity fields'' is precise only in this posterior-convex
+sense, \textbf{not} as a free additive sum (\S\ref{sec:validity}).
+\end{remark*}
+
+\section{Validity of the split: convex vs.\ free gates}\label{sec:validity}
+
+\begin{proposition}[When each expert is a valid flow]\label{prop:validity}
+Let $\hat\uvec_t=\sum_e w_e(\xvec,t)\,\hat\uvec_t^{(e)}$.
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{Convex, $\sum_e w_e=1$, $w_e\ge0$ (softmax / hard routing):} if the experts match the
+  per-domain flows of Thm.~\ref{thm:posterior}, each $\hat\uvec^{(e)}$ is individually a valid flow
+  and the blend is the valid mixture flow. Under \emph{hard} routing ($w\in\{0,1\}$, disjoint domains)
+  the blend is piecewise-single-expert.
+  \item \textbf{Free / additive (e.g.\ independent sigmoid gates, $\sum_e w_e\neq1$):} the blend may
+  fit a strictly larger function class, but an individual summand $\hat\uvec^{(e)}$ need not be a valid
+  flow (it can be a partial/curl-like component that alone does not transport $p_0\!\to\!p_1$), and the
+  blend need not correspond to any single clean probability path.
+\end{enumerate}
+\end{proposition}
+
+Thus \textbf{sum-to-one trades capacity for decomposability}: it is the exact structure that keeps
+``each expert = a valid flow'' and makes ``split the MoF back into standalone flows'' meaningful; free
+gates buy raw fit at the cost of that interpretation. This is the crux of the ``keep vs.\ drop the
+convex constraint'' design choice.
+
+\section{The apparent paradox and its resolution}
+
+The informal argument is: (i) $\text{big}\!\to\!\text{single}$ is lossy; (ii) $\text{big}\!\to\!\text{MoF}$
+is lossy but less; (iii) $\text{MoF}\!\to\!\text{single}$ is \emph{lossless}; therefore
+$\text{big}\!\to\!\text{MoF}\!\to\!\text{single}$ beats $\text{big}\!\to\!\text{single}$, contradicting a
+capacity-determined ceiling and the expectation that staging loses performance.
+
+\paragraph{Decompose achieved loss.}
+For a hypothesis class $\mathcal F$ and algorithm $\mathcal A$, write the achieved loss as
+\begin{equation}\label{eq:decomp}
+  \underbrace{\mathrm{Loss}(\mathcal A,\mathcal F)}_{\text{achieved}}
+  = \underbrace{R(\mathcal F)}_{\text{representational ceiling}} + \underbrace{G(\mathcal A,\mathcal F)}_{\text{optimization gap}},
+  \qquad R(\mathcal F)=\inf_{f\in\mathcal F}\mathrm{Loss}(f).
+\end{equation}
+Let $\Fc$ be the single-base class (capacity $C$) and $\mathcal F_{\text{MoF}}\supseteq\Fc$ the MoF class.
+
+\begin{proposition}[The ``lossless'' leg is regime-dependent]\label{prop:regime}
+$\text{MoF}\!\to\!\text{single}$ is (near) lossless \emph{iff} the MoF output function lies in $\Fc$.
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{Disjoint-domain / hard routing:} $\pi_e\in\{0,1\}$, so per input only one expert acts;
+  the MoF output is piecewise-single-expert and lies in $\Fc$ whenever $C$ suffices for the
+  \emph{union} of per-domain functions. Then $\text{MoF}\!\to\!\text{single}$ is near-lossless.
+  \item \textbf{Overlapping domains / soft routing:} $\pi_e\in(0,1)$ forces a genuine blend of two
+  velocities at the \emph{same} input; the output generally lies \emph{outside} $\Fc$, so
+  $\text{MoF}\!\to\!\text{single}$ is \textbf{lossy}.
+\end{itemize}
+\end{proposition}
+
+\begin{theorem}[No capacity is created by staging]\label{thm:ceiling}
+The final student is a single base in $\Fc$, hence its achievable loss is bounded below by $R(\Fc)$
+regardless of the path. In particular
+$\mathrm{Loss}\big(\text{big}\!\to\!\text{MoF}\!\to\!\text{single}\big)\ge R(\Fc)$, the same
+representational floor as $\text{big}\!\to\!\text{single}$.
+\end{theorem}
+
+\begin{corollary}[Resolution]\label{cor:resolution}
+The three premises never hold simultaneously in a way that beats $R(\Fc)$:
+\begin{itemize}[leftmargin=1.4em]
+  \item In the disjoint regime, leg (iii) is $\approx$lossless, but then leg (ii)'s advantage over
+  $\text{big}\!\to\!\text{single}$ is \emph{not} a higher ceiling (a single base of the same per-expert
+  capacity has the same floor on the union); it is an \emph{optimization} advantage (no cross-domain
+  interference during fitting), i.e.\ a reduction of $G$, not of $R$.
+  \item In the overlapping regime, leg (ii) genuinely lowers $R$ (MoF has more capacity), but leg
+  (iii) is then lossy: compressing a $\mathcal F_{\text{MoF}}$ function back into $\Fc$ pays exactly the
+  capacity difference.
+\end{itemize}
+Either way, staging cannot beat the $\Fc$ ceiling. What staging \emph{can} do is shrink the
+optimization gap $G(\mathcal A,\Fc)$: the well-optimized MoF is a smoother, easier distillation target
+(dark knowledge / born-again / progressive distillation), letting the single base approach its
+\emph{own} ceiling $R(\Fc)$ more closely than direct training does. Thus
+$\text{big}\!\to\!\text{MoF}\!\to\!\text{single}$ can beat \emph{direct} $\text{big}\!\to\!\text{single}$
+\textbf{without contradiction}: it recovers optimization gap, not representational capacity.
+\end{corollary}
+
+\section{Fixed activated capacity: when does a mixture beat a single base?}
+
+Consider top-$k$-of-$N$ routing: \emph{activated} parameters per input are $\approx kC/1$ (here we take
+$k{=}1$ so activated $=C$), while \emph{total} parameters are $NC$.
+
+\begin{proposition}[Partitioning gain]\label{prop:partition}
+With activated capacity fixed at $C$:
+\begin{itemize}[leftmargin=1.4em]
+  \item If the teacher velocity is \emph{routable} (input space splits into regions on which the
+  target is simpler, e.g.\ multi-domain or a nontrivial posterior $\pi(\xvec,t)$), then $N$ experts each
+  dedicate the full $C$ to one region, whereas a single $C$ must \emph{share} $C$ across all regions
+  (cross-region interference). The mixture's effective ceiling is the \emph{region-wise} best, which
+  dominates the shared-$C$ ceiling: $R(\mathcal F_{\text{MoF},\,k{=}1})\le R(\Fc)$, often strictly.
+  \item If the teacher is \emph{monolithic} (per-input intrinsic complexity $>C$ everywhere), each
+  input still sees only $C$ activated parameters, so the mixture cannot exceed the single-$C$ ceiling.
+\end{itemize}
+\end{proposition}
+
+\noindent Hence a mixture of identical small bases can match a large teacher at constant activated
+compute \emph{only} to the extent the teacher's velocity is routable/decomposable; this is precisely
+the structure Thm.~\ref{thm:posterior} exhibits for multi-domain data.
+
+\section{Contrast with classic (FFN-level) MoE}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{Classic MoE} & \textbf{MoF (this work)} \\
+\midrule
+Expert unit & FFN sub-module (not a flow) & full transformer $=$ a valid flow \\
+Routing & per-token, per-layer (fine) & per-sample, output-level (coarse) \\
+Mixing expressivity & high (re-routes each layer) & low (linear blend of final velocities) \\
+Split into standalone flows & no & yes (convex case, Prop.~\ref{prop:validity}) \\
+Param efficiency & high & low (coarse experts) \\
+Matches Thm.~\ref{thm:posterior} form & implicitly, entangled & explicitly ($w_e\!\approx\!\pi_e$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Classic MoE is the stronger tool for \emph{fitting} a teacher at fixed activated compute
+(Prop.~\ref{prop:partition}); MoF is the right object for the \emph{scientific} question of decomposing
+a teacher into individually valid, recombinable sub-flows (Cor.~\ref{cor:form},
+Prop.~\ref{prop:validity}). They optimize different objectives: fit efficiency vs.\ decomposability.
+
+\section{Testable predictions}
+\begin{enumerate}[leftmargin=1.4em]
+  \item \textbf{Domain overlap is the master switch.} The more disjoint the domains (posterior
+  $\pi\!\to\!\{0,1\}$, measurable via the router-specialization visualization), the more
+  $\text{big}\!\to\!\text{MoF}$'s gain is \emph{optimization} and the closer
+  $\text{MoF}\!\to\!\text{single}$ is to lossless; more overlap $\Rightarrow$ real ceiling gain but lossy
+  merge.
+  \item \textbf{Staging beats direct only up to $R(\Fc)$.} $\text{big}\!\to\!\text{MoF}\!\to\!\text{single}$
+  should modestly beat direct $\text{big}\!\to\!\text{single}$, by an amount $\approx$ the direct
+  optimization gap; a \emph{large} win indicates a large direct optimization gap (itself worth study),
+  not broken capacity.
+  \item \textbf{Convex vs.\ free gate.} Free (sigmoid) gates should reach $\le$ training MSE($v$) of
+  convex (softmax) gates, but the \emph{standalone} sampling quality of an individually extracted
+  expert should be higher for convex (Prop.~\ref{prop:validity}). This separates ``fit'' from
+  ``valid decomposition''.
+  \item \textbf{Fair baseline.} A $k{=}1$ MoF (activated $C$) must be compared against a single base of
+  capacity $C$ (equal activated compute), and against a classic MoE of equal activated compute, not
+  against a $2C$ dense model.
+\end{enumerate}
+
+\end{document}
