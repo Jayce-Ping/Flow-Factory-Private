@@ -302,6 +302,19 @@ class ModelArguments(ArgABC):
         metadata={"help": "MoF-V router: 'token_linear' (per-token linear gate on the input latent + timestep) "
                           "or 'global' (per-sample gate on pooled sequence + timestep; route_granularity='sample' only)."},
     )
+    mof_router_init: Literal['zero', 'normal'] = field(
+        default='zero',
+        metadata={"help": "MoF-V router HEAD (final linear) init. 'zero' -> uniform softmax / 0.5 sigmoid at start "
+                          "(== base flow model) BUT ties -> top-1 selection collapses to expert 0 (expert 1 never "
+                          "activated -> DEAD at init). 'normal' -> small Gaussian (std=mof_router_init_std) on the head "
+                          "weight so per-expert logits DIFFER from step 0 -> top-1 splits samples across experts and "
+                          "BOTH experts receive gradient (standard dead-expert-at-init prevention). Bias stays zero. "
+                          "Recommended 'normal' whenever top_k<num_experts with identical (copy/shared) expert init."},
+    )
+    mof_router_init_std: float = field(
+        default=0.02,
+        metadata={"help": "Std of the Gaussian for mof_router_init='normal' on the router head weight."},
+    )
     mof_router_input: Literal['prompt', 'latent', 'fused_gate', 'fused_film', 'fused_xattn'] = field(
         default='fused_film',
         metadata={"help": "How the GLOBAL router fuses prompt & input-latent x_t (ignored for "

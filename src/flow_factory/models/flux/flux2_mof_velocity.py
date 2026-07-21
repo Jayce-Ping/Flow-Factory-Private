@@ -73,10 +73,13 @@ class MoFGlobalRouter(nn.Module):
     MODES = ("prompt", "latent", "fused_gate", "fused_film", "fused_xattn")
 
     def __init__(self, num_experts: int, d_prompt: int, d_latent: int, d_time: int,
-                 d_hidden: int = 256, mode: str = "prompt"):
+                 d_hidden: int = 256, mode: str = "prompt",
+                 head_init: str = "zero", head_init_std: float = 0.02):
         super().__init__()
         if mode not in self.MODES:
             raise ValueError(f"MoFGlobalRouter mode must be one of {self.MODES}, got {mode!r}")
+        if head_init not in ("zero", "normal"):
+            raise ValueError(f"head_init must be 'zero' or 'normal', got {head_init!r}")
         self.mode = mode
         self.d_prompt, self.d_latent, self.d_hidden = d_prompt, d_latent, d_hidden
         self.t_proj = nn.Linear(d_time, d_hidden)
@@ -107,8 +110,14 @@ class MoFGlobalRouter(nn.Module):
         self.mlp = nn.Sequential(
             nn.SiLU(), nn.Linear(2 * d_hidden, d_hidden), nn.SiLU(), nn.Linear(d_hidden, num_experts),
         )
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)  # uniform mixture at start
+        nn.init.zeros_(self.mlp[-1].bias)  # zero bias -> no constant per-expert offset
+        if head_init == "normal":
+            # small Gaussian on the head weight: per-expert logits DIFFER from step 0 -> top-1 splits
+            # samples across experts so BOTH get gradient (dead-expert-at-init prevention). Small std
+            # keeps the start near-uniform (gates ~0.5) so it stays close to the base flow model.
+            nn.init.normal_(self.mlp[-1].weight, mean=0.0, std=head_init_std)
+        else:
+            nn.init.zeros_(self.mlp[-1].weight)  # uniform mixture at start (ties -> top-1 dead-expert risk)
 
     @staticmethod
     def _attn_pool(query: torch.Tensor, seq: torch.Tensor, d: int) -> torch.Tensor:
@@ -186,6 +195,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         soft_blend: bool = False,
         topk_sparse: bool = False,
         gate_fn: str = "softmax",
+        router_init: str = "zero",
+        router_init_std: float = 0.02,
     ):
         super().__init__()
         if route_granularity not in ("token", "sample"):
@@ -250,6 +261,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             self.router = MoFGlobalRouter(
                 num_experts, d_prompt=joint_attention_dim, d_latent=in_channels,
                 d_time=self.inner_dim, d_hidden=router_hidden_dim, mode=router_input,
+                head_init=router_init, head_init_std=router_init_std,
             )
 
         self._last_mof_aux: Optional[torch.Tensor] = None
@@ -538,6 +550,45 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         prev_cache = torch.is_autocast_cache_enabled()
         torch.set_autocast_cache_enabled(False)
         try:
+            if getattr(self.config, "topk_sparse", False):
+                # MODERN-MoE selective activation (shared base + per-expert adapter). Every rank loops
+                # ALL adapters in the same order (uniform base all-gather -> FSDP-safe; a 0-routed rank
+                # still invokes the base on a 1-sample zero-weight dummy so the gather count matches),
+                # but computes only each adapter's routed samples. Differentiable gate: sigmoid uses the
+                # raw gate; softmax uses Mixtral renorm (k>=2) / straight-through one-hot (k==1).
+                topw, topi = torch.topk(probs, k, dim=-1)
+                if getattr(self.config, "gate_fn", "softmax") == "sigmoid":
+                    gate = topw
+                elif k > 1:
+                    gate = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                else:
+                    gate = topw + (1.0 - topw).detach()
+                w_full = torch.zeros_like(probs).scatter_(-1, topi, gate)
+                out: Optional[torch.Tensor] = None
+                for e in range(n):
+                    idx = (w_full[:, e] > 0).nonzero(as_tuple=True)[0]
+                    if idx.numel() == 0:
+                        idx = torch.zeros(1, dtype=torch.long, device=hidden_states.device)
+                        we = w_full.new_zeros(1)
+                    else:
+                        we = w_full[idx, e]
+                    v_e = _run(e, idx)
+                    if out is None:
+                        out = v_e.new_zeros((B,) + tuple(v_e.shape[1:]))
+                    we_b = we.view(idx.shape[0], *([1] * (v_e.ndim - 1))).to(v_e.dtype)
+                    out.index_add_(0, idx, we_b * v_e)
+                return out, topi
+
+            if getattr(self.config, "soft_blend", False):
+                # Differentiable dense blend over ALL adapters by the full gates (uniform -> FSDP-safe).
+                out: Optional[torch.Tensor] = None
+                allidx = torch.arange(B, device=hidden_states.device)
+                for e in range(n):
+                    v_e = _run(e, allidx)
+                    we = probs[:, e].view(B, *([1] * (v_e.ndim - 1))).to(v_e.dtype)
+                    out = we * v_e if out is None else out + we * v_e
+                return out, torch.topk(probs, k, dim=-1)[1]
+
             if k >= n:
                 out: Optional[torch.Tensor] = None
                 allidx = torch.arange(B, device=hidden_states.device)
@@ -546,14 +597,27 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
                     we = probs[:, e].view(B, *([1] * (v_e.ndim - 1))).to(v_e.dtype)
                     out = we * v_e if out is None else out + we * v_e
                 return out, None
+
             topw, topi = torch.topk(probs, k, dim=-1)  # (B, k)
             topw = topw / topw.sum(dim=-1, keepdim=True).clamp_min(1e-9)
             w_full = torch.zeros_like(probs).scatter_(-1, topi, topw)  # (B, N)
+
+            if getattr(self.config, "dense_exec", False):
+                # FSDP-safe HARD top-k: run every adapter on ALL samples (uniform), weight by the
+                # one-hot renormalized top-k (non-differentiable router for k==1; see topk_sparse).
+                out: Optional[torch.Tensor] = None
+                allidx = torch.arange(B, device=hidden_states.device)
+                for e in range(n):
+                    v_e = _run(e, allidx)
+                    we = w_full[:, e].view(B, *([1] * (v_e.ndim - 1))).to(v_e.dtype)
+                    out = we * v_e if out is None else out + we * v_e
+                return out, topi
+
             out = None
             for e in range(n):
                 sel = w_full[:, e] > 0
                 if not bool(sel.any()):
-                    continue
+                    continue  # sparse skip -- DDP-safe only (FSDP -> divergent all-gather count)
                 idx = sel.nonzero(as_tuple=True)[0]
                 v_e = _run(e, idx)
                 if out is None:
@@ -597,7 +661,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
     def _mof_config_from_base(base, num_experts, top_k, route_granularity, router_type,
                              router_hidden_dim, expert_mode="distinct", router_input="prompt",
                              dense_exec=False, soft_blend=False, topk_sparse=False,
-                             gate_fn="softmax") -> dict:
+                             gate_fn="softmax", router_init="zero", router_init_std=0.02) -> dict:
         bc = dict(base.config)
         return dict(
             patch_size=bc["patch_size"], in_channels=bc["in_channels"], out_channels=bc.get("out_channels"),
@@ -610,6 +674,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             router_type=router_type, router_hidden_dim=router_hidden_dim, expert_mode=expert_mode,
             router_input=router_input, dense_exec=dense_exec, soft_blend=soft_blend,
             topk_sparse=topk_sparse, gate_fn=gate_fn,
+            router_init=router_init, router_init_std=router_init_std,
         )
 
     @classmethod
@@ -628,6 +693,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         soft_blend: bool = False,
         topk_sparse: bool = False,
         gate_fn: str = "softmax",
+        router_init: str = "zero",
+        router_init_std: float = 0.02,
     ) -> "Flux2VelocityMoFTransformer2DModel":
         """Init: replicate the base transformer into the experts (each a verbatim copy of the base,
         so the ensemble == base at init when the router is uniform).
@@ -645,7 +712,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             )
         model = cls(**cls._mof_config_from_base(
             base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode,
-            router_input, dense_exec, soft_blend, topk_sparse, gate_fn))
+            router_input, dense_exec, soft_blend, topk_sparse, gate_fn, router_init, router_init_std))
         base_sd = base.state_dict()
         with torch.no_grad():
             if expert_mode == "shared_lora":

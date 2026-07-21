@@ -227,6 +227,8 @@ class Flux2KleinAdapter(BaseAdapter):
             soft_blend=getattr(self.model_args, "mof_soft_blend", False),
             topk_sparse=getattr(self.model_args, "mof_topk_sparse", False),
             gate_fn=getattr(self.model_args, "mof_gate_fn", "softmax"),
+            router_init=getattr(self.model_args, "mof_router_init", "zero"),
+            router_init_std=getattr(self.model_args, "mof_router_init_std", 0.02),
         )
         if self.model_args.mof_base_transformer_path:
             mof = Flux2VelocityMoFTransformer2DModel.from_base_replicated(

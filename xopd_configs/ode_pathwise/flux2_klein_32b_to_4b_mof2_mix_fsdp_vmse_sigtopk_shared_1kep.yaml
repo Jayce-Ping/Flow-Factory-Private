@@ -1,25 +1,22 @@
 # Cross-OPD (XOPD): FLUX.2-dev (teacher) -> 2-expert VELOCITY-space MoF student, FSDP HYBRID_SHARD,
-# MIXED geneval_enhanced + ocr training. MODERN-MoE router variant of ..._mof2_mix_fsdp_vmse_1kep.yaml:
-# replaces the softmax convex blend with INDEPENDENT SIGMOID gating + top-1 SPARSE activation.
-# Deltas vs the soft_blend run:
-#   1. mof_gate_fn: sigmoid -- each expert gets an INDEPENDENT gate sigma(logit_e) in (0,1); the gates
-#      do NOT sum to 1. Removes the hard convex constraint (DeepSeek-V3-style gating).
-#   2. mof_topk_sparse: true -- SELECTIVE activation: every rank loops all experts (uniform FSDP
-#      all-gather -> no NCCL deadlock) but only COMPUTES each expert's routed samples (index_select;
-#      a 0-routed rank still invokes the expert on 1 zero-weight dummy to keep the all-gather uniform).
-#      With sigmoid the selected gate value is used DIRECTLY as the blend weight -> naturally
-#      differentiable (router trains from the main loss), and ~top_k/N x the FLOPs/activation of
-#      soft_blend (N=2/top-1 -> ~half the student forward + less activation memory).
-#   3. Velocity magnitude is now FREE (weights need not sum to 1). It is regularized by:
-#        - MSE(v) itself (matching the teacher velocity already supervises the blend magnitude), plus
-#        - router_z_loss (logsumexp^2, bounds the router logits), and
-#        - mof_weight_sum_penalty (soft (sum_e w_e - 1)^2 over the selected gates).
-#      All three are independent knobs (any -> 0 disables it); set both aux coeffs to 0 for a
-#      pure MSE(v)-only-regularized run.
-#   4. Load-balance aux code is KEPT but DISABLED (moe_load_balance_coeff: 0.0) for this run.
-#   5. Everything else (FSDP HYBRID_SHARD student + replicated 32B teacher, full-timestep MSE(v),
-#      1:1 geneval_enhanced+ocr mix @ 256/epoch, torch.compile, AC FSDP-side) matches the soft run
-#      so the router change is the only variable.
+# MIXED geneval_enhanced + ocr training. MODERN-MoE router: SHARED-LoRA experts + INDEPENDENT SIGMOID
+# gating + top-1 SPARSE activation + small-random router init. Design:
+#   1. mof_expert_mode: shared_lora -- ONE frozen 4B base + 2 LoRA adapters (expert_0/expert_1),
+#      switched per sample. Half the base params of distinct 2x4B (cheaper), experts differ ONLY by LoRA.
+#   2. mof_gate_fn: sigmoid -- INDEPENDENT gate sigma(logit_e) in (0,1); gates do NOT sum to 1 (the hard
+#      convex constraint is REMOVED). Velocity magnitude is FREE, regularized by MSE(v) ALONE for now
+#      (router_z_loss / weight-sum penalty coeffs start at 0; z-loss = logit stabilizer NOT anti-collapse).
+#   3. mof_topk_sparse: true -- SELECTIVE activation: every rank loops all adapters (uniform base
+#      all-gather -> no NCCL deadlock) but computes only each adapter's routed samples (a 0-routed rank
+#      still invokes the base on 1 zero-weight dummy to keep the gather count uniform). sigmoid -> the
+#      selected gate value is the blend weight DIRECTLY (differentiable; router trains from the main loss).
+#   4. mof_router_init: normal (std 0.02) -- per-expert logits DIFFER at init so top-1 activates BOTH
+#      experts from step 0 (dead-expert-at-init prevention; the zero-init head would tie -> collapse to e0).
+#   5. Anti-COLLAPSE (one expert taking over DURING training) is NOT engaged (moe_load_balance_coeff: 0);
+#      watch per-expert usage and enable the load-balance aux (~0.01) only if it collapses.
+#   6. compile_student OFF (torch.compile may not guard on PEFT set_adapter across the adapter switch);
+#      compile_teacher stays ON. Everything else (FSDP student + replicated 32B teacher, full-timestep
+#      MSE(v), 1:1 geneval+ocr @ 256/epoch, AC FSDP-side) matches the soft run so routing is the variable.
 
 # ===== Environment =====
 launcher: "accelerate"
@@ -51,26 +48,29 @@ model:
   model_type: "flux2-klein"
   resume_path: null
   resume_type: null
-  # --- MoF-V construction (per-SAMPLE top-1 global router; SIGMOID gate + topk_sparse selective activation) ---
+  # --- MoF-V construction (SHARED-LoRA: 1 base + 2 adapters; per-SAMPLE top-1 global router; SIGMOID gate + topk_sparse) ---
   mof_enabled: true
   mof_num_experts: 2
   mof_top_k: 1
-  mof_route_granularity: "sample"         # per-sample routing (top-1 selection)
+  mof_expert_mode: "shared_lora"          # ONE frozen 4B base + 2 LoRA adapters (expert_0/expert_1); experts differ ONLY by LoRA (needs noise_std=0)
+  mof_route_granularity: "sample"         # per-sample routing (top-1 selection); required by shared_lora
   mof_router_type: "global"               # per-sample gate
   mof_router_input: "prompt"              # route by prompt/domain (drives per-domain expert specialization)
-  mof_noise_std: 0.0                      # LoRA gaussian init breaks expert symmetry
+  mof_router_init: "normal"               # small-Gaussian router head -> per-expert logits DIFFER at init -> top-1 activates BOTH experts (no dead-expert-at-init)
+  mof_router_init_std: 0.02
+  mof_noise_std: 0.0                      # required by shared_lora (shared frozen base); LoRA lora_B zero-init -> experts identical until routed gradient diverges them
   mof_gate_fn: "sigmoid"                  # INDEPENDENT per-expert gate in (0,1); gates do NOT sum to 1 (free velocity magnitude)
-  mof_topk_sparse: true                   # SELECTIVE activation: loop all experts (uniform all-gather, FSDP-safe) but compute only routed samples
-  mof_dense_exec: true                    # kept as the FSDP-safety marker; topk_sparse takes precedence (also uniform all-gather)
-  mof_soft_blend: false                   # off: topk_sparse (sparse) instead of the dense softmax blend
-  # --- torch.compile (per-block in-place nn.Module.compile: keeps block class -> FSDP per-block wrap, and state_dict keys -> LoRA save/load unchanged) ---
+  mof_topk_sparse: true                   # SELECTIVE activation: loop all adapters (uniform base all-gather, FSDP-safe) but compute only routed samples
+  mof_dense_exec: true                    # FSDP-safety marker; topk_sparse takes precedence (also uniform)
+  mof_soft_blend: false                   # off: sparse top-k instead of dense blend
+  # --- torch.compile ---
   compile_teacher: true                   # compile frozen 32B teacher (no-grad/not-saved) -> speed up sampling / teacher-mean precompute
-  compile_student: true                   # compile each MoF expert's blocks -> speed up train forward/backward
-  compile_mode: "default"                 # 'default' (safe); avoid 'reduce-overhead' here (CUDA graphs use MORE memory next to the replicated teacher)
+  compile_student: false                  # OFF for shared_lora: torch.compile may not guard on PEFT set_adapter -> stale/ recompiled graph across adapter switches
+  compile_mode: "default"
 
 # ===== Logging =====
 log:
-  run_name: "flux2klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_1kep"
+  run_name: "flux2klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_shared_1kep"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -109,10 +109,10 @@ train:
   # --- L1 loss space: full-trajectory raw-velocity MSE ---
   xopd_dk_space: "v"                       # MSE ||v_s - v_t||^2 on ALL 28 steps (no xopd_train_steps / num_xopd_steps)
 
-  # --- MoF router regularizers (modern-MoE; replace the hard sum-to-1) ---
-  moe_load_balance_coeff: 0.0             # Switch load-balance aux: code KEPT but DISABLED for this run
-  router_z_loss_coeff: 1.0e-3             # ST-MoE z-loss: bound the router logits (prevent gate explosion)
-  mof_weight_sum_penalty_coeff: 1.0e-2    # soft (sum_e w_e - 1)^2 over selected gates: keep blended velocity magnitude ~1
+  # --- MoF router regularizers (modern-MoE; replace the hard sum-to-1). START ALL AT 0 (velocity-only). ---
+  moe_load_balance_coeff: 0.0             # Switch load-balance aux (the ANTI-COLLAPSE tool): code kept, DISABLED. Enable (~0.01) ONLY if experts collapse during training.
+  router_z_loss_coeff: 0.0               # ST-MoE z-loss (logit-magnitude stabilizer, NOT anti-collapse): disabled for now.
+  mof_weight_sum_penalty_coeff: 0.0       # soft sum-to-1: disabled -> velocity magnitude regularized by MSE(v) alone (free sigmoid gates).
   # --- Multi-source sampling ratio (equal 1:1 over geneval_enhanced + ocr) ---
   source_ratio: {geneval_enhanced: 1, ocr: 1}   # period=2 must tile unique_sample_num_per_epoch
 
