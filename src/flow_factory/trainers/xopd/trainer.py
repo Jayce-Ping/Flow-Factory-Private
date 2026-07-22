@@ -1077,25 +1077,36 @@ class XOPDTrainer(BaseTrainer):
         total_m = X_all.shape[0]
 
         # --- (b) rank0 clusters -> labels_all; broadcast; each rank slices its block ---
+        use_soft = getattr(ma, "mof_router_coldstart_label", "hard") == "soft"
+        soft_T = float(getattr(ma, "mof_router_coldstart_temperature", 0.5))
         labels_all = torch.zeros(total_m, dtype=torch.long, device=device)
+        soft_all = torch.zeros(total_m, n_clusters, dtype=torch.float32, device=device) if use_soft else None
         metrics = None
         if is_main:
-            lab, _ = balanced_spherical_kmeans(
+            lab, _, sim = balanced_spherical_kmeans(
                 X_all, n_clusters,
                 balanced=ma.mof_cluster_balanced,
                 pca_dim=ma.mof_cluster_pca_dim,
                 seed=int(self.training_args.seed),
             )
             labels_all = lab.to(device)
+            if use_soft:
+                # soft cluster responsibilities as the cold-start target (softmax over cosine sims / T)
+                soft_all = torch.softmax(sim.to(device).float() / soft_T, dim=-1)
             metrics = alignment_metrics(labels_all, sources_all)
             logger.info(
                 "[mof-coldstart] clustering done: sizes=%s ARI=%.4f purity=%.4f (vs sources %s) "
-                "-- source labels are DIAGNOSTIC ONLY (not used for clustering/CE)",
+                "| target=%s%s -- source labels are DIAGNOSTIC ONLY (not used for clustering/CE)",
                 metrics["cluster_sizes"], metrics["ari"], metrics["purity"], metrics["sources"],
+                ("soft(T=%.3g)" % soft_T) if use_soft else "hard(one-hot)", "",
             )
         if world_size > 1:
             dist.broadcast(labels_all, src=0)
-        labels_local = labels_all[offset:offset + prompt_seq_local.shape[0]].to("cpu")
+            if use_soft:
+                dist.broadcast(soft_all, src=0)
+        m_local = prompt_seq_local.shape[0]
+        labels_local = labels_all[offset:offset + m_local].to("cpu")
+        soft_local = soft_all[offset:offset + m_local].to("cpu") if use_soft else None
 
         # --- (c) data-parallel router cold-start (bypasses DeepSpeed/DDP engine) ---
         router = mof.router
@@ -1120,7 +1131,11 @@ class XOPDTrainer(BaseTrainer):
             )
             temb = router_time_embed(ts, g)
             dummy_latent = torch.zeros(b, 1, in_ch, device=device, dtype=rdtype)
-            return router(pe_batch, dummy_latent, temb)  # (b, N) softmax fp32
+            # MoFGlobalRouter.forward returns RAW logits -> softmax here so cold-start CE trains a
+            # proper distribution (classify prompt into a cluster), independent of the train-time
+            # gate_fn (softmax/sigmoid).
+            logits = router(pe_batch, dummy_latent, temb)  # (b, N) raw logits
+            return torch.softmax(logits.float(), dim=-1)   # (b, N) probs
 
         log_f = None
         default_path = os.path.join(
@@ -1146,7 +1161,7 @@ class XOPDTrainer(BaseTrainer):
             steps=ma.mof_router_coldstart_steps, lr=ma.mof_router_coldstart_lr,
             batch_size=ma.mof_router_coldstart_batch, world_size=world_size, device=device,
             log_every=ma.mof_router_coldstart_log_every, log_cb=log_cb,
-            seed=int(self.training_args.seed),
+            seed=int(self.training_args.seed), soft_targets=soft_local,
         )
 
         # --- (d) sync router replicas, clear grads, log summary ---

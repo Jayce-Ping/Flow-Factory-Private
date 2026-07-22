@@ -353,6 +353,20 @@ class ModelArguments(ArgABC):
         metadata={"help": "Router-only cold-start optimizer steps (data-parallel across ranks). Ignored unless "
                           "mof_router_coldstart."},
     )
+    mof_router_coldstart_label: Literal['hard', 'soft'] = field(
+        default='hard',
+        metadata={"help": "Cold-start CE target. 'hard' -> one-hot cluster label (NLL; the router is pushed to a "
+                          "confident per-cluster routing -> strong but can OVER-LOCK the prompt tendency). 'soft' -> "
+                          "soft cluster responsibilities target = softmax(cosine_sim(prompt, centroids) / "
+                          "mof_router_coldstart_temperature) (soft cross-entropy) -> gentler, mitigates over-locking "
+                          "and lets the main loss refine the partition. Ignored unless mof_router_coldstart."},
+    )
+    mof_router_coldstart_temperature: float = field(
+        default=0.5,
+        metadata={"help": "Softmax temperature T for the 'soft' cold-start targets softmax(cos_sim / T). Small T -> "
+                          "sharp (approaches one-hot); large T -> soft (toward uniform -> least locking). Only used "
+                          "when mof_router_coldstart_label='soft'."},
+    )
     mof_router_coldstart_lr: float = field(
         default=1e-3,
         metadata={"help": "AdamW lr for the router cold-start (router params only)."},
@@ -423,6 +437,11 @@ class ModelArguments(ArgABC):
                 raise ValueError(
                     f"mof_cluster_max_samples ({self.mof_cluster_max_samples}) must be >= mof_num_experts "
                     f"({self.mof_num_experts})."
+                )
+            if self.mof_router_coldstart_label == "soft" and self.mof_router_coldstart_temperature <= 0:
+                raise ValueError(
+                    f"mof_router_coldstart_temperature must be > 0 for soft cold-start, got "
+                    f"{self.mof_router_coldstart_temperature}."
                 )
 
         if self.moe_enable_ep:

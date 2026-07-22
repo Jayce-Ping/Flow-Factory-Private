@@ -133,7 +133,7 @@ def balanced_spherical_kmeans(
     pca_dim: int = 256,
     iters: int = 25,
     seed: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Spherical (cosine) k-means with k-means++ init and optional size balancing.
 
     Args:
@@ -145,8 +145,10 @@ def balanced_spherical_kmeans(
         seed: RNG seed (determinism).
 
     Returns:
-        ``(labels (M,), centroids (N, d))`` where ``d`` is the (possibly PCA'd)
-        clustering dim. Centroids are L2-normalized (cosine space).
+        ``(labels (M,), centroids (N, d), sim (M, N))`` where ``d`` is the (possibly
+        PCA'd) clustering dim. Centroids are L2-normalized (cosine space); ``sim`` is
+        the final cosine similarity of each point to every centroid (for building soft
+        cold-start targets = softmax(sim / T)).
     """
     if x.dim() != 2:
         raise ValueError(f"balanced_spherical_kmeans expects (M, D), got {tuple(x.shape)}")
@@ -172,7 +174,8 @@ def balanced_spherical_kmeans(
             labels = new_labels
             break
         labels = new_labels
-    return labels, centroids
+    sim = xn @ centroids.t()  # (M, N) final cosine sims (for soft targets = softmax(sim / T))
+    return labels, centroids, sim
 
 
 def assign_clusters(x: torch.Tensor, centroids: torch.Tensor, pca_basis: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -202,8 +205,13 @@ def coldstart_router(
     log_every: int = 10,
     log_cb: Optional[Callable[[int, float, float, float], None]] = None,
     seed: int = 0,
+    soft_targets: Optional[torch.Tensor] = None,
 ) -> None:
-    """Data-parallel router-only cross-entropy cold-start to cluster one-hot labels.
+    """Data-parallel router-only cross-entropy cold-start to cluster labels.
+
+    ``soft_targets`` (M, N): if given, use SOFT cross-entropy ``-sum_c q_c log p_c`` to these
+    per-prompt cluster-responsibility distributions (softmax(cos_sim / T)) instead of the hard
+    one-hot NLL to ``labels`` (which is then used only for the accuracy diagnostic).
 
     Each rank owns a shard (``prompt_seq``/``labels`` are THIS rank's local full-seq
     prompt embeds + cluster labels). Per step: draw a local minibatch, forward the
@@ -228,6 +236,10 @@ def coldstart_router(
         raise ValueError(
             f"prompt_seq ({prompt_seq.shape[0]}) and labels ({labels.shape[0]}) must align"
         )
+    if soft_targets is not None and soft_targets.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"soft_targets ({soft_targets.shape[0]}) and labels ({labels.shape[0]}) must align"
+        )
     m = prompt_seq.shape[0]
     if m == 0:
         raise ValueError("coldstart_router got an empty local shard; increase mof_cluster_max_samples.")
@@ -246,8 +258,12 @@ def coldstart_router(
         idx = torch.randperm(m, generator=gen)[:bs]
         pe = prompt_seq[idx].to(device)
         lab = labels[idx].to(device)
-        probs = router_forward_fn(pe)  # (bs, N)
-        loss = F.nll_loss(torch.log(probs.clamp_min(eps)), lab)
+        probs = router_forward_fn(pe)  # (bs, N) softmax probs
+        if soft_targets is not None:
+            st = soft_targets[idx].to(device)  # (bs, N) target distribution
+            loss = -(st * torch.log(probs.clamp_min(eps))).sum(dim=-1).mean()  # soft cross-entropy
+        else:
+            loss = F.nll_loss(torch.log(probs.clamp_min(eps)), lab)  # hard one-hot CE
         opt.zero_grad(set_to_none=True)
         loss.backward()
         if world_size > 1:
