@@ -74,6 +74,7 @@ log:
 train:
   trainer_type: 'grpo'  # Options: grpo, grpo-guard, nft, awm, dpo, dgpo
   advantage_aggregation: 'sum'  # Options: sum (weighted-sum), gdpo (per-reward group-norm)
+  policy_loss_type: 'step'  # Options: step, sum, gspo
   clip_range: 1.0e-4  # PPO/GRPO policy ratio clipping range
   adv_clip_range: 5.0  # Advantage clipping range (prevents extreme updates)
   kl_type: 'v-based'  # Options: x-based, v-based (KL divergence formulation)

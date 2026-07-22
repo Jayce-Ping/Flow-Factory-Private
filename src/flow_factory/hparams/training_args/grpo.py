@@ -34,6 +34,18 @@ class GRPOTrainingArguments(TrainingArguments):
         default='gdpo',
         metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
     )
+    policy_loss_type: Literal['step', 'sum', 'gspo'] = field(
+        default='step',
+        metadata={
+            "help": (
+                "GRPO policy loss aggregation. "
+                "'step': per-SDE importance ratio + clip (Flow-GRPO default); "
+                "'sum': REINFORCE on trajectory sum of new log-probs; "
+                "'gspo': trajectory-level importance ratio + one clip. "
+                "Options: ['step', 'sum', 'gspo']."
+            ),
+        },
+    )
     # Clipping / KL
     clip_range: tuple[float, float] = field(
         default=(-1e-4, 1e-4),
@@ -64,6 +76,15 @@ class GRPOTrainingArguments(TrainingArguments):
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
         if self.kl_type not in ['v-based', 'x-based']:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based'].")
+        if self.policy_loss_type not in ['step', 'sum', 'gspo']:
+            raise ValueError(
+                f"Invalid policy_loss_type: {self.policy_loss_type}. "
+                "Valid options are: ['step', 'sum', 'gspo']."
+            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
+        # Traj-level losses (sum / gspo) run one backward per micro-batch after
+        # looping all SDE steps, so they must not multiply GAS by K.
+        if self.policy_loss_type in ('sum', 'gspo'):
+            return 1
         return args.scheduler_args.num_sde_steps
