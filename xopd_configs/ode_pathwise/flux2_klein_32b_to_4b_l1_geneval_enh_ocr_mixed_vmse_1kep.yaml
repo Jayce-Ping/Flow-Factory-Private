@@ -1,0 +1,187 @@
+# Cross-OPD (XOPD): FLUX.2-dev (teacher) -> FLUX.2-klein-base-4B (student)
+# MIXED expert, v-MSE variant. Plain ONE-4B LoRA student on a 1:1 geneval_enhanced+ocr mixture,
+# IDENTICAL to flux2_klein_32b_to_4b_l1_geneval_enh_ocr_mixed_1kep.yaml (run 4cnkluwk) EXCEPT
+# xopd_dk_space: v (raw-velocity MSE) instead of the default MSE(xt). This is the apples-to-apples
+# single-4B baseline for the v-MSE MoF-2 mix + the v-MSE OCR ablations (the old mixed run used
+# MSE(xt), so it was not directly comparable). Same DeepSpeed ZeRO-2, data, eval, 1000 epochs.
+# LoRA (rank 64, alpha 128) on ALL linears (attn + MLP); 4B student distilled from the 32B
+# teacher. Train + eval @ 512px.
+# Cross-FAMILY distillation: teacher and student share the VAE / latent space
+# (AutoencoderKLFlux2, in_channels=128) but use DIFFERENT text encoders -- dev's
+# Mistral3 (dim 15360) vs klein's Qwen3 (dim 7680). Teacher text embeddings are
+# precomputed during preprocessing and the 48GB teacher text encoder is offloaded
+# before training; the 64GB teacher transformer stays resident.
+# Non-CFG (teacher_gs = student_gs = 1.0); pure L1 (l0_warmup_epochs=0).
+# FULL eval suite on all 6 test sets (geneval_enhanced/ocr/pickscore x gs1/gs4). Teacher-baseline
+# eval is SKIPPED here (eval_teacher_at_start: false): the shared teacher ceiling was computed once
+# by the FIRST run (flux2klein_32b_to_4b_l1_ocr_1kep) on the same 6 sets and is reused/overlaid.
+#
+# EQUAL PER-DOMAIN EXPOSURE: source_ratio 1:1 over {geneval_enhanced, ocr} with
+# unique_sample_num_per_epoch = 256 -> 4 batches/source/epoch = 128 samples/source/epoch,
+# i.e. EACH domain sees exactly the same 128 prompts/epoch as its specialist run. This isolates
+# the capacity/interference effect from a per-domain data-exposure confound. num_batches_per_epoch
+# = 256/32 = 8 total, GAS = 8 * 28 = 224, gradient_step_per_epoch = 1 (one optimizer step/epoch).
+
+# ===== Environment =====
+launcher: "accelerate"                    # Launcher. Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # DeepSpeed ZeRO-2 (proven multi-node path; FSDP multi-node deadlocks on this cluster). Teacher(64GB) replicated per GPU; ZeRO-2 shards student optim/grad.
+num_processes: 8                          # Number of processes (GPUs); overrides the config file
+main_process_port: 29500                  # Master process port
+mixed_precision: "bf16"                   # Mixed precision. Options: no, fp16, bf16
+
+# ===== Data (prompts only; L0's z0 is teacher-generated) =====
+data:
+  dataset_dir: "dataset/geneval_enhanced" # eval/test fallback
+  # --- Multi-source training: geneval_enhanced + ocr, equal 1:1 weight ---
+  # Each directory is preprocessed independently (teacher text embeddings precomputed
+  # per source) and L1 sampling block-cycles across them per train.source_ratio below.
+  # The source name is the basename of each directory (geneval_enhanced / ocr).
+  dataset_dirs:
+    - "dataset/geneval_enhanced"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32            # Batch size for offline teacher text encoding
+  dataloader_num_workers: 16              # DataLoader worker processes
+  force_reprocess: false                  # reuse the per-node caches built by the OCR + geneval_enhanced runs (identical hashes -> cache HIT on all 4 nodes).
+  cache_dir: "~/.cache/flow_factory/datasets"  # Preprocess cache directory (same as the specialist runs -> per-source cache HIT)
+  max_dataset_size: null                  # Truncate dataset size; null = no limit (full data for the formal run)
+  sampler_type: "auto"                    # Sampler. Options: auto, distributed_k_repeat, group_contiguous
+
+# ===== Model (student = mixed geneval_enhanced+ocr expert, LoRA on all linears) =====
+model:
+  finetune_type: "lora"                   # LoRA (faster + more expressive than full-rank@1e-5)
+  lora_rank: 64                           # expressiveness
+  lora_alpha: 128                         # scale (alpha/r = 2.0)
+  target_modules: "all-linear"            # ALL linears (attn + MLP), consistent with the two specialists + MoE/MoF configs for a fair capacity comparison.
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"  # Student path (HF repo id or local)
+  model_type: "flux2-klein"               # Adapter registry key (fixed for klein)
+  resume_path: null                       # Checkpoint/LoRA to resume from; null = none
+  resume_type: null                       # Options: lora, full, state; null = auto by finetune_type
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_l1_geneval_enh_ocr_mixed_vmse_1kep"
+  project: "Flow-Factory-XOPD"            # Logger project name
+  logging_backend: "wandb"                # Options: wandb, swanlab, tensorboard, none
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"  # shared cephfs checkpoint dir
+  save_freq: 50                           # SAVE checkpoints (the mixed student is compared against the two specialists + serves as a mixing baseline)
+  save_model_only: true                   # Save only model weights (not optimizer/scheduler state)
+
+# ===== Training (XOPD) =====
+train:
+  trainer_type: "xopd"                    # Selects the Cross-OPD trainer (fixed)
+  max_epochs: 1000                        # overnight long run
+  fsdp_shard_teacher: false               # ZeRO-2: teacher NOT sharded (resident 64GB/GPU); wraps trainable student only
+
+  # --- Cross-model teacher ---
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"  # Teacher path; only its transformer (~64GB) is loaded. VAE reused from student; teacher text encoder (Mistral3) is precomputed offline then offloaded
+  teacher_param_device: "cuda"            # Teacher transformer device. Options: cuda (only cuda supported today), cpu
+  assume_shared_vae_text_encoder: true    # FLUX.2-dev shares the VAE / latent space with klein (in_channels=128); its text encoder differs and is encoded separately. false raises.
+
+  # --- Teacher baseline eval: SKIPPED (reuse the FIRST run's shared teacher ceiling) ---
+  eval_teacher_at_start: false            # Skip the teacher-baseline eval at epoch 0; teacher transformer still loads for L1 supervision. Teacher ceiling reused from the OCR first run (same 6 test sets), overlaid in the comparison HTML.
+
+  # --- Dual classifier-free guidance (teacher / student independent) ---
+  teacher_guidance_scale: 1.0             # Teacher CFG. >1 runs cond+uncond passes (needs negatives); raise to distill guidance
+  student_guidance_scale: 1.0             # Student CFG for forward + rollout; synced into base guidance_scale
+
+  # --- L0: velocity-regression warmup (teacher-generated data) ---
+  l0_warmup_epochs: 0                     # Run L0 for the first N epochs, then switch to L1 (0 disables L0)
+  l0_num_inference_steps: 50              # Teacher rollout steps when generating z0 targets in L0
+  l0_inner_steps: 4                       # Random-t regression sub-steps per generated z0 batch; MUST be a multiple of num_train_timesteps (else auto-rounded up + warned).
+  l0_time_sampling: "logit_normal"        # L0 t sampling. Options: logit_normal, uniform
+  l0_weighting: "min_snr"                 # L0 loss weight w(t). Options: min_snr, snr, uniform
+  l0_snr_gamma: 5.0                       # Min-SNR-gamma clamp (used when l0_weighting=min_snr)
+
+  # --- L1: on-policy transition matching ---
+  pathwise_coef: 1.0                      # Coefficient on per-step Gaussian KL D_k (mean matching); >= 0
+  reinforce_coef: 0.0                     # REINFORCE trajectory-term coefficient; 0 disables (pure pathwise)
+  reinforce_horizon: null                 # Future steps aggregated into R_bar; null = all j > k
+  reinforce_future_reduction: "mean"      # R_bar aggregation. Options: sum, mean
+  normalize_d_k: false                    # true: divide D_k by 2*sigma_bar^2; false: plain MSE
+  kl_type: "x-based"                      # KL anchor type vs base. Options: x-based, v-based
+  kl_beta: 0.0                            # KL anchor coefficient; 0 disables
+
+  # --- L1 loss space: full-trajectory raw-velocity MSE (the ONLY delta vs the original mixed run) ---
+  xopd_dk_space: "v"                      # MSE ||v_s - v_t||^2 on ALL 28 steps. The original mixed run (4cnkluwk) used the
+                                          # default MSE(xt) (dt^2-weighted -> last-step dominance); this is its APPLES-TO-APPLES
+                                          # v-MSE twin so the plain-4B mixed baseline matches the v-MSE MoF / OCR ablations.
+
+  # --- Multi-source sampling ratio (equal 1:1 over geneval_enhanced + ocr) ---
+  source_ratio: {geneval_enhanced: 1, ocr: 1}   # 1:1 -> 4 batches/source/epoch = 128 samples/source/epoch (num_batches_per_epoch = 8)
+
+  # --- Sampling / batch ---
+  resolution: 512                         # Generation resolution (int or [H, W]); klein native is 1024, lower to save memory
+  num_inference_steps: 28                 # L1 student rollout steps (undistilled base models need more steps)
+  per_device_batch_size: 1                # Conservative: 32B teacher ~64GB resident + 4B student. Re-run a batch search once GPUs are free to raise it.
+  group_size: 1                           # Group size (XOPD default 1; only >1 if you add grouped REINFORCE)
+  unique_sample_num_per_epoch: 256        # 2 x 128: each source gets 128 prompts/epoch (= the single-domain specialist). num_batches_per_epoch = 256/32 = 8 total = 4 per source.
+  gradient_step_per_epoch: 1              # MUST be 1 for XOPD: L1 does exactly one on-policy optimizer step/epoch (auto GAS = num_batches_per_epoch * num_train_timesteps = 8*28 = 224)
+  num_inner_epochs: 1                     # MUST be 1 for XOPD (no rollout reuse); enforced at startup
+  gradient_accumulation_steps: auto       # Options: auto (recommended), or exactly num_batches_per_epoch * num_train_timesteps
+
+  # --- Optimizer ---
+  learning_rate: 1.0e-4                   # LoRA LR (matches the two specialists)
+  adam_weight_decay: 1.0e-4               # AdamW weight decay
+  adam_betas: [0.9, 0.999]               # AdamW betas
+  adam_epsilon: 1.0e-8                   # AdamW epsilon
+  max_grad_norm: 1.0                      # Gradient-norm clip threshold
+
+  # --- EMA ---
+  ema_decay: 0.0                          # EMA decay (0 disables) — matches the two specialists
+  ema_update_interval: 4                  # EMA update interval (epochs)
+  ema_device: "cuda"                      # EMA storage device. Options: cpu, cuda
+
+  # --- Memory / misc ---
+  enable_gradient_checkpointing: false     # Off for speed: 4B LoRA student + 64GB frozen teacher at 512px fits ZeRO-2 (~85GB/GPU observed). Flip true only if a first-step OOM appears.
+  offload_samples_to_cpu: false           # Offload sample tensors to CPU between sample() and optimize() to cut peak VRAM
+  seed: 42                                # Random seed
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"                    # Dynamics. Options: Flow-SDE, Dance-SDE, CPS, ODE (REINFORCE only meaningful under SDE)
+  noise_level: 0.0                        # SDE noise level a
+  num_sde_steps: null                     # Number of noise-injection steps per training step
+  sde_steps: null                         # Candidate noise window (randomly chosen during training); null = auto
+  seed: 42                                # Scheduler seed
+
+# ===== Evaluation (identical across the three-student study so all runs are comparable) =====
+eval:
+  resolution: 512                         # Eval @ 512px = TRAIN res (avoid train/eval resolution gap; cheaper eval).
+  per_device_batch_size: 1                # Eval batch size
+  num_inference_steps: 40                 # Eval steps
+  guidance_scale: 1.0                     # Eval CFG (global default; overridden per test_set)
+  eval_freq: 40                           # Eval every N epochs
+  seed: 42                                # Eval seed
+  test_sets:                              # FULL eval suite (evals on every domain): geneval(enhanced)/ocr/pickscore at gs=1.0 (no CFG) and gs=4.0 (CFG). Teacher ceiling reused from the OCR first run (eval_teacher_at_start: false here).
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval_enhanced,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}   # + PickScore (general preference, runs on any prompt/image)
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}   # OCR (isolated env) + PickScore
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (optional for XOPD; logging only, NOT part of the distillation loss) =====
+rewards:
+  - name: "geneval"                       # Reward name (referenced by eval_reward_names: [geneval])
+    reward_model: "geneval"               # Reward model type (matches dataset/geneval_enhanced)
+    weight: 1                             # Weight (for multi-reward aggregation)
+    batch_size: 64                        # Reward inference batch size
+    device: "cuda"                        # Device
+    dtype: float32                        # GenEval forces fp32 internally (autocast off + model.float()); this is a placeholder
+    async_reward: false                   # Compute reward synchronously
+  - name: "pick_score"                    # Referenced by eval_reward_names: [pick_score]
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  # OCR reward runs OUT-OF-PROCESS in the isolated `ocr` conda env (paddleocr 2.9.1,
+  # numpy<2) spawned by rewards/ocr.py, so ff's numpy2/torch stack stays untouched.
+  # The PaddleOCR worker is CPU-only; override its interpreter via env OCR_ENV_PYTHON
+  # (default /opt/conda/envs/ocr/bin/python).
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cpu"          # inert: the PaddleOCR worker always runs on CPU
+    dtype: float32
+    async_reward: false
