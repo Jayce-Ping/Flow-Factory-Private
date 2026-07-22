@@ -67,7 +67,8 @@ train:
   group_size: 24  # Group size for GRPO sampling
   global_std: true  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 48  # Unique samples per group
-  gradient_step_per_epoch: 2  # Gradient steps per epoch
+  gradient_step_per_epoch: 1  # Pure on-policy: one optimizer step per rollout epoch
+  # (sum loss has no IS; >1 steps on the same rollouts becomes biased off-policy)
   gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
   
   # Optimization
