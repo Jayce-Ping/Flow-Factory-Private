@@ -2997,6 +2997,84 @@ class XPDMTrainingArguments(XOPDTrainingArguments):
 
 
 @dataclass
+class XDMDTrainingArguments(XOPDTrainingArguments):
+    r"""Cross-model Distribution Matching Distillation (docs/xopd/dmd_cross_model_design.md).
+
+    Pure DMD (no MSE flow-anchor, no GAN head in v1): the 32B teacher is the frozen
+    ``real`` score; a second LoRA adapter ``fake`` on the SAME frozen klein-4B base is an
+    online score of the student distribution ``p_theta``; the ``student`` adapter is the
+    few-step generator. ``student`` trains through the main engine; ``fake`` trains via a
+    manual data-parallel optimizer (reuses the cold-start ``all_reduce(AVG)`` pattern), so
+    there is exactly one DeepSpeed/DDP engine. See the design doc for the alternation,
+    two-timescale ratio, and the collective-safety (broadcast selected step) requirements.
+
+    Inherits the (same-arch) teacher fields from ``XOPDTrainingArguments`` (``teacher_*``).
+    """
+
+    dmd_fake_ratio: int = field(
+        default=5,
+        metadata={
+            "help": (
+                "Two-timescale update ratio (DMD2 ``dfake_gen_update_ratio``): the ``fake`` "
+                "score is updated EVERY micro-step, the ``student`` generator once every "
+                "``dmd_fake_ratio`` micro-steps, so the fake score leads. Stage 1+2 (fake loop "
+                "only) trains fake every step and does NOT step the generator."
+            )
+        },
+    )
+    dmd_sim_steps: int = field(
+        default=4,
+        metadata={"help": "Few-step backward-simulation steps for the generator rollout (x0_G)."},
+    )
+    dmd_fake_lr: float = field(
+        default=1e-4,
+        metadata={"help": "LR for the manual-DP ``fake`` adapter optimizer (plain AdamW)."},
+    )
+    dmd_real_guidance_scale: float = field(
+        default=4.0,
+        metadata={"help": "CFG for the ``real`` (32B teacher) score in the DMD gradient (Stage 3)."},
+    )
+    dmd_fake_guidance_scale: float = field(
+        default=1.0,
+        metadata={"help": "CFG for the ``fake`` score (DMD2 asserts == 1: no guidance for fake)."},
+    )
+    dmd_t_min: float = field(
+        default=0.02,
+        metadata={"help": "Lower clamp on sigma=t/1000 for the fake/DM timestep sampling."},
+    )
+    dmd_t_max: float = field(
+        default=0.98,
+        metadata={"help": "Upper clamp on sigma=t/1000 for the fake/DM timestep sampling."},
+    )
+    dmd_grad_norm: float = field(
+        default=10.0,
+        metadata={"help": "Grad-norm clip for the ``fake`` adapter (manual-DP) step."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.dmd_fake_ratio < 1:
+            raise ValueError(f"dmd_fake_ratio must be >= 1, got {self.dmd_fake_ratio!r}.")
+        if self.dmd_sim_steps < 1:
+            raise ValueError(f"dmd_sim_steps must be >= 1, got {self.dmd_sim_steps!r}.")
+        if self.dmd_fake_guidance_scale != 1.0:
+            raise ValueError(
+                "DMD asserts no guidance for the fake score: dmd_fake_guidance_scale must be "
+                f"1.0, got {self.dmd_fake_guidance_scale!r}."
+            )
+        if not (0.0 <= self.dmd_t_min < self.dmd_t_max <= 1.0):
+            raise ValueError(
+                f"require 0 <= dmd_t_min < dmd_t_max <= 1, got ({self.dmd_t_min}, {self.dmd_t_max})."
+            )
+
+    def get_num_train_timesteps(self, args) -> int:
+        """DMD has no L1 transport trajectory; one generator update per batch. Returning 1 keeps
+        the auto-GAS machinery well-defined (the L1 one-step-per-epoch validation is disabled on
+        the DMD trainer via ``_validates_l1_one_step = False``)."""
+        return 1
+
+
+@dataclass
 class MoFDistillTrainingArguments(TrainingArguments):
     r"""Training arguments for MoF Distillation: distill weighted teacher mixture → student LoRA.
 
@@ -3645,6 +3723,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "opd": OPDTrainingArguments,
     "xopd": XOPDTrainingArguments,
     "xpdm": XPDMTrainingArguments,
+    "xdmd": XDMDTrainingArguments,
     "diffusion-opd": DiffusionOPDTrainingArguments,
     "ensemble-eval": EnsembleEvalTrainingArguments,
 }

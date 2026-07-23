@@ -1,0 +1,141 @@
+# XDMD Stage 1+2 SMOKE: cross-model DMD scaffold + fake-score loop.
+# FLUX.2-dev (32B real/teacher) -> FLUX.2-klein-base-4B (student + fake, two LoRA adapters on the
+# shared frozen base). This smoke ONLY exercises Stage 1+2 (docs/xopd/dmd_cross_model_design.md):
+#   (a) build the 'fake' adapter + its manual-DP optimizer,
+#   (b) per micro-step: student 4-step rollout -> x0_G (no grad); train 'fake' to the FM velocity
+#       of x0_G (random t, fresh noise) via all_reduce(AVG) + plain AdamW.
+# The generator DMD update (Stage 3) is NOT run here. Eval/checkpoint OFF; tiny data; 1 epoch.
+# Single-node (num_processes 8) smoke: MASTER_PORT=29580 XOPD_WORKERS="" \
+#   bash scripts/xopd_cluster/run_4node_xopd.sh xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_dmd_mix_smoke.yaml
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data =====
+data:
+  dataset_dir: "dataset/geneval_enhanced"
+  dataset_dirs:
+    - "dataset/geneval_enhanced"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (student = LoRA on all linears; 'fake' adapter added by the DMD trainer) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all-linear"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_dmd_mix_smoke"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 0                            # smoke: no checkpoints
+  save_model_only: true
+
+# ===== Training (XDMD) =====
+train:
+  trainer_type: "xdmd"                    # Cross-model DMD trainer (Stage 1+2)
+  max_epochs: 1                           # smoke: single epoch
+  fsdp_shard_teacher: false
+
+  # --- Cross-model teacher (loaded in __init__; NOT used in Stage 1+2, but resident) ---
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  # --- DMD knobs ---
+  dmd_sim_steps: 4                        # student few-step backward-simulation
+  dmd_fake_ratio: 5                       # two-timescale ratio (fake leads); Stage 1+2 trains fake every step
+  dmd_fake_lr: 1.0e-4                      # manual-DP fake optimizer LR
+  dmd_real_guidance_scale: 1.0            # teacher CFG for real score (Stage 3)
+  dmd_fake_guidance_scale: 1.0            # DMD asserts no CFG for fake
+  dmd_t_min: 0.02
+  dmd_t_max: 0.98
+  dmd_grad_norm: 10.0
+
+  # --- L0/L1 disabled (XDMD overrides start(); these are inert but kept valid) ---
+  l0_warmup_epochs: 0
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  normalize_d_k: false
+  kl_beta: 0.0
+  xopd_dk_space: "v"
+
+  # --- Multi-source sampling ratio ---
+  source_ratio: {geneval_enhanced: 1, ocr: 1}
+
+  # --- Sampling / batch (tiny for smoke) ---
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 16         # 16 / (1*8) = 2 batches/epoch -> a few fake steps
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  # --- Optimizer (student; unused in Stage 1+2) ---
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # --- EMA ---
+  ema_decay: 0.0
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # --- Memory / misc ---
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (OFF for smoke) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 0                            # smoke: no eval
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1, dataset_dir: dataset/geneval_enhanced, split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}
+
+# ===== Rewards (unused with eval_freq 0) =====
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
