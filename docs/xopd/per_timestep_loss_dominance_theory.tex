@@ -586,4 +586,84 @@ Logged \texttt{train/d\_k/\{ti\}} magnitudes differ across \texttt{v}/\texttt{xt
 per-timestep \emph{shape} and downstream eval (\S\ref{sec:empirical}), not raw values across spaces.
 \end{remark*}
 
+\section{Adaptive self-normalized reweighting (DiffusionNFT / DMD) for the OPD $d_k$}
+\label{sec:selfnorm}
+
+\paragraph{Empirical motivation.} With \texttt{xopd\_dk\_space}$\in\{$\texttt{v},\texttt{x0}$\}$ (the two
+that win, and to within noise are equal) the per-step magnitude $\dk$ is \emph{tilted the other way}
+from the \texttt{xt} case of \S\ref{sec:empirical}: it is \textbf{larger at early (high-noise) steps and
+smaller at late (clean) steps}. A single optimizer update over the $28$-step trajectory is therefore
+dominated by the early steps, and the clean end (which carries fine detail) is under-trained. We ask
+whether a \emph{per-step reweighting} that equalizes the step contributions helps.
+
+\paragraph{DiffusionNFT's weighting.} DiffusionNFT (Zheng et al., 2025, NVlabs/DiffusionNFT) replaces
+the manual $w(t)$ of Eq.~(1) with a \emph{self-normalized $\bm{x}_0$ regression} borrowed from DMD
+(Yin et al., 2024):
+\begin{equation}\label{eq:nft}
+  w(t)\,\norm{\bm{v}_\theta(\bm{x}_t,\bm{c},t)-\bm{v}}_2^2
+  \;\longleftarrow\;
+  \frac{\norm{\bm{x}_\theta(\bm{x}_t,\bm{c},t)-\bm{x}_0}_2^2}
+       {\mathrm{sg}\!\big(\mathrm{mean}\,|\,\bm{x}_\theta(\bm{x}_t,\bm{c},t)-\bm{x}_0\,|\big)},
+\end{equation}
+with $\bm{x}_\theta=\bm{x}_t-t\,\bm{v}_\theta$ (rectified flow) and $\mathrm{sg}$ the stop-gradient. The
+denominator is a \emph{detached} per-sample scale (mean absolute $\bm{x}_0$ error), so \eqref{eq:nft} is
+a \textbf{scale-invariant} regression: its gradient is the ordinary $\bm{x}_0$-MSE gradient divided by
+its own error magnitude, giving every $(\text{sample},t)$ a gradient of comparable RMS.
+
+\paragraph{Implied time weight.} Under rectified flow the target is $\bm{x}_0=\bm{x}_t-t\bm{v}$, so
+$\bm{x}_\theta-\bm{x}_0=-t(\bm{v}_\theta-\bm{v})$ and $\mathrm{mean}|\bm{x}_\theta-\bm{x}_0|=t\,\mathrm{mean}|\bm{v}_\theta-\bm{v}|$.
+Substituting into \eqref{eq:nft},
+\begin{equation}\label{eq:weff}
+  \eqref{eq:nft}=\underbrace{\frac{t}{\mathrm{sg}\!\big(\mathrm{mean}\,|\bm{v}_\theta-\bm{v}|\big)}}_{\;=:~w_{\mathrm{eff}}(t)\;}\,\norm{\bm{v}_\theta-\bm{v}}_2^2 .
+\end{equation}
+Two facts follow. (i) The scheme is \textbf{not} a naive equalizer: it keeps an explicit $t$ factor that
+\emph{up-weights high noise} --- exactly the direction the paper reports is stable, whereas the inverse
+$w(t)=1-t$ (up-weighting the clean end) \emph{collapses}. (ii) On top of the $t$ tilt it divides by the
+\emph{measured} per-step error scale, i.e.\ it adapts to the very early-large/late-small profile we observe
+and flattens the \emph{effective gradient} without hard-flipping the tilt.
+
+\paragraph{Transfer to the OPD $d_k$ (teacher target).} Our $d_k$ is a \emph{distillation} MSE whose
+target is the frozen teacher's prediction, not data. The construction transfers verbatim by replacing
+$\bm{x}_0$ with the teacher clean-latent $\bm{x}_0^{\mathrm{t}}$ and $\bm{x}_\theta$ with the student
+$\bm{x}_0^{\mathrm{s}}$:
+\begin{equation}\label{eq:opdnorm}
+  \dk^{\mathrm{norm}}
+  \;=\;
+  \frac{\norm{\bm{x}_0^{\mathrm{s}}-\bm{x}_0^{\mathrm{t}}}_2^2}
+       {\mathrm{sg}\!\big(\mathrm{mean}\,|\,\bm{x}_0^{\mathrm{s}}-\bm{x}_0^{\mathrm{t}}\,|\big)+\varepsilon}
+  \;=\;
+  \frac{t}{\mathrm{sg}\!\big(\mathrm{mean}\,|\bm{v}_{\mathrm{s}}-\bm{v}_{\mathrm{t}}|\big)+\varepsilon}\,
+  \norm{\bm{v}_{\mathrm{s}}-\bm{v}_{\mathrm{t}}}_2^2 ,
+\end{equation}
+applied independently at each trajectory step $k$ (with $t=t_k$). The two forms are identical because
+$\bm{x}_0^{\mathrm{s}}-\bm{x}_0^{\mathrm{t}}=-t(\bm{v}_{\mathrm{s}}-\bm{v}_{\mathrm{t}})$; the second is the
+cheaper drop-in for a $\bm{v}$-space $d_k$. The floor $\varepsilon>0$ guards the denominator (the
+teacher-student gap $\to 0$ near convergence, so $1/c_k\to\infty$ without it).
+
+\paragraph{Why this may beat the fixed \texttt{normalize\_d\_k}.} \texttt{normalize\_d\_k} divides $d_k$ by
+$2\bar\sigma^2$ --- a \emph{fixed}, schedule-only reweighting equivalent to a particular $t$-profile. Eq.
+\eqref{eq:opdnorm} instead divides by the \emph{measured} per-step teacher-student error, so it auto-tunes
+to the empirical early-large/late-small shape rather than a prior. It is the data-adaptive analogue of the
+loss-space identity $\mathrm{MSE}(v):\mathrm{MSE}(x_t):\mathrm{MSE}(x_0)=1:\dt^2:\sigma^2$: instead of
+choosing a space to reweight, it normalizes each step by its own realized magnitude.
+
+\paragraph{Predictions and risks.}
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{If} the early-step dominance was mostly a scale artifact, \eqref{eq:opdnorm} should lift
+clean-end fidelity (detail-sensitive eval: OCR text, geneval attributes) at equal compute, mirroring the
+$25\times$ efficiency DiffusionNFT reports.
+\item \textbf{Risk (collapse).} Do \emph{not} implement a hard equalizer or inverse tilt ($w\propto 1-t$ or
+$w\propto 1/\|\dk\|$ that cancels the $t$ factor): the paper shows this collapses. Keep the $t$ factor of
+\eqref{eq:weff} (i.e.\ normalize in $\bm{x}_0$ space, not raw $\bm{v}$ space) so high noise stays up-weighted.
+\item \textbf{Stop-gradient is load-bearing}: without $\mathrm{sg}$ the denominator enters the loss surface
+and the objective degenerates. \item \textbf{Convergence}: as the teacher-student gap shrinks the effective
+weight grows; monitor for late-training instability and rely on $\varepsilon$ + \texttt{max\_grad\_norm}.
+\end{itemize}
+
+\paragraph{Implementation sketch.} Add \texttt{xopd\_dk\_weighting}$\in\{$\texttt{none},
+\texttt{selfnorm\_x0}$\}$; when \texttt{selfnorm\_x0}, compute the per-step $\bm{x}_0$ (or $\bm{v}$) student
+$-$ teacher error, divide the per-step $d_k$ by $\mathrm{sg}(\mathrm{mean}|\cdot|)+\varepsilon$ per
+\eqref{eq:opdnorm}, and keep it orthogonal to \texttt{xopd\_dk\_space} (it \emph{subsumes} the fixed
+\texttt{normalize\_d\_k}). Ablate against \texttt{none} on the $v$-MSE and $x_0$-MSE arms.
+
 \end{document}
