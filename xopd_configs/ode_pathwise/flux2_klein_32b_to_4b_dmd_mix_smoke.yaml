@@ -84,15 +84,17 @@ train:
   # --- Multi-source sampling ratio ---
   source_ratio: {geneval_enhanced: 1, ocr: 1}
 
-  # --- Sampling / batch (tiny for smoke) ---
+  # --- Sampling / batch (single-node 8-GPU smoke) ---
+  # unique_sample_num_per_epoch = dmd_fake_ratio(5) * 1 * 8 = 40 -> num_batches_per_epoch = 5 ->
+  # fake:gen = 5:1, one generator update per epoch (b_idx==0).
   resolution: 512
   num_inference_steps: 28
   per_device_batch_size: 1
   group_size: 1
-  unique_sample_num_per_epoch: 16         # 16 / (1*8) = 2 batches/epoch -> a few fake steps
-  gradient_step_per_epoch: 1
+  unique_sample_num_per_epoch: 40         # 5 batches/epoch @ 8 GPUs -> fake:gen = 5:1, 1 gen update/epoch
+  gradient_step_per_epoch: 1              # exactly ONE generator optimizer step per epoch
   num_inner_epochs: 1
-  gradient_accumulation_steps: 1          # DMD: one generator optimizer step per generator turn (DMD2-style; NOT auto)
+  gradient_accumulation_steps: 1          # DMD: single generator update per epoch, not accumulated (DMD2 GAS==1); NOT auto
 
   # --- Optimizer (student; unused in Stage 1+2) ---
   learning_rate: 1.0e-4

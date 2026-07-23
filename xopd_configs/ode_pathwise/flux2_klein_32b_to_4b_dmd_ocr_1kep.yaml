@@ -83,14 +83,18 @@ train:
   xopd_dk_space: "v"
 
   # --- Sampling / batch ---
+  # DMD epoch geometry (32-GPU, per_device_batch_size=1): one epoch = num_batches_per_epoch micro-
+  # steps; the generator updates EXACTLY ONCE (b_idx==0), the fake score EVERY micro-step, so
+  # fake:gen = num_batches_per_epoch : 1. unique_sample_num_per_epoch = dmd_fake_ratio(5) * 1 * 32
+  # = 160 -> num_batches_per_epoch = 5 -> fake:gen = 5:1 and gradient_step_per_epoch = 1.
   resolution: 512
   num_inference_steps: 28
   per_device_batch_size: 1
   group_size: 1
-  unique_sample_num_per_epoch: 128        # OCR specialist exposure (128 prompts/epoch)
-  gradient_step_per_epoch: 1
+  unique_sample_num_per_epoch: 160        # 5 batches/epoch @ 32 GPUs -> fake:gen = 5:1, 1 gen update/epoch
+  gradient_step_per_epoch: 1              # exactly ONE generator optimizer step per epoch
   num_inner_epochs: 1
-  gradient_accumulation_steps: 1          # DMD: one generator optimizer step per generator turn (DMD2-style; NOT auto)
+  gradient_accumulation_steps: 1          # DMD: the single generator update per epoch is not accumulated (DMD2 asserts GAS==1); NOT auto
 
   # --- Optimizer (student generator; main engine) ---
   learning_rate: 1.0e-4
