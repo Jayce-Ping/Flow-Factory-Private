@@ -142,6 +142,16 @@ class XDMDTrainer(XOPDTrainer):
                 "per_device_batch_size * num_processes to make them match.",
                 n, ta.dmd_fake_ratio,
             )
+        # Few-step generator: eval SHOULD sample at the SAME step budget the generator is trained
+        # for (dmd_sim_steps), otherwise the eval curve reflects a mismatched inference schedule.
+        eval_steps = getattr(self.eval_args, "num_inference_steps", None)
+        if eval_steps is not None and int(eval_steps) != int(ta.dmd_sim_steps):
+            logger.warning(
+                "XDMD: eval.num_inference_steps (%s) != dmd_sim_steps (%d). DMD yields a few-step "
+                "generator; set eval.num_inference_steps = dmd_sim_steps so eval matches the "
+                "deployed inference budget.",
+                eval_steps, ta.dmd_sim_steps,
+            )
         logger.info(
             "XDMD ready: fake adapter (%d tensors) manual-DP AdamW(lr=%g); student active. "
             "world_size=%d, sim_steps=%d, real_gs=%g, fake:gen=%d:1 (1 gen update/epoch).",

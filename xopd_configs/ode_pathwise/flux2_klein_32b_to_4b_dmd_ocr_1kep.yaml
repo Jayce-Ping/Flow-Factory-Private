@@ -88,7 +88,7 @@ train:
   # fake:gen = num_batches_per_epoch : 1. unique_sample_num_per_epoch = dmd_fake_ratio(5) * 1 * 32
   # = 160 -> num_batches_per_epoch = 5 -> fake:gen = 5:1 and gradient_step_per_epoch = 1.
   resolution: 512
-  num_inference_steps: 28
+  num_inference_steps: 4                  # few-step generator: train sampling == dmd_sim_steps (4)
   per_device_batch_size: 1
   group_size: 1
   unique_sample_num_per_epoch: 160        # 5 batches/epoch @ 32 GPUs -> fake:gen = 5:1, 1 gen update/epoch
@@ -125,7 +125,7 @@ scheduler:
 eval:
   resolution: 512
   per_device_batch_size: 1
-  num_inference_steps: 40
+  num_inference_steps: 4                  # few-step generator: EVAL at 4 steps (matches training; this is the deployed inference budget)
   guidance_scale: 1.0
   eval_freq: 40
   seed: 42
