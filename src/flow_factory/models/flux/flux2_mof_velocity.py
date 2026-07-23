@@ -695,20 +695,26 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         gate_fn: str = "softmax",
         router_init: str = "zero",
         router_init_std: float = 0.02,
+        orthogonal_init: bool = False,
+        orthogonal_init_std: float = 0.02,
     ) -> "Flux2VelocityMoFTransformer2DModel":
         """Init: replicate the base transformer into the experts (each a verbatim copy of the base,
         so the ensemble == base at init when the router is uniform).
 
         ``expert_mode='distinct'``: N independent experts; ``noise_std`` > 0 adds per-expert Gaussian
         noise (symmetry breaking; with LoRA the gaussian LoRA init already breaks symmetry -> noise
-        defaults to 0). ``expert_mode='shared_lora'``: ONE base (the N experts are base + per-expert
-        LoRA adapter, built later by ``apply_expert_lora``); requires ``noise_std==0`` (the frozen
-        base is shared, so a per-expert frozen perturbation would make the bases distinct)."""
-        if expert_mode == "shared_lora" and noise_std > 0:
+        defaults to 0). ``orthogonal_init``: instead of independent noise, add MUTUALLY-ORTHOGONAL
+        (across experts), relative-scaled (``orthogonal_init_std`` * RMS(W)) perturbations to the N
+        distinct base copies per parameter tensor -> experts start in orthogonal directions (directed
+        symmetry break) while the blend ~ base (orthogonal perts average toward 0); LoRA trains on top.
+        ``expert_mode='shared_lora'``: ONE base (the N experts are base + per-expert LoRA adapter,
+        built later by ``apply_expert_lora``); requires ``noise_std==0`` and ``orthogonal_init=False``
+        (the frozen base is shared)."""
+        if expert_mode == "shared_lora" and (noise_std > 0 or orthogonal_init):
             raise ValueError(
-                "expert_mode='shared_lora' requires noise_std=0: the frozen base is SHARED across "
-                "experts (they differ only by LoRA), so per-expert frozen noise is impossible. Use "
-                "expert_mode='distinct' for genuinely distinct frozen bases."
+                "expert_mode='shared_lora' requires noise_std=0 and orthogonal_init=False: the frozen "
+                "base is SHARED across experts (they differ only by LoRA), so a per-expert frozen "
+                "perturbation is impossible. Use expert_mode='distinct' for distinct frozen bases."
             )
         model = cls(**cls._mof_config_from_base(
             base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode,
@@ -720,11 +726,40 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             else:
                 for e in range(num_experts):
                     model.experts[e].load_state_dict(base_sd)
-                    if noise_std > 0:
+                    if noise_std > 0 and not orthogonal_init:
                         for p in model.experts[e].parameters():
                             p.add_(torch.randn_like(p) * noise_std)
+                if orthogonal_init and num_experts > 1:
+                    cls._orthogonal_perturb_experts(model.experts, orthogonal_init_std)
             model.router_time_embed.load_state_dict(base.time_guidance_embed.state_dict())
         return model.to(dtype=next(base.parameters()).dtype)
+
+    @staticmethod
+    @torch.no_grad()
+    def _orthogonal_perturb_experts(experts, std: float) -> None:
+        """Break expert symmetry with MUTUALLY-ORTHOGONAL, relative-scaled perturbations to the N
+        distinct expert base copies (per parameter tensor). For each weight W, draw N random
+        directions, Gram-Schmidt them across experts (so expert i's perturbation is orthogonal to
+        the others), rescale each to RMS == std * RMS(W), and add. Experts thus start in orthogonal
+        directions (directed symmetry break), yet the mean perturbation is ~0 so the uniform blend
+        stays ~ base. Frozen-base seed; the trainable LoRA diverges from these distinct backbones."""
+        n = len(experts)
+        for params in zip(*[list(e.parameters()) for e in experts]):
+            w = params[0]
+            if w.numel() < n:
+                continue
+            flats = [torch.randn(w.numel(), device=w.device, dtype=torch.float32) for _ in range(n)]
+            basis = []  # Gram-Schmidt across experts
+            for i in range(n):
+                v = flats[i].clone()
+                for u in basis:
+                    v = v - (v @ u) / (u @ u + 1e-12) * u
+                basis.append(v)
+            wnorm = w.detach().float().norm()  # ||W|| ; RMS-relative scale = std*||W|| per direction
+            for i in range(n):
+                u = basis[i]
+                un = u / (u.norm() + 1e-12)
+                params[i].add_((un * (std * wnorm)).to(w.dtype).view_as(w))
 
     def apply_expert_lora(self, lora_rank: int, lora_alpha: int, target_modules) -> "PeftModel":
         """shared_lora: wrap ``self.base`` in PEFT with N named adapters (``expert_0..expert_{N-1}``),

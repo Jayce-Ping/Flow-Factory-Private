@@ -68,6 +68,12 @@ model:
   mof_topk_sparse: true                   # SELECTIVE activation: loop all experts (uniform all-gather, FSDP-safe) but compute only routed samples
   mof_dense_exec: true                    # FSDP-safety marker; topk_sparse takes precedence (also uniform)
   mof_soft_blend: false                   # off: sparse top-k instead of dense blend
+  # --- symmetry break: LIGHT prompt-cluster cold-start (just nudge the router off the symmetric
+  #     point; few steps to avoid over-locking the prompt tendency / overfitting the clustering) ---
+  mof_router_coldstart: true
+  mof_router_coldstart_steps: 50          # light (default 300) -- only slightly breaks symmetry
+  mof_router_coldstart_label: "hard"      # one-hot cluster CE (soft/temperature variants are separate ablations)
+  # (orthogonal expert init mof_orthogonal_init is an ALTERNATIVE symmetry break, ablated separately)
   # --- torch.compile (per-block in-place nn.Module.compile) ---
   compile_teacher: true                   # compile frozen 32B teacher -> speed up sampling / teacher-mean precompute
   compile_student: true                   # compile each distinct expert's blocks -> speed up train forward/backward

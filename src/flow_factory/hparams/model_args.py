@@ -315,6 +315,21 @@ class ModelArguments(ArgABC):
         default=0.02,
         metadata={"help": "Std of the Gaussian for mof_router_init='normal' on the router head weight."},
     )
+    mof_orthogonal_init: bool = field(
+        default=False,
+        metadata={"help": "MoF-V expert INIT-time diversification (distinct experts only): instead of "
+                          "identical base copies (+ optional mof_noise_std), add MUTUALLY-ORTHOGONAL "
+                          "(across experts), relative-scaled (mof_orthogonal_init_std * RMS(W)) "
+                          "perturbations to the N base copies per weight tensor. Experts start in "
+                          "orthogonal directions (directed symmetry break) while the uniform blend "
+                          "stays ~ base (orthogonal perts average to ~0). Alternative/complement to the "
+                          "cluster cold-start; requires expert_mode='distinct'."},
+    )
+    mof_orthogonal_init_std: float = field(
+        default=0.02,
+        metadata={"help": "RMS-relative scale of the orthogonal per-expert init perturbation "
+                          "(mof_orthogonal_init): each direction has RMS = std * RMS(W)."},
+    )
     mof_router_input: Literal['prompt', 'latent', 'fused_gate', 'fused_film', 'fused_xattn'] = field(
         default='fused_film',
         metadata={"help": "How the GLOBAL router fuses prompt & input-latent x_t (ignored for "
