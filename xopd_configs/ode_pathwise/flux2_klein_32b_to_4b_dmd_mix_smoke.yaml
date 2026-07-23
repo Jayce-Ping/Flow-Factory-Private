@@ -92,7 +92,7 @@ train:
   unique_sample_num_per_epoch: 16         # 16 / (1*8) = 2 batches/epoch -> a few fake steps
   gradient_step_per_epoch: 1
   num_inner_epochs: 1
-  gradient_accumulation_steps: auto
+  gradient_accumulation_steps: 1          # DMD: one generator optimizer step per generator turn (DMD2-style; NOT auto)
 
   # --- Optimizer (student; unused in Stage 1+2) ---
   learning_rate: 1.0e-4

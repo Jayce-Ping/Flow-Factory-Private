@@ -1,0 +1,156 @@
+# Cross-model DMD (XDMD): FLUX.2-dev (32B real/teacher) -> FLUX.2-klein-base-4B (student+fake).
+# Pure Distribution Matching Distillation on the OCR domain (docs/xopd/dmd_cross_model_design.md).
+# Two LoRA adapters on ONE frozen klein base: 'student' (the few-step generator we keep) trains
+# through the DeepSpeed ZeRO-2 engine; 'fake' (an online score of p_theta) trains via a manual
+# data-parallel optimizer (all_reduce(AVG)+plain AdamW). The 32B teacher is the frozen 'real' score.
+#
+# Two-timescale: fake updated EVERY step, student once every dmd_fake_ratio (=5) steps.
+# Generator gradient flows through ONE differentiable student step (backward-sim is no_grad); the
+# self-normalized DMD gradient grad=(p_real-p_fake)/mean|p_real| is applied via the stop-grad
+# identity loss_dm=0.5*||x0_G - sg(x0_G-grad)||^2. No MSE flow-anchor (student becomes few-step).
+#
+# FULL eval suite (geneval_enhanced/ocr/pickscore x gs1/gs4) to watch OOD as OCR specialization
+# forms. Teacher-baseline eval SKIPPED (reuse the shared teacher ceiling). Train+eval @ 512px.
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml   # ZeRO-2 (proven multi-node path); teacher(64GB) replicated per GPU, ZeRO-2 shards the student optim/grad. 'fake' is NOT engine-managed (manual-DP).
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data (OCR only) =====
+data:
+  dataset_dir: "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model (student = LoRA on all linears; 'fake' adapter added by the DMD trainer) =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all-linear"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_dmd_ocr_1kep"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 50
+  save_model_only: true
+
+# ===== Training (XDMD) =====
+train:
+  trainer_type: "xdmd"
+  max_epochs: 1000
+  fsdp_shard_teacher: false
+
+  # --- Cross-model teacher (the 'real' score) ---
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false            # reuse the shared teacher ceiling (overlaid in HTML)
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  # --- DMD knobs ---
+  dmd_fake_ratio: 5                       # fake:gen = 5:1 (fake leads, two-timescale)
+  dmd_sim_steps: 4                        # student few-step backward-simulation
+  dmd_fake_lr: 1.0e-4                      # manual-DP fake optimizer LR
+  dmd_real_guidance_scale: 1.0            # real (teacher) CFG. Raise (e.g. 4) ONLY after precomputing teacher negatives (needs teacher_guidance_scale>1 at preprocess).
+  dmd_fake_guidance_scale: 1.0            # DMD asserts no CFG for fake
+  dmd_t_min: 0.02                         # DM/fake diffusion-step sampling range (sigma=t/1000)
+  dmd_t_max: 0.98
+  dmd_grad_norm: 10.0                     # fake adapter (manual-DP) grad clip
+
+  # --- L0/L1 disabled (XDMD overrides start(); these are inert but kept valid) ---
+  l0_warmup_epochs: 0
+  pathwise_coef: 1.0
+  reinforce_coef: 0.0
+  normalize_d_k: false
+  kl_beta: 0.0
+  xopd_dk_space: "v"
+
+  # --- Sampling / batch ---
+  resolution: 512
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 128        # OCR specialist exposure (128 prompts/epoch)
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: 1          # DMD: one generator optimizer step per generator turn (DMD2-style; NOT auto)
+
+  # --- Optimizer (student generator; main engine) ---
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # --- EMA ---
+  ema_decay: 0.0
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # --- Memory / misc ---
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (full suite for OOD observation) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 40
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval_enhanced, split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval_enhanced, split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+# ===== Rewards (eval logging only; NOT part of the DMD loss) =====
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cpu"
+    dtype: float32
+    async_reward: false
