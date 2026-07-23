@@ -2668,7 +2668,7 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
-    xopd_dk_space: Literal["v", "xt", "x0"] = field(
+    xopd_dk_space: Literal["v", "xt", "x0", "x0_norm"] = field(
         default="xt",
         metadata={
             "help": (
@@ -2680,8 +2680,14 @@ class XOPDTrainingArguments(TrainingArguments):
                 "DiffusionOPD default). Any dynamics; honors normalize_d_k (/ 2*sigma_bar^2).\n"
                 " 'x0' = ||x0_s - x0_t||^2 = sigma^2*||dv||^2  (clean latent; x0 = x_t - sigma*v). "
                 "ODE-only.\n"
+                " 'x0_norm' = DiffusionNFT/DMD self-normalized x0 regression: 'x0' divided by "
+                "sg(mean|x0_s - x0_t|)+eps (detached per-sample scale). Scale-invariant per step -> "
+                "equalizes per-step gradient magnitude (removes the early-large/late-small tilt) "
+                "while keeping the high-noise weighting (normalized in x0 space). ODE-only; ignores "
+                "normalize_d_k (it subsumes it).\n"
                 "So MSE(v) : MSE(xt) : MSE(x0) = 1 : dt^2 : sigma^2. See "
-                "docs/xopd/per_timestep_loss_dominance_theory.tex."
+                "docs/xopd/per_timestep_loss_dominance_theory.tex (sec 'Adaptive self-normalized "
+                "reweighting')."
             )
         },
     )

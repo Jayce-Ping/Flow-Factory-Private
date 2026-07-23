@@ -136,6 +136,9 @@ def compute_per_step_kl(
         is ignored. ODE-only (the ``mu = x_t + v*dt`` identity).
     ``space="x0"``: clean-latent MSE ``mean(||x0_s - x0_t||^2)`` with ``x0 = x_t - sigma*v``
         (requires ``latents`` (= x_t) and ``sigma``). ``normalize`` is ignored. ODE-only.
+    ``space="x0_norm"``: DiffusionNFT/DMD self-normalized x0 regression --- the x0-MSE above divided
+        by ``sg(mean|x0_s - x0_t|)`` (detached per-sample scale) + eps. Scale-invariant per step
+        (equalizes per-step gradient magnitude, keeps the high-noise tilt). Same requirements as x0.
     ``space="xt"`` (default): the transition-mean / next-latent term (the DiffusionOPD default).
         ``normalize=True``: ``mean(||mu_s - mu_t||^2) / (2 * sigma_bar^2)`` with
         ``sigma_bar^2 = std_dev_t^2 * (-dt)``. ``normalize=False``: plain ``mean(||mu_s - mu_t||^2)``.
@@ -168,8 +171,29 @@ def compute_per_step_kl(
         x0_t = _to_clean_x0(mu_teacher, latents, sigma, dt)
         return ((x0_s - x0_t) ** 2).mean(dim=tuple(range(1, x0_s.ndim)))
 
+    if space == "x0_norm":
+        # DiffusionNFT / DMD self-normalized x0 regression: the per-sample x0-MSE divided by the
+        # DETACHED per-sample mean-abs x0 error. Scale-invariant -> equalizes each step's gradient
+        # magnitude (removing the early-large/late-small tilt) while keeping the implied high-noise
+        # weighting because the normalization is done in x0 space (see
+        # docs/xopd/per_timestep_loss_dominance_theory.tex, sec "Adaptive self-normalized reweighting").
+        # ``normalize`` is ignored. ODE-only (x0 = x_t - sigma*v).
+        if latents is None or sigma is None:
+            raise ValueError(
+                "compute_per_step_kl(space='x0_norm') requires `latents` (x_t) and `sigma`; "
+                f"got latents={'None' if latents is None else 'set'}, "
+                f"sigma={'None' if sigma is None else 'set'}."
+            )
+        x0_s = _to_clean_x0(mu_student, latents, sigma, dt)
+        x0_t = _to_clean_x0(mu_teacher, latents, sigma, dt)
+        err = x0_s - x0_t
+        spatial = tuple(range(1, err.ndim))
+        num = (err ** 2).mean(dim=spatial)                    # (B,) per-sample x0 MSE (numerator)
+        scale = err.abs().mean(dim=spatial).detach()          # (B,) sg(mean|x0_s - x0_t|)
+        return num / (scale + 1e-8)                           # eps floors the denominator as gap -> 0
+
     if space != "xt":
-        raise ValueError(f"space must be 'v', 'xt' or 'x0', got {space!r}.")
+        raise ValueError(f"space must be 'v', 'xt', 'x0' or 'x0_norm', got {space!r}.")
 
     diff_sq = (mu_student.float() - mu_teacher.float()) ** 2
     diff_sq = diff_sq.mean(dim=tuple(range(1, diff_sq.ndim)))  # (B,)
