@@ -105,6 +105,20 @@ interface, so raising real CFG (>1, with teacher negatives) is a config change o
 - **grad isolation**: `set_adapter` flips `requires_grad` to the active adapter; both optimizers
   zeroed after each turn.
 
+## 6b. Eval — few-step CONSISTENCY sampler (matches training rollout)
+
+DMD yields a few-step generator, so eval must sample the way the generator is trained, NOT with the
+standard ODE Euler sampler. `XDMDTrainer._run_eval_inference_batches` is overridden to use the SAME
+consistency schedule as training (`_dmd_consistency_latents`): from fresh noise, for each of
+`dmd_sim_steps` (=4) steps **predict one-step x0 → re-noise to the next σ level with fresh noise**;
+the final step returns x0 (no re-noise) → decode → images. Guidance-free (the DMD generator has no
+CFG, so the test-set `guidance_scale` is ignored). Configs set `train.num_inference_steps =
+eval.num_inference_steps = dmd_sim_steps = 4`. `_evaluate_validation_d_k` is a **no-op** for DMD (the
+consistency rollout is not an ODE transition trajectory, so the L1 per-timestep D_k is undefined).
+T2I only (raises on an I2I batch). Note: eval renoise uses fresh (unseeded) noise — the initial
+noise is per-prompt seeded, so dataset-averaged rewards are stable; perfect per-image reproducibility
+is intentionally dropped.
+
 ## 7. Verified (no GPU)
 - `import` + registry (`xdmd`); config parse + `__post_init__` for both configs (GAS=1,
   gspe=1, unique=160/40 → num_batches_per_epoch=5 at 32/8 GPU, fake_ratio=5, real_gs=1).

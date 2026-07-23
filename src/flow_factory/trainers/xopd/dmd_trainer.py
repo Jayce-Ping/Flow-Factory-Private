@@ -53,6 +53,7 @@ from peft import PeftModel
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu
 
 from ...scheduler import set_scheduler_timesteps
+from ...utils.base import create_generator_by_prompt, stitch_batch_metadata
 from ...utils.dist import reduce_loss_info
 from ...utils.logger_utils import setup_logger
 from ...utils.noise_schedule import flow_match_sigma
@@ -314,6 +315,117 @@ class XDMDTrainer(XOPDTrainer):
             w = int(res[1]) if len(res) > 1 else h
             return h, w
         return int(res), int(res)
+
+    # ------------------------------------------------- eval (consistency sampler) -
+    def _dmd_eval_hw(self, merged_eval: Any) -> Tuple[int, int]:
+        h = getattr(merged_eval, "height", None)
+        w = getattr(merged_eval, "width", None)
+        if h and w:
+            return int(h), int(w)
+        res = getattr(merged_eval, "resolution", None) or self.eval_args.resolution
+        if isinstance(res, (list, tuple)):
+            return int(res[0]), int(res[1] if len(res) > 1 else res[0])
+        return int(res), int(res)
+
+    @torch.no_grad()
+    def _dmd_consistency_latents(
+        self, pe: torch.Tensor, text_ids: torch.Tensor, height: int, width: int,
+        device: torch.device, generator: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Full ``dmd_sim_steps`` consistency schedule (SAME as training rollout): from fresh noise,
+        at each step predict one-step ``x0`` and re-noise to the next level with FRESH noise; the
+        final step returns ``x0`` (no re-noise). Guidance-free (DMD generator has no CFG)."""
+        ta = self.training_args
+        self._dmd_set_adapter("default")
+        self.adapter.rollout()
+        batch_size = pe.shape[0]
+        n = int(ta.dmd_sim_steps)
+
+        num_channels_latents = self.adapter.pipeline.transformer.config.in_channels // 4
+        z, latent_ids = self.adapter.pipeline.prepare_latents(
+            batch_size=batch_size,
+            num_latents_channels=num_channels_latents,
+            height=height,
+            width=width,
+            dtype=pe.dtype,
+            device=device,
+            generator=generator,
+            latents=None,
+        )
+        z = self.adapter.cast_latents(z)
+        mu = compute_empirical_mu(image_seq_len=z.shape[1], num_steps=n)
+        timesteps = set_scheduler_timesteps(
+            scheduler=self.adapter.pipeline.scheduler, num_inference_steps=n, device=device, mu=mu,
+        )
+        with self.autocast():
+            for i in range(n):
+                t_i = timesteps[i].repeat(batch_size).to(device)
+                sig_i = flow_match_sigma(t_i).reshape(-1, *([1] * (z.ndim - 1)))
+                v = self.adapter.predict_velocity(
+                    t=t_i, latents=z, latent_ids=latent_ids,
+                    prompt_embeds=pe, text_ids=text_ids, guidance_scale=1.0,
+                )
+                x0 = z - sig_i * v
+                if i < n - 1:
+                    t_next = timesteps[i + 1].repeat(batch_size).to(device)
+                    sig_next = flow_match_sigma(t_next).reshape(-1, *([1] * (z.ndim - 1)))
+                    z = (1.0 - sig_next) * x0 + sig_next * torch.randn_like(x0)  # re-noise (fresh)
+                else:
+                    z = x0
+        return z, latent_ids
+
+    def _run_eval_inference_batches(self, test_set_name, merged_eval, eval_seed):
+        """DMD eval override: sample with the SAME few-step CONSISTENCY schedule used in training
+        (one-step x0 -> re-noise -> ... -> x0), NOT the standard ODE Euler sampler, so the eval
+        reflects the deployed few-step generator. T2I only; guidance-free (test-set guidance_scale
+        is ignored -- the DMD generator has no CFG). No trajectory is stored (see
+        :meth:`_evaluate_validation_d_k`)."""
+        from ...models.flux.flux2_klein import Flux2KleinSample
+
+        if getattr(self, "_cross_vae", False):
+            raise NotImplementedError("XDMD eval assumes a same-arch (shared-VAE) teacher.")
+        device = self.accelerator.device
+        height, width = self._dmd_eval_hw(merged_eval)
+
+        all_samples: List = []
+        for batch in tqdm(
+            self.test_dataloaders[test_set_name],
+            desc=self._eval_progress_desc(test_set_name),
+            disable=not self.show_progress_bar,
+        ):
+            if batch.get("image_latents") is not None:
+                raise NotImplementedError(
+                    "XDMD consistency eval supports T2I only; got an I2I batch with image_latents."
+                )
+            pe = batch["prompt_embeds"].to(device)
+            text_ids = batch["text_ids"].to(device)
+            prompt = batch.get("prompt")
+            generator = create_generator_by_prompt(batch["prompt"], eval_seed)
+
+            z, latent_ids = self._dmd_consistency_latents(pe, text_ids, height, width, device, generator)
+            images = self.adapter.decode_latents(z, latent_ids, output_type="pt")
+
+            samples = [
+                Flux2KleinSample(
+                    height=height,
+                    width=width,
+                    image=images[b],
+                    latent_ids=latent_ids[b],
+                    prompt=prompt[b] if isinstance(prompt, list) else prompt,
+                    prompt_embeds=pe[b],
+                    text_ids=text_ids[b],
+                )
+                for b in range(pe.shape[0])
+            ]
+            stitch_batch_metadata(batch, samples)
+            all_samples.extend(samples)
+            self.eval_reward_buffer.add_samples(samples)
+        return all_samples
+
+    def _evaluate_validation_d_k(self) -> None:
+        """No-op for DMD: the consistency few-step rollout is NOT an ODE transition trajectory, so
+        the L1 per-timestep transition-D_k is not defined here (DMD's objective is distributional)."""
+        return
 
     # -------------------------------------------------------- generator (DMD) ----
     def _dmd_teacher_cond(self, prompt_batch: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
