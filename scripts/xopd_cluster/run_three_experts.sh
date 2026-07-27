@@ -74,7 +74,8 @@ CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_1kep.yaml:29585"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_soft_nolb_1kep.yaml:29586"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_geneval_enh_ocr_mixed_vmse_1kep.yaml:29587"
-  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_x0norm_1kep.yaml:29588"   # Phase 1 (NEXT): OCR x0_norm loss-space ablation (self-normalized x0)
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_x0norm_1kep.yaml:29588"   # Phase 1: OCR x0_norm loss-space ablation (stopped at ep255, treated as finished)
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_1kep.yaml:29589"  # MoF-2 router arm 3: sigmoid gate + top-1 sparse (first arm never run)
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }
