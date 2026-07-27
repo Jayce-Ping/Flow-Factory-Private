@@ -14,6 +14,7 @@
 
 \newcommand{\E}{\mathbb{E}}
 \newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathcal{N}}
 \newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
 \newcommand{\KL}{\mathrm{KL}}
 \newcommand{\sg}{\mathrm{sg}}
@@ -177,13 +178,27 @@ $\nabla_\theta L^{(x_0)}=(\xh^\theta-\xh^\psi)\,\partial_\theta\xh^\theta
 =-(\xh^\theta-\xh^\psi)\,\sigma\,\partial_\theta v_\theta$. \emph{Same error signal, different
 Jacobian} ($\partial_\theta x$ vs.\ $-\sigma\,\partial_\theta v_\theta$).
 
+\paragraph{Why ``biased'' (not a pejorative on MSE).}
+True DMD needs $s_{\fake}=\nabla\log p_\theta$, the score of the \emph{distribution of samples}
+produced by the generator $G_\theta$ (the pushforward of the noise prior under the sampler).
+Setting $\xh^{\fake}=\xh^\theta(x_t)$ substitutes a different object: the student's
+\emph{pointwise field} evaluated at $x_t$. These coincide only when $v_\theta$ is consistent
+with being the MMSE denoiser / score of its own induced $p_\theta$ (infinite capacity +
+consistency). In general --- and especially for a capacity-limited or few-step student being
+distilled toward $v_\psi$ --- $v_\theta$ approximates the \emph{teacher field}, not
+$\nabla\log p_\theta$. So $\xh^\theta$ is a \textbf{biased estimator of the fake score}:
+the KL identity fails even though the residual looks like an MSE. What remains is precisely
+a (self-)reweighted OPD residual, only routed through $\partial_\theta x$ instead of
+$\partial_\theta v_\theta$.
+
 \begin{prop*}[No free lunch]
 Replacing $\partial_\theta v_\theta$ by $\partial_\theta x$ (routing the same MSE residual through
 the sampler), or pinning the fake to teacher/student, does \emph{not} produce a distribution loss.
 Equation~\eqref{eq:dmd} equals the $\KL$ gradient only when $s_{\fake}=\nabla\log p_\theta$ is an
 \emph{independent, freshly trained} estimate of the student's own (moving) score. With
-fake$=$teacher the signal vanishes; with fake$=$student it is a biased, reweighted MSE routed
-through the rollout. Hence genuine DMD is irreducibly a \emph{three-network} system
+fake$=$teacher the signal vanishes; with fake$=$student ($\xh^{\fake}\leftarrow\xh^\theta$) the
+fake score is biased for $\nabla\log p_\theta$, leaving a reweighted MSE routed through the
+rollout. Hence genuine DMD is irreducibly a \emph{three-network} system
 (real, online-fake, student); it cannot be obtained from OPD by an algebraic substitution.
 \end{prop*}
 
