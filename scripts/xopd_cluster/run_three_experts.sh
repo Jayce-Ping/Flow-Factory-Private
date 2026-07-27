@@ -1,16 +1,24 @@
 #!/bin/bash
-# Sequentially run the XOPD capacity + ablation experiments on this 4-node cluster:
-#     Run #1  OCR                     (eval_teacher_at_start: true  -> the ONE shared teacher baseline)
-#     Run #2  geneval_enhanced        (eval_teacher_at_start: false -> reuses Run #1's ceiling)
-#     Run #3  OCR x0-space  (full-timestep clean-latent d_k; xopd_dk_space=x0)  -- prefer OTHER cluster
-#     Run #4  OCR selective (late-timestep; DEFERRED until v vs x0 picks winner)
-#     Run #5  OCR v-space   (full-timestep raw-velocity d_k; xopd_dk_space=v)
+# Sequentially run the XOPD loss-space ablation on this 4-node cluster.
 #
-# Plan (2026-07-16): MSE(v) >> MSE(xt) (xt last-step dominance). Next ablate MSE(x0) vs MSE(v);
-# selective ONLY after that. Prefer launching Run #3 (xspace) on an idle second cluster in parallel
-# with this cluster's Run #5 (vmse). See docs/xopd/progress/2026-07-16-loss-space-ablation-plan.md.
-# NOTE: MIXED trains on a SEPARATE cluster and is NOT in this chain. Loss spaces:
-# MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2 (xt is default for Runs #1/#2/#4 until #4 is re-forked).
+# PLAN (updated 2026-07-23): finish the FULL OCR loss-space ablation FIRST, pick the single best d_k
+# loss, and ONLY THEN move on to other experiments. Phase 2 is DEFERRED until the winner is chosen.
+#
+# Phase 1 -- OCR loss-space sweep (OCR-only data, otherwise identical; goal: pick the winning d_k):
+#     xt-MSE   (default, last-step dominated)       done  (h5j2xknk)
+#     v-MSE    (raw velocity)                       done  (5nyhyylw)
+#     x0-MSE   (clean latent, sigma^2 reweight)     other cluster (maydy3cw)
+#     x0_norm  (DiffusionNFT/DMD self-normalized)   <== NEXT (CONFIGS index 8)
+#     selective late/early + strat4 (all v-MSE)     per-timestep coverage variants
+#   Identity (ODE): MSE(v):MSE(xt):MSE(x0) = 1:dt^2:sigma^2; x0_norm = x0-MSE / sg(mean|x0_s-x0_t|).
+#   Finding so far: MSE(v) >> MSE(xt) (xt last-step dominance). v vs x0 vs x0_norm decides the winner.
+#
+# Phase 2 -- DEFERRED until Phase 1 picks the best loss: DMD (xopd_configs/.../dmd_ocr_1kep, needs a
+#   GPU smoke first), MoF-2 mix, mixed-data. NOT auto-chained here yet.
+#   See docs/xopd/dmd_cross_model_design.md and docs/xopd/progress/2026-07-16-loss-space-ablation-plan.md.
+#
+# NOTE: indices 5-7 (MoF-2 mix, mixed-data) predate this revision and are Phase-2-adjacent; they are
+# kept for START_AT/STOP_AT stability. The Phase-1 winner search is xt/v/x0/x0_norm (+ selective).
 #
 # Resuming / handing off (env):
 #   START_AT=<i>     start the chain at CONFIGS index i (skip already-done runs). Default 0.
@@ -66,6 +74,7 @@ CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_1kep.yaml:29585"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_soft_nolb_1kep.yaml:29586"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_geneval_enh_ocr_mixed_vmse_1kep.yaml:29587"
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_x0norm_1kep.yaml:29588"   # Phase 1 (NEXT): OCR x0_norm loss-space ablation (self-normalized x0)
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }
