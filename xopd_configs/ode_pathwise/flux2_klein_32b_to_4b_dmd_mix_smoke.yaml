@@ -65,7 +65,9 @@ train:
 
   # --- DMD knobs ---
   dmd_sim_steps: 4                        # student few-step backward-simulation
-  dmd_fake_ratio: 5                       # two-timescale ratio (fake leads); Stage 1+2 trains fake every step
+  dmd_fake_ratio: 6                       # two-timescale ratio (fake leads); trains fake every step.
+                                          # EVEN because the mixed source_ratio has period 2 and
+                                          # num_batches_per_epoch (== this) must divide by it.
   dmd_fake_lr: 1.0e-4                      # manual-DP fake optimizer LR
   dmd_real_guidance_scale: 1.0            # teacher CFG for real score (Stage 3)
   dmd_fake_guidance_scale: 1.0            # DMD asserts no CFG for fake
@@ -85,13 +87,14 @@ train:
   source_ratio: {geneval_enhanced: 1, ocr: 1}
 
   # --- Sampling / batch (single-node 8-GPU smoke) ---
-  # unique_sample_num_per_epoch = dmd_fake_ratio(5) * 1 * 8 = 40 -> num_batches_per_epoch = 5 ->
-  # fake:gen = 5:1, one generator update per epoch (b_idx==0).
+  # unique_sample_num_per_epoch = dmd_fake_ratio(6) * 1 * 8 = 48 -> num_batches_per_epoch = 6 ->
+  # fake:gen = 6:1, one generator update per epoch (b_idx==0). The count must stay divisible by the
+  # source_ratio period (2 here), so the ratio is even rather than the 5 the OCR-only run uses.
   resolution: 512
   num_inference_steps: 4                  # few-step generator: train sampling == dmd_sim_steps (4)
   per_device_batch_size: 1
   group_size: 1
-  unique_sample_num_per_epoch: 40         # 5 batches/epoch @ 8 GPUs -> fake:gen = 5:1, 1 gen update/epoch
+  unique_sample_num_per_epoch: 48         # 6 batches/epoch @ 8 GPUs -> fake:gen = 6:1, 1 gen update/epoch
   gradient_step_per_epoch: 1              # exactly ONE generator optimizer step per epoch
   num_inner_epochs: 1
   gradient_accumulation_steps: 1          # DMD: single generator update per epoch, not accumulated (DMD2 GAS==1); NOT auto

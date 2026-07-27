@@ -32,7 +32,9 @@ MASTER_PORT=${MASTER_PORT:-29540}
 # Worker IPs (ranks 1..N-1). Override with XOPD_WORKERS to run on fewer/more nodes,
 # e.g. XOPD_WORKERS="28.7.185.215" -> 2-node run (node0 rank0 + this worker rank1),
 # leaving the other nodes free for a vLLM judge / keepalive. NUM_MACHINES is derived.
-read -r -a WORKERS <<< "${XOPD_WORKERS:-28.7.185.215 28.7.185.156 28.7.195.15}"
+# Note the ${VAR-default} (no colon): XOPD_WORKERS="" must mean "no workers, single node", which is
+# the documented smoke usage. With ${VAR:-default} an explicit empty value fell back to all 4 nodes.
+read -r -a WORKERS <<< "${XOPD_WORKERS-28.7.185.215 28.7.185.156 28.7.195.15}"
 NUM_MACHINES=$((1 + ${#WORKERS[@]}))
 
 NCCL_DEBUG_LEVEL=${NCCL_DEBUG:-WARN}

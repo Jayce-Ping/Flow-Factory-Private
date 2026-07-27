@@ -39,7 +39,7 @@ Generator gradient (DMD2, adapted to rectified flow / velocity):
   ``d loss/d x0_G = grad`` and ``d loss/d theta = grad . d x0_G/d theta``.
 """
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Dict, Tuple
 
@@ -159,6 +159,25 @@ class XDMDTrainer(XOPDTrainer):
             len(fake_params), ta.dmd_fake_lr, self._world_size, ta.dmd_sim_steps,
             ta.dmd_real_guidance_scale, n,
         )
+
+    @contextmanager
+    def _dmd_unwrapped_transformer(self):
+        """Run the fake-score forward on the raw PeftModel instead of the prepared engine.
+
+        The fake adapter is added after ``accelerator.prepare`` and trained by the manual DP
+        optimizer, so the engine owns none of its gradients -- but a forward through the engine
+        wrapper still arms DeepSpeed's post-backward callback, and the backward that follows then
+        runs ZeRO's reduce epilogue over gradient buckets it never filled ("IndexError: list index
+        out of range"). Swapping the component bypasses the wrapper. This is only safe because
+        ZeRO-2 partitions optimizer state and gradients, not parameters: every rank still holds the
+        full student weights, so the raw module computes exactly what the engine would.
+        """
+        prev = self.adapter.get_component("transformer")
+        self.adapter.set_component("transformer", self._dmd_transformer)
+        try:
+            yield
+        finally:
+            self.adapter.set_component("transformer", prev)
 
     def _dmd_set_adapter(self, name: str) -> None:
         """Toggle the active adapter on the (unwrapped) PeftModel; PEFT flips requires_grad too."""
@@ -541,7 +560,7 @@ class XDMDTrainer(XOPDTrainer):
         z_t = (1.0 - sig) * x0_G + sig * eps
         v_target = eps - x0_G  # rectified-flow velocity target: z_t = (1-sig)*x0 + sig*eps
 
-        with self.autocast():
+        with self._dmd_unwrapped_transformer(), self.autocast():
             v_fake = self.adapter.predict_velocity(
                 t=t,
                 latents=z_t,
