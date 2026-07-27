@@ -163,8 +163,9 @@ $g=0$: DMD is \emph{degenerate}. Note this is \emph{not} what $x0\_norm$ does: $
 \emph{OPD} residual $\xh^\theta-\xh^\psi$ (student$-$teacher) and only borrows DMD2's per-sample
 self-normalization. So
 \begin{equation*}
-\boxed{\ x0\_norm=\text{OPD }x_0\text{ residual }+\text{ DMD2 self-normalization};\ \text{it is
-\emph{not} distribution matching (no online fake, differentiates }v\text{, not }x).\ }
+\boxed{\parbox{0.92\linewidth}{\centering
+$x0\_norm=\text{OPD }x_0\text{ residual }+\text{ DMD2 self-normalization}$;\\[0.35em]
+it is \emph{not} distribution matching (no online fake, differentiates $v$, not $x$).}}
 \end{equation*}
 
 \subsection{Reduction 2: fake $=$ the student's own one-step map $\Rightarrow$ reweighted MSE}
