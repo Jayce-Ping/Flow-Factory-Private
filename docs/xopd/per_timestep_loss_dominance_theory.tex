@@ -54,13 +54,86 @@ code: \texttt{compute\_per\_step\_kl} in
 \texttt{\_precompute\_d\_per\_timestep} / \texttt{\_optimize\_train\_pass} in
 \texttt{src/flow\_factory/trainers/xopd/trainer.py}.
 
-This note defines three implemented per-step MSE knobs ($L_{xt}$, $L_v$, $L_{x_0}$) plus the
-Gaussian transition KL $L_{\mathrm{KL}}$ (DanceOPD theory, \S\ref{ssec:danceopd-kl}), their exact
-conversion on the FLUX.2-klein 28-step grid, and why the default $L_{xt}$ (config \texttt{"xt"})
-dominates late timesteps. Companion data: \S\ref{sec:schedule}--\S\ref{sec:empirical}.
+This note defines four implemented per-step knobs ($L_{xt}$, $L_v$, $L_{x_0}$,
+$L_{x_0}^{\mathrm{norm}}$) plus the Gaussian transition KL $L_{\mathrm{KL}}$ (DanceOPD theory,
+\S\ref{ssec:danceopd-kl}) --- formulas in \S\ref{sec:loss-defs} --- their exact conversion on the
+FLUX.2-klein 28-step grid, and why the default $L_{xt}$ (config \texttt{"xt"}) dominates late
+timesteps. Companion data: \S\ref{sec:schedule}--\S\ref{sec:empirical}.
 \end{abstract}
 
 \tableofcontents
+
+%% ============================================================
+\section*{Five per-step losses at a glance}
+\addcontentsline{toc}{section}{Five per-step losses at a glance}
+\label{sec:loss-defs}
+%% ============================================================
+
+At every discrete step~$k$, student and teacher are evaluated on the \emph{same} on-policy state
+$x_t$; only their velocity predictions $v_s$ (student) and $v_t$ (teacher) differ. Let
+$\sigma=t/1000$ be the FM noise fraction and
+$\dt=\sigma^{\mathrm{sched}}_{k+1}-\sigma^{\mathrm{sched}}_k<0$ the schedule step. The five
+losses compared throughout this note are:
+\begin{align}
+L_{xt}
+  &= \norm{\mu_s-\mu_t}^2
+  &&\text{(default; \texttt{xopd\_dk\_space="xt"})},
+\label{eq:def-Lxt}\\[0.35em]
+L_v
+  &= \norm{v_s-v_t}^2
+  &&\text{(\texttt{xopd\_dk\_space="v"})},
+\label{eq:def-Lv}\\[0.35em]
+L_{x_0}
+  &= \norm{z_{0,s}-z_{0,t}}^2
+  &&\text{(\texttt{xopd\_dk\_space="x0"})},
+\label{eq:def-Lx0}\\[0.35em]
+L_{x_0}^{\mathrm{norm}}
+  &= \frac{\norm{z_{0,s}-z_{0,t}}^2}
+          {\mathrm{sg}\!\big(\mathrm{mean}\,|z_{0,s}-z_{0,t}|\big)+\varepsilon}
+  = \frac{L_{x_0}}
+          {\mathrm{sg}\!\big(\mathrm{mean}\,|z_{0,s}-z_{0,t}|\big)+\varepsilon}
+  &&\text{(\texttt{xopd\_dk\_space="x0\_norm"})},
+\label{eq:def-Lx0norm}\\[0.35em]
+L_{\mathrm{KL}}
+  &= \KL\!\bigl(p_m(\cdot\mid x_t)\,\big\|\,p_\theta(\cdot\mid x_t)\bigr)
+  = \frac{\dt^2}{2\sigma^2}\,L_v
+  = \frac{L_{xt}}{2\sigma^2}
+  &&\text{(DanceOPD transition KL)}.
+\label{eq:def-Lkl}
+\end{align}
+
+\paragraph{Definitions via the velocity bridge $v_s,v_t$.}
+The transition means and clean latents are \emph{deterministic functions} of the shared state
+$x_t$ and each model's velocity:
+\begin{align}
+\mu_s &= x_t + v_s\,\dt,
+\qquad
+\mu_t = x_t + v_t\,\dt
+&&\text{(ODE one-step means)},
+\label{eq:def-mu}\\
+z_{0,s} &= x_t - \sigma\,v_s,
+\qquad
+z_{0,t} = x_t - \sigma\,v_t
+&&\text{(recovered clean latents)}.
+\label{eq:def-z0}
+\end{align}
+Because $x_t$ is shared, it cancels in every difference, so $v_s-v_t$ is the single bridge:
+\begin{align}
+\mu_s-\mu_t &= \dt\,(v_s-v_t),
+\label{eq:bridge-mu}\\
+z_{0,s}-z_{0,t} &= -\sigma\,(v_s-v_t).
+\label{eq:bridge-z0}
+\end{align}
+Squaring both sides immediately yields the ODE identities
+$L_{xt}=\dt^2 L_v$, $L_{x_0}=\sigma^2 L_v$, and hence
+$L_{\mathrm{KL}}=L_{xt}/(2\sigma^2)=\dt^2 L_v/(2\sigma^2)$
+(\S\ref{sec:three-losses}). The self-normalized variant $L_{x_0}^{\mathrm{norm}}$
+\eqref{eq:def-Lx0norm} divides $L_{x_0}$ by a \emph{detached} per-sample mean-abs scale
+($\mathrm{sg}=$ stop-gradient; $\varepsilon>0$ floors the denominator), so it is
+scale-invariant and \emph{not} a fixed schedule reweighting of $L_v$
+(\S\ref{sec:selfnorm}). The first four losses are implemented knobs in
+\texttt{compute\_per\_step\_kl}; $L_{\mathrm{KL}}$ is the theoretical same-variance Gaussian
+transition KL (\S\ref{ssec:danceopd-kl}).
 
 %% ============================================================
 \section{Three per-step MSE losses and their exact conversion}
@@ -71,7 +144,9 @@ XOPD compares student and teacher on the \emph{same} on-policy rollout state $x_
 index~$k$; only their predictions differ. Under rectified-flow interpolation
 ($x_t=(1-\sigma)z_0+\sigma\varepsilon$, $\sigma=t/1000$) and ODE Euler stepping
 ($\mu=x_t+v\,\dt$, $\dt=\sigma^{\mathrm{sched}}_{k+1}-\sigma^{\mathrm{sched}}_k<0$), there are
-three equivalent MSE targets (config \texttt{xopd\_dk\_space}, default \texttt{"xt"}):
+three equivalent fixed MSE targets plus one adaptive self-normalized variant (config
+\texttt{xopd\_dk\_space}, default \texttt{"xt"}; definitions
+\eqref{eq:def-Lxt}--\eqref{eq:def-Lx0norm}):
 
 \begin{center}
 \renewcommand{\arraystretch}{1.25}
@@ -79,9 +154,10 @@ three equivalent MSE targets (config \texttt{xopd\_dk\_space}, default \texttt{"
 \toprule
 \textbf{knob} & \textbf{loss} & \textbf{formula} & \textbf{note} \\
 \midrule
-\texttt{xt} & $L_{xt}$ & $\norm{\mu_s-\mu_t}^2$ & transition mean / next latent (default) \\
-\texttt{v} & $L_v$ & $\norm{v_s-v_t}^2$ & raw velocity MSE; ODE-only \\
-\texttt{x0} & $L_{x_0}$ & $\norm{z_{0,s}-z_{0,t}}^2$ & clean-latent MSE; ODE-only \\
+\texttt{xt} & $L_{xt}$ & $\norm{\mu_s-\mu_t}^2$ \eqref{eq:def-Lxt} & transition mean / next latent (default) \\
+\texttt{v} & $L_v$ & $\norm{v_s-v_t}^2$ \eqref{eq:def-Lv} & raw velocity MSE; ODE-only \\
+\texttt{x0} & $L_{x_0}$ & $\norm{z_{0,s}-z_{0,t}}^2$ \eqref{eq:def-Lx0} & clean-latent MSE; ODE-only \\
+\texttt{x0\_norm} & $L_{x_0}^{\mathrm{norm}}$ & $L_{x_0}/(\mathrm{sg}(\mathrm{mean}|z_{0,s}-z_{0,t}|)+\varepsilon)$ \eqref{eq:def-Lx0norm} & DiffusionNFT/DMD self-norm; ODE-only \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -142,9 +218,9 @@ L_{x_0,k}$, which is the ``$(\dt/\sigma)^2$ blow-up'' narrative (\S\ref{sec:caus
 
 The three knobs above are \emph{unweighted} per-step MSE targets. A separate, widely used objective
 is the \textbf{same-variance Gaussian transition KL} between teacher and student one-step
-distributions. Under a local model $p(\cdot\mid x_t)=\N(\mu,\,\sigma_t^2 I)$ with shared
-covariance~$\sigma_t^2$ (DanceOPD Appendix~7.1; DiffusionOPD pathwise term), and
-$\mu=x_t+v\,\dt$:
+distributions (definition~\eqref{eq:def-Lkl}). Under a local model
+$p(\cdot\mid x_t)=\N(\mu,\,\sigma_t^2 I)$ with shared covariance~$\sigma_t^2$ (DanceOPD
+Appendix~7.1; DiffusionOPD pathwise term), and $\mu=x_t+v\,\dt$:
 \begin{equation}
 \boxed{
 L_{\mathrm{KL},k}
@@ -629,12 +705,15 @@ $\bm{x}_0^{\mathrm{s}}$:
 \begin{equation}\label{eq:opdnorm}
   \dk^{\mathrm{norm}}
   \;=\;
+  L_{x_0}^{\mathrm{norm}}
+  \;=\;
   \frac{\norm{\bm{x}_0^{\mathrm{s}}-\bm{x}_0^{\mathrm{t}}}_2^2}
        {\mathrm{sg}\!\big(\mathrm{mean}\,|\,\bm{x}_0^{\mathrm{s}}-\bm{x}_0^{\mathrm{t}}\,|\big)+\varepsilon}
   \;=\;
   \frac{t}{\mathrm{sg}\!\big(\mathrm{mean}\,|\bm{v}_{\mathrm{s}}-\bm{v}_{\mathrm{t}}|\big)+\varepsilon}\,
   \norm{\bm{v}_{\mathrm{s}}-\bm{v}_{\mathrm{t}}}_2^2 ,
 \end{equation}
+(definition~\eqref{eq:def-Lx0norm}; config \texttt{xopd\_dk\_space="x0\_norm"}),
 applied independently at each trajectory step $k$ (with $t=t_k$). The two forms are identical because
 $\bm{x}_0^{\mathrm{s}}-\bm{x}_0^{\mathrm{t}}=-t(\bm{v}_{\mathrm{s}}-\bm{v}_{\mathrm{t}})$; the second is the
 cheaper drop-in for a $\bm{v}$-space $d_k$. The floor $\varepsilon>0$ guards the denominator (the
