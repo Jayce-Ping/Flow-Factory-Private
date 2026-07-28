@@ -65,12 +65,16 @@ Because teacher and student **share the text encoder**, preprocessed
 Identical structure to OPD's SDE path, single-teacher and streamlined:
 
 1. Student rolls out its own trajectory (`student_guidance_scale`).
-2. Pre-pass (`no_grad`): per training timestep compute the student transition
-   mean and the teacher transition mean (`use_teacher_transformer`,
-   `teacher_guidance_scale`) -> per-step Gaussian KL `D_k`.
-3. Optional REINFORCE: `R_bar` via `reverse_cumulative` (when `reinforce_coef > 0`).
-4. Main pass (grad): `loss = pathwise_coef * D_k + reinforce_coef * R_bar * log_p
-   (+ kl_beta * anchor)`, accumulated per timestep.
+2. Pre-pass (`no_grad`): per training timestep compute the teacher transition
+   mean (`use_teacher_transformer`, `teacher_guidance_scale`). Teacher only --
+   the student mean is computed in the pass below, where it carries gradient.
+3. Main pass (grad): student transition mean -> per-step Gaussian KL `D_k`;
+   `loss = pathwise_coef * D_k (+ kl_beta * anchor)`, accumulated per timestep.
+
+XOPD has no REINFORCE trajectory term (OPD does; that is where `R_bar` and the
+score-function term live). It was tried under `Flow-SDE` and dropped, and a
+config that still sets `reinforce_coef > 0` now raises rather than silently
+training pathwise-only.
 
 ## Dual classifier-free guidance
 

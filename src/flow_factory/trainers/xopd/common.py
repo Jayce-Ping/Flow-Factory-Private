@@ -212,67 +212,6 @@ def compute_per_step_kl(
     return diff_sq / (2.0 * sigma_bar_sq)
 
 
-def reverse_cumulative(
-    d_list: List[torch.Tensor],
-    max_future_steps: Optional[int] = None,
-    *,
-    reduction: Literal["sum", "mean"] = "sum",
-) -> List[torch.Tensor]:
-    """Per-timestep future-KL aggregates for the REINFORCE coefficient.
-
-    Indexed so ``r_per_k[k] == bar_R_{k+1}`` (statistics over timesteps strictly
-    after ``k``). ``reduction='sum'`` is paper Eq. 11; ``'mean'`` averages future
-    ``D_j``. ``max_future_steps`` truncates the look-ahead window.
-    """
-    if reduction not in ("sum", "mean"):
-        raise ValueError(f"expected reduction 'sum' or 'mean', got reduction={reduction!r}.")
-    if not d_list:
-        return []
-
-    k_len = len(d_list)
-    if max_future_steps is not None and max_future_steps < 1:
-        raise ValueError(
-            f"expected max_future_steps None or >= 1, got max_future_steps={max_future_steps!r}."
-        )
-
-    if max_future_steps is None:
-        device = d_list[0].device
-        dtype = d_list[0].dtype
-        shape = d_list[0].shape
-        if reduction == "sum":
-            running = torch.zeros(shape, device=device, dtype=dtype)
-            r_per_k: List[torch.Tensor] = [None] * k_len  # type: ignore[list-item]
-            for k in range(k_len - 1, -1, -1):
-                r_per_k[k] = running.clone()
-                running = running + d_list[k]
-            return r_per_k
-
-        running_sum = torch.zeros(shape, device=device, dtype=dtype)
-        running_count = 0
-        r_per_k_mean: List[torch.Tensor] = [None] * k_len  # type: ignore[list-item]
-        for k in range(k_len - 1, -1, -1):
-            if running_count > 0:
-                r_per_k_mean[k] = running_sum / float(running_count)
-            else:
-                r_per_k_mean[k] = torch.zeros(shape, device=device, dtype=dtype)
-            running_sum = running_sum + d_list[k]
-            running_count += 1
-        return r_per_k_mean
-
-    r_per_k: List[torch.Tensor] = []
-    for k in range(k_len):
-        j_end = min(k + 1 + max_future_steps, k_len)
-        if j_end <= k + 1:
-            r_per_k.append(torch.zeros_like(d_list[0]))
-        else:
-            future = torch.stack(d_list[k + 1 : j_end], dim=0)
-            if reduction == "sum":
-                r_per_k.append(future.sum(dim=0))
-            else:
-                r_per_k.append(future.mean(dim=0))
-    return r_per_k
-
-
 def l0_loss_weight(
     sigma: torch.Tensor,
     scheme: Literal["min_snr", "snr", "uniform"] = "min_snr",

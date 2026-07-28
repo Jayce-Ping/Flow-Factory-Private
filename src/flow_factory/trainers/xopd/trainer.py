@@ -27,16 +27,16 @@ A single run runs two stages, switching on the outer epoch counter:
   data path ``x_t = (1-sigma) z0 + sigma eps`` with weight ``w(t)``.
 - **L1** (``epoch >= l0_warmup_epochs``): on-policy transition matching. The
   student rolls out its own trajectory; per training timestep the closed-form
-  Gaussian transition KL ``D_k`` (mean matching) drives the pathwise loss, with
-  an optional REINFORCE trajectory term.
+  Gaussian transition KL ``D_k`` (mean matching) is the loss, optionally plus a
+  KL anchor to the reference model.
 
 The teacher is a SEPARATE full transformer (not a LoRA snapshot), swapped in per
 forward via ``adapter.use_teacher_transformer`` (whole-module swap, DDP-bypassed
 for no_grad inference). Teacher and student use independent ``guidance_scale``.
 
-Math helpers (``D_k``, reverse-cumulative, forward-kwarg plumbing, L0 weighting)
-are copied into :mod:`flow_factory.trainers.xopd.common` so XOPD does not depend
-on OPD internals.
+Math helpers (``D_k``, forward-kwarg plumbing, L0 weighting) are copied into
+:mod:`flow_factory.trainers.xopd.common` so XOPD does not depend on OPD
+internals.
 
 Registry key: ``'xopd'`` -> :class:`XOPDTrainer`.
 """
@@ -75,7 +75,6 @@ from .common import (
     extract_i2i_condition_kwargs,
     interleaved_source_iter,
     l0_loss_weight,
-    reverse_cumulative,
     validate_l1_one_step_per_epoch,
     validate_source_ratio,
 )
@@ -91,7 +90,7 @@ logger = setup_logger(__name__)
 
 
 # Keys reused across student / teacher adapter.forward calls (mirror OPD).
-_STUDENT_RETURN_KWARGS = ["log_prob", "next_latents_mean", "std_dev_t", "dt"]
+_STUDENT_RETURN_KWARGS = ["next_latents_mean", "std_dev_t", "dt"]
 _TEACHER_RETURN_KWARGS = ["next_latents_mean", "std_dev_t", "dt"]
 
 
@@ -105,9 +104,6 @@ class XOPDTrainer(BaseTrainer):
 
         self._is_ode = self.adapter.scheduler.dynamics_type == "ODE"
         self.pathwise_coef = ta.pathwise_coef
-        self.reinforce_coef = ta.reinforce_coef
-        self.reinforce_horizon = ta.reinforce_horizon
-        self.reinforce_future_reduction = ta.reinforce_future_reduction
         self.normalize_d_k = ta.normalize_d_k
         self.xopd_dk_space = ta.xopd_dk_space
         self.teacher_gs = ta.teacher_guidance_scale
@@ -123,24 +119,6 @@ class XOPDTrainer(BaseTrainer):
                 "(it recovers v via mu = x_t + v*dt). Got dynamics_type="
                 f"{self.adapter.scheduler.dynamics_type!r}. Use 'xt' for SDE, or set "
                 "scheduler.dynamics_type='ODE'."
-            )
-
-        # Fail fast: the REINFORCE trajectory term is well-defined only under a
-        # stochastic (SDE) transition. Under ODE the transition is deterministic
-        # (std_dev_t == 0), so the scheduler returns log_prob == 0 / None and the
-        # term `reinforce_coef * (R_bar * log_prob)` silently contributes nothing
-        # to the loss. Rather than let `reinforce_coef > 0` look effective while
-        # being a no-op, reject the combination outright (use a Flow-SDE /
-        # Dance-SDE / CPS scheduler with noise_level > 0 to enable REINFORCE).
-        if self._is_ode and self.reinforce_coef > 0:
-            raise ValueError(
-                "XOPD: reinforce_coef > 0 requires a stochastic scheduler "
-                "(dynamics_type in {'Flow-SDE', 'Dance-SDE', 'CPS'} with "
-                "noise_level > 0). Under ODE the transition is deterministic, so "
-                "the REINFORCE term's log_prob is identically zero and the term is "
-                f"a no-op. Got dynamics_type='ODE' and reinforce_coef="
-                f"{self.reinforce_coef}. Set reinforce_coef=0 for ODE, or switch "
-                "to an SDE scheduler to use REINFORCE."
             )
 
         # Cache adapter.forward signature once for cheap per-step kwarg filtering.
@@ -180,16 +158,11 @@ class XOPDTrainer(BaseTrainer):
         else:
             self._init_same_arch_teacher()
 
-        if (
-            self.pathwise_coef == 0
-            and self.reinforce_coef == 0
-            and ta.kl_beta == 0
-            and ta.l0_warmup_epochs == 0
-        ):
+        if self.pathwise_coef == 0 and ta.kl_beta == 0 and ta.l0_warmup_epochs == 0:
             logger.warning(
                 "XOPDTrainer received a zero-signal config: pathwise_coef="
-                f"{self.pathwise_coef}, reinforce_coef={self.reinforce_coef}, "
-                f"kl_beta={ta.kl_beta}, l0_warmup_epochs={ta.l0_warmup_epochs}. "
+                f"{self.pathwise_coef}, kl_beta={ta.kl_beta}, "
+                f"l0_warmup_epochs={ta.l0_warmup_epochs}. "
                 "The student will not move; set at least one to a positive value."
             )
 
@@ -2623,11 +2596,9 @@ class XOPDTrainer(BaseTrainer):
                 batch = next(data_iter)
                 sample_kwargs = {
                     **self.training_args,
-                    # ODE rollouts (noise_level=0) collect no per-step log-probs
-                    # (flux2_klein._inference gates collection on noise_level>0), and log-probs
-                    # feed only the SDE-only REINFORCE term. Requesting them under ODE would
-                    # stack an empty list; skip them.
-                    "compute_log_prob": not self._is_ode,
+                    # Nothing reads per-step log-probs: they existed for the REINFORCE
+                    # trajectory term, which L1 no longer has.
+                    "compute_log_prob": False,
                     "trajectory_indices": trajectory_indices,
                     **batch,
                 }
@@ -2681,28 +2652,18 @@ class XOPDTrainer(BaseTrainer):
                 else None
             )
 
-            d_list, mu_teacher_list = self._precompute_d_per_timestep(
+            mu_teacher_list = self._precompute_teacher_means(
                 batch=batch,
                 latents_index_map=latents_index_map,
                 num_timesteps=num_timesteps,
                 timestep_indices=batch_steps,
             )
 
-            if self.reinforce_coef > 0:
-                r_per_k = reverse_cumulative(
-                    d_list,
-                    self.reinforce_horizon,
-                    reduction=self.reinforce_future_reduction,
-                )
-            else:
-                r_per_k = [torch.zeros_like(d) for d in d_list]
-
             loss_info = self._optimize_train_pass(
                 batch=batch,
                 latents_index_map=latents_index_map,
                 num_timesteps=num_timesteps,
                 mu_teacher_list=mu_teacher_list,
-                r_per_k=r_per_k,
                 loss_info=loss_info,
                 timestep_indices=batch_steps,
             )
@@ -2936,27 +2897,59 @@ class XOPDTrainer(BaseTrainer):
             cond["negative_text_ids"] = enc["negative_text_ids"]
         return cond
 
-    def _precompute_d_per_timestep(
+    def _l1_step_inputs(
+        self,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        num_timesteps: int,
+        timestep_index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """``(t, latents, forward_kwargs)`` for one trajectory position of a stored rollout."""
+        t = batch["timesteps"][:, timestep_index]
+        # Final timestep has no successor -> t_next=0. Must stay BATCHED (shape [B], like t):
+        # the I2I ragged fallback in the adapter indexes t_next[idx], which raises on a 0-dim
+        # scalar.
+        t_next = (
+            batch["timesteps"][:, timestep_index + 1]
+            if timestep_index + 1 < num_timesteps
+            else torch.zeros_like(t)
+        )
+        latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+        next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
+        forward_kwargs = self._build_forward_kwargs(
+            batch=batch,
+            t=t,
+            t_next=t_next,
+            latents=latents,
+            next_latents=next_latents,
+            compute_log_prob=False,
+            return_kwargs=_TEACHER_RETURN_KWARGS,
+            guidance_scale=self.student_gs,
+        )
+        return t, latents, forward_kwargs
+
+    def _precompute_teacher_means(
         self,
         batch: Dict[str, Any],
         latents_index_map: torch.Tensor,
         num_timesteps: int,
         timestep_indices: Optional[List[int]] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """No-grad pre-pass: per-timestep ``D_k`` and cached teacher mean.
+    ) -> List[torch.Tensor]:
+        """No-grad pre-pass: the per-timestep teacher mean the gradient pass regresses onto.
+
+        Teacher-only by design. The gradient pass runs its own student forward and computes
+        ``D_k`` there, so a student forward here would be duplicate work -- the student weights
+        do not move in between (one optimizer step per epoch). The one exception is HSCT, whose
+        teacher mean is conditioned on hidden states that can only be captured from a student
+        forward, so that path still pays for one.
 
         ``timestep_indices`` defaults to the L1 training subset
-        (``self._train_timestep_indices``). Callers that need a different set of
-        trajectory positions (e.g. the eval validation-``D_k`` pass, which walks
-        the FULL eval rollout) pass an explicit list; the returned ``d_list`` /
-        ``mu_teacher_list`` are aligned to that list.
+        (``self._train_timestep_indices``); the returned list is aligned to it.
         """
         step_indices = (
             timestep_indices if timestep_indices is not None else self._train_timestep_indices
         )
-        d_list: List[torch.Tensor] = []
         mu_teacher_list: List[torch.Tensor] = []
-        device = self.accelerator.device
 
         with torch.no_grad(), self.autocast():
             # Teacher text conditioning. Same-arch: the teacher's own embeddings are
@@ -2966,59 +2959,85 @@ class XOPDTrainer(BaseTrainer):
             # OWN resident text encoder, so encode the teacher prompts on the fly
             # from the raw prompt strings (constant across timesteps).
             teacher_text_cond = self._build_teacher_text_cond(batch)
-            for timestep_index in step_indices:
-                t = batch["timesteps"][:, timestep_index]
-                # Final timestep has no successor -> t_next=0. Must stay BATCHED
-                # (shape [B], like t): the I2I ragged fallback in the adapter
-                # indexes t_next[idx], which raises on a 0-dim scalar.
-                t_next = (
-                    batch["timesteps"][:, timestep_index + 1]
-                    if timestep_index + 1 < num_timesteps
-                    else torch.zeros_like(t)
-                )
-                latents = batch["all_latents"][:, latents_index_map[timestep_index]]
-                next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
-
-                forward_kwargs = self._build_forward_kwargs(
-                    batch=batch,
-                    t=t,
-                    t_next=t_next,
-                    latents=latents,
-                    next_latents=next_latents,
-                    compute_log_prob=False,
-                    return_kwargs=_TEACHER_RETURN_KWARGS,
-                    guidance_scale=self.student_gs,
+            for timestep_index in tqdm(
+                step_indices,
+                desc=f"Epoch {self.epoch} Teacher pre-pass",
+                position=1,
+                leave=False,
+                disable=not self.show_progress_bar,
+            ):
+                _, _, forward_kwargs = self._l1_step_inputs(
+                    batch, latents_index_map, num_timesteps, timestep_index
                 )
 
-                # HSCT: capture the student transformer hidden states from THIS forward
-                # (free; same call site) to condition the inverse transport.
+                student_hidden = None
+                if self._is_hsct:
+                    # The ONLY reason to run the student here: the inverse transport is
+                    # conditioned on this forward's transformer hidden states.
+                    self._hsct_capture = True
+                    self.adapter.forward(**forward_kwargs)
+                    self._hsct_capture = False
+                    student_hidden = self._hsct_h_list(forward_kwargs["latents"].shape[0])
+
+                if self._pixel_loss:
+                    # PIXEL-space target: the teacher next state decoded by D_T (detached).
+                    mu_teacher_list.append(
+                        self._teacher_next_pixels_cross_vae(
+                            forward_kwargs, teacher_text_cond, student_hidden=student_hidden
+                        )
+                    )
+                    continue
+
+                mu_teacher_list.append(
+                    self._teacher_mean_dispatch(
+                        forward_kwargs, teacher_text_cond, student_hidden=student_hidden
+                    )
+                )
+
+        return mu_teacher_list
+
+    def _validation_d_k_per_timestep(
+        self,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        num_timesteps: int,
+        timestep_indices: List[int],
+    ) -> List[torch.Tensor]:
+        """No-grad per-timestep ``D_k`` over a stored rollout, for the eval validation metric.
+
+        Unlike the training pre-pass this DOES need the student mean, because ``D_k`` itself is
+        what the caller reports (:meth:`_evaluate_validation_d_k`).
+        """
+        if self._pixel_loss:
+            raise ValueError(
+                "validation D_k is not defined for the pixel-space L1 loss "
+                "(xopd_pixel_loss=True): there is no latent-space mu_teacher to compare against."
+            )
+        d_list: List[torch.Tensor] = []
+
+        with torch.no_grad(), self.autocast():
+            teacher_text_cond = self._build_teacher_text_cond(batch)
+            for timestep_index in timestep_indices:
+                t, latents, forward_kwargs = self._l1_step_inputs(
+                    batch, latents_index_map, num_timesteps, timestep_index
+                )
+
                 self._hsct_capture = self._is_hsct
                 student_out = self.adapter.forward(**forward_kwargs)
                 self._hsct_capture = False
                 if student_out.next_latents_mean is None:
                     raise RuntimeError(
-                        "Student forward did not return `next_latents_mean` during "
-                        f"pre-pass; requested return_kwargs={_TEACHER_RETURN_KWARGS!r}."
+                        "Student forward did not return `next_latents_mean` during the "
+                        f"validation D_k pass; requested return_kwargs={_TEACHER_RETURN_KWARGS!r}."
                     )
-
                 student_hidden = (
-                    self._hsct_h_list(forward_kwargs["latents"].shape[0]) if self._is_hsct else None
+                    self._hsct_h_list(forward_kwargs["latents"].shape[0])
+                    if self._is_hsct else None
                 )
-                if self._pixel_loss:
-                    # PIXEL-space target: cache the teacher next state decoded by D_T (detached).
-                    # d_k here feeds only REINFORCE (disabled with pixel loss), so a per-sample
-                    # zero placeholder keeps r_per_k shapes without an extra student decode.
-                    teacher_px = self._teacher_next_pixels_cross_vae(
-                        forward_kwargs, teacher_text_cond, student_hidden=student_hidden
-                    )
-                    mu_teacher_list.append(teacher_px)
-                    d_list.append(torch.zeros(teacher_px.shape[0], device=device))
-                    continue
 
                 mu_teacher = self._teacher_mean_dispatch(
                     forward_kwargs, teacher_text_cond, student_hidden=student_hidden
                 )
-
                 d_k = compute_per_step_kl(
                     mu_student=student_out.next_latents_mean,
                     mu_teacher=mu_teacher,
@@ -3030,9 +3049,8 @@ class XOPDTrainer(BaseTrainer):
                     sigma=self._noise_fraction(self.adapter, t),
                 )
                 d_list.append(d_k.detach())
-                mu_teacher_list.append(mu_teacher)
 
-        return d_list, mu_teacher_list
+        return d_list
 
     # ===================== Eval validation D_k =====================
     def _evaluate_validation_d_k(self) -> None:
@@ -3043,16 +3061,16 @@ class XOPDTrainer(BaseTrainer):
         (:meth:`_run_eval_inference_batches`), which uses the SAME settings
         (``eval.num_inference_steps``, that set's ``guidance_scale``, EMA params).
         No second rollout is done here. We then run
-        :meth:`_precompute_d_per_timestep` over ALL rollout steps to get the
+        :meth:`_validation_d_k_per_timestep` over ALL rollout steps to get the
         per-timestep Gaussian-transition KL ``D_k``. Per-step means (gathered
         across ranks) are logged as ``eval/{set}/d_k/{ti}`` and the trajectory
         mean as ``eval/{set}/d_k_mean`` into the shared ``_eval_log_sink`` so they
         land on the same wandb step as the student/teacher reward curves.
 
-        This is a validation loss: with reinforce_coef=0 / kl_beta=0 the training
-        L1 loss equals the pathwise ``D_k``, so this mirrors ``train/d_k`` on held-out
-        prompts. Only gs=1.0 sets are scored (matches the no-CFG training transition
-        and the gs=1.0 cached teacher text embeddings).
+        This is a validation loss: with kl_beta=0 the training L1 loss equals the
+        pathwise ``D_k``, so this mirrors ``train/d_k`` on held-out prompts. Only
+        gs=1.0 sets are scored (matches the no-CFG training transition and the
+        gs=1.0 cached teacher text embeddings).
         """
         if not self.test_dataloaders:
             return
@@ -3090,7 +3108,7 @@ class XOPDTrainer(BaseTrainer):
                     mbatch = BaseSample.stack(micro)
                     lim = mbatch["latent_index_map"]
                     nt = mbatch["timesteps"].shape[1]
-                    d_list, _ = self._precompute_d_per_timestep(
+                    d_list = self._validation_d_k_per_timestep(
                         batch=mbatch,
                         latents_index_map=lim,
                         num_timesteps=nt,
@@ -3125,13 +3143,12 @@ class XOPDTrainer(BaseTrainer):
         latents_index_map: torch.Tensor,
         num_timesteps: int,
         mu_teacher_list: List[torch.Tensor],
-        r_per_k: List[torch.Tensor],
         loss_info: Dict[str, List[torch.Tensor]],
         timestep_indices: Optional[List[int]] = None,
     ) -> Dict[str, List[torch.Tensor]]:
         """Gradient main pass: per-timestep student forward + loss + backward.
 
-        ``timestep_indices`` MUST match the list passed to ``_precompute_d_per_timestep``
+        ``timestep_indices`` MUST match the list passed to ``_precompute_teacher_means``
         (so ``mu_teacher_list[k_idx]`` aligns with this step); defaults to the per-epoch
         ``self._train_timestep_indices``.
         """
@@ -3144,7 +3161,7 @@ class XOPDTrainer(BaseTrainer):
             for k_idx, timestep_index in enumerate(
                 tqdm(
                     step_indices,
-                    desc=f"Epoch {self.epoch} Timestep",
+                    desc=f"Epoch {self.epoch} Student (grad)",
                     position=1,
                     leave=False,
                     disable=not self.show_progress_bar,
@@ -3169,8 +3186,7 @@ class XOPDTrainer(BaseTrainer):
                         t_next=t_next,
                         latents=latents,
                         next_latents=next_latents,
-                        # See sample(): no log-probs under ODE (unused without REINFORCE).
-                        compute_log_prob=not self._is_ode,
+                        compute_log_prob=False,
                         return_kwargs=self._student_return_kwargs_for_train(),
                         guidance_scale=self.student_gs,
                     )
@@ -3207,15 +3223,7 @@ class XOPDTrainer(BaseTrainer):
                         )
 
                     pathwise_loss = d_k_grad.mean()
-
-                    r_kp1 = r_per_k[k_idx].detach()
-                    log_prob_new = student_out.log_prob
-                    if self.reinforce_coef > 0 and log_prob_new is not None:
-                        reinforce_loss = (r_kp1 * log_prob_new).mean()
-                    else:
-                        reinforce_loss = torch.zeros((), device=device)
-
-                    loss = self.pathwise_coef * pathwise_loss + self.reinforce_coef * reinforce_loss
+                    loss = self.pathwise_coef * pathwise_loss
 
                     # MoE load-balancing aux (only when the student is a weight-space MoE
                     # and moe_load_balance_coeff > 0; a no-op otherwise). Read right after
@@ -3253,10 +3261,6 @@ class XOPDTrainer(BaseTrainer):
                         loss_info["kl_loss"].append(kl_loss.detach())
 
                     loss_info["d_k"].append(pathwise_loss.detach())
-                    loss_info["r_bar"].append(r_kp1.mean().detach())
-                    if log_prob_new is not None:
-                        loss_info["log_prob"].append(log_prob_new.mean().detach())
-                    loss_info["reinforce_loss"].append(reinforce_loss.detach())
                     loss_info["loss"].append(loss.detach())
                     # Per-timestep-index d_k/loss detail (on top of the all-timestep
                     # averages above). Keyed by the trajectory position so the same

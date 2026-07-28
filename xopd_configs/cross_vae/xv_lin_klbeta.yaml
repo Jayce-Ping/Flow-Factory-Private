@@ -75,9 +75,6 @@ train:
 
   # --- L1: on-policy transition matching (pathwise only, ODE) ---
   pathwise_coef: 1.0
-  reinforce_coef: 0.0
-  reinforce_horizon: null
-  reinforce_future_reduction: "mean"
   normalize_d_k: false
   kl_type: "x-based"
   kl_beta: 1.0                             # STRONG KL anchor to base SD3.5: test if it prevents the LR1e-4 drift-collapse

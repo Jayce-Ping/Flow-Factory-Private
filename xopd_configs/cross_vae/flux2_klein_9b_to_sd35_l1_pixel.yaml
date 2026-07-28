@@ -6,7 +6,7 @@
 #
 # This file: pure L1 (l0_warmup_epochs=0) with the WHITENING transport (M7).
 # Flip vae_transport among whitening / linear / pixel to compare L1 transport baselines.
-# Pathwise only (reinforce_coef=0), ODE.
+# Pathwise only, ODE.
 
 # ===== Environment =====
 launcher: "accelerate"
@@ -79,9 +79,6 @@ train:
 
   # --- L1: on-policy transition matching (pathwise only) ---
   pathwise_coef: 1.0
-  reinforce_coef: 0.0                      # No REINFORCE this round (ODE)
-  reinforce_horizon: null
-  reinforce_future_reduction: "mean"
   normalize_d_k: false
   kl_type: "x-based"
   kl_beta: 0.0

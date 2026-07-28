@@ -84,9 +84,6 @@ train:
 
   # --- L1: on-policy transition matching ---
   pathwise_coef: 1.0                      # Coefficient on per-step d_k (mean matching); >= 0
-  reinforce_coef: 0.0                     # REINFORCE trajectory-term coefficient; 0 disables (pure pathwise)
-  reinforce_horizon: null                 # Future steps aggregated into R_bar; null = all j > k
-  reinforce_future_reduction: "mean"      # R_bar aggregation. Options: sum, mean
   normalize_d_k: false                    # true: divide D_k by 2*sigma_bar^2; false: plain MSE (x-space is plain x0-MSE regardless)
   kl_type: "x-based"                      # KL anchor type vs base. Options: x-based, v-based (kl_beta=0 -> inactive)
   kl_beta: 0.0                            # KL anchor coefficient; 0 disables

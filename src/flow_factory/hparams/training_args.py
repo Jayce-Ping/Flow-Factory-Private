@@ -2578,20 +2578,6 @@ class XOPDTrainingArguments(TrainingArguments):
             "help": "Coefficient on the per-step Gaussian KL D_k (transition mean matching)."
         },
     )
-    reinforce_coef: float = field(
-        default=0.0,
-        metadata={
-            "help": "Coefficient on the REINFORCE trajectory term. 0 disables it (pure pathwise)."
-        },
-    )
-    reinforce_horizon: Optional[int] = field(
-        default=None,
-        metadata={"help": "Max future steps aggregated into R_bar; None = all j > k."},
-    )
-    reinforce_future_reduction: Literal["sum", "mean"] = field(
-        default="mean",
-        metadata={"help": "How to aggregate future D_j into R_bar. Options: 'sum', 'mean'."},
-    )
     normalize_d_k: bool = field(
         default=False,
         metadata={"help": "If True, divide D_k by 2*sigma_bar^2; otherwise plain MSE."},
@@ -2792,12 +2778,6 @@ class XOPDTrainingArguments(TrainingArguments):
                     "bridges x_S->teacher space for the on-policy teacher query, then D_T/D_S "
                     f"decode both sides to pixels); got vae_transport={self.vae_transport!r}."
                 )
-            if self.xopd_pixel_loss and self.reinforce_coef > 0:
-                raise ValueError(
-                    "xopd_pixel_loss=True is pathwise-only; the pixel target caches D_T pixels "
-                    "and skips the per-step REINFORCE d_k. Set reinforce_coef=0, got "
-                    f"reinforce_coef={self.reinforce_coef!r}."
-                )
         elif self.xopd_pixel_loss:
             raise ValueError(
                 "xopd_pixel_loss=True is cross-VAE only (teacher_model_type must be set)."
@@ -2835,14 +2815,16 @@ class XOPDTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"`pathwise_coef` must be >= 0, got pathwise_coef={self.pathwise_coef!r}."
             )
-        if self.reinforce_coef < 0:
+        # XOPD dropped the REINFORCE trajectory term (L1 is pathwise D_k + optional KL anchor).
+        # AbstractArguments.from_dict funnels unknown YAML keys into extra_kwargs with only a
+        # warning, so a stale `reinforce_coef: 1.0` would otherwise run as pathwise-only while
+        # looking like it asked for something else. A leftover 0 is harmless and stays quiet.
+        stale_reinforce = self.extra_kwargs.get("reinforce_coef")
+        if stale_reinforce is not None and float(stale_reinforce) > 0:
             raise ValueError(
-                f"`reinforce_coef` must be >= 0, got reinforce_coef={self.reinforce_coef!r}."
-            )
-        if self.reinforce_future_reduction not in ("sum", "mean"):
-            raise ValueError(
-                f"`reinforce_future_reduction` must be 'sum' or 'mean', got "
-                f"reinforce_future_reduction={self.reinforce_future_reduction!r}."
+                "XOPD no longer implements the REINFORCE trajectory term, but the config sets "
+                f"reinforce_coef={stale_reinforce!r}. Remove the key (the L1 loss is "
+                "pathwise_coef * D_k, plus kl_beta * KL to the reference model)."
             )
         if self.kl_beta < 0:
             raise ValueError(f"`kl_beta` must be >= 0, got kl_beta={self.kl_beta!r}.")

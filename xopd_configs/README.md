@@ -7,23 +7,20 @@ for the algorithm.
 
 ## Layout
 
-Top-level grouping is by **loss dynamics**, because the REINFORCE trajectory term
-is only well-defined under a stochastic (SDE) transition — under ODE the
-transition is deterministic, `log_prob` is identically zero, and
-`XOPDTrainer.__init__` **raises** if `reinforce_coef > 0`. So "has REINFORCE" and
-"is SDE" are the same axis, and it is the cleanest top-level split.
+Top-level grouping is by **teacher/student latent space**: whether the two share
+a VAE (the teacher transformer is swapped into the student pipeline) or need a
+transport between different ones.
 
 ```
 xopd_configs/
-├── ode_pathwise/     # dynamics_type=ODE, reinforce_coef=0  (deterministic pathwise distillation only)
-├── sde_reinforce/    # dynamics_type=Flow-SDE, noise_level=0.7, reinforce_coef=1.0  (pathwise + REINFORCE)
+├── ode_pathwise/     # dynamics_type=ODE  (deterministic pathwise distillation)
 └── cross_vae/        # heterogeneous VAE spaces (FLUX.2 teacher -> SD3.5 student) via a latent transport
 ```
 
 ### cross_vae/ — heterogeneous latent spaces
 
-`ode_pathwise` / `sde_reinforce` assume teacher and student **share a VAE** (the
-teacher transformer is swapped into the student pipeline). `cross_vae/` distills
+`ode_pathwise` assumes teacher and student **share a VAE** (the teacher
+transformer is swapped into the student pipeline). `cross_vae/` distills
 across **different VAEs** (FLUX.2-dev/9B teacher → SD3.5-medium student): the
 teacher is an **independent frozen adapter** and a `vae_transport` carries its
 signal into the student latent space. Theory & method derivation:
@@ -38,7 +35,7 @@ signal into the student latent space. Theory & method derivation:
 | `flux2_dev_32b_to_sd35_l1.yaml`    | FLUX.2-dev (~32B)    | pure L1 |
 | `flux2_dev_32b_to_sd35_l0l1.yaml`  | FLUX.2-dev (~32B)    | L0 warmup → L1 |
 
-Key knobs (pathwise only, `reinforce_coef=0`, ODE):
+Key knobs (pathwise, ODE):
 
 - `teacher_model_type`: teacher adapter key (`flux2-klein` / `flux2`); its presence
   switches on the cross-VAE path.
@@ -105,32 +102,20 @@ Each group holds the same 2×2 matrix of **teacher × stage**:
   leaves the L0 velocity-regression stage). Pairing the two isolates each
   stage's contribution.
 
-## ode_pathwise vs sde_reinforce
+## The REINFORCE trajectory term is gone
 
-`sde_reinforce/*` is a mirror of `ode_pathwise/*`, identical except:
-
-| setting | ode_pathwise | sde_reinforce |
-|---------|--------------|---------------|
-| `scheduler.dynamics_type` | `ODE` | `Flow-SDE` |
-| `scheduler.noise_level`   | `0.0` | `0.7` |
-| `scheduler.num_sde_steps` | n/a   | `null` → full pool |
-| `scheduler.sde_steps`     | n/a   | `null` → `range(num_inference_steps-1)` (all steps are SDE/training steps) |
-| `train.reinforce_coef`    | `0.0` | `1.0` |
-
-Under SDE, `num_train_timesteps = num_sde_steps = num_inference_steps - 1 = 27`
-(vs 28 under ODE); `gradient_accumulation_steps: auto` resolves GAS to
-`num_batches_per_epoch * num_train_timesteps` automatically, so the one-optimizer-
-step-per-epoch L1 invariant holds in both groups with no manual GAS tuning.
-
-> In the `sde_reinforce/*_l0only.yaml` configs `reinforce_coef=1.0` is kept only
-> for symmetry: REINFORCE is an L1-only term, and an L0-only run never reaches
-> L1, so it has no effect there.
+An earlier `sde_reinforce/` group mirrored `ode_pathwise/` under `Flow-SDE` with
+`reinforce_coef=1.0`, adding a score-function trajectory term on top of the
+pathwise loss. It was probed once (a 100-epoch A/B against its `reinforce_coef=0`
+control) and not pursued, so both the term and those configs were removed: L1 is
+now `pathwise_coef * D_k` plus the optional KL anchor, and XOPD raises if a config
+still asks for a non-zero `reinforce_coef`. The OPD trainer, where REINFORCE is
+the method rather than an option, is unaffected.
 
 ## Run
 
 ```bash
 ff-train xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1.yaml
-ff-train xopd_configs/sde_reinforce/flux2_klein_9b_to_4b_l1.yaml
 ```
 
 The `num_processes` / batch geometry in these files target 32 GPUs (with a clean

@@ -11,7 +11,7 @@
 # plateaus (~0.10) and the transported image is blurry. 'conv' adds a learned
 # (PixelShuffle) upsample + conv residual on top of the frozen closed-form base affine
 # (do-no-harm zero-init) plus a paired linear inverse net; it stays LINEAR so the L1
-# transition-mean pushforward remains EXACT. Pathwise only (reinforce_coef=0), ODE.
+# transition-mean pushforward remains EXACT. Pathwise only, ODE.
 
 # ===== Environment =====
 launcher: "accelerate"
@@ -87,9 +87,6 @@ train:
 
   # --- L1: on-policy transition matching (pathwise only) ---
   pathwise_coef: 1.0
-  reinforce_coef: 0.0                      # No REINFORCE this round (ODE)
-  reinforce_horizon: null
-  reinforce_future_reduction: "mean"
   normalize_d_k: false
   kl_type: "x-based"
   kl_beta: 0.0

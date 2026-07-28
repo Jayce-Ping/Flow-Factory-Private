@@ -73,9 +73,6 @@ train:
   l0_snr_gamma: 5.0
 
   pathwise_coef: 1.0
-  reinforce_coef: 0.0
-  reinforce_horizon: null
-  reinforce_future_reduction: "mean"
   normalize_d_k: false
   kl_type: "x-based"
   kl_beta: 0.0
