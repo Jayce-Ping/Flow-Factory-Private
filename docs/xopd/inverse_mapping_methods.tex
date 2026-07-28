@@ -26,6 +26,7 @@
 \newcommand{\zT}{z_{T}}
 \newcommand{\zS}{z_{S}}
 \newcommand{\hS}{h_{S}}
+\newcommand{\Bridge}{\mathcal{B}}
 
 \title{\textbf{Learning the Cross-VAE Inverse Mapping}\\[0.3em]
 \large Latent-Discriminator and Conditional-Flow Methods (Algorithm Pseudocode)}
@@ -48,7 +49,9 @@ $\Enc_T(\Dec_S(\zS))$). This note gives pseudocode for two inverse-learning meth
 replace the mean-seeking MSE with \emph{manifold-respecting} objectives: (1) a
 latent-discriminator (adversarial + cycle-consistency) inverse, and (2) a conditional
 normalizing-flow inverse trained by maximum likelihood. Both keep the \emph{linear} forward
-$P$ so the L1 transition-mean pushforward stays exact.
+$P$ so the L1 transition-mean pushforward stays exact. We also slot in (3)
+\href{https://arxiv.org/abs/2606.32020}{Cross-Space Bridge} as an external $Q$ recipe aimed at
+Teacher-space VSD/GAN rather than L1 pushforward.
 \end{abstract}
 
 \section{Setup and Notation}
@@ -175,13 +178,54 @@ zero-initialised head net $g$.
 \end{algorithmic}
 \end{algorithm}
 
+\section{Method 3: Cross-Space Bridge (Nguyen et~al., arXiv:2606.32020)}
+\label{sec:bridge}
+
+External recipe for the same hard inverse $Q:\Zb\!\to\!\Za$, designed for
+\textbf{Teacher-space} VSD/GAN (DMD2-style one-step distillation), not for XOPD L1
+pushforward. Full write-up:
+\texttt{docs/xopd/cross\_space\_distillation\_bridge.tex}.
+
+\begin{algorithm}[h]
+\caption{Cross-Space Bridge --- offline training (summary)}
+\label{alg:bridge}
+\begin{algorithmic}[1]
+\Require frozen $\Enc_T,\Enc_S$, Student decoder prefix $\Dec_S^{(n)}$ (frozen; $n{=}1$ expands
+         grid to Teacher resolution); projector $g_\phi$ (e.g.\ SwinIR); Teacher denoiser for
+         attention maps; weights $\alpha,\beta$ (default $1$); temperature $\tau$.
+\For{each minibatch of images $x$}
+  \State $\zT \gets \Enc_T(x)$; \quad $\zS \gets \Enc_S(x)$
+  \State $f_{\mathrm{prior}} \gets \Dec_S^{(n)}(\zS)$
+         \Comment{spatial prior: $h{\times}w \to H{\times}W$, no trainable params}
+  \State $\hat\zT \gets g_\phi(f_{\mathrm{prior}})$
+  \State $\mathcal{L}_{\mathrm{rec}} \gets \norm{\zT-\hat\zT}_1$
+  \State $\mathcal{L}_{\mathrm{attn}} \gets \sum_l \tau^2\,\mathrm{KL}\big(
+         P^l(\hat\zT;t,c)\,\|\,P^l(\zT;t,c)\big)$
+         \Comment{reverse KL on Teacher self-attention; $t{=}1$ in paper}
+  \State $\phi \gets \phi - \eta\,\nabla_\phi\big(
+         \alpha\mathcal{L}_{\mathrm{rec}}+\beta\mathcal{L}_{\mathrm{attn}}\big)$
+\EndFor
+\State \Return $\Bridge_\phi = g_\phi\circ\Dec_S^{(n)}$
+       \Comment{freeze; map Student latents into Teacher space for VSD/GAN}
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Contrast with Methods 1--2.}
+Bridge also targets on-manifold $\hat\zT$, but (i)~uses a \emph{frozen Student-decoder
+prefix} instead of student DiT hidden states, (ii)~uses Teacher \emph{attention} reverse KL
+instead of a latent discriminator or cINN likelihood, and (iii)~is paired with
+distribution matching \emph{in $\Za$}, so it does not need to keep a linear forward $P$
+for L1. To reuse Bridge inside XOPD L1, still need $P$ (or Route~B pixel adjoint); the
+Attention Fidelity term alone is a drop-in regularizer for any $Q$.
+
 \section{Notes}
 \label{sec:notes}
 
 \begin{itemize}[leftmargin=1.4em,itemsep=2pt]
-  \item \textbf{Linear $P$ kept.} Both methods only change the inverse $Q$; the forward $P$
+  \item \textbf{Linear $P$ kept.} Methods 1--2 only change the inverse $Q$; the forward $P$
         stays a frozen closed-form affine, so the L1 transition-mean pushforward remains exact
         and analytically consistent (\texttt{docs/xopd/xopd\_vae\_space\_align.tex}, Prop.~affine).
+        Method~3 (Bridge) typically \emph{does not} use $P$ during distillation.
   \item \textbf{Do-no-harm init.} Modelling the residual $r=\zT-b(\zS)$ with a zero-initialised
         flow (Alg.~\ref{alg:coupling}) means at step $0$, $F.\textsc{inverse}(\mathbf{0}\mid c)=\mathbf{0}$
         and $\hat\zT=b(\zS)=P^{+}\zS$ --- exactly the current linear pseudo-inverse baseline; the
@@ -189,7 +233,8 @@ zero-initialised head net $g$.
   \item \textbf{Why this fixes the collapse.} A deterministic MSE $Q$ returns the conditional
         mean (off-manifold). Method 1's discriminator and Method 2's likelihood both reward
         \emph{distribution membership}, so $\hat\zT$ lands on $\Za$ and the teacher is queried
-        in-distribution; the L1 guidance becomes meaningful.
+        in-distribution; the L1 guidance becomes meaningful. Bridge's Attention Fidelity plays
+        an analogous role for Teacher-space VSD.
   \item \textbf{L1 mean matching.} $D_k$ matches transition means; default \texttt{query\_mode}
         $=$ mode ($v{=}0$, deterministic, on-manifold central point). \texttt{sample} injects
         stochastic-but-on-manifold teacher opinions; \texttt{mean\_k} averages $K$ samples to

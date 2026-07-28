@@ -395,4 +395,16 @@ does not discuss any concrete construction, parameterization, initialization, or
 for $(\Tmap,\Tinv)$, nor does it compare or select among candidate methods.
 \end{remark}
 
+\begin{remark}[External concrete $\Tinv$: Cross-Space Bridge]
+\label{rem:bridge}
+\href{https://arxiv.org/abs/2606.32020}{Cross-Space Distillation (arXiv:2606.32020)} learns a
+Bridge $\mathcal{B}_\phi:\Zb\to\Za$ (Student-decoder spatial prior $+$ projector) so that
+distribution-based one-step distillation (VSD/GAN) can run under Cross-Resolution and Cross-VAE
+mismatch. In our terms this is a concrete $\Tinv$ satisfying a soft version of (P1)--(P2) for
+\emph{sample} transport into Teacher space; it does not by itself supply the Jacobian pushforward
+(P3) needed for Student-space velocity matching. See
+\texttt{docs/xopd/cross\_space\_distillation\_bridge.tex} for the mapping onto Routes~A--C and
+the XOPD L0/L1 hierarchy (Rem.~\ref{rem:layering}).
+\end{remark}
+
 \end{document}

@@ -514,7 +514,10 @@ M7 白化/AdaLN 仿射   & 闭式     & 低（对角二阶）   & \ding{51} & \d
 \bottomrule
 \end{tabular}
 \caption{六种 VAE 隐空间传输方法对 XOPD L0/L1 的适配性对比。\ding{51}=干净适配，
-$\triangle$=可行但昂贵，\ding{55}=不适合。}
+$\triangle$=可行但昂贵，\ding{55}=不适合。
+（外部相关：Cross-Space Bridge \href{https://arxiv.org/abs/2606.32020}{arXiv:2606.32020}
+学的是 student$\to$teacher 的 $Q$，服务 Teacher-space VSD/GAN，见
+\texttt{cross\_space\_distillation\_bridge.tex}；不宜直接填入上表的 L1 列。）}
 \end{table}
 
 \begin{tcolorbox}[colback=yellow!6,colframe=orange!60!black,title=推荐路线]
