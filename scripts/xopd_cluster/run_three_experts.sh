@@ -77,7 +77,9 @@ CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_x0norm_1kep.yaml:29588"   # Phase 1: OCR x0_norm loss-space ablation (stopped at ep255, treated as finished)
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_1kep.yaml:29589"  # MoF-2 router arm 3: sigmoid gate + top-1 sparse. STOPPED at ~ep160: the router was single-expert
                                                                                                 # from init (E0 never selected; logit gap +0.44 vs +-0.02 across prompts), so arm 4 supersedes it.
-  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_cs_soft_t02_1kep.yaml:29590"  # MoF-2 router arm 4: arm 3 + k-means cold-start (soft targets, T=0.2) to break router symmetry PER PROMPT
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_cs_soft_t02_1kep.yaml:29590"  # MoF-2 router arm 4: arm 3 + k-means cold-start (soft targets, T=0.2). Cold-start runs but converges
+                                                                                                           # degenerately (acc 0.48, maxprob 1.0 within 10 of 300 steps); not the lr -- a CPU sweep learns the same clusters at every lr.
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigsoft_nolb_1kep.yaml:29591"  # MoF-2 router arm 5: NON-CONVEX dense soft mixing -- independent sigmoid gates over ALL experts, no load balance
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }
