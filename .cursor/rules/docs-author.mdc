@@ -1,0 +1,14 @@
+---
+description: All docs under docs/ must use author Jayce-Ping
+globs: docs/**/*
+alwaysApply: false
+---
+
+# Docs author
+
+When creating or editing documents under `docs/` (LaTeX lecture notes, analyses, experiment reports, Markdown notes with an author field):
+
+- Set the author to **`Jayce-Ping`**.
+- For LaTeX: `\author{Jayce-Ping}` (not `Flow-Factory`, `Flow Factory`, or other placeholders).
+- For Markdown that has an explicit author/作者 line for the *document itself*, use `Jayce-Ping`. Do **not** rewrite cited paper authors (e.g. "Wei Zhou et al.").
+- Scripts that generate `docs/**/*.tex` must emit `\author{Jayce-Ping}` as well.

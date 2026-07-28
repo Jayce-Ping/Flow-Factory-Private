@@ -36,7 +36,7 @@
 
 \title{\textbf{Avoiding the Student$\to$Teacher Inverse in Cross-Latent On-Policy Distillation}\\[0.3em]
 \large Working Analysis (Draft)}
-\author{Flow Factory}
+\author{Jayce-Ping}
 \date{}
 
 \begin{document}
@@ -262,5 +262,20 @@ The inverse $\Tinv$ is required only because we chose a \emph{pointwise vector-f
 student-chosen states. Switching to distributional / score / $x_0$ objectives---which push
 forward canonically under the easy $\Tmap$ and whose gradients use only adjoints (VJPs) of
 forward maps---removes $\Tinv$ from the problem.
+
+\section{Related: Cross-Space Bridge as a Route~A interface}
+\label{sec:bridge-related}
+
+\href{https://arxiv.org/abs/2606.32020}{Nguyen et~al.\ (arXiv:2606.32020)} train a lightweight
+Bridge $\mathcal{B}_\phi:\Zb\to\Za$ (frozen Student-decoder spatial prior $+$ SwinIR projector;
+$\ell_1$ latent recon $+$ reverse-KL on Teacher attention) so that compact Students can run
+DMD2-style VSD/GAN \emph{in Teacher space} under Cross-Resolution and Cross-VAE mismatch.
+
+In the language of this note, Bridge is a concrete learned $\Tinv$ used as a
+\textbf{Route~A interface}: Student samples are mapped into $\Za$, then score / adversarial
+matching proceeds where the Teacher is defined. It does not construct a forward $\Tmap$ with
+Jacobian for pointwise velocity pushforward in $\Zb$ (Routes~B/C and XOPD L1 remain separate).
+Companion write-up: \texttt{docs/xopd/cross\_space\_distillation\_bridge.tex}; inverse-method
+slot: \texttt{inverse\_mapping\_methods.tex} \S Method~3.
 
 \end{document}

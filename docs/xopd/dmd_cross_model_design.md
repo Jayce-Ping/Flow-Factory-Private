@@ -43,6 +43,17 @@ existing XOPD `assume_shared_vae` assumption), so `v_real − v_fake` at a commo
 well-defined. Text conditioning differs (dev vs. klein text encoders); we reuse the
 existing XOPD teacher-text-embedding precompute for `v_real`.
 
+### 1.2 Cross-VAE extension (not this RFC's scope)
+
+If Teacher and Student use **different** VAEs / latent grids, `v_real − v_fake` is not
+defined at a shared `x_t`. [Cross-Space Distillation (arXiv:2606.32020)](https://arxiv.org/abs/2606.32020)
+trains a lightweight **Bridge** $Q: z_S \mapsto \hat z_T$ (frozen Student-decoder spatial
+prior + projector; $\ell_1$ + Teacher attention reverse-KL), freezes it, then runs
+DMD2-style VSD/GAN in **Teacher** space. That is the natural prerequisite for a
+cross-VAE version of this RFC: map Student/`fake` states through Bridge before
+`v_real`/`discriminator` queries. Mapping onto XOPD Routes A–C:
+`docs/xopd/cross_space_distillation_bridge.tex`.
+
 ---
 
 ## 2. Flow-matching form of the DMD gradient (DMD2 is ε-prediction)
