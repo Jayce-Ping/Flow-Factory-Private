@@ -838,7 +838,7 @@ def generate_experiments_tex(
         r"\usepackage[table]{xcolor}",
         "",
         r"\title{Flow-Factory OPD \& Ensemble Eval Experiments}",
-        r"\author{Flow-Factory}",
+        r"\author{Jayce-Ping}",
         rf"\date{{Generated {fetched_at} from W\&B project \texttt{{{project}}}}}",
         "",
         r"\begin{document}",
