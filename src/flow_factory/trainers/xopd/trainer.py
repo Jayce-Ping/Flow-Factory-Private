@@ -43,6 +43,7 @@ Registry key: ``'xopd'`` -> :class:`XOPDTrainer`.
 
 import os
 from collections import defaultdict
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1115,7 +1116,6 @@ class XOPDTrainer(BaseTrainer):
         params = [p for p in list(router.parameters()) + list(router_time_embed.parameters())]
         for p in params:
             p.requires_grad_(True)
-        rdtype = next(router.parameters()).dtype
         in_ch = int(mof.config.in_channels)
         guidance_embeds = bool(getattr(mof.config, "guidance_embeds", False))
         student_gs = float(self.student_gs)
@@ -1123,6 +1123,11 @@ class XOPDTrainer(BaseTrainer):
 
         def router_forward_fn(pe_batch: torch.Tensor) -> torch.Tensor:
             b = pe_batch.shape[0]
+            # Resolve the dtype from the LIVE parameters on every call: under FSDP mixed precision
+            # the sharded parameter is bf16 outside an unshard context but summon_full_params
+            # materializes the fp32 master, so a dtype captured before the context would feed bf16
+            # inputs into fp32 weights.
+            rdtype = next(router.parameters()).dtype
             pe_batch = pe_batch.to(device=device, dtype=rdtype)
             t = torch.rand(b, device=device, generator=tgen)
             ts = (t * 1000).to(rdtype)
@@ -1157,18 +1162,36 @@ class XOPDTrainer(BaseTrainer):
             log_f.write(json.dumps({"step": step, "ce": ce, "acc": acc_v, "maxprob": maxprob}) + "\n")
             log_f.flush()
 
-        coldstart_router(
-            router_forward_fn, params, prompt_seq_local, labels_local,
-            steps=ma.mof_router_coldstart_steps, lr=ma.mof_router_coldstart_lr,
-            batch_size=ma.mof_router_coldstart_batch, world_size=world_size, device=device,
-            log_every=ma.mof_router_coldstart_log_every, log_cb=log_cb,
-            seed=int(self.training_args.seed), soft_targets=soft_local,
-        )
+        # Under FSDP the router is not its own wrap unit (TRANSFORMER_BASED_WRAP only wraps the
+        # blocks), so it lives in the ROOT unit's flat parameter: outside an unshard context each
+        # rank holds just its slice and the router forward dies on a size mismatch. Materialize the
+        # root unit for the cold-start -- recurse=False keeps that to the small non-block remainder
+        # rather than the 8B of expert blocks -- and let writeback scatter the result back into the
+        # shards. The replica broadcast below must also happen INSIDE the context: on full
+        # parameters it is the intended no-op safety sync, whereas on shards it would overwrite
+        # every rank with rank 0's slice.
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        # --- (d) sync router replicas, clear grads, log summary ---
-        if world_size > 1:
-            for p in params:
-                dist.broadcast(p.data, src=0)
+        prepared = self.adapter.transformer
+        unshard = (
+            FSDP.summon_full_params(prepared, recurse=False, writeback=True, with_grads=True)
+            if isinstance(prepared, FSDP) else nullcontext()
+        )
+        with unshard:
+            coldstart_router(
+                router_forward_fn, params, prompt_seq_local, labels_local,
+                steps=ma.mof_router_coldstart_steps, lr=ma.mof_router_coldstart_lr,
+                batch_size=ma.mof_router_coldstart_batch, world_size=world_size, device=device,
+                log_every=ma.mof_router_coldstart_log_every, log_cb=log_cb,
+                seed=int(self.training_args.seed), soft_targets=soft_local,
+            )
+
+            # --- (d) sync router replicas ---
+            if world_size > 1:
+                for p in params:
+                    dist.broadcast(p.data, src=0)
+
+        # --- clear grads, log summary ---
         for p in self.adapter.transformer.parameters():
             p.grad = None
         if is_main and log_f is not None:

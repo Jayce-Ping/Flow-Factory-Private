@@ -75,14 +75,19 @@ CONFIGS=(
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_soft_nolb_1kep.yaml:29586"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_geneval_enh_ocr_mixed_vmse_1kep.yaml:29587"
   "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_l1_ocr_x0norm_1kep.yaml:29588"   # Phase 1: OCR x0_norm loss-space ablation (stopped at ep255, treated as finished)
-  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_1kep.yaml:29589"  # MoF-2 router arm 3: sigmoid gate + top-1 sparse (first arm never run)
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_1kep.yaml:29589"  # MoF-2 router arm 3: sigmoid gate + top-1 sparse. STOPPED at ~ep160: the router was single-expert
+                                                                                                # from init (E0 never selected; logit gap +0.44 vs +-0.02 across prompts), so arm 4 supersedes it.
+  "xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_mof2_mix_fsdp_vmse_sigtopk_cs_soft_t02_1kep.yaml:29590"  # MoF-2 router arm 4: arm 3 + k-means cold-start (soft targets, T=0.2) to break router symmetry PER PROMPT
 )
 
 log() { echo "[orchestrator $(date '+%F %T')] $*"; }
 
 start_keepalive() {
   log "starting GPU keepalive on all 4 nodes"
-  local KA='source /opt/conda/etc/profile.d/conda.sh && conda activate ff && cd /root/Flow-Factory-Private && pkill -f "[g]pu_keepalive.py" 2>/dev/null; setsid python .scratch/gpu_keepalive.py > /root/gpu_keepalive.log 2>&1 < /dev/null &'
+  # The pre-kill must be anchored to the python process: an unanchored pattern also matches THIS
+  # launching shell (its command line names the script and its log), so pkill killed the shell
+  # before it could start anything -- keepalive then silently never ran and the nodes sat idle.
+  local KA='source /opt/conda/etc/profile.d/conda.sh && conda activate ff && cd /root/Flow-Factory-Private && pkill -9 -f "^python .*gpu_keepalive\.py" 2>/dev/null; setsid nohup python .scratch/gpu_keepalive.py > /root/gpu_keepalive.log 2>&1 < /dev/null &'
   for ip in "${WORKERS[@]}"; do ssh -o StrictHostKeyChecking=no -f "$ip" "bash -lc '$KA'" || true; done
   bash -lc "$KA" || true
 }
