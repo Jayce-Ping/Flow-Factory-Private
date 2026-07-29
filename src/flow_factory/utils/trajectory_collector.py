@@ -24,13 +24,18 @@ Memory-efficient recording utilities for denoising trajectories.
 Both produce compact storage + lightweight index maps to eliminate redundant
 data in multi-GPU gather operations.
 """
-from typing import Union, List, Optional, Literal, Set, Dict, Any, TypeVar
+from typing import Union, List, Optional, Literal, Set, Dict, Any, TypeVar, Tuple
 from collections import defaultdict
 import torch
 
 
 T = TypeVar('T')
 TrajectoryIndicesType = Union[Literal['all'], List[int], None]
+SCHEDULER_TRAIN_INDICES = "scheduler_train"
+SchedulerAwareTrajectoryIndicesType = Union[
+    TrajectoryIndicesType,
+    Literal["scheduler_train"],
+]
 
 
 # =============================================================================
@@ -386,6 +391,66 @@ def compute_trajectory_indices(
             positions.add(idx + 1)
     
     return sorted(positions)
+
+
+def resolve_scheduler_train_collection_indices(
+    trajectory_indices: SchedulerAwareTrajectoryIndicesType,
+    *,
+    scheduler_train_indices: Union[List[int], torch.Tensor],
+    num_inference_steps: int,
+) -> Tuple[TrajectoryIndicesType, TrajectoryIndicesType]:
+    """Resolve scheduler-selected training steps after the inference schedule is configured.
+
+    Args:
+        trajectory_indices: Normal collector indices or ``"scheduler_train"``.
+        scheduler_train_indices: Scheduler-selected denoising step indices for the
+            current inference schedule.
+        num_inference_steps: Number of denoising steps in that schedule.
+
+    Returns:
+        A pair ``(latent_indices, callback_indices)``. Latent indices include each
+        selected transition's current and successor positions; callback indices
+        contain only the selected transition steps.
+    """
+    if trajectory_indices != SCHEDULER_TRAIN_INDICES:
+        return trajectory_indices, trajectory_indices
+    if not isinstance(num_inference_steps, int) or num_inference_steps < 1:
+        raise ValueError(
+            "scheduler_train collection requires num_inference_steps >= 1, "
+            f"got num_inference_steps={num_inference_steps!r}."
+        )
+    if isinstance(scheduler_train_indices, torch.Tensor):
+        if scheduler_train_indices.ndim != 1:
+            raise ValueError(
+                "scheduler_train_indices must be one-dimensional, "
+                f"got shape={tuple(scheduler_train_indices.shape)}."
+            )
+        step_indices = scheduler_train_indices.detach().cpu().tolist()
+    elif isinstance(scheduler_train_indices, list):
+        step_indices = list(scheduler_train_indices)
+    else:
+        raise TypeError(
+            "scheduler_train_indices must be a list or torch.Tensor, "
+            f"got {type(scheduler_train_indices).__name__}: {scheduler_train_indices!r}."
+        )
+    if not step_indices:
+        raise ValueError(
+            "scheduler_train collection requires at least one stochastic training step, "
+            f"got scheduler_train_indices={step_indices!r}."
+        )
+    if any(
+        not isinstance(index, int) or index < 0 or index >= num_inference_steps
+        for index in step_indices
+    ):
+        raise ValueError(
+            "scheduler_train_indices must contain integers in "
+            f"[0, {num_inference_steps}), got {step_indices!r}."
+        )
+    latent_indices = compute_trajectory_indices(
+        train_timestep_indices=step_indices,
+        num_inference_steps=num_inference_steps,
+    )
+    return latent_indices, step_indices
 
 
 def create_trajectory_collector(

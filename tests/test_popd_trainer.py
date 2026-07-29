@@ -16,11 +16,24 @@
 
 import unittest
 from collections import defaultdict
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
 
+from flow_factory.samples import BaseSample
 from flow_factory.trainers.xopd.trainer import XOPDTrainer
+from flow_factory.utils.trajectory_collector import (
+    SCHEDULER_TRAIN_INDICES,
+    resolve_scheduler_train_collection_indices,
+)
+
+
+class _AttrDict(dict):
+    """Dictionary with attribute access for lightweight TrainingArguments tests."""
+
+    def __getattr__(self, name):
+        return self[name]
 
 
 class TestPOPDTrainerCache(unittest.TestCase):
@@ -83,6 +96,72 @@ class TestPOPDTrainerCache(unittest.TestCase):
         quantiles = trainer._gather_popd_gamma_quantiles(loss_info)
         torch.testing.assert_close(quantiles["popd/gamma_p50"], torch.tensor(0.5))
         torch.testing.assert_close(quantiles["popd/gamma/t2_p90"], torch.tensor(0.82))
+
+
+class TestPOPDScheduleAlignment(unittest.TestCase):
+    def test_scheduler_train_sentinel_resolves_after_schedule_is_configured(self) -> None:
+        trajectory_indices, callback_indices = resolve_scheduler_train_collection_indices(
+            SCHEDULER_TRAIN_INDICES,
+            scheduler_train_indices=torch.tensor([3, 1]),
+            num_inference_steps=5,
+        )
+        self.assertEqual(trajectory_indices, [1, 2, 3, 4])
+        self.assertEqual(callback_indices, [3, 1])
+
+    def test_same_arch_sde_sample_defers_step_selection_to_inference(self) -> None:
+        captured = {}
+
+        class _Adapter:
+            scheduler = SimpleNamespace(train_timesteps=torch.tensor([35]))
+
+            def rollout(self):
+                return None
+
+            def inference(self, **kwargs):
+                captured.update(kwargs)
+                return []
+
+        trainer = XOPDTrainer.__new__(XOPDTrainer)
+        trainer.adapter = _Adapter()
+        trainer.training_args = _AttrDict(
+            xopd_resample_steps_per_batch=False,
+            num_inference_steps=28,
+            num_batches_per_epoch=1,
+            xopd_train_steps=None,
+            num_xopd_steps=None,
+        )
+        trainer._is_popd = True
+        trainer._is_ode = False
+        trainer._cross_vae = False
+        trainer.log_args = SimpleNamespace(verbose=False)
+        trainer.accelerator = SimpleNamespace(is_local_main_process=False)
+        trainer.epoch = 0
+        trainer.autocast = nullcontext
+        trainer._make_train_iter = lambda: iter([{}])
+        trainer._maybe_offload_samples_to_cpu = lambda samples: None
+
+        self.assertEqual(trainer.sample(), [])
+        self.assertEqual(captured["trajectory_indices"], SCHEDULER_TRAIN_INDICES)
+
+        captured.clear()
+        trainer._is_popd = False
+        self.assertEqual(trainer.sample(), [])
+        self.assertEqual(captured["trajectory_indices"], SCHEDULER_TRAIN_INDICES)
+
+
+class TestPOPDCallbackOffload(unittest.TestCase):
+    def test_sample_to_moves_callback_tensors_in_extra_kwargs(self) -> None:
+        sample = BaseSample(
+            extra_kwargs={
+                "next_latents_mean": torch.ones(2),
+                "std_dev_t": torch.ones(1),
+                "dt": -torch.ones(1),
+            }
+        )
+        sample.to("meta")
+        self.assertEqual(sample.extra_kwargs["next_latents_mean"].device.type, "meta")
+        self.assertEqual(sample.extra_kwargs["std_dev_t"].device.type, "meta")
+        self.assertEqual(sample.extra_kwargs["dt"].device.type, "meta")
 
 
 if __name__ == "__main__":

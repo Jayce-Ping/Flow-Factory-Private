@@ -51,9 +51,10 @@ from ...utils.image import (
 from ...utils.trajectory_collector import (
     TrajectoryCollector,
     CallbackCollector,
-    TrajectoryIndicesType,
+    SchedulerAwareTrajectoryIndicesType,
     create_trajectory_collector,
     create_callback_collector,
+    resolve_scheduler_train_collection_indices,
 )
 from ...utils.logger_utils import setup_logger
 
@@ -822,7 +823,7 @@ class Flux2KleinAdapter(BaseAdapter):
         hidden_states_layers: Tuple[int, ...] = (9, 18, 27),
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = "all",
+        trajectory_indices: SchedulerAwareTrajectoryIndicesType = "all",
     ) -> List[Flux2KleinSample]:
 
         device = self.device
@@ -936,6 +937,11 @@ class Flux2KleinAdapter(BaseAdapter):
             device=device,
             mu=mu,
         )
+        trajectory_indices, callback_indices = resolve_scheduler_train_collection_indices(
+            trajectory_indices,
+            scheduler_train_indices=self.scheduler.train_timesteps,
+            num_inference_steps=num_inference_steps,
+        )
 
         guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
         guidance = guidance.expand(latents.shape[0])
@@ -948,7 +954,7 @@ class Flux2KleinAdapter(BaseAdapter):
             log_prob_collector = create_trajectory_collector(
                 trajectory_indices, num_inference_steps
             )
-        callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
+        callback_collector = create_callback_collector(callback_indices, num_inference_steps)
 
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
@@ -1103,7 +1109,7 @@ class Flux2KleinAdapter(BaseAdapter):
         # Other arguments
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = "all",
+        trajectory_indices: SchedulerAwareTrajectoryIndicesType = "all",
     ) -> List[Flux2KleinSample]:
         if isinstance(prompt, str):
             prompt = [prompt]

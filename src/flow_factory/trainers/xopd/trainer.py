@@ -68,7 +68,7 @@ from ...utils.base import (
 from ...utils.dist import reduce_loss_info
 from ...utils.logger_utils import setup_logger
 from ...utils.noise_schedule import TimeSampler, flow_match_sigma
-from ...utils.trajectory_collector import compute_trajectory_indices
+from ...utils.trajectory_collector import SCHEDULER_TRAIN_INDICES, compute_trajectory_indices
 from ..abc import BaseTrainer
 from .common import (
     POPDResponsibility,
@@ -2611,17 +2611,23 @@ class XOPDTrainer(BaseTrainer):
         samples: List[BaseSample] = []
         data_iter = self._make_train_iter()
 
-        # Per-batch selective mode: store latents for EVERY candidate step so each
-        # micro-batch can later draw its own k steps; else store just this epoch's subset.
-        rollout_steps = (
-            self._candidate_train_timestep_indices
-            if self.training_args.xopd_resample_steps_per_batch
-            else self._train_timestep_indices
-        )
-        trajectory_indices = compute_trajectory_indices(
-            train_timestep_indices=rollout_steps,
-            num_inference_steps=self.training_args.num_inference_steps,
-        )
+        if not self._is_ode and not self._cross_vae:
+            # Evaluation may leave a different-length schedule on the scheduler.
+            # Resolve stochastic train steps only after inference configures this
+            # rollout's schedule inside the same-architecture adapter.
+            trajectory_indices = SCHEDULER_TRAIN_INDICES
+        else:
+            # Per-batch selective mode: store latents for EVERY candidate step so each
+            # micro-batch can later draw its own k steps; else store just this epoch's subset.
+            rollout_steps = (
+                self._candidate_train_timestep_indices
+                if self.training_args.xopd_resample_steps_per_batch
+                else self._train_timestep_indices
+            )
+            trajectory_indices = compute_trajectory_indices(
+                train_timestep_indices=rollout_steps,
+                num_inference_steps=self.training_args.num_inference_steps,
+            )
 
         with torch.no_grad(), self.autocast():
             for _ in tqdm(

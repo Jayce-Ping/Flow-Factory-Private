@@ -46,6 +46,24 @@ If rollout and training `forward()` diverge, `ratio` deviates from 1.0 at epoch 
 - Dtype round-trip guard: `scheduler/*.py` — `next_latents = next_latents.to(_input_dtype).float()` ensures stored trajectory matches training replay (e.g., `scheduler/flow_match_euler_discrete.py` L362, `scheduler/unipc_multistep.py` L345)
 - `cast_latents()`: `models/abc.py` L165 — applied identically in `inference()` before/after each `forward()` call
 
+## Recorded Fix Patterns
+
+### Resolve scheduler-selected collection after `set_timesteps`
+- **Date**: 2026-07-29
+- **Symptom**: An evaluation rollout with 40 steps followed by a 28-step SDE training rollout produced missing callback/latent indices; P-OPD raised on `-1` index-map entries, while direct SDE replay could silently select the wrong stored state.
+- **Root Cause**: XOPD read `scheduler.train_timesteps` before `adapter.inference()` replaced the evaluation schedule with the training schedule, so stochastic step selection was based on stale schedule length.
+- **Fix**: Same-architecture SDE XOPD now passes a `scheduler_train` collection sentinel; the FLUX.2 Klein adapter resolves selected transitions and their current/successor latent positions immediately after configuring the rollout schedule.
+- **Lesson**: Any trajectory indices derived from scheduler state must be resolved after the exact inference schedule is installed, not before entering `adapter.inference()`.
+- **Related Constraint**: #20 (train-inference consistency).
+
+### Move tensors stored in sample `extra_kwargs`
+- **Date**: 2026-07-29
+- **Symptom**: With `offload_samples_to_cpu=True`, latent-sized P-OPD behavior callbacks remained on GPU and could negate sample offloading; reload also left dictionary-held tensors on the old device.
+- **Root Cause**: `BaseSample.to()` moved dataclass tensor fields and direct tensor lists but did not recurse into `extra_kwargs`.
+- **Fix**: `BaseSample.to()` now delegates each field to `move_tensors_to_device` with its existing depth contract, so direct tensor values in `extra_kwargs` offload and reload with the sample.
+- **Lesson**: Sample extension data participates in the training data path and must obey the same device lifecycle as declared dataclass fields.
+- **Related Constraint**: #8 (component/sample offloading lifecycle).
+
 ## Cross-refs
 
 - `constraints.md` #7 (coupled/decoupled paradigm)

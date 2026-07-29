@@ -43,7 +43,7 @@ from ..utils.base import (
     hash_tensor,
     hash_pil_image_list,
     hash_tensor_list,
-    is_tensor_list,
+    move_tensors_to_device,
     standardize_image_batch,
     standardize_video_batch,
 )
@@ -232,21 +232,18 @@ class BaseSample:
 
         return {k: tensor_to_repr(v) for k, v in self.to_dict().items()}
 
-    def to(self, device: Union[torch.device, str], depth : int = 1) -> BaseSample:
+    def to(self, device: Union[torch.device, str], depth: int = 1) -> BaseSample:
         """Move all tensor fields to specified device."""
         assert 0 <= depth <= 1, "Only depth 0 and 1 are supported."
         device = torch.device(device)
         for field in fields(self):
             value = getattr(self, field.name)
-            if isinstance(value, torch.Tensor):
-                setattr(self, field.name, value.to(device))
-            elif depth == 1 and is_tensor_list(value):
-                setattr(
-                    self,
-                    field.name,
-                    [t.to(device) if isinstance(t, torch.Tensor) else t for t in value]
-                )
-            
+            setattr(
+                self,
+                field.name,
+                move_tensors_to_device(value, device, max_depth=depth),
+            )
+
         return self
 
     def _hash_id_fields(self, hasher: hashlib._Hash) -> None:
