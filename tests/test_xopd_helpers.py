@@ -22,43 +22,19 @@ from flow_factory.hparams.training_args import XOPDTrainingArguments
 from flow_factory.trainers.xopd.common import (
     align_l0_inner_steps,
     compute_per_step_kl,
+    compute_popd_diagnostics,
+    compute_popd_gaussian_mean_kl,
+    compute_popd_quantiles,
+    compute_popd_responsibility,
+    compute_transition_variance,
     extract_i2i_condition_kwargs,
+    extract_popd_behavior_transition,
     interleaved_source_iter,
     l0_loss_weight,
-    reverse_cumulative,
     validate_l1_one_step_per_epoch,
+    validate_popd_configuration,
     validate_source_ratio,
 )
-
-
-class TestXOPDReverseCumulative(unittest.TestCase):
-    def test_sum_full_horizon(self) -> None:
-        d0 = torch.tensor([1.0, 10.0])
-        d1 = torch.tensor([2.0, 20.0])
-        d2 = torch.tensor([3.0, 30.0])
-        r = reverse_cumulative([d0, d1, d2], max_future_steps=None, reduction="sum")
-        self.assertEqual(len(r), 3)
-        torch.testing.assert_close(r[2], torch.zeros(2))
-        torch.testing.assert_close(r[1], d2)
-        torch.testing.assert_close(r[0], d1 + d2)
-
-    def test_mean_full_horizon(self) -> None:
-        d0 = torch.tensor([1.0])
-        d1 = torch.tensor([2.0])
-        d2 = torch.tensor([3.0])
-        r = reverse_cumulative([d0, d1, d2], max_future_steps=None, reduction="mean")
-        torch.testing.assert_close(r[2], torch.zeros(1))
-        torch.testing.assert_close(r[1], d2)
-        torch.testing.assert_close(r[0], (d1 + d2) / 2.0)
-
-    def test_bounded_horizon(self) -> None:
-        d_list = [torch.tensor([float(i)]) for i in range(4)]  # [0, 1, 2, 3]
-        r_sum = reverse_cumulative(d_list, max_future_steps=2, reduction="sum")
-        # k=0: sum(d[1], d[2]) = 3; k=3: no future -> 0.
-        torch.testing.assert_close(r_sum[0], torch.tensor([1.0 + 2.0]))
-        torch.testing.assert_close(r_sum[3], torch.tensor([0.0]))
-        r_mean = reverse_cumulative(d_list, max_future_steps=2, reduction="mean")
-        torch.testing.assert_close(r_mean[0], torch.tensor([1.5]))
 
 
 class TestXOPDPerStepKL(unittest.TestCase):
@@ -183,6 +159,262 @@ class TestXOPDTrainingArguments(unittest.TestCase):
         self.assertEqual(args.guidance_scale, 1.0)
         # Preprocess must encode negatives if EITHER side uses CFG.
         self.assertEqual(args.get_preprocess_guidance_scale(), 4.0)
+
+    def test_popd_defaults_preserve_direct_xopd(self) -> None:
+        args = XOPDTrainingArguments(teacher_model_name_or_path="/tmp/teacher")
+        self.assertEqual(args.xopd_target_mode, "direct")
+        self.assertEqual(args.popd_alpha, 0.5)
+        self.assertEqual(args.popd_temperature, 1.0)
+
+    def test_direct_xopd_ignores_unused_popd_values(self) -> None:
+        args = XOPDTrainingArguments(
+            teacher_model_name_or_path="/tmp/teacher",
+            xopd_target_mode="direct",
+            popd_alpha=0.0,
+            popd_temperature=0.0,
+        )
+        self.assertEqual(args.xopd_target_mode, "direct")
+
+    def test_popd_rejects_invalid_alpha_and_temperature(self) -> None:
+        for alpha in (0.0, 1.0, float("nan")):
+            with self.subTest(alpha=alpha), self.assertRaises(ValueError):
+                XOPDTrainingArguments(
+                    teacher_model_name_or_path="/tmp/teacher",
+                    xopd_target_mode="p_opd",
+                    popd_alpha=alpha,
+                )
+        for temperature in (0.0, -1.0, float("nan")):
+            with self.subTest(temperature=temperature), self.assertRaises(ValueError):
+                XOPDTrainingArguments(
+                    teacher_model_name_or_path="/tmp/teacher",
+                    xopd_target_mode="p_opd",
+                    popd_temperature=temperature,
+                )
+
+
+class TestPOPDConfiguration(unittest.TestCase):
+    def test_accepts_supported_same_vae_sde_configuration(self) -> None:
+        validate_popd_configuration(
+            target_mode="p_opd",
+            dynamics_type="Flow-SDE",
+            noise_level=0.7,
+            xopd_dk_space="xt",
+            normalize_d_k=True,
+            is_cross_vae=False,
+            pixel_loss=False,
+        )
+
+    def test_direct_mode_is_unrestricted(self) -> None:
+        validate_popd_configuration(
+            target_mode="direct",
+            dynamics_type="ODE",
+            noise_level=0.0,
+            xopd_dk_space="x0_norm",
+            normalize_d_k=False,
+            is_cross_vae=True,
+            pixel_loss=True,
+        )
+
+    def test_rejects_unsupported_popd_combinations(self) -> None:
+        invalid = (
+            {"dynamics_type": "ODE"},
+            {"noise_level": 0.0},
+            {"xopd_dk_space": "v"},
+            {"normalize_d_k": False},
+            {"is_cross_vae": True},
+            {"pixel_loss": True},
+        )
+        base = {
+            "target_mode": "p_opd",
+            "dynamics_type": "Flow-SDE",
+            "noise_level": 0.7,
+            "xopd_dk_space": "xt",
+            "normalize_d_k": True,
+            "is_cross_vae": False,
+            "pixel_loss": False,
+        }
+        for override in invalid:
+            kwargs = {**base, **override}
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                validate_popd_configuration(**kwargs)
+
+
+class TestPOPDTransitionVariance(unittest.TestCase):
+    def test_flow_and_dance_sde_include_negative_dt(self) -> None:
+        std = torch.tensor([2.0, 3.0])
+        dt = torch.tensor([-0.25, -0.5])
+        expected = torch.tensor([1.0, 4.5])
+        for dynamics_type in ("Flow-SDE", "Dance-SDE"):
+            with self.subTest(dynamics_type=dynamics_type):
+                actual = compute_transition_variance(std, dt, dynamics_type)
+                torch.testing.assert_close(actual, expected)
+
+    def test_cps_uses_step_standard_deviation_directly(self) -> None:
+        actual = compute_transition_variance(
+            torch.tensor([2.0, 3.0]),
+            torch.tensor([-0.25, -0.5]),
+            "CPS",
+        )
+        torch.testing.assert_close(actual, torch.tensor([4.0, 9.0]))
+
+    def test_rejects_ode_and_invalid_variance(self) -> None:
+        with self.assertRaises(ValueError):
+            compute_transition_variance(torch.ones(1), torch.tensor([-0.1]), "ODE")
+        for std in (torch.zeros(1), torch.tensor([float("nan")])):
+            with self.subTest(std=std), self.assertRaises(ValueError):
+                compute_transition_variance(std, torch.tensor([-0.1]), "Flow-SDE")
+
+
+class TestPOPDResponsibility(unittest.TestCase):
+    def test_identical_components_return_alpha(self) -> None:
+        mu = torch.zeros(2, 3)
+        result = compute_popd_responsibility(
+            next_latents=torch.randn(2, 3),
+            mu_old=mu,
+            mu_teacher=mu,
+            transition_variance=torch.ones(2),
+            alpha=0.25,
+            temperature=1.0,
+        )
+        torch.testing.assert_close(result.log_ratio_sum, torch.zeros(2))
+        torch.testing.assert_close(result.teacher_responsibility, torch.full((2,), 0.25))
+        torch.testing.assert_close(result.teacher_old_kl_joint, torch.zeros(2))
+        self.assertEqual(result.event_dim, 3)
+
+    def test_gate_tracks_which_component_better_explains_transition(self) -> None:
+        mu_old = torch.zeros(2, 2)
+        mu_teacher = torch.ones(2, 2)
+        next_latents = torch.stack((torch.ones(2), torch.zeros(2)))
+        result = compute_popd_responsibility(
+            next_latents=next_latents,
+            mu_old=mu_old,
+            mu_teacher=mu_teacher,
+            transition_variance=torch.ones(2),
+            alpha=0.5,
+            temperature=1.0,
+        )
+        self.assertGreater(result.teacher_responsibility[0].item(), 0.5)
+        self.assertLess(result.teacher_responsibility[1].item(), 0.5)
+
+    def test_temperature_event_dim_matches_latent_mean(self) -> None:
+        mu_old = torch.zeros(1, 4)
+        mu_teacher = torch.ones(1, 4)
+        result = compute_popd_responsibility(
+            next_latents=torch.zeros(1, 4),
+            mu_old=mu_old,
+            mu_teacher=mu_teacher,
+            transition_variance=torch.ones(1),
+            alpha=0.5,
+            temperature=4.0,
+        )
+        torch.testing.assert_close(
+            result.tempered_log_ratio,
+            result.log_ratio_sum / result.event_dim,
+        )
+
+    def test_responsibility_is_detached(self) -> None:
+        mu_old = torch.zeros(1, 2, requires_grad=True)
+        mu_teacher = torch.ones(1, 2, requires_grad=True)
+        result = compute_popd_responsibility(
+            next_latents=torch.zeros(1, 2),
+            mu_old=mu_old,
+            mu_teacher=mu_teacher,
+            transition_variance=torch.ones(1),
+            alpha=0.5,
+            temperature=1.0,
+        )
+        self.assertFalse(result.teacher_responsibility.requires_grad)
+
+    def test_gaussian_mean_kl_only_updates_student(self) -> None:
+        mu_student = torch.zeros(1, 2, requires_grad=True)
+        mu_teacher = torch.ones(1, 2, requires_grad=True)
+        loss = compute_popd_gaussian_mean_kl(
+            mu_student,
+            mu_teacher,
+            torch.ones(1),
+        ).mean()
+        loss.backward()
+        self.assertIsNotNone(mu_student.grad)
+        self.assertIsNone(mu_teacher.grad)
+
+    def test_diagnostics_report_joint_and_per_dimension_scales(self) -> None:
+        mu_old = torch.zeros(1, 2)
+        mu_teacher = torch.tensor([[2.0, 0.0]])
+        next_latents = torch.tensor([[2.0, -2.0]])
+        variance = torch.tensor([4.0])
+        result = compute_popd_responsibility(
+            next_latents=next_latents,
+            mu_old=mu_old,
+            mu_teacher=mu_teacher,
+            transition_variance=variance,
+            alpha=0.5,
+            temperature=1.0,
+        )
+        metrics = compute_popd_diagnostics(
+            next_latents=next_latents,
+            mu_old=mu_old,
+            mu_teacher=mu_teacher,
+            mu_student=mu_old,
+            transition_variance=variance,
+            dt=torch.tensor([-0.25]),
+            responsibility=result,
+        )
+        torch.testing.assert_close(metrics["old_innovation_rms"], torch.ones(1))
+        torch.testing.assert_close(metrics["teacher_old_gap_l2"], torch.tensor([2.0]))
+        torch.testing.assert_close(
+            metrics["teacher_old_gap_rms"],
+            torch.tensor([2.0**0.5]),
+        )
+        torch.testing.assert_close(metrics["teacher_old_kl_joint"], torch.tensor([0.5]))
+        torch.testing.assert_close(metrics["teacher_old_kl_per_dim"], torch.tensor([0.25]))
+        torch.testing.assert_close(metrics["behavior_drift_rms"], torch.zeros(1))
+        self.assertTrue(all(not value.requires_grad for value in metrics.values()))
+
+
+class TestPOPDBehaviorTransition(unittest.TestCase):
+    def test_extracts_callback_values_for_trajectory_timestep(self) -> None:
+        mu_old = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+        std = torch.tensor([[[0.1], [0.2], [0.3]], [[0.4], [0.5], [0.6]]])
+        dt = -torch.ones(2, 3, 1)
+        callback_map = torch.tensor([[2, 0, 1, -1], [2, 0, 1, -1]])
+        result = extract_popd_behavior_transition(
+            {
+                "next_latents_mean": mu_old,
+                "std_dev_t": std,
+                "dt": dt,
+                "callback_index_map": callback_map,
+            },
+            timestep_index=1,
+        )
+        torch.testing.assert_close(result.mu_old, mu_old[:, 0])
+        torch.testing.assert_close(result.std_dev_t, std[:, 0])
+        torch.testing.assert_close(result.dt, dt[:, 0])
+
+    def test_rejects_missing_or_inconsistent_callback_data(self) -> None:
+        valid = {
+            "next_latents_mean": torch.zeros(2, 1, 3),
+            "std_dev_t": torch.ones(2, 1, 1),
+            "dt": -torch.ones(2, 1, 1),
+            "callback_index_map": torch.zeros(2, 2, dtype=torch.long),
+        }
+        for missing in valid:
+            batch = {key: value for key, value in valid.items() if key != missing}
+            with self.subTest(missing=missing), self.assertRaises(KeyError):
+                extract_popd_behavior_transition(batch, timestep_index=0)
+
+        inconsistent = dict(valid)
+        inconsistent["callback_index_map"] = torch.tensor([[0, -1], [-1, 0]])
+        with self.assertRaises(ValueError):
+            extract_popd_behavior_transition(inconsistent, timestep_index=0)
+
+    def test_quantiles_use_all_per_sample_values(self) -> None:
+        quantiles = compute_popd_quantiles(torch.arange(100, dtype=torch.float32))
+        expected = torch.quantile(
+            torch.arange(100, dtype=torch.float32),
+            torch.tensor([0.01, 0.10, 0.50, 0.90, 0.99]),
+        )
+        for key, value in zip(("p01", "p10", "p50", "p90", "p99"), expected):
+            torch.testing.assert_close(quantiles[key], value)
 
 
 def _fake_source_dataloaders():
@@ -330,4 +562,3 @@ class TestExtractI2IConditionKwargs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

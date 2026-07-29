@@ -25,9 +25,629 @@ from __future__ import annotations
 
 import inspect
 import math
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, FrozenSet, Generator, List, Literal, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
+
+
+@dataclass(frozen=True)
+class POPDResponsibility:
+    """Detached Gaussian-mixture responsibility statistics for one transition batch."""
+
+    log_ratio_sum: torch.Tensor
+    log_ratio_per_dim: torch.Tensor
+    tempered_log_ratio: torch.Tensor
+    gate_logit: torch.Tensor
+    teacher_responsibility: torch.Tensor
+    teacher_old_kl_joint: torch.Tensor
+    teacher_old_kl_per_dim: torch.Tensor
+    event_dim: int
+    alpha: float
+    temperature: float
+
+
+@dataclass(frozen=True)
+class POPDBehaviorTransition:
+    """Cached behavior-policy statistics aligned to one rollout timestep."""
+
+    mu_old: torch.Tensor
+    std_dev_t: torch.Tensor
+    dt: torch.Tensor
+
+
+def extract_popd_behavior_transition(
+    batch: Dict[str, Any],
+    *,
+    timestep_index: int,
+) -> POPDBehaviorTransition:
+    """Extract cached behavior mean and scheduler scales for one trajectory step.
+
+    Args:
+        batch: Stacked rollout sample containing callback tensors and their index map.
+        timestep_index: Original denoising-loop step index.
+
+    Returns:
+        Detached behavior transition statistics aligned to ``timestep_index``.
+    """
+    if not isinstance(batch, dict):
+        raise TypeError(f"expected dict for batch, got {type(batch).__name__}: {batch!r}")
+    if not isinstance(timestep_index, int) or timestep_index < 0:
+        raise ValueError(
+            f"expected non-negative int timestep_index, got timestep_index={timestep_index!r}."
+        )
+    required = ("next_latents_mean", "std_dev_t", "dt", "callback_index_map")
+    missing = [name for name in required if name not in batch]
+    if missing:
+        raise KeyError(
+            "P-OPD rollout is missing required behavior callback fields "
+            f"{missing!r}; available keys={sorted(batch.keys())!r}. "
+            "Ensure sample() requests next_latents_mean, std_dev_t, and dt."
+        )
+
+    callback_map = batch["callback_index_map"]
+    if not isinstance(callback_map, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor for callback_index_map, "
+            f"got {type(callback_map).__name__}: {callback_map!r}"
+        )
+    if callback_map.ndim == 2:
+        if callback_map.shape[0] < 1:
+            raise ValueError(
+                "expected callback_index_map with a non-empty batch dimension, "
+                f"got shape={tuple(callback_map.shape)}."
+            )
+        first_map = callback_map[0]
+        if not torch.equal(callback_map, first_map.unsqueeze(0).expand_as(callback_map)):
+            raise ValueError(
+                "expected every sample to share the same callback_index_map, "
+                f"got shape={tuple(callback_map.shape)} and values={callback_map.cpu().tolist()}."
+            )
+        callback_map = first_map
+    elif callback_map.ndim != 1:
+        raise ValueError(
+            "expected callback_index_map shape (T,) or (B,T), "
+            f"got shape={tuple(callback_map.shape)}."
+        )
+    if timestep_index >= callback_map.shape[0]:
+        raise ValueError(
+            f"timestep_index={timestep_index} exceeds callback_index_map length "
+            f"{callback_map.shape[0]}."
+        )
+    compact_index = int(callback_map[timestep_index].item())
+    if compact_index < 0:
+        raise ValueError(
+            f"P-OPD behavior callbacks were not collected for timestep_index={timestep_index}; "
+            f"callback_index_map value={compact_index}."
+        )
+
+    selected: Dict[str, torch.Tensor] = {}
+    batch_size: Optional[int] = None
+    for name in ("next_latents_mean", "std_dev_t", "dt"):
+        value = batch[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"expected torch.Tensor for cached {name}, got {type(value).__name__}: {value!r}"
+            )
+        if value.ndim < 2:
+            raise ValueError(
+                f"expected cached {name} shape (B,T,...), got shape={tuple(value.shape)}."
+            )
+        if batch_size is None:
+            batch_size = int(value.shape[0])
+        elif value.shape[0] != batch_size:
+            raise ValueError(
+                f"expected cached {name} batch size {batch_size}, got shape={tuple(value.shape)}."
+            )
+        if compact_index >= value.shape[1]:
+            raise ValueError(
+                f"callback compact index {compact_index} exceeds cached {name} timestep "
+                f"dimension {value.shape[1]} for shape={tuple(value.shape)}."
+            )
+        selected[name] = value[:, compact_index].detach()
+
+    return POPDBehaviorTransition(
+        mu_old=selected["next_latents_mean"],
+        std_dev_t=selected["std_dev_t"],
+        dt=selected["dt"],
+    )
+
+
+def compute_popd_quantiles(values: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Compute detached P-OPD p01/p10/p50/p90/p99 statistics.
+
+    Args:
+        values: Non-empty finite tensor containing globally gathered sample values.
+
+    Returns:
+        Mapping from percentile name to detached scalar tensor.
+    """
+    if not isinstance(values, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor for P-OPD quantiles, got {type(values).__name__}: {values!r}"
+        )
+    flattened = values.detach().float().flatten()
+    if flattened.numel() < 1:
+        raise ValueError(
+            f"expected at least one value for P-OPD quantiles, got shape={tuple(values.shape)}."
+        )
+    if not torch.isfinite(flattened).all():
+        raise ValueError(
+            f"expected finite values for P-OPD quantiles, got values={flattened.cpu().tolist()}."
+        )
+    probabilities = torch.tensor(
+        [0.01, 0.10, 0.50, 0.90, 0.99],
+        device=flattened.device,
+        dtype=flattened.dtype,
+    )
+    quantiles = torch.quantile(flattened, probabilities)
+    return {
+        name: value.detach() for name, value in zip(("p01", "p10", "p50", "p90", "p99"), quantiles)
+    }
+
+
+def validate_popd_configuration(
+    *,
+    target_mode: str,
+    dynamics_type: str,
+    noise_level: float,
+    xopd_dk_space: str,
+    normalize_d_k: bool,
+    is_cross_vae: bool,
+    pixel_loss: bool,
+) -> None:
+    """Validate that an XOPD configuration satisfies the P-OPD probability assumptions.
+
+    Args:
+        target_mode: XOPD target mode, either ``"direct"`` or ``"p_opd"``.
+        dynamics_type: Scheduler dynamics used for rollout and replay.
+        noise_level: Positive scheduler noise scale used by stochastic transitions.
+        xopd_dk_space: Distillation loss space.
+        normalize_d_k: Whether transition-mean error is covariance-normalized.
+        is_cross_vae: Whether teacher and student use different latent spaces.
+        pixel_loss: Whether the L1 target is decoded to pixel space.
+    """
+    if target_mode == "direct":
+        return
+    if target_mode != "p_opd":
+        raise ValueError(
+            f"P-OPD target mode must be 'direct' or 'p_opd', got target_mode={target_mode!r}."
+        )
+    supported_dynamics = ("Flow-SDE", "Dance-SDE", "CPS")
+    if dynamics_type not in supported_dynamics:
+        raise ValueError(
+            "P-OPD requires a stochastic Gaussian transition with dynamics_type in "
+            f"{supported_dynamics!r}, got dynamics_type={dynamics_type!r}."
+        )
+    if (
+        isinstance(noise_level, bool)
+        or not isinstance(noise_level, (int, float))
+        or not math.isfinite(float(noise_level))
+        or float(noise_level) <= 0.0
+    ):
+        raise ValueError(
+            "P-OPD requires a finite scheduler noise_level > 0, "
+            f"got noise_level={noise_level!r}, dynamics_type={dynamics_type!r}."
+        )
+    if xopd_dk_space != "xt":
+        raise ValueError(
+            "P-OPD local mixture-KL surrogate requires xopd_dk_space='xt', "
+            f"got xopd_dk_space={xopd_dk_space!r}."
+        )
+    if normalize_d_k is not True:
+        raise ValueError(
+            "P-OPD local mixture-KL surrogate requires normalize_d_k=True, "
+            f"got normalize_d_k={normalize_d_k!r}."
+        )
+    if is_cross_vae:
+        raise ValueError(
+            "P-OPD currently requires a shared latent space and identity transport, "
+            f"got is_cross_vae={is_cross_vae!r}."
+        )
+    if pixel_loss:
+        raise ValueError(
+            "P-OPD is defined on Gaussian latent transitions and does not support "
+            f"pixel loss, got pixel_loss={pixel_loss!r}."
+        )
+
+
+def _batch_scalar(
+    value: torch.Tensor,
+    *,
+    name: str,
+    batch_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Convert a scheduler batch-scalar tensor to shape ``(B,)`` with strict validation."""
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"expected torch.Tensor for {name}, got {type(value).__name__}: {value!r}")
+    if value.ndim < 1:
+        raise ValueError(
+            f"expected {name} to include a batch dimension, got shape={tuple(value.shape)}"
+        )
+    actual_batch_size = int(value.shape[0])
+    if batch_size is not None and actual_batch_size != batch_size:
+        raise ValueError(
+            f"expected {name} batch size {batch_size}, got shape={tuple(value.shape)}."
+        )
+    flattened = value.float().reshape(actual_batch_size, -1)
+    if flattened.shape[1] != 1:
+        raise ValueError(
+            f"expected one scalar per sample for {name}, got shape={tuple(value.shape)} "
+            f"with {flattened.shape[1]} values per sample."
+        )
+    flattened = flattened[:, 0]
+    if not torch.isfinite(flattened).all():
+        raise ValueError(
+            f"expected finite values for {name}, got shape={tuple(value.shape)} "
+            f"and values={flattened.detach().cpu().tolist()}."
+        )
+    return flattened
+
+
+def _broadcast_batch_scalar(value: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Broadcast a validated ``(B,)`` tensor over a reference tensor's event dimensions."""
+    return value.reshape(value.shape[0], *([1] * (reference.ndim - 1)))
+
+
+def _validate_same_event_shape(
+    reference: torch.Tensor,
+    tensors: Dict[str, torch.Tensor],
+    *,
+    reference_name: str,
+) -> None:
+    """Validate floating event tensors share a non-empty ``(B, ...)`` shape."""
+    if not isinstance(reference, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor for {reference_name}, "
+            f"got {type(reference).__name__}: {reference!r}"
+        )
+    if reference.ndim < 2 or reference.shape[0] < 1:
+        raise ValueError(
+            f"expected {reference_name} shape (B, event...) with B >= 1, "
+            f"got shape={tuple(reference.shape)}."
+        )
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"expected torch.Tensor for {name}, got {type(tensor).__name__}: {tensor!r}"
+            )
+        if tensor.shape != reference.shape:
+            raise ValueError(
+                f"expected {name}.shape={tuple(reference.shape)} to match {reference_name}, "
+                f"got {name}.shape={tuple(tensor.shape)}."
+            )
+        if not torch.isfinite(tensor.detach().float()).all():
+            raise ValueError(
+                f"expected finite {name}, got shape={tuple(tensor.shape)} "
+                f"with abs_max={tensor.detach().float().abs().max().item()!r}."
+            )
+    if not torch.isfinite(reference.detach().float()).all():
+        raise ValueError(
+            f"expected finite {reference_name}, got shape={tuple(reference.shape)} "
+            f"with abs_max={reference.detach().float().abs().max().item()!r}."
+        )
+
+
+def compute_transition_variance(
+    std_dev_t: torch.Tensor,
+    dt: torch.Tensor,
+    dynamics_type: str,
+) -> torch.Tensor:
+    """Compute the actual scalar Gaussian transition variance for each sample.
+
+    Args:
+        std_dev_t: Scheduler diffusion scale, one scalar per sample.
+        dt: Scheduler timestep delta, one strictly negative scalar per sample.
+        dynamics_type: One of ``Flow-SDE``, ``Dance-SDE``, or ``CPS``.
+
+    Returns:
+        A float32 tensor of shape ``(B,)`` containing strictly positive variances.
+    """
+    std = _batch_scalar(std_dev_t, name="std_dev_t")
+    delta = _batch_scalar(dt, name="dt", batch_size=std.shape[0])
+    if not (delta < 0).all():
+        raise ValueError(
+            "expected strictly negative dt for a denoising SDE transition, "
+            f"got dynamics_type={dynamics_type!r}, dt={delta.detach().cpu().tolist()}."
+        )
+    if dynamics_type in ("Flow-SDE", "Dance-SDE"):
+        variance = std.square() * (-delta)
+    elif dynamics_type == "CPS":
+        variance = std.square()
+    elif dynamics_type == "ODE":
+        raise ValueError(
+            "P-OPD requires positive Gaussian transition variance, but "
+            "dynamics_type='ODE' is deterministic."
+        )
+    else:
+        raise ValueError(
+            "expected dynamics_type in ('Flow-SDE', 'Dance-SDE', 'CPS'), "
+            f"got dynamics_type={dynamics_type!r}."
+        )
+    if not torch.isfinite(variance).all() or not (variance > 0).all():
+        raise ValueError(
+            "expected finite positive transition variance for P-OPD, "
+            f"got dynamics_type={dynamics_type!r}, variance={variance.detach().cpu().tolist()}, "
+            f"std_dev_t={std.detach().cpu().tolist()}, dt={delta.detach().cpu().tolist()}."
+        )
+    return variance
+
+
+def compute_popd_responsibility(
+    *,
+    next_latents: torch.Tensor,
+    mu_old: torch.Tensor,
+    mu_teacher: torch.Tensor,
+    transition_variance: torch.Tensor,
+    alpha: float,
+    temperature: float,
+) -> POPDResponsibility:
+    """Compute detached P-OPD teacher responsibility from a behavior transition.
+
+    Args:
+        next_latents: Observed transition sampled by the behavior student.
+        mu_old: Mean of that behavior-student transition.
+        mu_teacher: Teacher transition mean at the same state.
+        transition_variance: Shared scalar covariance value per sample.
+        alpha: Prior teacher mixture probability in ``(0, 1)``.
+        temperature: Positive temperature applied after the exact event-dimension sum.
+
+    Returns:
+        Detached density-ratio, posterior-gate, and teacher-gap statistics.
+    """
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError(f"expected numeric alpha in (0, 1), got {type(alpha).__name__}: {alpha!r}")
+    if not math.isfinite(float(alpha)) or not 0.0 < float(alpha) < 1.0:
+        raise ValueError(f"expected alpha in (0, 1), got alpha={alpha!r}.")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError(
+            "expected positive numeric temperature, "
+            f"got {type(temperature).__name__}: {temperature!r}"
+        )
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0:
+        raise ValueError(f"expected finite temperature > 0, got temperature={temperature!r}.")
+
+    _validate_same_event_shape(
+        next_latents,
+        {"mu_old": mu_old, "mu_teacher": mu_teacher},
+        reference_name="next_latents",
+    )
+    batch_size = int(next_latents.shape[0])
+    variance = _batch_scalar(
+        transition_variance,
+        name="transition_variance",
+        batch_size=batch_size,
+    )
+    if not (variance > 0).all():
+        raise ValueError(
+            "expected strictly positive transition_variance for P-OPD, "
+            f"got values={variance.detach().cpu().tolist()}."
+        )
+    variance_b = _broadcast_batch_scalar(variance, next_latents)
+    event_dim = math.prod(next_latents.shape[1:])
+    with torch.no_grad():
+        observed = next_latents.detach().float()
+        old = mu_old.detach().float()
+        teacher = mu_teacher.detach().float()
+        old_sq = (observed - old).square()
+        teacher_sq = (observed - teacher).square()
+        log_ratio_sum = ((old_sq - teacher_sq) / (2.0 * variance_b)).flatten(1).sum(dim=1)
+        teacher_old_kl_joint = ((teacher - old).square() / (2.0 * variance_b)).flatten(1).sum(dim=1)
+        log_ratio_per_dim = log_ratio_sum / float(event_dim)
+        tempered_log_ratio = log_ratio_sum / float(temperature)
+        prior_logit = math.log(float(alpha)) - math.log1p(-float(alpha))
+        gate_logit = tempered_log_ratio + prior_logit
+        teacher_responsibility = torch.sigmoid(gate_logit)
+
+    finite_outputs = {
+        "log_ratio_sum": log_ratio_sum,
+        "teacher_old_kl_joint": teacher_old_kl_joint,
+        "gate_logit": gate_logit,
+        "teacher_responsibility": teacher_responsibility,
+    }
+    for name, value in finite_outputs.items():
+        if not torch.isfinite(value).all():
+            raise ValueError(
+                f"expected finite {name} for P-OPD, got values={value.detach().cpu().tolist()}, "
+                f"event_dim={event_dim}, alpha={alpha!r}, temperature={temperature!r}, "
+                f"variance_min={variance.min().item()!r}."
+            )
+
+    return POPDResponsibility(
+        log_ratio_sum=log_ratio_sum,
+        log_ratio_per_dim=log_ratio_per_dim,
+        tempered_log_ratio=tempered_log_ratio,
+        gate_logit=gate_logit,
+        teacher_responsibility=teacher_responsibility,
+        teacher_old_kl_joint=teacher_old_kl_joint,
+        teacher_old_kl_per_dim=teacher_old_kl_joint / float(event_dim),
+        event_dim=event_dim,
+        alpha=float(alpha),
+        temperature=float(temperature),
+    )
+
+
+def compute_popd_gaussian_mean_kl(
+    mu_student: torch.Tensor,
+    mu_teacher: torch.Tensor,
+    transition_variance: torch.Tensor,
+) -> torch.Tensor:
+    """Compute per-dimension Gaussian mean KL with gradients only through the student.
+
+    Args:
+        mu_student: Current student transition mean.
+        mu_teacher: Detached teacher transition mean.
+        transition_variance: Shared scalar covariance value per sample.
+
+    Returns:
+        Per-sample mean KL tensor of shape ``(B,)``.
+    """
+    _validate_same_event_shape(
+        mu_student,
+        {"mu_teacher": mu_teacher},
+        reference_name="mu_student",
+    )
+    variance = _batch_scalar(
+        transition_variance,
+        name="transition_variance",
+        batch_size=mu_student.shape[0],
+    )
+    if not (variance > 0).all():
+        raise ValueError(
+            "expected strictly positive transition_variance for Gaussian mean KL, "
+            f"got values={variance.detach().cpu().tolist()}."
+        )
+    variance_b = _broadcast_batch_scalar(variance, mu_student)
+    diff = mu_student.float() - mu_teacher.detach().float()
+    mean_kl = (diff.square() / (2.0 * variance_b)).flatten(1).mean(dim=1)
+    if not torch.isfinite(mean_kl.detach()).all():
+        raise ValueError(
+            "expected finite P-OPD Gaussian mean KL, "
+            f"got values={mean_kl.detach().cpu().tolist()}, "
+            f"student_shape={tuple(mu_student.shape)}, variance_min={variance.min().item()!r}."
+        )
+    return mean_kl
+
+
+def _event_rms(value: torch.Tensor) -> torch.Tensor:
+    """Compute per-sample event RMS."""
+    return value.float().square().flatten(1).mean(dim=1).sqrt()
+
+
+def _event_l2(value: torch.Tensor) -> torch.Tensor:
+    """Compute per-sample event L2 norm."""
+    return value.float().square().flatten(1).sum(dim=1).sqrt()
+
+
+def compute_popd_diagnostics(
+    *,
+    next_latents: torch.Tensor,
+    mu_old: torch.Tensor,
+    mu_teacher: torch.Tensor,
+    mu_student: torch.Tensor,
+    transition_variance: torch.Tensor,
+    dt: torch.Tensor,
+    responsibility: POPDResponsibility,
+) -> Dict[str, torch.Tensor]:
+    """Compute detached per-sample P-OPD scale and sampler diagnostics.
+
+    Args:
+        next_latents: Observed behavior transition.
+        mu_old: Cached behavior transition mean.
+        mu_teacher: Teacher transition mean.
+        mu_student: Current gradient-pass student transition mean.
+        transition_variance: Shared scalar covariance value per sample.
+        dt: Scheduler timestep delta per sample.
+        responsibility: Detached output from :func:`compute_popd_responsibility`.
+
+    Returns:
+        Mapping of metric names to detached finite tensors of shape ``(B,)``.
+    """
+    _validate_same_event_shape(
+        next_latents,
+        {
+            "mu_old": mu_old,
+            "mu_teacher": mu_teacher,
+            "mu_student": mu_student,
+        },
+        reference_name="next_latents",
+    )
+    batch_size = int(next_latents.shape[0])
+    variance = _batch_scalar(
+        transition_variance,
+        name="transition_variance",
+        batch_size=batch_size,
+    )
+    if not (variance > 0).all():
+        raise ValueError(
+            "expected strictly positive transition_variance for P-OPD diagnostics, "
+            f"got values={variance.detach().cpu().tolist()}."
+        )
+    delta = _batch_scalar(dt, name="dt", batch_size=batch_size)
+    if responsibility.teacher_responsibility.shape != (batch_size,):
+        raise ValueError(
+            "expected responsibility.teacher_responsibility shape "
+            f"({batch_size},), got {tuple(responsibility.teacher_responsibility.shape)}."
+        )
+    if responsibility.event_dim != math.prod(next_latents.shape[1:]):
+        raise ValueError(
+            "P-OPD responsibility event dimension does not match diagnostic tensors: "
+            f"responsibility.event_dim={responsibility.event_dim}, "
+            f"tensor_event_dim={math.prod(next_latents.shape[1:])}, "
+            f"shape={tuple(next_latents.shape)}."
+        )
+
+    with torch.no_grad():
+        observed = next_latents.detach().float()
+        old = mu_old.detach().float()
+        teacher = mu_teacher.detach().float()
+        student = mu_student.detach().float()
+        variance_b = _broadcast_batch_scalar(variance, observed)
+        transition_std = variance.sqrt()
+        std_b = _broadcast_batch_scalar(transition_std, observed)
+        gamma = responsibility.teacher_responsibility.detach()
+        gamma_b = _broadcast_batch_scalar(gamma, observed)
+
+        teacher_old_gap = teacher - old
+        student_teacher_gap = student - teacher
+        behavior_drift = student - old
+        ungated_mean_kl = (student_teacher_gap.square() / (2.0 * variance_b)).flatten(1).mean(dim=1)
+        metrics = {
+            "transition_std": transition_std,
+            "transition_variance": variance,
+            "abs_dt": delta.abs(),
+            "next_latent_rms": _event_rms(observed),
+            "mu_old_rms": _event_rms(old),
+            "mu_teacher_rms": _event_rms(teacher),
+            "mu_student_rms": _event_rms(student),
+            "old_innovation_rms": _event_rms((observed - old) / std_b),
+            "teacher_innovation_rms": _event_rms((observed - teacher) / std_b),
+            "behavior_drift_rms": _event_rms(behavior_drift / std_b),
+            "teacher_old_gap_rms": _event_rms(teacher_old_gap),
+            "teacher_old_gap_l2": _event_l2(teacher_old_gap),
+            "teacher_old_gap_whitened_rms": _event_rms(teacher_old_gap / std_b),
+            "teacher_old_kl_joint": responsibility.teacher_old_kl_joint,
+            "teacher_old_kl_per_dim": responsibility.teacher_old_kl_per_dim,
+            "log_rho_sum": responsibility.log_ratio_sum,
+            "log_rho_per_dim": responsibility.log_ratio_per_dim,
+            "tempered_log_ratio": responsibility.tempered_log_ratio,
+            "gate_logit": responsibility.gate_logit,
+            "gamma": gamma,
+            "gamma_lt_001": (gamma < 0.01).float(),
+            "gamma_gt_099": (gamma > 0.99).float(),
+            "gate_entropy": F.softplus(responsibility.gate_logit)
+            - gamma * responsibility.gate_logit,
+            "student_teacher_gap_rms": _event_rms(student_teacher_gap),
+            "student_teacher_gap_whitened_rms": _event_rms(student_teacher_gap / std_b),
+            "ungated_mean_kl": ungated_mean_kl,
+            "gated_mean_kl": gamma * ungated_mean_kl,
+            "effective_gate": gamma,
+            "teacher_pull_rms": _event_rms(gamma_b * (old - teacher) / variance_b),
+            "event_dim": torch.full_like(gamma, float(responsibility.event_dim)),
+            "alpha": torch.full_like(gamma, responsibility.alpha),
+            "temperature": torch.full_like(gamma, responsibility.temperature),
+            "temperature_over_event_dim": torch.full_like(
+                gamma,
+                responsibility.temperature / float(responsibility.event_dim),
+            ),
+        }
+
+    for name, value in metrics.items():
+        value = value.detach()
+        if value.shape != (batch_size,):
+            raise ValueError(
+                f"expected P-OPD diagnostic {name!r} shape ({batch_size},), "
+                f"got shape={tuple(value.shape)}."
+            )
+        if not torch.isfinite(value).all():
+            raise ValueError(
+                f"expected finite P-OPD diagnostic {name!r}, "
+                f"got values={value.cpu().tolist()}, "
+                f"variance_min={variance.min().item()!r}, event_dim={responsibility.event_dim}."
+            )
+        metrics[name] = value
+    return metrics
 
 
 def cache_forward_signature(

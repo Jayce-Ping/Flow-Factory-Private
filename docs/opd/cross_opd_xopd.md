@@ -76,6 +76,104 @@ score-function term live). It was tried under `Flow-SDE` and dropped, and a
 config that still sets `reinforce_coef > 0` now raises rather than silently
 training pathwise-only.
 
+### P-OPD — probability-mixture proximal target
+
+P-OPD (Proximal On-Policy Distillation) is an optional XOPD L1 target mode:
+
+```yaml
+train:
+  xopd_target_mode: p_opd
+  xopd_dk_space: xt
+  normalize_d_k: true
+  popd_alpha: 0.5
+  popd_temperature: 1.0
+scheduler:
+  dynamics_type: Flow-SDE
+  noise_level: 0.7
+```
+
+It mixes complete transition densities, not velocities or Gaussian means. For
+the behavior transition `y ~ pi_old` with shared covariance
+`Sigma_t = sigma_tr^2 I`,
+
+```text
+log rho = sum_event(((y - mu_old)^2 - (y - mu_teacher)^2) / (2 sigma_tr^2))
+gamma_T = sigmoid(logit(alpha) + log_rho / temperature)
+loss = mean_batch(stop_gradient(gamma_T) * KL_mean(mu_student || mu_teacher))
+```
+
+The behavior mean, transition standard deviation and `dt` are captured from the
+same student rollout that produced `y`; they are not recomputed from the base
+model or EMA. The current implementation still performs exactly one optimizer
+step per rollout epoch, so the local surrogate is evaluated at
+`theta = theta_old`, where its gradient matches the probability-mixture KL to
+first order.
+
+Directly interpolating velocities,
+`alpha * v_teacher + (1 - alpha) * v_old`, is not P-OPD. At a strict on-policy
+start it only multiplies the ordinary teacher-MSE gradient by `alpha`.
+
+#### Sampler and covariance requirements
+
+P-OPD requires a stochastic Gaussian transition with positive model-independent
+covariance. Supported dynamics are:
+
+- `Flow-SDE` and `Dance-SDE`:
+  `sigma_tr^2 = std_dev_t^2 * (-dt)`;
+- `CPS`: `sigma_tr^2 = std_dev_t^2`.
+
+`ODE` is rejected because its transition is deterministic and the density ratio
+is undefined. P-OPD also currently rejects cross-VAE transport and pixel-space
+loss: teacher, behavior student and trainable student must share the latent
+event, scheduler, timestep, dynamics and covariance.
+
+#### Latent sum, latent mean and temperature
+
+The implementation always computes the joint event-dimension sum first:
+
+- `temperature = 1` is the exact Gaussian-mixture posterior responsibility;
+- `temperature = D`, where `D` is the latent event dimension, exactly reproduces
+  a latent-mean log ratio, but is a tempered surrogate rather than the original
+  mixture KL;
+- `1 < temperature < D` is an explicit effective-dimension compromise.
+
+For `y ~ pi_old`,
+`E[log rho] = -KL(pi_old || pi_teacher)`. The joint KL grows with latent
+dimension, resolution and teacher/student gap, so the exact sum can concentrate
+at `gamma_T ~= 0` and remove nearly all teacher signal. Latent mean is much more
+stable across resolution, but often keeps `gamma_T` near `alpha`, reducing the
+adaptive gate to an almost constant loss multiplier and weakening protection
+against a globally incompatible teacher. A first calibration sweep should
+compare `temperature in {1, sqrt(D), D}` without changing any other variable.
+
+#### P-OPD diagnostics
+
+P-OPD logs detached per-sample statistics globally and by trained trajectory
+step under `train/popd/...`. Important groups are:
+
+- sampler checks: transition variance/std, `abs_dt`,
+  `old_innovation_rms` (expected near 1), and `behavior_drift_rms` (expected near
+  0 before the optimizer step);
+- target scale: teacher/old RMS and L2 gaps, whitened RMS,
+  joint KL and per-dimension KL;
+- gate behavior: raw joint and per-dimension log ratios, tempered log ratio,
+  gate logit, gamma moments and p01/p10/p50/p90/p99, saturation rates below 0.01
+  and above 0.99, and binary gate entropy;
+- optimization scale: student/teacher gap, ungated and gated mean KL,
+  effective gate, teacher-pull gradient proxy and the existing parameter
+  `grad_norm`.
+
+RMS metrics are comparable across latent shapes; L2 and joint-sum metrics retain
+the probability scale and therefore grow with event dimension. NaN/Inf
+statistics, non-positive variance, missing callbacks, or rollout/replay
+covariance mismatch raise immediately rather than clamping or falling back to
+direct XOPD.
+
+The canonical configuration is
+[`xopd_configs/sde_pathwise/flux2_klein_32b_to_4b_popd.yaml`](../../xopd_configs/sde_pathwise/flux2_klein_32b_to_4b_popd.yaml).
+This implements TOP-D's external proximal teacher for Gaussian flow
+transitions; it does not implement TOP-D's internal trust-region iterations.
+
 ## Dual classifier-free guidance
 
 `teacher_guidance_scale` and `student_guidance_scale` are independent (default

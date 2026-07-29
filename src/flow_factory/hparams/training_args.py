@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
@@ -2590,6 +2591,36 @@ class XOPDTrainingArguments(TrainingArguments):
         default=0.0,
         metadata={"help": "KL anchor coefficient against the base model; 0 disables."},
     )
+    xopd_target_mode: Literal["direct", "p_opd"] = field(
+        default="direct",
+        metadata={
+            "help": (
+                "L1 teacher-target mode. 'direct' preserves standard XOPD transition "
+                "matching. 'p_opd' enables Proximal On-Policy Distillation: a detached "
+                "Gaussian-mixture teacher responsibility gates the covariance-normalized "
+                "transition-mean KL."
+            )
+        },
+    )
+    popd_alpha: float = field(
+        default=0.5,
+        metadata={
+            "help": (
+                "P-OPD teacher prior mixture probability alpha. Must be strictly between "
+                "0 and 1. Ignored when xopd_target_mode='direct'."
+            )
+        },
+    )
+    popd_temperature: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "P-OPD responsibility temperature applied AFTER summing the joint latent "
+                "log-density ratio. 1.0 is exact latent-sum; event dimension D reproduces "
+                "latent-mean; intermediate values are explicit tempered surrogates."
+            )
+        },
+    )
 
     # ---- L1 training-timestep selection (parallel to scheduler sde_steps/num_sde_steps) ----
     xopd_train_steps: Optional[List[int]] = field(
@@ -2815,6 +2846,34 @@ class XOPDTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"`pathwise_coef` must be >= 0, got pathwise_coef={self.pathwise_coef!r}."
             )
+        if self.xopd_target_mode not in ("direct", "p_opd"):
+            raise ValueError(
+                "`xopd_target_mode` must be 'direct' or 'p_opd', "
+                f"got xopd_target_mode={self.xopd_target_mode!r}."
+            )
+        if self.xopd_target_mode == "p_opd":
+            if (
+                isinstance(self.popd_alpha, bool)
+                or not isinstance(self.popd_alpha, (int, float))
+                or not math.isfinite(float(self.popd_alpha))
+                or not 0.0 < float(self.popd_alpha) < 1.0
+            ):
+                raise ValueError(
+                    "`popd_alpha` must be a finite number strictly between 0 and 1, "
+                    f"got popd_alpha={self.popd_alpha!r} for "
+                    f"xopd_target_mode={self.xopd_target_mode!r}."
+                )
+            if (
+                isinstance(self.popd_temperature, bool)
+                or not isinstance(self.popd_temperature, (int, float))
+                or not math.isfinite(float(self.popd_temperature))
+                or float(self.popd_temperature) <= 0.0
+            ):
+                raise ValueError(
+                    "`popd_temperature` must be a finite number > 0, "
+                    f"got popd_temperature={self.popd_temperature!r} for "
+                    f"xopd_target_mode={self.xopd_target_mode!r}."
+                )
         # XOPD dropped the REINFORCE trajectory term (L1 is pathwise D_k + optional KL anchor).
         # AbstractArguments.from_dict funnels unknown YAML keys into extra_kwargs with only a
         # warning, so a stale `reinforce_coef: 1.0` would otherwise run as pathwise-only while

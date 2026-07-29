@@ -14,8 +14,22 @@ transport between different ones.
 ```
 xopd_configs/
 ├── ode_pathwise/     # dynamics_type=ODE  (deterministic pathwise distillation)
+├── sde_pathwise/     # stochastic Gaussian transitions (P-OPD)
 └── cross_vae/        # heterogeneous VAE spaces (FLUX.2 teacher -> SD3.5 student) via a latent transport
 ```
+
+### sde_pathwise/ — P-OPD
+
+`flux2_klein_32b_to_4b_popd.yaml` enables Proximal On-Policy Distillation for
+the shared-VAE FLUX.2-dev -> FLUX.2-klein-base-4B path. P-OPD uses a
+probability-space Gaussian mixture and therefore requires positive-variance
+`Flow-SDE`, `Dance-SDE`, or `CPS` transitions; it cannot run under `ODE`.
+
+The example sets `popd_temperature: 1.0`, the exact joint latent-sum baseline.
+Use the logged event dimension `D` for controlled `sqrt(D)` and `D`
+(latent-mean) temperature ablations. See
+[`docs/opd/cross_opd_xopd.md`](../docs/opd/cross_opd_xopd.md#p-opd--probability-mixture-proximal-target)
+for assumptions, loss equations, and diagnostics.
 
 ### cross_vae/ — heterogeneous latent spaces
 

@@ -28,7 +28,9 @@ A single run runs two stages, switching on the outer epoch counter:
 - **L1** (``epoch >= l0_warmup_epochs``): on-policy transition matching. The
   student rolls out its own trajectory; per training timestep the closed-form
   Gaussian transition KL ``D_k`` (mean matching) is the loss, optionally plus a
-  KL anchor to the reference model.
+  KL anchor to the reference model. ``xopd_target_mode='p_opd'`` instead applies
+  a detached Gaussian-mixture teacher responsibility to the covariance-normalized
+  transition KL.
 
 The teacher is a SEPARATE full transformer (not a LoRA snapshot), swapped in per
 forward via ``adapter.use_teacher_transformer`` (whole-module swap, DDP-bypassed
@@ -44,6 +46,7 @@ Registry key: ``'xopd'`` -> :class:`XOPDTrainer`.
 import os
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -68,14 +71,22 @@ from ...utils.noise_schedule import TimeSampler, flow_match_sigma
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..abc import BaseTrainer
 from .common import (
+    POPDResponsibility,
     align_l0_inner_steps,
     build_forward_kwargs,
     cache_forward_signature,
     compute_per_step_kl,
+    compute_popd_diagnostics,
+    compute_popd_gaussian_mean_kl,
+    compute_popd_quantiles,
+    compute_popd_responsibility,
+    compute_transition_variance,
     extract_i2i_condition_kwargs,
+    extract_popd_behavior_transition,
     interleaved_source_iter,
     l0_loss_weight,
     validate_l1_one_step_per_epoch,
+    validate_popd_configuration,
     validate_source_ratio,
 )
 from .router_coldstart import (
@@ -94,6 +105,17 @@ _STUDENT_RETURN_KWARGS = ["next_latents_mean", "std_dev_t", "dt"]
 _TEACHER_RETURN_KWARGS = ["next_latents_mean", "std_dev_t", "dt"]
 
 
+@dataclass(frozen=True)
+class _POPDStepCache:
+    """Detached behavior-transition state for one P-OPD training timestep."""
+
+    next_latents: torch.Tensor
+    mu_old: torch.Tensor
+    transition_variance: torch.Tensor
+    dt: torch.Tensor
+    responsibility: POPDResponsibility
+
+
 class XOPDTrainer(BaseTrainer):
     """Cross-model on-policy distillation trainer (L0 velocity regression + L1)."""
 
@@ -108,6 +130,10 @@ class XOPDTrainer(BaseTrainer):
         self.xopd_dk_space = ta.xopd_dk_space
         self.teacher_gs = ta.teacher_guidance_scale
         self.student_gs = ta.student_guidance_scale
+        self.xopd_target_mode = ta.xopd_target_mode
+        self._is_popd = self.xopd_target_mode == "p_opd"
+        self.popd_alpha = float(ta.popd_alpha) if self._is_popd else 0.5
+        self.popd_temperature = float(ta.popd_temperature) if self._is_popd else 1.0
 
         # 'v' (raw velocity), 'x0' (clean-latent) and 'x0_norm' (self-normalized x0) d_k all recover
         # v from the ODE Euler mean (mu = x_t + v*dt); that identity only holds under ODE, so require
@@ -153,6 +179,15 @@ class XOPDTrainer(BaseTrainer):
         self._pixel_loss = bool(ta.xopd_pixel_loss)
         self._hsct_hidden: Dict[int, torch.Tensor] = {}
         self._hsct_capture = False
+        validate_popd_configuration(
+            target_mode=self.xopd_target_mode,
+            dynamics_type=self.adapter.scheduler.dynamics_type,
+            noise_level=self.adapter.scheduler.noise_level,
+            xopd_dk_space=self.xopd_dk_space,
+            normalize_d_k=self.normalize_d_k,
+            is_cross_vae=self._cross_vae,
+            pixel_loss=self._pixel_loss,
+        )
         if self._cross_vae:
             self._init_cross_vae_teacher()
         else:
@@ -967,6 +1002,7 @@ class XOPDTrainer(BaseTrainer):
         AdamW on the router params + manual grad all_reduce); cleans grads after.
         """
         import json
+
         import torch.distributed as dist
 
         if not getattr(self.model_args, "mof_router_coldstart", False):
@@ -2602,6 +2638,15 @@ class XOPDTrainer(BaseTrainer):
                     "trajectory_indices": trajectory_indices,
                     **batch,
                 }
+                if self._is_popd:
+                    # P-OPD needs the behavior policy's exact transition mean and
+                    # covariance from this SAME rollout. Callback collection reuses the
+                    # already-computed scheduler output; it adds no model forward.
+                    sample_kwargs["extra_call_back_kwargs"] = [
+                        "next_latents_mean",
+                        "std_dev_t",
+                        "dt",
+                    ]
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)
                 stitch_batch_metadata(batch, sample_batch)
@@ -2658,12 +2703,24 @@ class XOPDTrainer(BaseTrainer):
                 num_timesteps=num_timesteps,
                 timestep_indices=batch_steps,
             )
+            step_indices = batch_steps if batch_steps is not None else self._train_timestep_indices
+            popd_cache_list = (
+                self._precompute_popd_step_caches(
+                    batch=batch,
+                    latents_index_map=latents_index_map,
+                    mu_teacher_list=mu_teacher_list,
+                    timestep_indices=step_indices,
+                )
+                if self._is_popd
+                else None
+            )
 
             loss_info = self._optimize_train_pass(
                 batch=batch,
                 latents_index_map=latents_index_map,
                 num_timesteps=num_timesteps,
                 mu_teacher_list=mu_teacher_list,
+                popd_cache_list=popd_cache_list,
                 loss_info=loss_info,
                 timestep_indices=batch_steps,
             )
@@ -2996,6 +3053,108 @@ class XOPDTrainer(BaseTrainer):
 
         return mu_teacher_list
 
+    def _precompute_popd_step_caches(
+        self,
+        *,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        mu_teacher_list: List[torch.Tensor],
+        timestep_indices: List[int],
+    ) -> List[_POPDStepCache]:
+        """Build detached P-OPD responsibilities from cached behavior transitions."""
+        if len(mu_teacher_list) != len(timestep_indices):
+            raise ValueError(
+                "P-OPD teacher cache must align one-to-one with training timesteps, "
+                f"got len(mu_teacher_list)={len(mu_teacher_list)} and "
+                f"timestep_indices={timestep_indices!r}."
+            )
+        if not isinstance(latents_index_map, torch.Tensor) or latents_index_map.ndim != 1:
+            raise ValueError(
+                "P-OPD expects a shared 1D latent_index_map, "
+                f"got type={type(latents_index_map).__name__}, "
+                f"shape={getattr(latents_index_map, 'shape', None)}."
+            )
+        if "all_latents" not in batch or not isinstance(batch["all_latents"], torch.Tensor):
+            raise KeyError(
+                "P-OPD requires tensor batch['all_latents'] from the behavior rollout, "
+                f"available keys={sorted(batch.keys())!r}."
+            )
+
+        caches: List[_POPDStepCache] = []
+        for k_idx, timestep_index in enumerate(timestep_indices):
+            if timestep_index + 1 >= latents_index_map.shape[0]:
+                raise ValueError(
+                    f"P-OPD timestep_index={timestep_index} has no successor in "
+                    f"latent_index_map of length {latents_index_map.shape[0]}."
+                )
+            next_compact_index = int(latents_index_map[timestep_index + 1].item())
+            if next_compact_index < 0 or next_compact_index >= batch["all_latents"].shape[1]:
+                raise ValueError(
+                    "P-OPD next-latent index is missing or out of range: "
+                    f"timestep_index={timestep_index}, compact_index={next_compact_index}, "
+                    f"all_latents.shape={tuple(batch['all_latents'].shape)}."
+                )
+            next_latents = batch["all_latents"][:, next_compact_index].detach()
+            behavior = extract_popd_behavior_transition(
+                batch,
+                timestep_index=int(timestep_index),
+            )
+            variance = compute_transition_variance(
+                behavior.std_dev_t,
+                behavior.dt,
+                self.adapter.scheduler.dynamics_type,
+            )
+            mu_teacher = mu_teacher_list[k_idx].detach()
+            responsibility = compute_popd_responsibility(
+                next_latents=next_latents,
+                mu_old=behavior.mu_old,
+                mu_teacher=mu_teacher,
+                transition_variance=variance,
+                alpha=self.popd_alpha,
+                temperature=self.popd_temperature,
+            )
+            caches.append(
+                _POPDStepCache(
+                    next_latents=next_latents,
+                    mu_old=behavior.mu_old,
+                    transition_variance=variance,
+                    dt=behavior.dt,
+                    responsibility=responsibility,
+                )
+            )
+        return caches
+
+    @staticmethod
+    def _append_popd_diagnostics(
+        loss_info: Dict[str, List[torch.Tensor]],
+        diagnostics: Dict[str, torch.Tensor],
+        *,
+        timestep_index: int,
+    ) -> None:
+        """Accumulate detached global and per-timestep P-OPD scalar diagnostics."""
+        for name, values in diagnostics.items():
+            loss_info[f"popd/{name}"].append(values)
+            timestep_key = f"popd/{name}/t{timestep_index}"
+            # Preserve per-sample values so reduce_loss_info reports true
+            # min/max/mean/std independently for every trained transition.
+            loss_info[timestep_key].append(values)
+
+    def _gather_popd_gamma_quantiles(
+        self,
+        loss_info: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        """Gather per-sample gamma values and compute true global quantiles."""
+        quantile_metrics: Dict[str, torch.Tensor] = {}
+        gamma_keys = [
+            key for key in loss_info if key == "popd/gamma" or key.startswith("popd/gamma/t")
+        ]
+        for key in gamma_keys:
+            local = torch.cat(loss_info[key]).detach()
+            gathered = self.accelerator.gather(local)
+            for quantile_name, value in compute_popd_quantiles(gathered).items():
+                quantile_metrics[f"{key}_{quantile_name}"] = value
+        return quantile_metrics
+
     def _validation_d_k_per_timestep(
         self,
         batch: Dict[str, Any],
@@ -3143,6 +3302,7 @@ class XOPDTrainer(BaseTrainer):
         latents_index_map: torch.Tensor,
         num_timesteps: int,
         mu_teacher_list: List[torch.Tensor],
+        popd_cache_list: Optional[List[_POPDStepCache]],
         loss_info: Dict[str, List[torch.Tensor]],
         timestep_indices: Optional[List[int]] = None,
     ) -> Dict[str, List[torch.Tensor]]:
@@ -3156,6 +3316,17 @@ class XOPDTrainer(BaseTrainer):
         step_indices = (
             timestep_indices if timestep_indices is not None else self._train_timestep_indices
         )
+        if self._is_popd and (popd_cache_list is None or len(popd_cache_list) != len(step_indices)):
+            raise ValueError(
+                "P-OPD requires one behavior cache per training timestep, "
+                f"got cache_count={None if popd_cache_list is None else len(popd_cache_list)} "
+                f"and timestep_indices={step_indices!r}."
+            )
+        if not self._is_popd and popd_cache_list is not None:
+            raise ValueError(
+                "Direct XOPD must not receive P-OPD behavior caches, "
+                f"got cache_count={len(popd_cache_list)}."
+            )
 
         with self.autocast():
             for k_idx, timestep_index in enumerate(
@@ -3198,8 +3369,75 @@ class XOPDTrainer(BaseTrainer):
                         )
 
                     mu_teacher = mu_teacher_list[k_idx]
+                    ti = int(timestep_index)
 
-                    if self._pixel_loss:
+                    if self._is_popd:
+                        if student_out.std_dev_t is None or student_out.dt is None:
+                            raise RuntimeError(
+                                "P-OPD student forward must return `std_dev_t` and `dt`; "
+                                f"got std_dev_t={student_out.std_dev_t!r}, dt={student_out.dt!r}, "
+                                f"timestep_index={ti}."
+                            )
+                        popd_cache = popd_cache_list[k_idx]
+                        current_variance = compute_transition_variance(
+                            student_out.std_dev_t,
+                            student_out.dt,
+                            self.adapter.scheduler.dynamics_type,
+                        )
+                        if current_variance.shape != popd_cache.transition_variance.shape or not (
+                            torch.allclose(
+                                current_variance.detach(),
+                                popd_cache.transition_variance,
+                                rtol=1.0e-5,
+                                atol=1.0e-7,
+                            )
+                        ):
+                            raise RuntimeError(
+                                "P-OPD rollout/current transition covariance mismatch at "
+                                f"timestep_index={ti}: rollout_variance="
+                                f"{popd_cache.transition_variance.detach().cpu().tolist()}, "
+                                f"current_variance={current_variance.detach().cpu().tolist()}."
+                            )
+                        current_dt = (
+                            student_out.dt.detach().float().reshape(student_out.dt.shape[0], -1)
+                        )
+                        rollout_dt = (
+                            popd_cache.dt.detach().float().reshape(popd_cache.dt.shape[0], -1)
+                        )
+                        if current_dt.shape != rollout_dt.shape or not torch.allclose(
+                            current_dt,
+                            rollout_dt,
+                            rtol=1.0e-5,
+                            atol=1.0e-7,
+                        ):
+                            raise RuntimeError(
+                                "P-OPD rollout/current dt mismatch at "
+                                f"timestep_index={ti}: rollout_dt={rollout_dt.cpu().tolist()}, "
+                                f"current_dt={current_dt.cpu().tolist()}."
+                            )
+                        ungated_mean_kl = compute_popd_gaussian_mean_kl(
+                            student_out.next_latents_mean,
+                            mu_teacher,
+                            popd_cache.transition_variance,
+                        )
+                        d_k_grad = (
+                            popd_cache.responsibility.teacher_responsibility * ungated_mean_kl
+                        )
+                        diagnostics = compute_popd_diagnostics(
+                            next_latents=popd_cache.next_latents,
+                            mu_old=popd_cache.mu_old,
+                            mu_teacher=mu_teacher,
+                            mu_student=student_out.next_latents_mean,
+                            transition_variance=popd_cache.transition_variance,
+                            dt=popd_cache.dt,
+                            responsibility=popd_cache.responsibility,
+                        )
+                        self._append_popd_diagnostics(
+                            loss_info,
+                            diagnostics,
+                            timestep_index=ti,
+                        )
+                    elif self._pixel_loss:
                         # DECODE-space L1: D_S(mu_student) (grad -> LoRA) vs cached D_T(mu_teacher)
                         # pixels. Both faithful decoders land in the SAME RGB space, so the match
                         # is unbiased with NO base-point/displacement correction (unlike raw
@@ -3267,7 +3505,6 @@ class XOPDTrainer(BaseTrainer):
                     # physical step maps to a stable series even when xopd_train_steps/
                     # num_xopd_steps subset or re-draw the trained steps; reduce_loss_info
                     # then averages each key over that step's num_batches_per_epoch samples.
-                    ti = int(timestep_index)
                     loss_info[f"d_k/{ti}"].append(pathwise_loss.detach())
                     loss_info[f"loss/{ti}"].append(loss.detach())
 
@@ -3279,7 +3516,11 @@ class XOPDTrainer(BaseTrainer):
                         )
                         self.optimizer.step()
                         self.optimizer.zero_grad()
+                        popd_quantiles = (
+                            self._gather_popd_gamma_quantiles(loss_info) if self._is_popd else {}
+                        )
                         loss_info = reduce_loss_info(self.accelerator, loss_info)
+                        loss_info.update(popd_quantiles)
                         loss_info["grad_norm"] = grad_norm
                         self.log_data(
                             {f"train/{k}": v for k, v in loss_info.items()},
@@ -3328,13 +3569,25 @@ class XOPDTrainer(BaseTrainer):
                 raise RuntimeError(
                     "x-based KL requires `next_latents_mean` from both student and reference."
                 )
-            kl_div = compute_per_step_kl(
-                mu_student=student_out.next_latents_mean,
-                mu_teacher=ref_out.next_latents_mean,
-                std_dev_t=student_out.std_dev_t,
-                dt=student_out.dt,
-                normalize=self.normalize_d_k,
-            ).mean()
+            if self._is_popd:
+                transition_variance = compute_transition_variance(
+                    student_out.std_dev_t,
+                    student_out.dt,
+                    self.adapter.scheduler.dynamics_type,
+                )
+                kl_div = compute_popd_gaussian_mean_kl(
+                    student_out.next_latents_mean,
+                    ref_out.next_latents_mean,
+                    transition_variance,
+                ).mean()
+            else:
+                kl_div = compute_per_step_kl(
+                    mu_student=student_out.next_latents_mean,
+                    mu_teacher=ref_out.next_latents_mean,
+                    std_dev_t=student_out.std_dev_t,
+                    dt=student_out.dt,
+                    normalize=self.normalize_d_k,
+                ).mean()
 
         kl_loss = self.training_args.kl_beta * kl_div
         return kl_div, kl_loss
