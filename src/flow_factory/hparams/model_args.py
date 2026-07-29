@@ -315,6 +315,16 @@ class ModelArguments(ArgABC):
         default=0.02,
         metadata={"help": "Std of the Gaussian for mof_router_init='normal' on the router head weight."},
     )
+    mof_force_expert: Optional[int] = field(
+        default=None,
+        metadata={"help": "DIAGNOSTIC / EVAL ONLY: override routing to send every sample to this "
+                          "expert index, to measure what one expert is worth on its own. The expert "
+                          "receives the blend's TOTAL gate weight (not 1.0), so the velocity keeps "
+                          "its trained magnitude -- with free sigmoid gates the weights need not sum "
+                          "to one, and rescaling the field would degrade samples for reasons "
+                          "unrelated to the expert. None = normal routing. Do NOT set for training: "
+                          "the unrouted expert would receive no gradient."},
+    )
     mof_orthogonal_init: bool = field(
         default=False,
         metadata={"help": "MoF-V expert INIT-time diversification (distinct experts only): instead of "

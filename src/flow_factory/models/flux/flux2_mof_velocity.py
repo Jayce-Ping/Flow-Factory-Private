@@ -197,12 +197,18 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         gate_fn: str = "softmax",
         router_init: str = "zero",
         router_init_std: float = 0.02,
+        force_expert: Optional[int] = None,
     ):
         super().__init__()
         if route_granularity not in ("token", "sample"):
             raise ValueError(f"route_granularity must be 'token' or 'sample', got {route_granularity!r}")
         if gate_fn not in ("softmax", "sigmoid"):
             raise ValueError(f"gate_fn must be 'softmax' or 'sigmoid', got {gate_fn!r}")
+        if force_expert is not None and not 0 <= int(force_expert) < num_experts:
+            raise ValueError(
+                f"force_expert must be None or in [0, num_experts={num_experts}), "
+                f"got force_expert={force_expert!r}."
+            )
         if router_type not in ("token_linear", "global"):
             raise ValueError(f"router_type must be 'token_linear' or 'global', got {router_type!r}")
         if router_input not in MoFGlobalRouter.MODES:
@@ -288,10 +294,29 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
 
     def _gate(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply the configured gate function to raw router logits (last dim = experts).
-        'softmax' -> coupled, sums to 1 (convex); 'sigmoid' -> independent per-expert in (0,1)."""
+        'softmax' -> coupled, sums to 1 (convex); 'sigmoid' -> independent per-expert in (0,1).
+
+        ``force_expert`` (DIAGNOSTIC, eval-only) overrides the routing decision to send everything
+        to one expert, so a run can measure what that expert alone is worth. It hands that expert
+        the blend's TOTAL weight rather than 1.0: the trained weights need not sum to one (free
+        sigmoid gates), and rescaling the velocity field would degrade the samples for a reason
+        unrelated to which expert produced them.
+        """
         if getattr(self.config, "gate_fn", "softmax") == "sigmoid":
-            return torch.sigmoid(logits.float())
-        return torch.softmax(logits.float(), dim=-1)
+            gates = torch.sigmoid(logits.float())
+        else:
+            gates = torch.softmax(logits.float(), dim=-1)
+
+        forced = getattr(self.config, "force_expert", None)
+        if forced is None:
+            return gates
+        if not 0 <= int(forced) < gates.shape[-1]:
+            raise ValueError(
+                f"force_expert must be in [0, {gates.shape[-1]}), got force_expert={forced!r}."
+            )
+        one = torch.zeros_like(gates)
+        one[..., int(forced)] = gates.sum(dim=-1)
+        return one
 
     def _load_balance_aux(self, gates: torch.Tensor, topi: Optional[torch.Tensor]) -> torch.Tensor:
         """Switch/GShard load balance ``N * sum_e f_e * P_e`` (min at uniform). ``gates`` is
@@ -661,7 +686,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
     def _mof_config_from_base(base, num_experts, top_k, route_granularity, router_type,
                              router_hidden_dim, expert_mode="distinct", router_input="prompt",
                              dense_exec=False, soft_blend=False, topk_sparse=False,
-                             gate_fn="softmax", router_init="zero", router_init_std=0.02) -> dict:
+                             gate_fn="softmax", router_init="zero", router_init_std=0.02,
+                             force_expert=None) -> dict:
         bc = dict(base.config)
         return dict(
             patch_size=bc["patch_size"], in_channels=bc["in_channels"], out_channels=bc.get("out_channels"),
@@ -675,6 +701,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             router_input=router_input, dense_exec=dense_exec, soft_blend=soft_blend,
             topk_sparse=topk_sparse, gate_fn=gate_fn,
             router_init=router_init, router_init_std=router_init_std,
+            force_expert=force_expert,
         )
 
     @classmethod
@@ -695,6 +722,7 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
         gate_fn: str = "softmax",
         router_init: str = "zero",
         router_init_std: float = 0.02,
+        force_expert: Optional[int] = None,
         orthogonal_init: bool = False,
         orthogonal_init_std: float = 0.02,
     ) -> "Flux2VelocityMoFTransformer2DModel":
@@ -718,7 +746,8 @@ class Flux2VelocityMoFTransformer2DModel(ModelMixin, ConfigMixin):
             )
         model = cls(**cls._mof_config_from_base(
             base, num_experts, top_k, route_granularity, router_type, router_hidden_dim, expert_mode,
-            router_input, dense_exec, soft_blend, topk_sparse, gate_fn, router_init, router_init_std))
+            router_input, dense_exec, soft_blend, topk_sparse, gate_fn, router_init, router_init_std,
+            force_expert))
         base_sd = base.state_dict()
         with torch.no_grad():
             if expert_mode == "shared_lora":
