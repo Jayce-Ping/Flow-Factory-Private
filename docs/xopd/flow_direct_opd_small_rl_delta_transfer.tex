@@ -1,0 +1,1646 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\inner}[2]{\left\langle #1,\,#2 \right\rangle}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\Sbase}{S_0}
+\newcommand{\Srl}{S_R}
+\newcommand{\Lbase}{L_0}
+\newcommand{\Lactor}{L_\theta}
+\newcommand{\Lbeh}{L_{\bar\theta}}
+\newcommand{\dmuS}{\Delta\mu_S}
+\newcommand{\dvS}{\Delta v_S}
+\newcommand{\dbS}{\Delta b_S}
+\DeclareMathOperator*{\argmaxop}{arg\,max}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\title{\textbf{Weak-to-Strong Flow Direct-OPD}\\[0.3em]
+\large Transferring a small model's RL-induced policy shift to a larger flow model}
+\author{Jayce-Ping}
+\date{2026-07-30}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Suppose reinforcement learning is affordable for a small flow model but expensive for a much
+larger model.  Let $\Sbase$ be the small base checkpoint, $\Srl$ the same model after RL, and
+$\Lbase$ a larger base model that we wish to improve.  Directly distilling $\Srl$ into the large
+model is undesirable: it transfers both the useful RL change and the small model's capacity
+limitations.  Motivated by Direct On-Policy Distillation for language models, we instead transfer
+the \emph{policy shift} from $\Sbase$ to $\Srl$ and apply it on states visited by the large
+recipient.
+
+The formulation does not require flow models themselves to be Gaussian.  At the most general
+level, the donor signal is the Radon--Nikodym ratio
+$\dd K_{\Srl}/\dd K_{\Sbase}$ between two conditional Markov kernels, and the exact
+KL-regularized target is the geometric tilt
+\[
+K_{\Lbase}
+\left(\frac{\dd K_{\Srl}}{\dd K_{\Sbase}}\right)^\lambda.
+\]
+Gaussianity enters only when a stochastic sampler is chosen to make this target tractable.  For
+continuous SDEs with shared diffusion, Girsanov's theorem turns the local donor shift into a drift
+correction $b_{\Lbase}+\lambda(b_{\Srl}-b_{\Sbase})$; the globally tilted path law generally
+requires an additional Doob continuation-value correction.  For Euler SDE and SDE-DPM-Solver++
+kernels, the conditional target is Gaussian and the mean shift is available in closed form.
+For deterministic ODE sampling, transition likelihood ratios are singular, but the same
+velocity-delta target survives as a rescaled small-noise control-energy limit.  We derive all
+four levels, give a recipient-on-policy training algorithm, and state compatibility checks and
+experiments for FLUX.2-klein-base-9B $\rightarrow$ FLUX.2-dev.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Motivation, roles, and literature}
+\label{sec:motivation}
+%% ============================================================
+
+\subsection{The weak-to-strong setting}
+
+We use role-based notation rather than naming models by size:
+\begin{center}
+\begin{tabular}{@{}cll@{}}
+\toprule
+symbol & role & concrete example\\
+\midrule
+$\Sbase$ & small donor reference before RL & FLUX.2-klein-base-9B\\
+$\Srl$ & same donor after task RL & a GenEval2 Flow-DPPO 9B LoRA\\
+$\Lbase$ & large recipient reference & FLUX.2-dev, approximately 32B\\
+$\Lactor$ & trainable large recipient & initialized from $\Lbase$\\
+$\Lbeh$ & frozen rollout behavior checkpoint & refreshed from $\Lactor$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The small pair is a \emph{donor} and the large model is a \emph{recipient}.  Calling the 9B
+checkpoint ``teacher'' and the 32B checkpoint ``student'' obscures the central point: the final
+9B policy need not be better than the 32B model.  The transferable object is the change induced
+by RL,
+\begin{equation}
+\dvS(t,x,c)
+:=
+v_{\Srl}(t,x,c)-v_{\Sbase}(t,x,c),
+\label{eq:velocity-shift}
+\end{equation}
+not the absolute field $v_{\Srl}$.
+
+Directly matching $v_{\Lactor}$ to $v_{\Srl}$ imports the donor's pretraining biases, capacity
+ceiling, and any missing knowledge.  Base subtraction removes what the donor already preferred
+before RL and isolates what RL changed.
+
+\subsection{The matching language-model literature}
+
+The same idea has appeared in increasingly direct forms:
+\begin{itemize}[leftmargin=1.6em]
+\item Proxy-Tuning~\cite{proxytuning} adds
+      $\text{logits}_{\mathrm{small,tuned}}-\text{logits}_{\mathrm{small,base}}$
+      to a larger base model at decoding time.
+\item RAST~\cite{rast} specializes the donor change to an RL-induced reasoning shift and tests
+      transfer across model scales.
+\item THINKLOGIT~\cite{thinklogit} uses the same arithmetic for long-reasoning transfer and
+      optionally trains the small guider against target-aware preferences.
+\item Logit Grafting~\cite{logitgrafting} shows that additive post-training logit deltas are
+      exponential tilts and the exact solution of a KL-regularized reward objective.
+\item Direct-OPD~\cite{directopd}, posted to arXiv in July 2026, is the closest match to the present
+      goal.  It treats
+      $\log\pi_{\mathrm{small,RL}}-\log\pi_{\mathrm{small,ref}}$
+      as a dense implicit reward and trains a stronger student on its own on-policy states.
+\end{itemize}
+
+Categorical logits are natural parameters of the next-token distribution, so adding a logit
+delta gives an exact exponential tilt.  A flow velocity is not generally a log density or a
+natural parameter.  The remainder of this note identifies the conditions under which velocity
+arithmetic has the same exact interpretation and what remains when those conditions do not hold.
+
+\begin{tcolorbox}[colback=gray!5,colframe=gray!55,title=Scope]
+The proposed method transfers an observed RL-induced policy shift.  Calling that shift the
+``original RL reward'' requires the additional approximation that $\Srl$ is near the optimum of a
+KL-regularized RL problem anchored at $\Sbase$.  GRPO clipping, reward normalization, finite
+optimization, or zero-KL RL weaken that literal reward interpretation, but do not invalidate the
+checkpoint-pair policy shift itself.
+\end{tcolorbox}
+
+%% ============================================================
+\section{General non-Gaussian kernel formulation}
+\label{sec:kernel}
+%% ============================================================
+
+\subsection{Recipient-on-policy query states}
+
+Let
+\begin{equation}
+z=(t,x,c)
+\label{eq:query-state}
+\end{equation}
+denote a physical time, latent state, and raw conditioning input.  At outer iteration $k$, we
+sample $z$ from a frozen recipient behavior process $\Lbeh$.  All donor and recipient models are
+then queried on the same physical $(t,x,c)$, although each architecture may encode the raw
+condition $c$ with its own text encoder.
+
+For the moment, let
+\begin{equation}
+K_j(\dd y\mid z),
+\qquad
+j\in\{\Sbase,\Srl,\Lbase,\Lactor\},
+\label{eq:general-kernels}
+\end{equation}
+be arbitrary conditional Markov kernels on the same next-state space.  They need not be Gaussian.
+Assume
+\begin{equation}
+K_{\Srl}(\cdot\mid z)\ll K_{\Sbase}(\cdot\mid z),
+\qquad
+K_{\Lbase}(\cdot\mid z)\ll K_{\Sbase}(\cdot\mid z),
+\label{eq:absolute-continuity}
+\end{equation}
+so a version of the donor ratio is defined
+$K_{\Lbase}(\cdot\mid z)$-almost everywhere.
+
+\begin{definition}[Donor policy shift]
+\label{def:donor-ratio}
+The small-model RL shift at query $z$ is the Radon--Nikodym derivative
+\begin{equation}
+R_S(y\mid z)
+:=
+\frac{
+  \dd K_{\Srl}(\cdot\mid z)
+}{
+  \dd K_{\Sbase}(\cdot\mid z)
+}(y),
+\qquad
+r_S(y\mid z):=\log R_S(y\mid z).
+\label{eq:donor-ratio}
+\end{equation}
+\end{definition}
+
+The ratio is larger than one on next states whose probability RL increased and smaller than one
+where RL suppressed probability.  It removes the donor's absolute base policy.
+
+\subsection{Exact geometric tilt}
+
+For transfer strength $\lambda>0$, define the conditional normalizer
+\begin{equation}
+Z_\lambda(z)
+:=
+\int
+R_S(y\mid z)^\lambda
+K_{\Lbase}(\dd y\mid z).
+\label{eq:kernel-normalizer}
+\end{equation}
+For $\lambda=0$, define $R_S^0\equiv1$, so
+$Z_0=1$ and $Q_0=K_{\Lbase}$ even on sets where $R_S=0$.
+
+\begin{proposition}[KL-regularized donor-shift target]
+\label{prop:kernel-tilt}
+For $\lambda>0$, if $0<Z_\lambda(z)<\infty$, the kernel
+\begin{equation}
+\frac{
+  \dd Q_\lambda(\cdot\mid z)
+}{
+  \dd K_{\Lbase}(\cdot\mid z)
+}(y)
+=
+\frac{R_S(y\mid z)^\lambda}{Z_\lambda(z)}
+\label{eq:kernel-tilt}
+\end{equation}
+is the unique maximizer of
+\begin{equation}
+\argmaxop_K
+\left\{
+\lambda\E_{Y\sim K}[r_S(Y\mid z)]
+-
+\KL(K\Vert K_{\Lbase})
+\right\}.
+\label{eq:kernel-variational}
+\end{equation}
+Equivalently, for every $K\ll K_{\Lbase}$ for which the two sides are
+well-defined in the extended-real sense,
+\begin{equation}
+\lambda\E_K[r_S]
+-\KL(K\Vert K_{\Lbase})
+=
+\log Z_\lambda
+-\KL(K\Vert Q_\lambda).
+\label{eq:kernel-kl-identity}
+\end{equation}
+If $K\not\ll Q_\lambda$, the right side and the variational objective are both interpreted as
+$-\infty$ rather than as an indeterminate difference of infinities.
+\end{proposition}
+
+\begin{proof}
+From \eqref{eq:kernel-tilt},
+\[
+\log\frac{\dd Q_\lambda}{\dd K_{\Lbase}}
+=
+\lambda r_S-\log Z_\lambda .
+\]
+Substitute this identity into
+$\KL(K\Vert Q_\lambda)
+=\E_K[\log(\dd K/\dd Q_\lambda)]$
+and rearrange to obtain \eqref{eq:kernel-kl-identity}.  Nonnegativity of KL gives the maximizer.
+\end{proof}
+
+For densities with respect to a common base measure,
+\begin{equation}
+q_\lambda(y\mid z)
+=
+\frac{
+  k_{\Lbase}(y\mid z)
+  \left[
+    k_{\Srl}(y\mid z)/k_{\Sbase}(y\mid z)
+  \right]^\lambda
+}{
+  Z_\lambda(z)
+}.
+\label{eq:density-tilt}
+\end{equation}
+This is a \emph{geometric} or product-of-experts tilt.  It must not be confused with the
+arithmetic probability mixture used by P-OPD,
+\begin{equation}
+(1-\alpha)K_{\mathrm{old}}+\alpha K_T.
+\label{eq:not-mixture}
+\end{equation}
+The geometric target has no component-responsibility sigmoid.
+
+\subsection{Implicit and non-Gaussian kernels}
+
+The general construction is useful beyond Gaussian transitions whenever the ratio can be
+estimated:
+\begin{enumerate}[leftmargin=1.6em]
+\item If all log densities are evaluable, optimize
+      \begin{equation}
+      \KL(K_{\Lactor}\Vert K_{\Lbase})
+      -\lambda\E_{K_{\Lactor}}[r_S].
+      \label{eq:implicit-kernel-loss}
+      \end{equation}
+      The unknown $\log Z_\lambda$ is independent of the trainable parameters.
+\item If only donor transition samples are available, train a conditional discriminator with
+      equal class priors.  Its Bayes optimum obeys
+      \begin{equation}
+      D^*(z,y)
+      =
+      \frac{k_{\Srl}(y\mid z)}
+           {k_{\Srl}(y\mid z)+k_{\Sbase}(y\mid z)},
+      \qquad
+      \operatorname{logit}D^*(z,y)=r_S(y\mid z).
+      \label{eq:ratio-classifier}
+      \end{equation}
+      Both classes must use the same query-state distribution; otherwise the classifier also
+      learns a state-occupancy ratio.
+\item One may sample approximately from $Q_\lambda$ by weighting
+      $K_{\Lbase}$ transitions with $R_S^\lambda$, followed by resampling or SMC.  This is exact
+      in the population limit but can have severe effective-sample-size collapse.
+\item MMD, OT, score matching, Stein losses, or conditional flow matching can project implicit
+      kernels into a trainable model.  Without an exact ratio identity they are surrogates, not
+      exact realizations of \eqref{eq:kernel-tilt}.
+\end{enumerate}
+
+The kernel formulation therefore separates two statements:
+\begin{itemize}[leftmargin=1.6em]
+\item \emph{Flow matching does not require Gaussian probability paths.}
+\item \emph{A chosen stochastic sampler may use Gaussian increments because they make the
+      policy-shift ratio and target loss tractable.}
+\end{itemize}
+
+%% ============================================================
+\section{Continuous-SDE formulation}
+\label{sec:sde}
+%% ============================================================
+
+\subsection{Shared-diffusion processes and Girsanov ratio}
+
+Use an increasing-time coordinate $\tau\in[0,T]$ and consider
+\begin{equation}
+\dd X_\tau
+=
+b_j(\tau,X_\tau,c)\dd\tau
++\sigma_\tau\dd W_\tau,
+\qquad
+a_\tau:=\sigma_\tau\sigma_\tau^\top\succ0.
+\label{eq:continuous-sde}
+\end{equation}
+All donor and recipient processes share the diffusion coefficient and initial law; only their
+drifts differ.  We assume the required Girsanov exponentials are true martingales for every pair
+whose path measures are compared.  Define
+\begin{equation}
+\dbS:=b_{\Srl}-b_{\Sbase},
+\qquad
+u_\tau:=\sigma_\tau^\top a_\tau^{-1}\dbS.
+\label{eq:sde-drift-shift}
+\end{equation}
+
+\begin{proposition}[Donor path ratio]
+\label{prop:girsanov-ratio}
+Under a Novikov or equivalent martingale condition, Girsanov's theorem gives
+\begin{align}
+\log\frac{\dd P_{\Srl}}{\dd P_{\Sbase}}
+&=
+\int_0^T u_\tau^\top\dd W_\tau^{\Sbase}
+-\frac12\int_0^T\norm{u_\tau}^2\dd\tau
+\label{eq:girsanov-brownian}\\
+&=
+\int_0^T
+\dbS^\top a_\tau^{-1}
+\left[
+\dd X_\tau
+-\frac{b_{\Srl}+b_{\Sbase}}{2}\dd\tau
+\right].
+\label{eq:girsanov-canonical}
+\end{align}
+All fields are evaluated along the same path $X_{0:T}$.
+\end{proposition}
+
+The corresponding path KL between two shared-diffusion processes is
+\begin{equation}
+\KL(P_b\Vert P_{\Lbase})
+=
+\frac12
+\E_{P_b}
+\int_0^T
+\norm{b-b_{\Lbase}}_{a_\tau^{-1}}^2
+\dd\tau .
+\label{eq:girsanov-kl}
+\end{equation}
+This is an exact stochastic-process identity, not a Gaussian one-step
+approximation~\cite{gradualft}.
+
+\subsection{Local zero-discount control target}
+
+At a frozen $(\tau,x,c)$, consider using a candidate drift $b$ over one infinitesimal interval.
+The expected donor log-ratio rate under that candidate is
+\begin{equation}
+\mathfrak r_S(b)
+=
+\dbS^\top a^{-1}(b-b_{\Sbase})
+-\frac12\norm{\dbS}_{a^{-1}}^2.
+\label{eq:local-reward-rate}
+\end{equation}
+The recipient drift-KL rate relative to $\Lbase$ is
+\begin{equation}
+\mathfrak c_{\Lbase}(b)
+=
+\frac12\norm{b-b_{\Lbase}}_{a^{-1}}^2.
+\label{eq:local-kl-rate}
+\end{equation}
+
+\begin{proposition}[Local SDE policy-shift graft]
+\label{prop:local-sde-graft}
+The frozen-state objective
+\begin{equation}
+\mathcal H_\lambda(b)
+=
+\lambda\mathfrak r_S(b)-\mathfrak c_{\Lbase}(b)
+\label{eq:local-hamiltonian}
+\end{equation}
+has the unique optimum
+\begin{equation}
+\boxed{
+b^*
+=
+b_{\Lbase}
++\lambda(b_{\Srl}-b_{\Sbase}).
+}
+\label{eq:local-drift-target}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Terms independent of $b$ can be discarded.  Completing the square gives
+\[
+\mathcal H_\lambda(b)
+=
+\mathrm{constant}
+-\frac12
+\norm{
+b-[b_{\Lbase}+\lambda\dbS]
+}_{a^{-1}}^2 .
+\]
+Positive definiteness of $a$ gives the unique optimum.
+\end{proof}
+
+Equation~\eqref{eq:local-drift-target} is the continuous-SDE counterpart of adding a small-model
+logit delta to a large language model.  It is exact for the frozen-state, immediate-reward
+problem.  Using recipient on-policy states but detaching them during optimization produces a
+semi-gradient version of this objective.
+
+\subsection{Why the globally tilted path needs a value correction}
+
+For this subsection, additionally assume
+\begin{equation}
+P_{\Lbase}\ll P_{\Sbase},
+\qquad
+0<\mathcal Z_\lambda
+:=
+\E_{P_{\Lbase}}
+\left[
+\left(
+\frac{\dd P_{\Srl}}{\dd P_{\Sbase}}
+\right)^\lambda
+\right]
+<\infty .
+\label{eq:path-tilt-assumptions}
+\end{equation}
+The ideal path-space target is
+\begin{equation}
+\frac{\dd\mathbb Q_\lambda}{\dd P_{\Lbase}}
+=
+\frac1{\mathcal Z_\lambda}
+\left(
+\frac{\dd P_{\Srl}}{\dd P_{\Sbase}}
+\right)^\lambda.
+\label{eq:global-path-tilt}
+\end{equation}
+Define
+\begin{equation}
+\bar b=b_{\Lbase}+\lambda\dbS
+\label{eq:myopic-drift}
+\end{equation}
+and the state-dependent potential
+\begin{equation}
+U_\lambda
+=
+\lambda\dbS^\top a^{-1}(b_{\Lbase}-b_{\Sbase})
++\frac{\lambda(\lambda-1)}2
+\norm{\dbS}_{a^{-1}}^2.
+\label{eq:path-potential}
+\end{equation}
+Completing the stochastic exponential shows that
+\eqref{eq:global-path-tilt} is a Feynman--Kac weighting of the process with drift $\bar b$.
+Let
+\begin{equation}
+H(\tau,x)
+=
+\E_{\bar b}^{\tau,x}
+\left[
+\exp\left(
+\int_\tau^T U_\lambda(s,X_s)\dd s
+\right)
+\right].
+\label{eq:desirability}
+\end{equation}
+Under the usual regularity conditions, $H$ solves
+\begin{equation}
+\partial_\tau H
++\bar b\cdot\nabla H
++\frac12a:\nabla^2H
++U_\lambda H
+=0,
+\qquad
+H(T,x)=1.
+\label{eq:desirability-pde}
+\end{equation}
+The globally tilted process has Doob-transformed drift
+\begin{equation}
+\boxed{
+b_{\mathbb Q_\lambda}
+=
+b_{\Lbase}
++\lambda(b_{\Srl}-b_{\Sbase})
++a\nabla\log H.
+}
+\label{eq:global-drift}
+\end{equation}
+If the shared initial law is $\rho_0$, the unconditional global tilt also changes it:
+\begin{equation}
+\mathbb Q_\lambda(X_0\in\dd x)
+=
+\frac{H(0,x)\rho_0(\dd x)}{\mathcal Z_\lambda},
+\qquad
+\mathcal Z_\lambda
+=
+\int H(0,x)\rho_0(\dd x).
+\label{eq:tilted-initial-law}
+\end{equation}
+Therefore the drift \eqref{eq:global-drift} started from the original $\rho_0$ does not by itself
+realize the unconditional target \eqref{eq:global-path-tilt}.  If the generative base-noise law
+must remain fixed, define the tilt conditionally on $X_0=x$ and normalize each conditional path
+law by $H(0,x)$ before averaging over the original $\rho_0$.
+
+The last term is a continuation-value correction.  It vanishes only in special cases, for example
+when $U_\lambda$ is spatially constant.  Therefore simple drift arithmetic should be described as
+the local, zero-discount Direct-OPD target, not as the exact globally normalized path tilt.  This
+is the continuous analogue of Direct-OPD's practical immediate-token surrogate versus its
+idealized sequence-level objective.
+
+%% ============================================================
+\section{Gaussian, Euler-SDE, and DPM-SDE specializations}
+\label{sec:dpm-sde}
+%% ============================================================
+
+\subsection{Generic shared-covariance Gaussian transition}
+
+Condition on a recipient query state $z$.  Suppose the donor pair shares covariance $\Sigma_S$
+and the recipient pair shares covariance $\Sigma_L$:
+\begin{align}
+K_{\Sbase}&=\N(\mu_{\Sbase},\Sigma_S),
+&
+K_{\Srl}&=\N(\mu_{\Srl},\Sigma_S),
+\nonumber\\
+K_{\Lbase}&=\N(\mu_{\Lbase},\Sigma_L),
+&
+K_{\Lactor}&=\N(\mu_\theta,\Sigma_L).
+\label{eq:two-covariance-gaussians}
+\end{align}
+Define
+\begin{equation}
+\dmuS:=\mu_{\Srl}-\mu_{\Sbase},
+\qquad
+\bar\mu_S:=\frac{\mu_{\Srl}+\mu_{\Sbase}}2.
+\label{eq:mean-shift}
+\end{equation}
+The donor log ratio is linear in $y$:
+\begin{equation}
+r_S(y)
+=
+\dmuS^\top\Sigma_S^{-1}(y-\bar\mu_S).
+\label{eq:gaussian-log-ratio}
+\end{equation}
+
+\begin{proposition}[Closed-form Gaussian geometric tilt]
+\label{prop:gaussian-tilt}
+The kernel target \eqref{eq:kernel-tilt} is
+\begin{equation}
+Q_\lambda
+=
+\N(\mu_\lambda^*,\Sigma_L),
+\qquad
+\boxed{
+\mu_\lambda^*
+=
+\mu_{\Lbase}
++\lambda\Sigma_L\Sigma_S^{-1}\dmuS.
+}
+\label{eq:gaussian-target-mean}
+\end{equation}
+Consequently,
+\begin{equation}
+\boxed{
+\KL(K_{\Lactor}\Vert Q_\lambda)
+=
+\frac12
+\norm{
+\mu_\theta-\mu_{\Lbase}
+-\lambda\Sigma_L\Sigma_S^{-1}\dmuS
+}_{\Sigma_L^{-1}}^2.
+}
+\label{eq:gaussian-training-kl}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Insert \eqref{eq:gaussian-log-ratio} into
+$\log K_{\Lbase}(y)+\lambda r_S(y)$.  Its quadratic term remains
+$-\tfrac12 y^\top\Sigma_L^{-1}y$ and its linear term is
+\[
+y^\top
+\left[
+\Sigma_L^{-1}\mu_{\Lbase}
++\lambda\Sigma_S^{-1}\dmuS
+\right].
+\]
+Completing the square gives \eqref{eq:gaussian-target-mean}.  The equal-covariance Gaussian KL
+from $K_{\Lactor}$ to $Q_\lambda$ gives \eqref{eq:gaussian-training-kl}.
+\end{proof}
+
+If all four covariances are the same,
+\begin{equation}
+\boxed{
+\mu_\lambda^*
+=
+\mu_{\Lbase}
++\lambda(\mu_{\Srl}-\mu_{\Sbase}).
+}
+\label{eq:equal-covariance-target}
+\end{equation}
+Thus mean-delta arithmetic is not an arbitrary heuristic in this regime; it is the exact natural
+parameter update selected by the general kernel objective.
+
+\begin{remark}[Unequal donor covariances]
+If $\Sbase$ and $\Srl$ do not share covariance, the donor reward is quadratic and the target
+precision becomes
+\begin{equation}
+\Lambda_*
+=
+\Lambda_{\Lbase}
++\lambda(\Lambda_{\Srl}-\Lambda_{\Sbase}),
+\label{eq:unequal-precision}
+\end{equation}
+which is normalizable only if $\Lambda_*\succ0$.  Plain mean or velocity subtraction is then not
+the exact target.
+\end{remark}
+
+\subsection{Euler--Maruyama SDE}
+
+For a step of length $h>0$, let
+\begin{equation}
+K_j^h(\cdot\mid x)
+=
+\N(x+h\,b_j,\;hA),
+\qquad
+A\succ0.
+\label{eq:euler-sde-kernel}
+\end{equation}
+All drifts are evaluated at the same $(t,x,c)$.  Proposition~\ref{prop:gaussian-tilt} gives
+\begin{equation}
+Q_\lambda^h
+=
+\N\!\left(
+x+h[b_{\Lbase}+\lambda(b_{\Srl}-b_{\Sbase})],
+hA
+\right).
+\label{eq:euler-target}
+\end{equation}
+Writing
+\begin{equation}
+b_*:=b_{\Lbase}+\lambda(b_{\Srl}-b_{\Sbase}),
+\end{equation}
+the exact event-sum conditional KL is
+\begin{equation}
+\ell_{\mathrm{Euler,sum}}
+=
+\frac{h}{2}
+\norm{b_{\Lactor}-b_*}_{A^{-1}}^2.
+\label{eq:euler-sde-kl}
+\end{equation}
+For isotropic $A=g_t^2I$ and event dimension $D$,
+\begin{align}
+\ell_{\mathrm{Euler,sum}}
+&=
+\frac{h}{2g_t^2}
+\sum_{d=1}^D
+(b_{\Lactor,d}-b_{*,d})^2,
+\label{eq:euler-sum}\\
+\ell_{\mathrm{Euler,mean}}
+&=
+\frac1D\ell_{\mathrm{Euler,sum}}.
+\label{eq:euler-mean}
+\end{align}
+The sum is the joint transition KL; the mean is its dimension-normalized version.  They have the
+same isolated minimizer but different strength relative to other losses and trust budgets.
+
+\subsection{First-order SDE-DPM-Solver++}
+
+SDE-DPM-Solver++ is a stochastic solver for a \emph{chosen Gaussian diffusion path}; it is not a
+generic property of arbitrary flow matching.  Assume
+\begin{equation}
+X_t=\alpha_tX_0+\sigma_t\varepsilon,
+\qquad
+\varepsilon\sim\N(0,I),
+\qquad
+\ell_t:=\log\frac{\alpha_t}{\sigma_t}.
+\label{eq:dpm-path}
+\end{equation}
+For a reverse step from noisier $s$ to cleaner $t$, set
+\begin{equation}
+h:=\ell_t-\ell_s>0.
+\label{eq:dpm-h}
+\end{equation}
+The first-order SDE-DPM-Solver++ update~\cite{dpmsolverpp} is
+\begin{equation}
+X_t
+=
+\underbrace{\frac{\sigma_t}{\sigma_s}e^{-h}}_{A_{t,s}}X_s
++
+\underbrace{\alpha_t(1-e^{-2h})}_{B_{t,s}}
+\widehat x_{0,j}(X_s,s)
++
+\underbrace{\sigma_t\sqrt{1-e^{-2h}}}_{C_{t,s}}\xi,
+\qquad
+\xi\sim\N(0,I).
+\label{eq:dpm-first-order}
+\end{equation}
+Conditioned on $X_s=x_s$,
+\begin{equation}
+K_j(\cdot\mid x_s)
+=
+\N(\mu_j,\Sigma_{t,s}),
+\quad
+\mu_j=A_{t,s}x_s+B_{t,s}\widehat x_{0,j},
+\quad
+\Sigma_{t,s}=C_{t,s}^2I.
+\label{eq:dpm-first-kernel}
+\end{equation}
+The stochastic covariance is model independent and the mean is affine in the model's data
+prediction.  Therefore the exact graft is
+\begin{align}
+\mu_*
+&=
+\mu_{\Lbase}
++\lambda(\mu_{\Srl}-\mu_{\Sbase})
+\nonumber\\
+&=
+A_{t,s}x_s
++B_{t,s}
+\left[
+\widehat x_{0,\Lbase}
++\lambda(
+\widehat x_{0,\Srl}
+-\widehat x_{0,\Sbase}
+)
+\right],
+\label{eq:dpm-grafted-mean}
+\end{align}
+or equivalently
+\begin{equation}
+\boxed{
+\widehat x_{0,*}
+=
+\widehat x_{0,\Lbase}
++\lambda(
+\widehat x_{0,\Srl}
+-\widehat x_{0,\Sbase}
+).
+}
+\label{eq:dpm-x0-target}
+\end{equation}
+The exact solver-kernel loss is
+\begin{equation}
+\KL(K_{\Lactor}\Vert Q_\lambda)
+=
+\frac{B_{t,s}^2}{2C_{t,s}^2}
+\norm{\widehat x_{0,\Lactor}-\widehat x_{0,*}}^2.
+\label{eq:dpm-first-kl}
+\end{equation}
+This equality is exact for the selected first-order numerical transition kernel.  It does not
+claim that the numerical solver exactly integrates the underlying continuous SDE.
+
+\subsection{Multistep SDE-DPM-Solver++}
+
+A multistep solver is Markov only after its history is included in the state.  For
+SDE-DPM-Solver++(2M), let $r$ be the previous history point and define
+\begin{equation}
+r_0:=\frac{\ell_s-\ell_r}{h}>0,
+\quad
+D_{0,j}:=\widehat x_{0,j}(x_s,s),
+\quad
+D_{1,j}:=
+\frac{
+\widehat x_{0,j}(x_s,s)
+-\widehat x_{0,j}(x_r,r)
+}{r_0}.
+\label{eq:dpm-history-terms}
+\end{equation}
+Equation (20) of DPM-Solver++ can be written
+\begin{equation}
+\mu_j
+=
+A_{t,s}x_s
++B_{t,s}D_{0,j}
++\frac{B_{t,s}}2D_{1,j},
+\qquad
+\Sigma_{t,s}=C_{t,s}^2I.
+\label{eq:dpm-2m-mean}
+\end{equation}
+The exact target conditioned on the common augmented history is
+\begin{equation}
+\boxed{
+\mu_*
+=
+\mu_{\Lbase}
++\lambda(\mu_{\Srl}-\mu_{\Sbase}).
+}
+\label{eq:dpm-2m-target}
+\end{equation}
+Every current and historical model-output term contributes to the mean difference.  Grafting only
+the current velocity or current $\widehat x_0$ omits the multistep derivative correction and is
+not the exact conditional target.
+
+More generally, if
+\begin{equation}
+\mu_j(\mathcal H_n)
+=
+A_nx_n+\sum_{q=0}^{m-1}B_{nq}M_{j,nq}(\mathcal H_n),
+\label{eq:generic-multistep}
+\end{equation}
+then compute the \emph{whole solver mean} for each model on the same history and graft
+$\mu_{\Lbase}+\lambda(\mu_{\Srl}-\mu_{\Sbase})$.  Marginalizing random histories generally
+produces a non-Gaussian mixture kernel.
+
+\subsection{When a flow velocity can use DPM-SDE}
+
+For a known affine Gaussian conditional path
+\begin{equation}
+X_t=\alpha_tX_0+\sigma_t\varepsilon,
+\qquad
+\dot X_t=\dot\alpha_tX_0+\dot\sigma_t\varepsilon,
+\label{eq:affine-path}
+\end{equation}
+define
+\begin{equation}
+\mathcal D_t
+:=
+\alpha_t\dot\sigma_t-\sigma_t\dot\alpha_t
+\neq0.
+\label{eq:path-determinant}
+\end{equation}
+A flow-velocity prediction $v_j(t,x)$ converts to
+\begin{align}
+\widehat x_{0,j}
+&=
+\frac{\dot\sigma_t x-\sigma_tv_j(t,x)}{\mathcal D_t},
+\label{eq:velocity-to-x0}\\
+\widehat\varepsilon_j
+&=
+\frac{-\dot\alpha_t x+\alpha_tv_j(t,x)}{\mathcal D_t}.
+\label{eq:velocity-to-epsilon}
+\end{align}
+For normalized VP schedules satisfying
+$\alpha_t^2+\sigma_t^2=1$, standard diffusion $v$-prediction defines
+\begin{equation}
+v_{\mathrm{pred}}
+=
+\alpha_t\varepsilon-\sigma_tX_0,
+\qquad
+\widehat x_0
+=
+\alpha_tx-\sigma_tv_{\mathrm{pred}}.
+\label{eq:standard-v-pred}
+\end{equation}
+The physical path derivative and the standard network output differ by
+\begin{equation}
+v_{\mathrm{physical}}
+=
+\mathcal D_t\,v_{\mathrm{pred}}.
+\label{eq:physical-v-scale}
+\end{equation}
+Thus a raw $v_{\mathrm{pred}}$ must not be substituted for the physical flow velocity without this
+schedule-dependent conversion.
+
+DPM-SDE is applicable only when the flow model's parameterization belongs to a compatible
+Gaussian diffusion schedule with monotone half-logSNR and a valid reverse SDE.  An arbitrary
+non-Gaussian flow-matching path, nonlinear interpolation, or bare learned ODE field does not
+canonically define $\widehat x_0$, a score, a reverse diffusion, or a DPM-SDE transition.
+
+\begin{tcolorbox}[colback=red!4,colframe=red!45!black,title=DPM-SDE exactness boundary]
+The final zero-variance DPM step is deterministic and has no transition-density ratio.  Exact
+kernel grafting requires positive model-independent covariance, a common augmented solver history,
+and model outputs converted into the same prediction parameterization.
+\end{tcolorbox}
+
+%% ============================================================
+\section{Deterministic ODE formulations}
+\label{sec:ode}
+%% ============================================================
+
+\subsection{Why transition ratios fail}
+
+For an ODE Euler step,
+\begin{equation}
+K_j(\dd y\mid x)
+=
+\delta_{x+h\,v_j(t,x,c)}(\dd y).
+\label{eq:ode-dirac}
+\end{equation}
+If the donor maps differ, $K_{\Srl}$ and $K_{\Sbase}$ are mutually singular, so
+$\dd K_{\Srl}/\dd K_{\Sbase}$ is undefined.  Girsanov also fails because the diffusion covariance
+is zero.  No deterministic transition KL or policy ratio can justify the target directly.
+
+\subsection{Selected small-noise control limit}
+
+Introduce a reference small-noise family
+\begin{equation}
+K_j^{\varepsilon,h}
+=
+\N(x+h\,v_j,\;\varepsilon hA),
+\qquad
+A\succ0.
+\label{eq:small-noise-family}
+\end{equation}
+For every $\varepsilon>0$, the exact geometric target has mean
+\begin{equation}
+x+h
+\left[
+v_{\Lbase}
++\lambda(v_{\Srl}-v_{\Sbase})
+\right].
+\label{eq:small-noise-target}
+\end{equation}
+Define
+\begin{equation}
+v_*:=v_{\Lbase}+\lambda(v_{\Srl}-v_{\Sbase}).
+\label{eq:ode-field-target}
+\end{equation}
+Then
+\begin{equation}
+\frac{\varepsilon}{h}
+\KL(K_{\Lactor}^{\varepsilon,h}\Vert Q_\lambda^{\varepsilon,h})
+=
+\frac12
+\norm{v_{\Lactor}-v_*}_{A^{-1}}^2.
+\label{eq:ode-control-limit}
+\end{equation}
+The ratio itself does not exist at $\varepsilon=0$, but the Gaussian family selects a finite
+deterministic target and its rescaled KL is exactly a quadratic control metric.
+
+The practical recipient-on-policy ODE loss is therefore
+\begin{equation}
+\boxed{
+\mathcal L_{\mathrm{ODE}}
+=
+\E_{\substack{
+C,t\\
+X_t\sim\rho_{\Lbeh,t}
+}}
+\left[
+w(t)
+\norm{
+[v_{\Lactor}-v_{\Lbase}]
+-\lambda[v_{\Srl}-v_{\Sbase}]
+}_{G_t}^2
+\right].
+}
+\label{eq:ode-main-loss}
+\end{equation}
+Without a declared small-noise SDE, $G_t$ and $w(t)$ are modeling choices.  Common options are
+identity velocity geometry, a scheduler-derived control metric, or a per-dimension RMS
+normalization.
+
+\subsection{Lagrangian flow-map delta}
+
+The Eulerian field loss queries the 9B donor on 32B recipient states.  If those states are too far
+outside the donor occupancy, a Lagrangian alternative evaluates every model on its own trajectory.
+Let $\Phi_{j,t}(Z,c)$ be flow maps from common base noise $Z$ and define
+\begin{equation}
+\Psi_t^\lambda(Z,c)
+=
+\Phi_{\Lbase,t}(Z,c)
++\lambda
+\left[
+\Phi_{\Srl,t}(Z,c)
+-\Phi_{\Sbase,t}(Z,c)
+\right].
+\label{eq:flow-map-delta}
+\end{equation}
+Its path derivative is
+\begin{align}
+\dot\Psi_t^\lambda
+&=
+v_{\Lbase}(t,\Phi_{\Lbase,t},c)
+\nonumber\\
+&\quad+
+\lambda
+\left[
+v_{\Srl}(t,\Phi_{\Srl,t},c)
+-v_{\Sbase}(t,\Phi_{\Sbase,t},c)
+\right].
+\label{eq:flow-map-velocity}
+\end{align}
+Conditional flow matching uses
+\begin{equation}
+\mathcal L_{\mathrm{map\text{-}CFM}}
+=
+\E_{C,Z,t}
+\norm{
+v_\theta(t,\Psi_t^\lambda,C)
+-\dot\Psi_t^\lambda
+}^2.
+\label{eq:flow-map-cfm}
+\end{equation}
+Its population optimum is the conditional mean
+\begin{equation}
+u_t(x,c)
+=
+\E[
+\dot\Psi_t^\lambda(Z,c)
+\mid
+\Psi_t^\lambda(Z,c)=x
+].
+\label{eq:map-marginal-field}
+\end{equation}
+Under standard regularity, this field transports the chosen pseudo-path
+marginals~\cite{flowmatching}.
+It is exact for the explicitly declared common-noise coupling, not a zero-noise policy-ratio
+identity.
+
+\subsection{Marginal density-ratio target}
+
+ODE time marginals may possess smooth densities even though their transition kernels are Dirac.
+Assume, at each $(t,c)$,
+\begin{equation}
+\rho_{\Srl,t}(\cdot\mid c)\ll\rho_{\Sbase,t}(\cdot\mid c),
+\qquad
+\rho_{\Lbase,t}(\cdot\mid c)\ll\rho_{\Sbase,t}(\cdot\mid c),
+\label{eq:marginal-support}
+\end{equation}
+and define the finite positive normalizer
+\begin{equation}
+Z_t(c)
+=
+\int
+\rho_{\Lbase,t}(x\mid c)
+\left[
+\frac{\rho_{\Srl,t}(x\mid c)}
+     {\rho_{\Sbase,t}(x\mid c)}
+\right]^\lambda
+\dd x
+\in(0,\infty).
+\label{eq:marginal-normalizer}
+\end{equation}
+The static density target is
+\begin{equation}
+q_t(x\mid c)
+=
+\frac1{Z_t(c)}
+\rho_{\Lbase,t}(x\mid c)
+\left[
+\frac{\rho_{\Srl,t}(x\mid c)}
+     {\rho_{\Sbase,t}(x\mid c)}
+\right]^\lambda.
+\label{eq:marginal-ratio-target}
+\end{equation}
+On the region where all three component densities are positive, its static score identity is
+\begin{equation}
+\nabla\log q_t
+=
+\nabla\log\rho_{\Lbase,t}
++\lambda
+\left[
+\nabla\log\rho_{\Srl,t}
+-\nabla\log\rho_{\Sbase,t}
+\right].
+\label{eq:marginal-score-arithmetic}
+\end{equation}
+However, products and ratios of densities following their respective continuity or
+Fokker--Planck dynamics do not generally follow the dynamics induced by score arithmetic.
+Consequently, score or velocity arithmetic does not automatically generate
+the complete path \eqref{eq:marginal-ratio-target}.  A strict endpoint version requires an
+endpoint density-ratio estimator, importance resampling, DMD with an online fake score, or a
+dynamic corrector.  This is a separate and more expensive distribution-level method.
+
+%% ============================================================
+\section{Main training objective and algorithm}
+\label{sec:algorithm}
+%% ============================================================
+
+\subsection{Recommended transition-mean implementation}
+
+The safest implementation uses the \emph{actual scheduler or solver transition mean} rather than
+assuming a particular Euler coefficient.  On a recipient behavior state and common solver
+history, compute
+\begin{equation}
+\dmuS
+=
+\mu_{\Srl}-\mu_{\Sbase}.
+\label{eq:actual-mean-shift}
+\end{equation}
+When donor and recipient covariances differ but each pair is internally matched, define
+\begin{equation}
+d_\mu
+:=
+\Sigma_L\Sigma_S^{-1}\dmuS.
+\label{eq:preconditioned-shift}
+\end{equation}
+The unit-strength recipient trust cost is
+\begin{equation}
+K_1
+:=
+\frac12
+d_\mu^\top\Sigma_L^{-1}d_\mu.
+\label{eq:unit-trust-kl}
+\end{equation}
+Define the corresponding per-dimension quantities
+\begin{equation}
+\bar K_1:=K_1/D,
+\qquad
+\bar\kappa:=\kappa/D.
+\label{eq:normalized-trust}
+\end{equation}
+Given nominal strength $\lambda_0$ and either a conditional joint-KL budget $\kappa$ or the
+equivalent per-dimension budget $\bar\kappa$, set
+\begin{equation}
+\lambda_{\mathrm{eff}}
+=
+\begin{cases}
+\lambda_0, & K_1=0,\\[0.3em]
+\min\!\left\{
+\lambda_0,\sqrt{\kappa/K_1}
+\right\}
+=
+\min\!\left\{
+\lambda_0,\sqrt{\bar\kappa/\bar K_1}
+\right\},
+& K_1>0.
+\end{cases}
+\label{eq:lambda-clipping}
+\end{equation}
+This guarantees
+\begin{equation}
+\KL(Q_{\lambda_{\mathrm{eff}}}\Vert K_{\Lbase})
+\le\kappa .
+\label{eq:target-trust-guarantee}
+\end{equation}
+The target mean is
+\begin{equation}
+\mu_{\mathrm{target}}
+=
+\mu_{\Lbase}
++\lambda_{\mathrm{eff}}d_\mu.
+\label{eq:main-target-mean}
+\end{equation}
+
+The dimension-normalized training loss is
+\begin{equation}
+\boxed{
+\mathcal L_{\mathrm{Flow\text{-}Direct\text{-}OPD}}
+=
+\E_{z\sim\nu_{\Lbeh}}
+\left[
+\frac{1}{2D}
+\norm{
+\mu_\theta(z)
+-\sg(\mu_{\mathrm{target}}(z))
+}_{\Sigma_L^{-1}}^2
+\right].
+}
+\label{eq:main-training-loss}
+\end{equation}
+Removing $1/D$ recovers the exact joint conditional KL.  The displayed optimization loss uses the
+per-dimension convention; \eqref{eq:target-trust-guarantee} is the equivalent joint guarantee.
+Equation~\eqref{eq:normalized-trust} makes the conversion explicit.
+
+If one shared isotropic Euler-SDE wrapper is used, this simplifies to
+\begin{align}
+v_{\mathrm{target}}
+&=
+v_{\Lbase}
++\lambda_{\mathrm{eff}}
+(v_{\Srl}-v_{\Sbase}),
+\label{eq:main-velocity-target}\\
+\mathcal L
+&=
+\E_{\nu_{\Lbeh}}
+\left[
+\frac{h_t}{2Dg_t^2}
+\norm{
+v_{\Lactor}-\sg(v_{\mathrm{target}})
+}^2
+\right].
+\label{eq:main-velocity-loss}
+\end{align}
+For the ODE arm, use \eqref{eq:ode-main-loss} instead of claiming a transition KL.
+
+\subsection{Recipient-on-policy optimization}
+
+\begin{algorithm}[htbp]
+\caption{Weak-to-Strong Flow Direct-OPD}
+\label{alg:flow-direct-opd}
+\begin{algorithmic}[1]
+\Require frozen donor reference $\Sbase$; frozen donor RL checkpoint $\Srl$
+\Require large recipient reference $\Lbase$; trainable recipient $\Lactor\leftarrow\Lbase$
+\Require nominal strength $\lambda_0$; optional trust budget $\kappa$
+\For{outer iteration $k=0,1,\ldots$}
+  \State Freeze behavior checkpoint $\Lbeh\leftarrow\Lactor$
+  \State Roll out $\Lbeh$ and cache recipient states, physical times, and solver histories
+  \For{each sampled training state/history $z$}
+    \State Evaluate $\mu_{\Sbase}(z)$ and $\mu_{\Srl}(z)$ without gradients
+    \State Evaluate $\mu_{\Lbase}(z)$ without gradients
+    \State Compute $\dmuS$, $d_\mu$, and $K_1$
+    \State If $\kappa$ is absent set $\lambda_{\mathrm{eff}}\leftarrow\lambda_0$;
+      otherwise use \eqref{eq:lambda-clipping}
+    \State Set $\mu_{\mathrm{target}}\leftarrow
+      \mu_{\Lbase}+\lambda_{\mathrm{eff}}d_\mu$
+    \State Evaluate trainable $\mu_\theta(z)$ and accumulate
+      \eqref{eq:main-training-loss}
+  \EndFor
+  \State Update $\theta$; log realized recipient-to-base displacement and refresh behavior
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+The donor pair and recipient reference are detached.  The query distribution is the recipient's
+own behavior occupancy, which is the flow analogue of Direct-OPD evaluating the weak checkpoint
+ratio on strong-student prefixes.  Refreshing the behavior model limits stale-state error, but the
+detached optimization remains a local semi-gradient rather than the full path gradient of
+\eqref{eq:global-path-tilt}.
+
+\subsection{Reliability masks and composition}
+
+If the donor shift is unreliable on some recipient states, introduce a detached mask
+$m(z)\in[0,1]$:
+\begin{equation}
+\mu_{\mathrm{target}}
+=
+\mu_{\Lbase}
++m(z)\lambda_{\mathrm{eff}}d_\mu.
+\label{eq:masked-target}
+\end{equation}
+Possible masks use cross-seed or cross-checkpoint donor-delta agreement, donor-state OOD tests, or
+explicit domain routing.  A mask based only on $\norm{\dmuS}$ is not a correctness test: a large
+shift can encode a reward shortcut.
+
+Several independently learned shifts can be composed:
+\begin{equation}
+\mu_{\mathrm{target}}
+=
+\mu_{\Lbase}
++\sum_{m=1}^M
+\lambda_m d_\mu^{(m)}.
+\label{eq:composed-shifts}
+\end{equation}
+This is exact for a product of conditional donor ratios when the normalizer exists.  In practice,
+joint trust projection is needed because individually safe shifts can add constructively or
+conflict.
+
+%% ============================================================
+\section{Alternative objectives and their exactness}
+\label{sec:alternatives}
+%% ============================================================
+
+\begin{center}
+\begin{tabular}{@{}
+  >{\raggedright\arraybackslash}p{0.05\textwidth}
+  >{\raggedright\arraybackslash}p{0.19\textwidth}
+  >{\raggedright\arraybackslash}p{0.27\textwidth}
+  >{\raggedright\arraybackslash}p{0.37\textwidth}
+@{}}
+\toprule
+arm & construction & exact meaning & principal boundary\\
+\midrule
+A & inference-time velocity graft
+& a declared ODE field; exact conditional Gaussian mean under shared SDE covariance
+& requires all three frozen models at inference and can move donor queries off-support\\
+\addlinespace
+B & recipient-on-policy residual field distillation
+& weighted $L^2$ projection of arm A under the behavior occupancy
+& finite capacity and stale occupancy; not an endpoint distribution objective\\
+\addlinespace
+C & kernel or SDE transition tilt
+& exact local KL-regularized target \eqref{eq:kernel-tilt}
+& needs density ratio or shared stochastic kernel; global path target has Doob correction\\
+\addlinespace
+D & endpoint ratio tilt
+& exact static distribution target \eqref{eq:marginal-ratio-target}
+& expensive ratio/score estimation; product path is not automatically dynamically consistent\\
+\addlinespace
+E & common-noise flow-map CFM
+& exact CFM target for the explicit pseudo-path \eqref{eq:flow-map-delta}
+& coupling- and coordinate-dependent; additive maps can fold or leave the valid region\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Zero-training inference oracle}
+
+Before any recipient training, integrate
+\begin{equation}
+\dot X_t
+=
+v_{\Lbase}(t,X_t,c)
++\lambda
+\left[
+v_{\Srl}(t,X_t,c)
+-v_{\Sbase}(t,X_t,c)
+\right].
+\label{eq:inference-graft}
+\end{equation}
+This needs one 32B and two 9B forwards per solver query, but directly tests whether the field
+direction transfers.  If a correctly implemented closed-loop graft provides no
+reward--quality Pareto improvement, training arm B toward the same field target is unlikely to
+rescue the hypothesis.
+
+\subsection{Endpoint importance-CFM}
+
+Under the support and normalizability assumptions
+\eqref{eq:marginal-support}--\eqref{eq:marginal-normalizer} at $t=1$, estimate
+\begin{equation}
+r_1(y,c)
+=
+\log\rho_{\Srl,1}(y\mid c)
+-\log\rho_{\Sbase,1}(y\mid c).
+\label{eq:endpoint-reward}
+\end{equation}
+Generate $Y_i\sim\rho_{\Lbase,1}$ and weight
+\begin{equation}
+w_i=\exp(\lambda r_1(Y_i,c)).
+\label{eq:endpoint-weights}
+\end{equation}
+The population weight normalizer is
+$Z_1(c)=\E_{Y\sim\rho_{\Lbase,1}}[w(Y,c)]\in(0,\infty)$.
+Resampling by $w_i$ followed by ordinary endpoint CFM targets
+\begin{equation}
+q_1(y\mid c)
+\propto
+\rho_{\Lbase,1}(y\mid c)e^{\lambda r_1(y,c)}
+\label{eq:endpoint-target}
+\end{equation}
+in the population limit.  Its feasibility is governed by
+\begin{equation}
+\mathrm{ESS}
+=
+\frac{(\sum_iw_i)^2}{\sum_iw_i^2}.
+\label{eq:ess}
+\end{equation}
+Collapsed ESS is an estimation failure, not evidence that policy-shift transfer itself is false.
+DMD~\cite{dmd} is an alternative when an online fake-score model is affordable.
+
+\subsection{Comparison with direct teacher imitation and P-OPD}
+
+Vanilla diffusion/flow distillation~\cite{diffusionopd} uses
+$v_{\mathrm{target}}=v_{\Srl}$ and transfers the donor's absolute policy.  The canonical case in
+which it agrees with Flow Direct-OPD is $\Sbase=\Lbase$ and $\lambda=1$; more generally equality
+requires
+$v_{\Lbase}+\lambda(v_{\Srl}-v_{\Sbase})=v_{\Srl}$
+pointwise.
+
+P-OPD uses an arithmetic mixture and a posterior responsibility.  Its exact local-gradient
+interpretation requires a sampled stochastic transition and positive shared covariance; the gate
+collapses in the deterministic limit.  Flow Direct-OPD uses a geometric ratio tilt.  Under shared
+Gaussian covariance the product closes to one Gaussian and no responsibility gate appears.  The
+two methods solve different proximal problems.
+
+%% ============================================================
+\section{FLUX.2 compatibility, diagnostics, and experiments}
+\label{sec:practice}
+%% ============================================================
+
+\subsection{What the public model configs establish}
+
+The public Hugging Face configs for
+\href{https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B}{FLUX.2-klein-base-9B}
+and
+\href{https://huggingface.co/black-forest-labs/FLUX.2-dev}{FLUX.2-dev}
+show encouraging structural compatibility:
+\begin{center}
+\begin{tabular}{@{}
+  >{\raggedright\arraybackslash}p{0.17\textwidth}
+  >{\raggedright\arraybackslash}p{0.35\textwidth}
+  >{\raggedright\arraybackslash}p{0.37\textwidth}
+@{}}
+\toprule
+component & observed relation & implication\\
+\midrule
+scheduler & same FlowMatchEulerDiscreteScheduler fields & physical sigma grids can be matched\\
+transformer I/O & Flux2Transformer2DModel, 128 channels & output tensor geometry can match\\
+RoPE axes & $(32,32,32,32)$ for both & latent token coordinate convention is compatible\\
+VAE config & AutoencoderKLFlux2, 32 latent channels & same declared latent architecture\\
+text encoder & Qwen3 vs.\ Mistral3 & embeddings are not interchangeable\\
+joint attention dim & $7680$ vs.\ $15360$ & each model must use its own conditioning path\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Configuration equality is not numerical identity.  The two published VAE weight files have
+different sizes (approximately $168.1$MB and $336.2$MB), consistent with a precision difference
+but not proving equal fp32 values.  Train-time identity grafting requires direct state and
+one-step parity tests.
+
+\subsection{Fail-closed compatibility checks}
+
+Before training:
+\begin{enumerate}[leftmargin=1.6em]
+\item Pin the exact $\Sbase$ revision from which the RL checkpoint was produced.  Disabling the
+      RL adapter must recover that base numerically.
+\item Compare VAE state dictionaries after fp32 conversion; encode the same images with posterior
+      mode and compare packed latent coordinates, latent IDs, scaling, and decode parity.
+\item Use one diffusers revision and compare complete sigma/timestep grids, dynamic shift, and
+      solver coefficients at every intended resolution and NFE.
+\item Instrument one step of each official pipeline and verify that converted outputs represent
+      the same physical velocity or complete transition mean, including sign.
+\item Feed the same raw prompt to each model's own text encoder.  Begin with guidance scale $1$;
+      equal CFG numbers across the two pipelines need not define equal physical fields.
+\item Compute donor subtraction in fp32 and deterministic eval mode.  Require its RMS to be well
+      above repeated-forward and dtype noise before interpreting it as an RL signal.
+\end{enumerate}
+
+If latent coordinates differ, a state transport map $T$ is required and vector shifts must be
+pushforwarded by its Jacobian.  Matching tensor shape alone is insufficient.
+
+\subsection{Required scale and reliability logs}
+
+At every sampled timestep, log both RMS and event-L2 scales:
+\begin{itemize}[leftmargin=1.6em]
+\item $\operatorname{RMS}(\dvS)$,
+      $\operatorname{RMS}(v_{\Lbase})$, and their ratio;
+\item one-step displacement $|h_t|\operatorname{RMS}(\lambda\dvS)$;
+\item joint and per-dimension $K_1$, $\lambda_{\mathrm{eff}}$, and clipping rate;
+\item open-loop and closed-loop endpoint latent displacement;
+\item cross-seed, cross-checkpoint, or cross-scale cosine similarity of donor deltas;
+\item recipient-state OOD diagnostics relative to $\Sbase$ and $\Srl$ trajectory states;
+\item realized post-update
+      $\operatorname{RMS}(v_{\Lactor}-v_{\Lbase})$
+      versus the requested target.
+\end{itemize}
+
+For donor pairs $i,j$, let $G_k=A_k^{-1}$ for an SDE control metric, or use the explicitly
+declared ODE metric.  A control-energy weighted cosine is
+\begin{equation}
+\operatorname{Cos}_{ij}
+=
+\frac{
+\sum_k h_k
+(\Delta v_{S,k}^{(i)})^\top G_k\Delta v_{S,k}^{(j)}
+}{
+\sqrt{\sum_k h_k\norm{\Delta v_{S,k}^{(i)}}_{G_k}^2}
+\sqrt{\sum_k h_k\norm{\Delta v_{S,k}^{(j)}}_{G_k}^2}
+}.
+\label{eq:delta-cosine}
+\end{equation}
+This measures signal stability, not agreement with an unavailable 32B RL delta.
+
+\subsection{Minimum informative experiment sequence}
+
+\paragraph{Stage 0: compatibility.}
+Use $32$--$64$ prompts across intended resolutions and timesteps.  Stop on latent, scheduler,
+parameterization, conditioning, or checkpoint-provenance failure.
+
+\paragraph{Stage 1: open-loop field probe.}
+Freeze $\Lbase$ trajectories and evaluate all three frozen fields on identical states.  Compare
+the final RL checkpoint with intermediate checkpoints and independent RL seeds.  A GenEval-perfect
+checkpoint may be less transferable than an earlier checkpoint if it encodes reward shortcuts.
+
+\paragraph{Stage 2: closed-loop zero-training oracle.}
+For the deterministic diagnostic only, introduce a signed graft coefficient $\eta$ and sweep
+\begin{equation}
+\eta\in
+\{-0.5,-0.25,0,0.125,0.25,0.5,1.0\}.
+\label{eq:signed-graft-sweep}
+\end{equation}
+Use $\eta$ in place of $\lambda$ in \eqref{eq:inference-graft}.  Negative values are sign controls
+for the ODE field and are outside the one-sided kernel-ratio theory of
+Section~\ref{sec:kernel}; a negative kernel tilt would require mutual absolute continuity and
+finite negative moments.
+Include:
+\begin{itemize}[leftmargin=1.6em]
+\item a compute-matched $\Lbase$ run with more recipient-only NFEs;
+\item a $\Sbase-\Sbase$ sham delta;
+\item prompt-shuffled and norm-matched random deltas;
+\item absolute $\Srl$ and $\Sbase$ fields scaled to the same RMS;
+\item negative $\eta$, which should tend to reverse a genuine RL-improvement direction.
+\end{itemize}
+
+\paragraph{Stage 3: recipient training.}
+Only if two neighboring positive strengths improve the reward--quality frontier, train
+\eqref{eq:main-training-loss}.  Use the smallest strength within uncertainty of the best oracle
+result and refresh recipient rollouts frequently.
+
+\paragraph{Stage 4: alternative representations.}
+If field grafting fails because donor queries are OOD on recipient states, test
+flow-map CFM~\eqref{eq:flow-map-cfm}.  Attempt endpoint ratio/DMD only after verifying ratio
+calibration and adequate ESS.
+
+\subsection{Evaluation and failure modes}
+
+For the GenEval example, report overall and per-category GenEval together with prompt alignment,
+PickScore, OCR, aesthetics/realism, diversity, duplicate rate, and editing performance.  A perfect
+GenEval score is not sufficient evidence of transferable general capability.
+
+Likely failures include:
+\begin{itemize}[leftmargin=1.6em]
+\item the 9B RL delta encodes detector-specific shortcuts rather than compositional improvement;
+\item FLUX.2-dev may already have little GenEval headroom, which must be measured under the exact
+      evaluation protocol;
+\item recipient trajectories leave the donor's reliable state region, especially late in
+      denoising;
+\item Qwen-conditioned donor corrections are not compatible with Mistral-conditioned recipient
+      behavior;
+\item the final RL checkpoint overshoots while an intermediate checkpoint transfers;
+\item a numerically small delta is dominated by bf16 or nondeterministic-forward noise;
+\item an open-loop-safe direction becomes unstable after closed-loop state drift;
+\item a fixed global $\lambda$ spends its scale on timestep or resolution differences;
+\item field loss improves while reward and perceptual quality degrade, demonstrating objective
+      mismatch rather than implementation success.
+\end{itemize}
+
+\begin{tcolorbox}[colback=gray!5,colframe=gray!55,title=Recommended first implementation]
+Use inference-time ODE velocity grafting as the causal oracle.  If it succeeds, distill the
+recipient residual on recipient on-policy states.  Keep Euler-SDE or SDE-DPM-Solver++ as the
+probabilistically exact transition arm and scale-calibration reference.  Do not begin with
+endpoint density-ratio/DMD: it is more expensive and cannot repair an intrinsically
+non-transferable donor shift.
+\end{tcolorbox}
+
+\subsection{Flow-Factory implementation}
+
+The framework implementation uses trainer key
+\texttt{flow-direct-opd} and lives under
+\path{src/flow_factory/trainers/fdopd/}.  The canonical configuration is
+\path{examples/flow_direct_opd/lora/flux2/default.yaml}.  It uses the Multi-Reward donor LoRA
+\begin{center}
+\small
+\url{https://huggingface.co/Tencent-Hunyuan-Multimodal-RL/FLUX2-klein-base-9b-GenEval2-Multi-Reward}
+\end{center}
+by default; replacing only \texttt{donor\_rl\_lora\_path} with the corresponding Single-Reward
+repository gives the first policy-shift ablation.
+
+The implemented V1 dynamics are ODE velocity residuals and the existing Flow-SDE, Dance-SDE, and
+CPS transition-mean wrappers.  DPM-SDE remains a theoretical extension because the current
+Flow-Factory scheduler registry does not expose a DPM-SDE augmented-history transition.
+
+%% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%% ============================================================
+
+The small RL checkpoint should be viewed as a cheap instrument that discovers a policy-improvement
+direction, not as an absolute teacher for the larger model.  The general transferable signal is
+the conditional kernel ratio $\dd K_{\Srl}/\dd K_{\Sbase}$.  Its geometric tilt of the large
+reference kernel is an exact KL-regularized objective without any Gaussian assumption.  Shared
+Gaussian SDE and DPM-SDE kernels make the target computationally simple: the donor transition-mean
+shift is added to the large reference mean, and the resulting training loss is a covariance-weighted
+residual MSE.  Continuous SDEs give the same local drift target through Girsanov, while the exact
+global path tilt additionally contains a continuation-value correction.
+
+For ODE flow models, transition ratios are not defined.  Nevertheless, the same velocity arithmetic
+is a principled rescaled small-noise control limit and a valid deterministic field construction.
+Flow-map CFM and endpoint density-ratio methods provide alternative deterministic and distributional
+targets when the Eulerian donor shift is unreliable.  The practical research question is therefore
+not whether a 9B model is a good teacher for a 32B model, but whether the \emph{change discovered by
+9B RL} is stable and useful on the 32B model's own states.
+
+\begin{thebibliography}{10}
+
+\bibitem{directopd}
+Shiyuan Feng, Huan-ang Gao, Haohan Chi, et al.
+\newblock Weak-to-Strong Generalization via Direct On-Policy Distillation.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2607.05394}.
+
+\bibitem{proxytuning}
+Alisa Liu, Xiaochuang Han, Yizhong Wang, Yulia Tsvetkov, Yejin Choi, and Noah A. Smith.
+\newblock Tuning Language Models by Proxy.
+\newblock 2024.
+\newblock \url{https://arxiv.org/abs/2401.08565}.
+
+\bibitem{rast}
+Siru Ouyang, Xinyu Zhu, Zilin Xiao, Minhao Jiang, Yu Meng, and Jiawei Han.
+\newblock RAST: Reasoning Activation in LLMs via Small-model Transfer.
+\newblock 2025.
+\newblock \url{https://arxiv.org/abs/2506.15710}.
+
+\bibitem{thinklogit}
+Yunxiang Zhang, Muhammad Khalifa, Lechen Zhang, et al.
+\newblock Logit Arithmetic Elicits Long Reasoning Capabilities Without Training.
+\newblock \emph{Findings of ACL}, 2026.
+\newblock \url{https://arxiv.org/abs/2507.12759}.
+
+\bibitem{logitgrafting}
+Apurv Verma, Binh-Nguyen Nguyen, Lingxiao Wang, and NhatHai Phan.
+\newblock Logit Grafting: The Post-Training Delta is Sparse, Portable, and Powerful.
+\newblock \emph{2nd Workshop on Compositional Learning at ICML}, 2026.
+\newblock \url{https://openreview.net/forum?id=yWJLnCEKBI}.
+
+\bibitem{flowmatching}
+Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le.
+\newblock Flow Matching for Generative Modeling.
+\newblock \emph{International Conference on Learning Representations}, 2023.
+\newblock \url{https://arxiv.org/abs/2210.02747}.
+
+\bibitem{dpmsolverpp}
+Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu.
+\newblock DPM-Solver++: Fast Solver for Guided Sampling of Diffusion Probabilistic Models.
+\newblock 2022.
+\newblock \url{https://arxiv.org/abs/2211.01095}.
+
+\bibitem{dmd}
+Tianwei Yin, Micha\"el Gharbi, Richard Zhang, Eli Shechtman, Fr\'edo Durand,
+William T. Freeman, and Taesung Park.
+\newblock One-step Diffusion with Distribution Matching Distillation.
+\newblock \emph{CVPR}, 2024.
+\newblock \url{https://arxiv.org/abs/2311.18828}.
+
+\bibitem{diffusionopd}
+Quanhao Li, Junqiu Yu, Kaixun Jiang, et al.
+\newblock DiffusionOPD: A Unified Perspective of On-Policy Distillation in Diffusion Models.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2605.15055}.
+
+\bibitem{gradualft}
+Gudrun Thorkelsdottir and Arindam Banerjee.
+\newblock
+Gradual Fine-Tuning for Flow Matching Models.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2601.22495}.
+
+\end{thebibliography}
+
+\end{document}

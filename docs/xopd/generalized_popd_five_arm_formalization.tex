@@ -1,0 +1,1639 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\TV}{\mathrm{TV}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\inner}[2]{\left\langle #1,\,#2 \right\rangle}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\vold}{v_{\mathrm{old}}}
+\newcommand{\vT}{v_T}
+\newcommand{\vtheta}{v_\theta}
+\DeclareMathOperator{\logit}{logit}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\title{\textbf{Five Formalizations of Proximal On-Policy Distillation for Flow Models}\\[0.3em]
+\large From deterministic field matching to stochastic transition and marginal mixtures}
+\author{Jayce-Ping}
+\date{2026-07-30}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Flow models admit both deterministic ODE sampling and stochastic SDE sampling.  A proximal
+distillation rule built from Gaussian transition likelihoods is therefore exact only for the SDE
+case; its deterministic limit is singular.  This note develops five concrete arms under one
+flow-matching notation.  Arm A0 is direct ODE teacher-field regression.  Arm A1 adds an explicit
+field-space trust region with a local one-step transport interpretation.  Arm A2 constructs a
+teacher gate from forward flow-matching prediction risk; it is solver-agnostic but is a predictive
+surrogate rather than a state-density ratio.  Arm A3 is the existing SDE transition-mixture P-OPD,
+whose detached-responsibility loss matches the exact mixture-KL gradient locally at the behavior
+student.  Arm A4 uses old and teacher trajectories in a two-source conditional flow-matching
+objective and exactly realizes their mixture of time marginals in the population limit.
+
+The derivations stay at the level needed for flow-matching practice: every arm specifies its
+sampling distribution, target, loss, gradient, scale convention, exactness claim, and failure
+boundary.  In particular, plain ODE MSE is not an unscaled zero-noise KL; it is a quadratic
+field/transport geometry, or equivalently a rescaled small-noise control-energy limit.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Common notation and reusable results}
+\label{sec:common}
+%% ============================================================
+
+\subsection{Flow, rollout, and scale conventions}
+
+We parameterize time so that sampling integrates from $t=0$ (base noise) to $t=1$ (generated
+sample).  This is only a change of orientation from schedulers that denoise from $1$ to $0$.  Let
+$C$ denote conditioning information and $Z\sim\rho_{\mathrm{base}}(\cdot\mid C)$ the initial
+noise.  At outer iteration $k$, the frozen behavior student has vector field
+$\vold=v_{\theta_k}$ and rollout
+\begin{equation}
+\frac{\dd X_t^{\mathrm{old}}}{\dd t}
+  =\vold(t,X_t^{\mathrm{old}},C),
+\qquad
+X_0^{\mathrm{old}}=Z .
+\label{eq:old-ode}
+\end{equation}
+The frozen teacher field is $\vT$, and $\vtheta$ is the trainable field.  Their flow maps and
+time marginals are denoted by $\Phi_t^{\mathrm{old}},\Phi_t^T,\Phi_t^\theta$ and
+$\rho_{\mathrm{old},t},\rho_{T,t},\rho_{\theta,t}$.
+
+Let $\omega(t)>0$ be a normalized training-time density,
+$\int_0^1\omega(t)\dd t=1$.  The old-occupancy expectation is
+\begin{equation}
+\E_{\mathrm{old}}[f]
+  :=
+  \E_{C,Z}\int_0^1
+  \omega(t)
+  f(t,X_t^{\mathrm{old}},C)\dd t .
+\label{eq:old-occupancy}
+\end{equation}
+The state $X_t^{\mathrm{old}}$ is detached during optimization.  Thus
+\eqref{eq:old-occupancy} describes fixed-input field regression; it does not differentiate
+through the ODE solver.
+
+For a detached positive-definite metric $G_t$, define
+\begin{equation}
+\norm{a}_{G_t}^2=a^\top G_ta,
+\qquad
+\norm{a}_{\mathrm{old},G}^2
+  =\E_{\mathrm{old}}\!\left[\norm{a(t,X_t^{\mathrm{old}},C)}_{G_t}^2\right].
+\label{eq:field-norm}
+\end{equation}
+The default practical choice is $G_t=I$.  A covariance-derived metric
+$G_t=A_t^{-1}$ is meaningful only when a reference covariance $A_t$ has been explicitly declared;
+an ODE does not supply one automatically.
+
+If the latent event has dimension $D$, then
+\begin{equation}
+\operatorname{RMS}_{G_t}(a)^2
+  :=\frac{1}{D}\norm{a}_{G_t}^2,
+\qquad
+\norm{a}_{G_t}^2
+  =D\,\operatorname{RMS}_{G_t}(a)^2.
+\label{eq:rms-vs-sum}
+\end{equation}
+The event sum is the scale used by a joint Gaussian density.  The RMS or event mean is easier to
+compare across resolutions.  A trust radius or temperature must state which convention it uses;
+the two differ by $D$ in squared scale.
+
+\subsection{Three different objects}
+
+The five arms act on three related but non-interchangeable objects:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+object & notation & what is compared\\
+\midrule
+one-step conditional kernel & $K(\dd y\mid x,t)$ & stochastic next-state law\\
+vector field / flow map & $v(t,x)$, $\Phi_t(z)$ & deterministic transport rule\\
+time marginal & $\rho_t=(\Phi_t)_\#\rho_{\mathrm{base}}$ & distribution of states at time $t$\\
+\bottomrule
+\end{tabular}
+\end{center}
+An SDE transition KL belongs to the first row.  ODE velocity MSE belongs to the second.  A
+marginal-mixture construction belongs to the third.  Replacing one row by another can produce a
+useful surrogate, but it is not an algebraic identity.
+
+\subsection{Why deterministic transition KL is singular}
+
+For one numerical step of size $h$, let
+\begin{equation}
+F_j^h(x)=x+h\,v_j(t,x),
+\qquad
+K_j(\dd y\mid x)=\delta_{F_j^h(x)}(\dd y),
+\qquad
+j\in\{\mathrm{old},T\}.
+\label{eq:deterministic-kernels}
+\end{equation}
+
+\begin{proposition}[No smooth conditional-KL trust region for unequal ODE maps]
+\label{prop:dirac-kl}
+Assume $F_{\mathrm{old}}^h(x)\neq F_T^h(x)$ and define
+\[
+Q_\alpha=(1-\alpha)K_{\mathrm{old}}+\alpha K_T,
+\qquad \alpha\in(0,1).
+\]
+Then
+\begin{equation}
+\KL(\delta_y\Vert Q_\alpha)
+=
+\begin{cases}
+-\log(1-\alpha), & y=F_{\mathrm{old}}^h(x),\\
+-\log\alpha, & y=F_T^h(x),\\
++\infty, & \text{otherwise}.
+\end{cases}
+\label{eq:dirac-mixture-kl}
+\end{equation}
+Therefore the objective is finite at the old map but infinite after a generic arbitrarily small
+output perturbation.  It has no local teacher-pull gradient.
+\end{proposition}
+
+\begin{proof}
+$Q_\alpha$ places mass only at the two displayed atoms.  The Radon--Nikodym derivative of
+$\delta_y$ with respect to $Q_\alpha$ is $1/(1-\alpha)$ at the old atom, $1/\alpha$ at the
+teacher atom, and does not exist elsewhere.  Substitution into the definition of KL gives
+\eqref{eq:dirac-mixture-kl}.
+\end{proof}
+
+JS divergence is finite here, but it is piecewise constant as the atoms move and supplies no
+useful local teacher-pull gradient.  A deterministic PPO-style likelihood ratio is likewise
+undefined.  The problem is the singular support, not merely the choice of divergence.
+
+\subsection{What does survive the small-noise limit}
+
+Smooth two outputs with a shared covariance $\varepsilon A$, where $A\succ0$:
+\begin{equation}
+p_a^\varepsilon=\N(a,\varepsilon A),
+\qquad
+p_b^\varepsilon=\N(b,\varepsilon A).
+\end{equation}
+The equal-covariance Gaussian identity gives
+\begin{equation}
+\KL(p_a^\varepsilon\Vert p_b^\varepsilon)
+  =\frac{1}{2\varepsilon}\norm{a-b}_{A^{-1}}^2,
+\qquad
+2\varepsilon\,
+\KL(p_a^\varepsilon\Vert p_b^\varepsilon)
+  =\norm{a-b}_{A^{-1}}^2 .
+\label{eq:rescaled-gaussian-kl}
+\end{equation}
+The unscaled KL diverges as $\varepsilon\to0$ for $a\neq b$, but the rescaled KL is exactly a
+quadratic transport cost.
+
+For Euler means $\mu_j=x+h\,v_j$ and diffusion covariance
+$\Sigma=\varepsilon h A$,
+\begin{equation}
+\KL\!\left(
+  \N(\mu_1,\varepsilon hA)
+  \,\middle\Vert\,
+  \N(\mu_2,\varepsilon hA)
+\right)
+=\frac{h}{2\varepsilon}\norm{v_1-v_2}_{A^{-1}}^2 .
+\label{eq:euler-kl-control}
+\end{equation}
+Let $P_1^{\mathrm{grid}}$ and $P_2^{\mathrm{grid}}$ be the two Markov trajectory laws on the same
+grid and with the same initial law.  The KL chain rule and \eqref{eq:euler-kl-control} give
+\begin{align}
+\varepsilon\KL(P_1^{\mathrm{grid}}\Vert P_2^{\mathrm{grid}})
+&=
+\frac12
+\E_{P_1^{\mathrm{grid}}}
+\sum_\ell h_\ell
+\norm{
+  v_1(t_\ell,X_\ell)-v_2(t_\ell,X_\ell)
+}_{A_\ell^{-1}}^2
+\nonumber\\
+&\longrightarrow
+\frac12
+\E_{P_1}
+\int_0^1
+\norm{v_1(t,X_t)-v_2(t,X_t)}_{A_t^{-1}}^2\dd t .
+\label{eq:control-energy-limit}
+\end{align}
+Equation~\eqref{eq:control-energy-limit} is the principled bridge from SDE KL to ODE MSE.  It
+preserves a rescaled pairwise control cost; it does \emph{not} preserve the transition-mixture
+responsibility gate, as Section~\ref{sec:a3} will show.
+
+\subsection{A field-space trust region controls ODE displacement}
+
+\begin{proposition}[Old-occupancy field bound]
+\label{prop:gronwall}
+Assume $\vtheta(t,\cdot,c)$ is $L$-Lipschitz for every $(t,c)$.  Couple the candidate and old ODEs
+with the same $(C,Z)$.  Then
+\begin{align}
+\norm{X_1^\theta-X_1^{\mathrm{old}}}
+&\le
+\int_0^1 e^{L(1-s)}
+\norm{
+  \vtheta(s,X_s^{\mathrm{old}},C)
+  -\vold(s,X_s^{\mathrm{old}},C)
+}\dd s,
+\label{eq:pathwise-gronwall}\\
+\E\norm{X_1^\theta-X_1^{\mathrm{old}}}^2
+&\le
+e^{2L}
+\int_0^1
+\E\norm{
+  \vtheta(s,X_s^{\mathrm{old}},C)
+  -\vold(s,X_s^{\mathrm{old}},C)
+}^2\dd s .
+\label{eq:mean-gronwall}
+\end{align}
+Consequently,
+\begin{equation}
+W_2^2(\rho_{\theta,1},\rho_{\mathrm{old},1})
+\le
+\E\norm{X_1^\theta-X_1^{\mathrm{old}}}^2 .
+\label{eq:w2-coupling}
+\end{equation}
+If additionally
+\begin{equation}
+\omega(t)\ge\omega_*>0,
+\qquad
+G_t\succeq g_*I
+\label{eq:field-bound-assumptions}
+\end{equation}
+for all trained times, then the field norm in \eqref{eq:field-norm} controls the endpoint:
+\begin{equation}
+W_2^2(\rho_{\theta,1},\rho_{\mathrm{old},1})
+\le
+\frac{e^{2L}}{\omega_*g_*}
+\norm{\vtheta-\vold}_{\mathrm{old},G}^2 .
+\label{eq:field-norm-endpoint}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Add and subtract
+$\vtheta(t,X_t^{\mathrm{old}},C)$ in the difference of the two ODEs.  The candidate-field
+Lipschitz bound and Gr\"onwall's inequality give \eqref{eq:pathwise-gronwall}.  Cauchy--Schwarz
+gives \eqref{eq:mean-gronwall}.  The common-noise pairing is a valid coupling of the two endpoint
+laws, proving \eqref{eq:w2-coupling}.  Finally,
+\emph{under the additional lower bounds} in \eqref{eq:field-bound-assumptions},
+\[
+\norm{\vtheta-\vold}_{\mathrm{old},G}^2
+\ge
+\omega_*g_*
+\int_0^1
+\E\norm{\vtheta(t,X_t^{\mathrm{old}})-\vold(t,X_t^{\mathrm{old}})}^2\dd t,
+\]
+which gives \eqref{eq:field-norm-endpoint}.
+\end{proof}
+
+\begin{remark}
+The bound controls departure from the \emph{old} rollout because the field error is evaluated at
+old states.  Replacing it by a candidate--teacher endpoint guarantee requires candidate-occupancy
+teacher error, or an additional coverage/Lipschitz argument.  Old-state MSE alone does not give a
+global teacher-distribution convergence theorem.
+\end{remark}
+
+%% ============================================================
+\section{Arm A0: Direct ODE-OPD}
+\label{sec:a0}
+%% ============================================================
+
+\subsection{Objective and gradient}
+
+Direct ODE-OPD queries the teacher on states visited by the behavior student and regresses the
+current field to the teacher:
+\begin{equation}
+\mathcal L_{\mathrm{A0}}(\theta)
+  =
+  \frac12
+  \norm{\vtheta-\vT}_{\mathrm{old},G}^2
+  =
+  \frac12
+  \E_{\mathrm{old}}\!\left[
+    \norm{\vtheta(t,X_t^{\mathrm{old}},C)
+          -\vT(t,X_t^{\mathrm{old}},C)}_{G_t}^2
+  \right].
+\label{eq:a0-loss}
+\end{equation}
+This is the same direct-matching family as DiffusionOPD/XOPD~\cite{diffusionopd}: rollout is
+on-policy, while optimization is closed-form regression and does not require transition
+likelihoods.  Their deterministic transition-mean objective corresponds specifically to the
+$h_\ell^2$-weighted velocity loss derived below, rather than to an arbitrary choice of
+$(\omega,G)$ in \eqref{eq:a0-loss}.
+
+\begin{proposition}[A0 is old-occupancy weighted field regression]
+\label{prop:a0-projection}
+In unrestricted output space, every attained population minimizer of \eqref{eq:a0-loss} satisfies
+\begin{equation}
+v^\star(t,x,c)=\vT(t,x,c)
+\label{eq:a0-unrestricted}
+\end{equation}
+almost everywhere under the old occupation measure.  In a model class $\mathcal V$, any attained
+global solution is the weighted least-squares fit
+\begin{equation}
+v_{\mathcal V}^\star
+\in
+\arg\min_{v\in\mathcal V}
+\norm{v-\vT}_{\mathrm{old},G}^2 .
+\label{eq:a0-finite-capacity}
+\end{equation}
+Its parameter gradient is
+\begin{equation}
+\nabla_\theta\mathcal L_{\mathrm{A0}}
+=
+\E_{\mathrm{old}}\!\left[
+  J_\theta^\top G_t(\vtheta-\vT)
+\right],
+\qquad
+J_\theta=\partial_\theta\vtheta .
+\label{eq:a0-gradient}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Positive definiteness gives
+$\norm{v-\vT}_{G_t}^2\ge0$, with equality exactly at $v=\vT$.  Integration preserves this
+characterization almost everywhere under the occupation measure.  Restricting the minimization
+to $\mathcal V$ gives \eqref{eq:a0-finite-capacity}; differentiating the detached-input quadratic
+gives \eqref{eq:a0-gradient}.
+\end{proof}
+
+For a linear output model $v_\theta=B(t,x,c)\theta$, the finite-capacity optimum obeys the weighted
+normal equations
+\begin{equation}
+\E_{\mathrm{old}}[B^\top G_tB]\,\theta^\star
+=
+\E_{\mathrm{old}}[B^\top G_t\vT].
+\label{eq:a0-normal-equations}
+\end{equation}
+For a nonlinear network, stationarity only implies tangent-space orthogonality
+\begin{equation}
+\E_{\mathrm{old}}\!\left[
+  J_{\theta^\star}^{\top}G_t(v_{\theta^\star}-\vT)
+\right]=0;
+\label{eq:a0-tangent}
+\end{equation}
+it does not imply existence or uniqueness of a global least-squares solution.
+
+\subsection{The practical loss space}
+
+For an Euler step and a linear flow-matching path,
+\begin{equation}
+\mu_\theta-\mu_T
+  =h(\vtheta-\vT),
+\qquad
+\widehat x_0^\theta-\widehat x_0^T
+  =s(\vtheta-\vT).
+\label{eq:a0-spaces}
+\end{equation}
+The plus sign follows from the common noise-to-data time orientation:
+$x_s=x_0-sv$ and hence $\widehat x_0=x_s+sv$.  A native data-to-noise predictor
+$u=\varepsilon-x_0=-v$ uses the opposite sign; the squared-loss scale below is unchanged.
+Therefore velocity, next-state mean, and clean-prediction MSE differ only by timestep weights:
+\begin{equation}
+\mathcal L_v:\mathcal L_{x_t}:\mathcal L_{x_0}
+\quad\Longleftrightarrow\quad
+1:h^2:s^2 .
+\label{eq:a0-space-weights}
+\end{equation}
+At one fixed timestep these factors only rescale the gradient.  Across a trajectory they define
+different quadrature rules.  In particular,
+\begin{equation}
+\int_0^1\norm{\Delta v_t}^2\dd t
+\approx
+\sum_\ell h_\ell\norm{\Delta v_\ell}^2
+=
+\sum_\ell \frac{\norm{\Delta\mu_\ell}^2}{h_\ell},
+\label{eq:a0-control-quadrature}
+\end{equation}
+whereas an unnormalized sum of next-state MSE uses $h_\ell^2$ and tends to zero under grid
+refinement.
+
+\subsection{What A0 does and does not guarantee}
+
+If the fitted field remains close to the old field, Proposition~\ref{prop:gronwall} turns measured
+field displacement into a bound on rollout displacement.  A0 itself, however, contains no
+old-field penalty.  The triangle inequality only gives
+\begin{equation}
+\norm{\vtheta-\vold}_{\mathrm{old},G}
+\le
+\norm{\vtheta-\vT}_{\mathrm{old},G}
++
+\norm{\vT-\vold}_{\mathrm{old},G},
+\label{eq:a0-no-trust}
+\end{equation}
+which can be large when the teacher is far from the student.
+
+The loss also constrains only old-occupancy regions.  Low-density or teacher-only states receive
+little or no supervision in a finite batch.  Refreshing the student rollout after every outer
+iteration improves coverage adaptively, but does not turn a local regression result into a global
+distribution contraction.
+
+\begin{tcolorbox}[colback=gray!5,colframe=gray!55,title=Exact interpretation of Arm A0]
+A0 is on-policy \emph{field regression}: the inputs come from the current behavior flow.  It is
+not proximal merely because those inputs are on-policy, and it is not an ODE transition KL because
+unequal deterministic kernels are singular by Proposition~\ref{prop:dirac-kl}.
+\end{tcolorbox}
+
+%% ============================================================
+\section{Arm A1: Transport-Projected ODE-OPD}
+\label{sec:a1}
+%% ============================================================
+
+\subsection{Quadratic proximal target}
+
+Arm A1 explicitly anchors the field to the behavior student:
+\begin{equation}
+\mathcal L_{\mathrm{A1},\alpha}(v)
+=
+\frac{\alpha}{2}\norm{v-\vT}_{\mathrm{old},G}^2
++
+\frac{1-\alpha}{2}\norm{v-\vold}_{\mathrm{old},G}^2,
+\qquad
+\alpha\in[0,1].
+\label{eq:a1-loss}
+\end{equation}
+
+\begin{proposition}[Barycentric target]
+\label{prop:a1-barycenter}
+Define
+\begin{equation}
+v_\alpha=(1-\alpha)\vold+\alpha\vT,
+\qquad
+D_k=\norm{\vT-\vold}_{\mathrm{old},G}.
+\label{eq:a1-target}
+\end{equation}
+Then
+\begin{equation}
+\mathcal L_{\mathrm{A1},\alpha}(v)
+=
+\frac12\norm{v-v_\alpha}_{\mathrm{old},G}^2
++
+\frac{\alpha(1-\alpha)}{2}D_k^2 .
+\label{eq:a1-square-completion}
+\end{equation}
+Thus $v_\alpha$ is the unrestricted optimum.  In a finite neural class, training is a weighted
+least-squares fit to $v_\alpha$, not a parameter interpolation between the two networks.
+\end{proposition}
+
+\begin{proof}
+Apply pointwise
+\[
+\alpha\norm{v-a}_G^2+(1-\alpha)\norm{v-b}_G^2
+=
+\norm{v-\alpha a-(1-\alpha)b}_G^2
++
+\alpha(1-\alpha)\norm{a-b}_G^2
+\]
+and average under the old occupancy.
+\end{proof}
+
+\subsection{Equivalent trust-budget projection}
+
+Consider the explicit field-space trust problem
+\begin{equation}
+\min_v\ \frac12\norm{v-\vT}_{\mathrm{old},G}^2
+\quad\text{subject to}\quad
+\frac12\norm{v-\vold}_{\mathrm{old},G}^2\le\delta .
+\label{eq:a1-constrained}
+\end{equation}
+
+\begin{proposition}[Closed-form trust projection]
+\label{prop:a1-trust-projection}
+Let $R=\sqrt{2\delta}$.  If $D_k>0$, the unrestricted solution of
+\eqref{eq:a1-constrained} is
+\begin{equation}
+v_R
+=
+\vold+\alpha_R(\vT-\vold),
+\qquad
+\alpha_R=\min\!\left\{1,\frac{R}{D_k}\right\}.
+\label{eq:a1-alpha-radius}
+\end{equation}
+If $D_k=0$, $v_R=\vold=\vT$.  Conversely, a fixed $\alpha$ corresponds to
+\begin{equation}
+R_\alpha=\alpha D_k,
+\qquad
+\delta_\alpha=\frac{\alpha^2D_k^2}{2}.
+\label{eq:a1-relative-radius}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Write $u=v-\vold$ and $d=\vT-\vold$.  The objective is
+\[
+\norm{u-d}_{\mathrm{old},G}^2
+=\norm{u}_{\mathrm{old},G}^2+D_k^2
+-2\inner{u}{d}_{\mathrm{old},G}.
+\]
+For fixed $\norm{u}_{\mathrm{old},G}$, Cauchy--Schwarz makes $u$ parallel to $d$ optimal.
+The best allowed length is $\min\{R,D_k\}$, giving \eqref{eq:a1-alpha-radius}.
+\end{proof}
+
+A fixed $\alpha$ is therefore a \emph{relative} trust radius: the absolute update grows with the
+teacher--old gap.  If a fixed absolute field RMS radius $r$ is desired, use
+\begin{align}
+d_k^{\mathrm{RMS}}
+&=
+\sqrt{\E_{\mathrm{old}}[
+  \operatorname{RMS}_{G_t}(\vT-\vold)^2
+]},
+\nonumber\\
+\alpha_k
+&=
+\begin{cases}
+1, & d_k^{\mathrm{RMS}}=0,\\
+\min\{1,r/d_k^{\mathrm{RMS}}\}, & d_k^{\mathrm{RMS}}>0.
+\end{cases}
+\label{eq:a1-rms-alpha}
+\end{align}
+
+\subsection{Wasserstein projection of a stochastic branch target}
+
+At one old state, define the old and teacher Euler outputs
+\begin{equation}
+y_{\mathrm{old}}=x+h\vold(t,x),
+\qquad
+y_T=x+h\vT(t,x),
+\end{equation}
+and the branch mixture
+\begin{equation}
+Q_{\alpha,x}
+=(1-\alpha)\delta_{y_{\mathrm{old}}}
++\alpha\delta_{y_T}.
+\label{eq:a1-branch-mixture}
+\end{equation}
+
+\begin{proposition}[Best deterministic quadratic-transport projection]
+\label{prop:a1-wasserstein}
+For the quadratic ground metric $G_t$,
+\begin{align}
+\arg\min_y W_{2,G_t}^2(\delta_y,Q_{\alpha,x})
+&=(1-\alpha)y_{\mathrm{old}}+\alpha y_T,
+\label{eq:a1-wasserstein-minimizer}\\
+\min_y W_{2,G_t}^2(\delta_y,Q_{\alpha,x})
+&=\alpha(1-\alpha)
+  \norm{y_T-y_{\mathrm{old}}}_{G_t}^2 .
+\label{eq:a1-irreducible}
+\end{align}
+\end{proposition}
+
+\begin{proof}
+The only coupling from $\delta_y$ to $Q_{\alpha,x}$ sends masses $1-\alpha$ and $\alpha$ to the
+two atoms, so
+\[
+W_{2,G_t}^2(\delta_y,Q_{\alpha,x})
+=(1-\alpha)\norm{y-y_{\mathrm{old}}}_{G_t}^2
++\alpha\norm{y-y_T}_{G_t}^2.
+\]
+Completing the square yields \eqref{eq:a1-wasserstein-minimizer} and
+\eqref{eq:a1-irreducible}.
+\end{proof}
+
+For Euler maps, the minimizer is $x+h v_\alpha$ and the irreducible cost is
+\begin{equation}
+\alpha(1-\alpha)h^2\norm{\vT-\vold}_{G_t}^2 .
+\label{eq:a1-euler-cost}
+\end{equation}
+Thus A1 is the best deterministic approximation to a local stochastic branch mixture under the
+chosen quadratic metric.  It does \emph{not} reproduce the two-atom law.
+
+\subsection{Why one update is only a scaled A0 update}
+
+\begin{proposition}[First-step anchor degeneracy]
+\label{prop:a1-first-step}
+Assume exact replay, so $v_{\theta_k}=\vold$ on every stored state.  Then
+\begin{equation}
+\left.
+\nabla_\theta\mathcal L_{\mathrm{A1},\alpha}
+\right|_{\theta_k}
+=
+\alpha
+\left.
+\nabla_\theta\mathcal L_{\mathrm{A0}}
+\right|_{\theta_k}.
+\label{eq:a1-first-gradient}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The old-anchor gradient contains
+$J_{\theta_k}^{\top}G_t(v_{\theta_k}-\vold)$, which is pointwise zero.  Only the
+teacher term remains, multiplied by $\alpha$.
+\end{proof}
+
+For plain SGD, one step is therefore A0 with learning rate $\alpha\eta$.  Adam moments, clipping,
+weight decay, and the optimizer epsilon can prevent the final parameter update from scaling
+exactly by $\alpha$, but the loss gradient identity remains exact.  If output-space gradient
+descent with $G_t=I$ and step size $0<\eta<2$ is repeated against a frozen old target, then
+\begin{equation}
+v^{(m)}
+=
+\vold
++\alpha\bigl[1-(1-\eta)^m\bigr](\vT-\vold).
+\label{eq:a1-inner-steps}
+\end{equation}
+The old anchor becomes active after the first update and the limit is $v_\alpha$.  Genuine
+first-update trust enforcement instead requires explicit projection, a constrained line search,
+or post-update stopping based on the measured field displacement.
+
+\begin{tcolorbox}[colback=gray!5,colframe=gray!55,title=Practical meaning of Arm A1]
+A1 supplies a real geometric trust region only when the radius is enforced or the anchored
+subproblem is optimized beyond its first gradient.  With one on-policy optimizer step, a fixed
+$\alpha$ is only a teacher-gradient scale.  Flow-DPPO~\cite{flowdppo} motivates controlling
+current--old divergence; A1 is a field-space analogue with a local one-step transport
+interpretation, not a deterministic likelihood ratio or a full-flow-map projection.
+\end{tcolorbox}
+
+%% ============================================================
+\section{Arm A2: Forward-Risk P-OPD}
+\label{sec:a2}
+%% ============================================================
+
+\subsection{Forward-process evidence}
+
+Arm A2 keeps efficient ODE rollout but constructs a supervised flow-matching test after the
+rollout.  Let $x_{\mathrm{data}}=X_1^{\mathrm{old}}$ be the old ODE endpoint, draw
+$s\sim\omega_{\mathrm{FM}}$ on $[0,1]$ and
+$\varepsilon\sim\N(0,I_D)$, and form
+\begin{equation}
+x_s=(1-s)x_{\mathrm{data}}+s\varepsilon
+    =x_{\mathrm{data}}+s u,
+\qquad
+u=\varepsilon-x_{\mathrm{data}}.
+\label{eq:a2-forward-path}
+\end{equation}
+Let $z=(x_s,s,C)$ and evaluate frozen predictions
+$f_{\mathrm{old}}(z)$ and $f_T(z)$ of the native data-to-noise target $u$ on the same input.
+Every A2 expectation below is over $(C,Z,s,\varepsilon)$ under this construction.  This is the
+solver-decoupled forward-flow-matching construction~\cite{flowmatching} shared by DPO,
+DiffusionNFT, AWM, DGPO, and CRD.
+
+To make event scaling explicit, define
+\begin{equation}
+E_j(z,u)
+=
+\frac{1}{2c_D}\norm{u-f_j(z)}^2,
+\qquad
+c_D=
+\begin{cases}
+1, & \text{event sum},\\
+D, & \text{event mean},
+\end{cases}
+\label{eq:a2-energy}
+\end{equation}
+and
+\begin{equation}
+A_T=E_{\mathrm{old}}-E_T,
+\qquad
+\gamma_T
+=
+\sigma\!\left(
+  \logit\alpha+\frac{A_T}{\tau_s}
+\right).
+\label{eq:a2-gate}
+\end{equation}
+Positive $A_T$ means that the teacher predicts the sampled forward target better than the old
+student.
+
+\subsection{Exact auxiliary Gaussian interpretation}
+
+\begin{proposition}[When the forward-risk gate is a Bayes responsibility]
+\label{prop:a2-gaussian}
+Fix $z$ and introduce a component label $B\in\{\mathrm{old},T\}$ with
+$\Pr(B=T)=\alpha$.  Declare the predictive likelihood
+\begin{equation}
+p_j(u\mid z)
+=
+(2\pi\sigma_r^2(s))^{-D/2}
+\exp\!\left[
+  -\frac{\norm{u-f_j(z)}^2}{2\sigma_r^2(s)}
+\right].
+\label{eq:a2-predictive-model}
+\end{equation}
+Then
+\begin{equation}
+\Pr(B=T\mid u,z)
+=
+\sigma\!\left(
+  \logit\alpha
+  +\frac{c_D A_T}{\sigma_r^2(s)}
+\right).
+\label{eq:a2-posterior}
+\end{equation}
+Therefore \eqref{eq:a2-gate} is exactly this posterior when
+\begin{equation}
+\tau_s=\frac{\sigma_r^2(s)}{c_D}.
+\label{eq:a2-exact-temperature}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The common Gaussian normalizers cancel and
+\[
+\log\frac{p_T(u\mid z)}{p_{\mathrm{old}}(u\mid z)}
+=
+\frac{
+  \norm{u-f_{\mathrm{old}}}^2-\norm{u-f_T}^2
+}{2\sigma_r^2(s)}
+=
+\frac{c_DA_T}{\sigma_r^2(s)}.
+\]
+Bayes' rule for the two-component mixture gives \eqref{eq:a2-posterior}.
+\end{proof}
+
+The covariance $\sigma_r^2(s)I$ in Proposition~\ref{prop:a2-gaussian} is a \emph{declared
+predictive-residual model}; it is not automatically equal to the variance used to create $x_s$.
+Unequal component covariances would add log-determinant and quadratic terms that a plain
+square-loss difference does not contain.  Using an event mean with an unchanged numerical
+temperature is equivalent to inflating the predictive covariance by $D$.
+
+\subsection{What risk difference estimates}
+
+\begin{proposition}[Conditional square-loss decomposition]
+\label{prop:a2-risk-decomposition}
+Let
+\begin{equation}
+m_{\mathrm{old}}(z)=\E[u\mid z],
+\qquad
+V_{\mathrm{old}}(z)
+=
+\E\!\left[
+  \norm{u-m_{\mathrm{old}}(z)}^2\mid z
+\right],
+\label{eq:a2-conditional-mean}
+\end{equation}
+where the expectation is under old-generated endpoints and fresh forward noise.  Then
+\begin{equation}
+\E[E_j\mid z]
+=
+\frac{1}{2c_D}
+\left(
+  V_{\mathrm{old}}(z)
+  +\norm{f_j(z)-m_{\mathrm{old}}(z)}^2
+\right)
+\label{eq:a2-bias-variance}
+\end{equation}
+and
+\begin{equation}
+\E[A_T\mid z]
+=
+\frac{
+  \norm{f_{\mathrm{old}}-m_{\mathrm{old}}}^2
+  -\norm{f_T-m_{\mathrm{old}}}^2
+}{2c_D}.
+\label{eq:a2-expected-advantage}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Write
+$u-f_j=(u-m_{\mathrm{old}})+(m_{\mathrm{old}}-f_j)$.  The conditional cross term vanishes because
+$\E[u-m_{\mathrm{old}}\mid z]=0$.  Subtracting the two decompositions cancels the same
+irreducible conditional variance.
+\end{proof}
+
+Thus $A_T$ is a one-sample unbiased estimate of the conditional \emph{risk difference}.  The
+nonlinear gate is not an unbiased estimate of the sigmoid of the mean risk difference:
+\begin{equation}
+\E[\gamma_T\mid z]
+\neq
+\sigma\!\left(
+  \logit\alpha+\frac{\E[A_T\mid z]}{\tau_s}
+\right)
+\quad\text{in general}.
+\label{eq:a2-sigmoid-bias}
+\end{equation}
+Also, the old ODE field need not equal $m_{\mathrm{old}}(z)$ after an endpoint has been re-noised
+with fresh $\varepsilon$.  The construction compares two predictors on old-generated data; it
+does not assume that the old predictor is Bayes-optimal for the new coupling.
+
+\subsection{Gated projected target and trust radius}
+
+Let $r_s>0$ be an event-$L^2$ output radius in metric $G_s$.  A per-dimension RMS radius
+$r_s^{\mathrm{RMS}}$ corresponds to $r_s=\sqrt D\,r_s^{\mathrm{RMS}}$.  Define
+\begin{equation}
+d(z)=f_T(z)-f_{\mathrm{old}}(z),
+\qquad
+c(z)=
+\begin{cases}
+1, & \norm{d(z)}_{G_s}=0,\\
+\min\{1,r_s/\norm{d(z)}_{G_s}\}, & \norm{d(z)}_{G_s}>0.
+\end{cases}
+\label{eq:a2-projection-coef}
+\end{equation}
+The detached target and loss are
+\begin{align}
+f_\gamma(z,u)
+&=
+f_{\mathrm{old}}(z)
++\sg(\gamma_T)c(z)d(z),
+\label{eq:a2-target}\\
+\mathcal L_{\mathrm{A2}}(\theta)
+&=
+\E\!\left[
+  \frac{1}{2c_D}
+  \norm{f_\theta(z)-f_\gamma(z,u)}_{G_s}^2
+\right].
+\label{eq:a2-loss}
+\end{align}
+Since $0\le\gamma_T,c\le1$,
+\begin{equation}
+\norm{f_\gamma-f_{\mathrm{old}}}_{G_s}\le r_s.
+\label{eq:a2-target-trust}
+\end{equation}
+At exact replay, $f_{\theta_{\mathrm{old}}}=f_{\mathrm{old}}$, and
+\begin{equation}
+\left.
+\nabla_\theta\mathcal L_{\mathrm{A2}}
+\right|_{\theta_{\mathrm{old}}}
+=
+-\frac{1}{c_D}
+\E\!\left[
+  \gamma_Tc(z)
+  J_{\mathrm{old}}^\top G_s
+  (f_T-f_{\mathrm{old}})
+\right].
+\label{eq:a2-local-gradient}
+\end{equation}
+The gate decides whether the teacher is useful on this supervised forward target; $c(z)$ decides
+how far the target is allowed to move.
+
+For any $\delta\in(0,\tfrac12)$,
+\begin{align}
+\gamma_T\le\delta
+&\iff
+A_T\le
+\tau_s\bigl(\logit\delta-\logit\alpha\bigr),\\
+\gamma_T\ge1-\delta
+&\iff
+A_T\ge
+\tau_s\bigl(\logit(1-\delta)-\logit\alpha\bigr).
+\label{eq:a2-saturation}
+\end{align}
+An event sum normally scales as $D$ at a fixed per-coordinate risk gap, so a fixed $\tau_s$
+becomes increasingly binary with resolution.  An event mean is stable across $D$ but changes the
+auxiliary Gaussian model.  A practical implementation should log both $A_T$ and $A_T/D$, gate
+entropy and saturation, $\norm{d}_{\mathrm{RMS}}$, $\norm{d}_{2}$, $c(z)$, and the realized
+post-update field displacement.
+
+\begin{tcolorbox}[colback=yellow!5,colframe=yellow!45!black,title=Exact boundary of Arm A2]
+The Gaussian statement concerns an auxiliary likelihood for the target $u$ conditioned on $z$.
+Neither $\rho_T(x_s)$ nor $\rho_{\mathrm{old}}(x_s)$ appears.  Therefore the gate is predictive
+risk evidence on old-generated samples, not a teacher/old state-density ratio and not an exact
+marginal-mixture objective.  Timestep centering, running-scale normalization, or a calibrated
+temperature can be useful, but they define an explicit surrogate.
+\end{tcolorbox}
+
+%% ============================================================
+\section{Arm A3: SDE Transition-Mixture P-OPD}
+\label{sec:a3}
+%% ============================================================
+
+\subsection{Exact one-step mixture}
+
+Unlike Sections~\ref{sec:a0}--\ref{sec:a2}, Arm A3 uses a frozen behavior \emph{SDE} rollout.
+On a grid, sample
+\begin{equation}
+X_{\ell+1}^{\mathrm{old}}
+\sim
+p_{\mathrm{old},\ell}(
+  \,\cdot\mid X_\ell^{\mathrm{old}},C
+),
+\qquad
+J\sim\nu_{\mathrm{train}},
+\label{eq:a3-behavior-rollout}
+\end{equation}
+and let $\E_{\mathrm{SDE-old}}$ denote expectation over
+$(C,X_{0:L}^{\mathrm{old}},J)$.  The next state
+$Y=X_{J+1}^{\mathrm{old}}$ must be the actual transition sampled in this rollout.
+
+Condition on one $(C,J,X_J^{\mathrm{old}})$.  The old, teacher, and current one-step kernels share
+a positive, model-independent covariance:
+\begin{equation}
+p_j(y)=\N(y\mid\mu_j,\Sigma),
+\qquad
+j\in\{\mathrm{old},T,\theta\},
+\qquad
+\Sigma\succ0.
+\label{eq:a3-kernels}
+\end{equation}
+Define
+\begin{equation}
+q_\alpha(y)
+=(1-\alpha)p_{\mathrm{old}}(y)+\alpha p_T(y),
+\qquad
+Y\sim p_{\mathrm{old}},
+\label{eq:a3-mixture}
+\end{equation}
+and
+\begin{equation}
+\gamma(Y)
+=
+\frac{\alpha p_T(Y)}{q_\alpha(Y)}
+=
+\sigma\!\left(
+  \logit\alpha
+  +\log\frac{p_T(Y)}{p_{\mathrm{old}}(Y)}
+\right).
+\label{eq:a3-responsibility}
+\end{equation}
+This is the flow-transition version of TOP-D's external probability-mixture
+teacher~\cite{topd}.
+
+\begin{proposition}[Exact local mixture-KL gradient]
+\label{prop:a3-exact-gradient}
+Let
+$\mathcal K(\mu_\theta)=\KL(p_\theta\Vert q_\alpha)$.  At the behavior mean,
+\begin{equation}
+\left.
+\nabla_{\mu_\theta}\mathcal K
+\right|_{\mu_\theta=\mu_{\mathrm{old}}}
+=
+\E_{p_{\mathrm{old}}}[\gamma(Y)]
+\Sigma^{-1}(\mu_{\mathrm{old}}-\mu_T).
+\label{eq:a3-exact-gradient}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Write $Y=\mu_\theta+\Sigma^{1/2}Z$ with $Z\sim\N(0,I)$.  Under this
+reparameterization, $\log p_\theta(Y)$ is independent of $\mu_\theta$, so
+\[
+\nabla_{\mu_\theta}\mathcal K
+=-\E_{p_\theta}[\nabla_y\log q_\alpha(Y)].
+\]
+The mixture score is
+\[
+\nabla_y\log q_\alpha(y)
+=
+\Sigma^{-1}\!\left(
+  (1-\gamma(y))\mu_{\mathrm{old}}
+  +\gamma(y)\mu_T-y
+\right).
+\]
+At $\mu_\theta=\mu_{\mathrm{old}}$, the expectation of
+$Y-\mu_{\mathrm{old}}$ vanishes, leaving \eqref{eq:a3-exact-gradient}.
+\end{proof}
+
+Now define the detached local surrogate
+\begin{equation}
+\mathcal S_{\mathrm{sum}}(\mu_\theta)
+=
+\E_{Y\sim p_{\mathrm{old}}}\!\left[
+  \sg(\gamma(Y))
+  \frac12
+  \norm{\mu_\theta-\mu_T}_{\Sigma^{-1}}^2
+\right].
+\label{eq:a3-local-surrogate}
+\end{equation}
+Its gradient at $\mu_\theta=\mu_{\mathrm{old}}$ is exactly
+\eqref{eq:a3-exact-gradient}.  If $\mu_\theta$ is a network output, both gradients are
+left-multiplied by the same Jacobian $\partial_\theta\mu_\theta^\top$.
+
+The complete Arm A3 event-sum loss averages this conditional surrogate over the actual behavior
+SDE trajectory:
+\begin{equation}
+\mathcal L_{\mathrm{A3,sum}}(\theta)
+=
+\E_{\mathrm{SDE-old}}\!\left[
+  \sg(\gamma_J(Y))
+  \frac12
+  \norm{
+    \mu_{\theta,J}(X_J^{\mathrm{old}},C)
+    -\mu_{T,J}(X_J^{\mathrm{old}},C)
+  }_{\Sigma_J^{-1}}^2
+\right].
+\label{eq:a3-arm-loss}
+\end{equation}
+The fixed-state theorem applies inside this outer expectation.  Replacing
+$\E_{\mathrm{SDE-old}}$ by the ODE occupation measure \eqref{eq:old-occupancy} would remove the
+sampled stochastic transition and invalidate the density-ratio construction.
+
+An event-mean implementation uses
+\begin{equation}
+\mathcal S_{\mathrm{mean}}=\frac{1}{D}\mathcal S_{\mathrm{sum}},
+\qquad
+\nabla\mathcal S_{\mathrm{mean}}
+=
+\frac1D\nabla\mathcal K
+\quad\text{at }\mu_\theta=\mu_{\mathrm{old}}.
+\label{eq:a3-mean-gradient}
+\end{equation}
+It matches the gradient of the dimension-normalized objective $\mathcal K/D$, not the numerical
+gradient of the unnormalized joint KL.
+
+\subsection{Ratio law and overlap}
+
+\begin{proposition}[Gaussian ratio law]
+\label{prop:a3-ratio-law}
+Fix $\alpha\in(0,1)$ and let
+\begin{equation}
+\Delta=\mu_T-\mu_{\mathrm{old}},
+\qquad
+K=\frac12\Delta^\top\Sigma^{-1}\Delta
+=\KL(p_{\mathrm{old}}\Vert p_T).
+\label{eq:a3-K}
+\end{equation}
+Under $Y\sim p_{\mathrm{old}}$,
+\begin{equation}
+\log\frac{p_T(Y)}{p_{\mathrm{old}}(Y)}
+\sim\N(-K,2K).
+\label{eq:a3-ratio-law}
+\end{equation}
+Moreover,
+\begin{equation}
+\E_{p_{\mathrm{old}}}[\gamma(Y)]
+\le
+\min\!\left\{
+\alpha,\,
+\frac12\sqrt{\frac{\alpha}{1-\alpha}}e^{-K/4}
+\right\}.
+\label{eq:a3-overlap-bound}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Write $Y=\mu_{\mathrm{old}}+\Sigma^{1/2}Z$.  Direct expansion gives
+\[
+\log\frac{p_T(Y)}{p_{\mathrm{old}}(Y)}
+=Z^\top\Sigma^{-1/2}\Delta-K.
+\]
+The first term has variance $\Delta^\top\Sigma^{-1}\Delta=2K$.  For the second claim, put
+$r=p_T/p_{\mathrm{old}}$.  The arithmetic--geometric mean inequality gives
+\[
+\gamma
+=\frac{\alpha r}{1-\alpha+\alpha r}
+\le
+\frac12\sqrt{\frac{\alpha}{1-\alpha}}\sqrt r.
+\]
+Integrating under $p_{\mathrm{old}}$ gives the Gaussian Bhattacharyya coefficient
+\[
+\int\sqrt{p_{\mathrm{old}}p_T}
+=
+\exp\!\left(-\frac18\Delta^\top\Sigma^{-1}\Delta\right)
+=e^{-K/4}.
+\]
+Finally, concavity of
+$r\mapsto\alpha r/(1-\alpha+\alpha r)$ and $\E_{p_{\mathrm{old}}}[r]=1$
+give the bound by $\alpha$.
+\end{proof}
+
+Equation~\eqref{eq:a3-overlap-bound} makes the mechanism explicit: the expected teacher pull is
+controlled by overlap between the two complete transition events, not merely by per-coordinate
+agreement.
+
+\subsection{The ODE limit: the gate disappears, the control cost survives}
+
+Keep $\alpha\in(0,1)$ fixed and let
+\begin{equation}
+\mu_j=x+hF_j,
+\qquad
+\Sigma_\varepsilon=\varepsilon hA,
+\qquad
+A\succ0 .
+\label{eq:a3-euler-sde}
+\end{equation}
+Then
+\begin{equation}
+K_\varepsilon
+=
+\frac{h}{2\varepsilon}
+\norm{F_T-F_{\mathrm{old}}}_{A^{-1}}^2.
+\label{eq:a3-small-noise-K}
+\end{equation}
+If $F_T\neq F_{\mathrm{old}}$ and $h/\varepsilon\to\infty$, then
+\begin{equation}
+\gamma(Y)\to0
+\quad\text{in probability},\qquad
+\E[\gamma(Y)]
+=
+O\!\left(
+  \exp\!\left[
+    -\frac{h}{8\varepsilon}
+    \norm{F_T-F_{\mathrm{old}}}_{A^{-1}}^2
+  \right]
+\right).
+\label{eq:a3-small-noise-collapse}
+\end{equation}
+The mean-gradient with respect to the drift is
+\begin{equation}
+\left.
+\nabla_{F_\theta}\mathcal K
+\right|_{F_\theta=F_{\mathrm{old}}}
+=
+\frac{h}{\varepsilon}\E[\gamma(Y)]
+A^{-1}(F_{\mathrm{old}}-F_T),
+\label{eq:a3-drift-gradient}
+\end{equation}
+so the exponential overlap loss dominates the polynomial $1/\varepsilon$ factor and the teacher
+gradient vanishes.
+
+This limit requires $K_\varepsilon\to\infty$.  Taking $h\to0$ first at fixed nonzero diffusion
+intensity instead makes the one-step $K_\varepsilon$ small.  The relevant ODE statement is the
+zero-noise limit at a fixed practical solver grid, or any joint limit with $h/\varepsilon\to\infty$.
+
+In contrast, the pairwise KL obeys
+\begin{equation}
+\frac{\varepsilon}{h}
+\KL\!\left(
+  \N(x+hF_\theta,\varepsilon hA)
+  \,\middle\Vert\,
+  \N(x+hF_T,\varepsilon hA)
+\right)
+=
+\frac12\norm{F_\theta-F_T}_{A^{-1}}^2,
+\label{eq:a3-pairwise-control}
+\end{equation}
+which is the control-energy geometry of \eqref{eq:control-energy-limit}.  The transition-mixture
+KL itself instead approaches a flat component-selection cost:
+\begin{equation}
+\KL(p_{\mathrm{old}}\Vert q_\alpha)
+\longrightarrow
+-\log(1-\alpha).
+\label{eq:a3-mixture-flat-limit}
+\end{equation}
+To verify the limit, put $r=p_T/p_{\mathrm{old}}$ and write
+\begin{equation}
+\KL(p_{\mathrm{old}}\Vert q_\alpha)
+=
+-\log(1-\alpha)
+-\E_{p_{\mathrm{old}}}
+\log\!\left(
+  1+\frac{\alpha}{1-\alpha}r
+\right).
+\label{eq:a3-mixture-limit-expansion}
+\end{equation}
+Using $\log(1+x)\le2\sqrt{x}$ and the Bhattacharyya coefficient from
+Proposition~\ref{prop:a3-ratio-law},
+\begin{equation}
+0
+\le
+-\log(1-\alpha)
+-\KL(p_{\mathrm{old}}\Vert q_\alpha)
+\le
+2\sqrt{\frac{\alpha}{1-\alpha}}e^{-K_\varepsilon/4},
+\label{eq:a3-mixture-limit-bound}
+\end{equation}
+which tends to zero when $K_\varepsilon\to\infty$.
+Thus the quadratic metric has a useful deterministic limit, while the probability-mixture gate
+does not.
+
+\subsection{Temperature, latent sum, and latent mean}
+
+For equal-covariance Gaussians and $T_g>0$,
+\begin{equation}
+\frac{1}{T_g}
+\log\frac{\N(y\mid\mu_T,\Sigma)}
+         {\N(y\mid\mu_{\mathrm{old}},\Sigma)}
+=
+\log\frac{\N(y\mid\mu_T,T_g\Sigma)}
+         {\N(y\mid\mu_{\mathrm{old}},T_g\Sigma)}.
+\label{eq:a3-temperature-covariance}
+\end{equation}
+Therefore dividing the log ratio by $T_g$ is pointwise equivalent to inflating both component
+covariances by $T_g$.  A fully consistent inflated-covariance mixture would also sample
+$Y\sim\N(\mu_{\mathrm{old}},T_g\Sigma)$ and divide the local quadratic by $T_g$.  Changing only
+the gate temperature while retaining original samples and loss normalization is a tempered
+surrogate, not the exact gradient of the original mixture KL.
+
+Define the whitened per-coordinate gap
+\begin{equation}
+w^2
+=
+\frac1D
+\Delta^\top\Sigma^{-1}\Delta .
+\label{eq:a3-whitened-rms}
+\end{equation}
+Then
+\begin{equation}
+K=\frac{D}{2}w^2,
+\qquad
+L_{\mathrm{sum}}
+\sim
+\N\!\left(-\frac{D}{2}w^2,Dw^2\right),
+\label{eq:a3-sum-law}
+\end{equation}
+while
+\begin{equation}
+L_{\mathrm{mean}}
+=\frac{L_{\mathrm{sum}}}{D}
+\sim
+\N\!\left(-\frac12w^2,\frac{w^2}{D}\right).
+\label{eq:a3-mean-law}
+\end{equation}
+The sum is the exact joint event likelihood.  The mean is exactly gate temperature $T_g=D$, or
+covariance inflation by $D$.  As $D$ grows at fixed $w$, the sum gate separates exponentially;
+the mean gate converges to
+\begin{equation}
+\sigma\!\left(\logit\alpha-\frac12w^2\right)
+\label{eq:a3-mean-limit}
+\end{equation}
+and becomes deterministic across samples.  Intermediate temperatures define surrogates with an
+explicit effective dimension.  This reproduces the companion exact-sum gate analysis.
+
+\begin{tcolorbox}[colback=red!4,colframe=red!45!black,title=Exact boundary of Arm A3]
+The local-gradient equality requires: the same complete latent event, positive shared
+model-independent covariance, an actual transition sampled by the frozen old student,
+$\mu_\theta=\mu_{\mathrm{old}}$ at the expansion point, detached old/teacher/gate quantities, and
+the untempered joint ratio.  It is an equality of first derivatives at one on-policy point, not
+an equality of loss values, Hessians, multi-step trajectory objectives, or gradients after
+multiple stale-data updates.
+\end{tcolorbox}
+
+%% ============================================================
+\section{Arm A4: Marginal-Mixture Conditional Flow Matching}
+\label{sec:a4}
+%% ============================================================
+
+\subsection{Mixture marginals and their velocity}
+
+Fix a conditioning value $C=c$.  All densities and fields in this section are conditional on
+$c$, which is suppressed from the notation; the final training loss also averages over $C$.
+Assume the old and teacher ODE marginals have densities satisfying their continuity equations:
+\begin{equation}
+\partial_t\rho_{b,t}
++\nabla_x\!\cdot(\rho_{b,t}v_b)=0,
+\qquad
+\rho_{b,0}=\rho_{\mathrm{base}},
+\qquad
+b\in\{\mathrm{old},T\}.
+\label{eq:a4-source-continuity}
+\end{equation}
+Define
+\begin{align}
+q_t
+&=(1-\alpha)\rho_{\mathrm{old},t}+\alpha\rho_{T,t},
+\label{eq:a4-mixture-density}\\
+q_tu_t
+&=(1-\alpha)\rho_{\mathrm{old},t}\vold
+  +\alpha\rho_{T,t}\vT .
+\label{eq:a4-mixture-flux}
+\end{align}
+
+\begin{proposition}[Exact mixture continuity equation]
+\label{prop:a4-continuity}
+The pair $(q_t,u_t)$ satisfies
+\begin{equation}
+\partial_tq_t+\nabla_x\!\cdot(q_tu_t)=0,
+\qquad
+q_0=\rho_{\mathrm{base}}.
+\label{eq:a4-continuity}
+\end{equation}
+Where $q_t(x)>0$, define
+\begin{equation}
+\gamma_t(x)
+=
+\frac{\alpha\rho_{T,t}(x)}{q_t(x)}.
+\label{eq:a4-marginal-responsibility}
+\end{equation}
+Then
+\begin{equation}
+u_t(x)
+=(1-\gamma_t(x))\vold(t,x)
++\gamma_t(x)\vT(t,x).
+\label{eq:a4-mixture-velocity}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Substitute \eqref{eq:a4-mixture-density}--\eqref{eq:a4-mixture-flux}:
+\begin{align*}
+\partial_tq_t+\nabla\!\cdot(q_tu_t)
+&=(1-\alpha)
+  [\partial_t\rho_{\mathrm{old},t}
+   +\nabla\!\cdot(\rho_{\mathrm{old},t}\vold)]\\
+&\quad
+  +\alpha
+  [\partial_t\rho_{T,t}
+   +\nabla\!\cdot(\rho_{T,t}\vT)]
+=0.
+\end{align*}
+The common base law gives $q_0=\rho_{\mathrm{base}}$.  Dividing the flux by $q_t$ gives
+\eqref{eq:a4-mixture-velocity}.
+\end{proof}
+
+This is the deterministic analogue of a probability-mixture responsibility, but the
+responsibility is over time marginals rather than one-step Dirac kernels.
+
+\subsection{Two-source CFM without density ratios}
+
+Sample one source branch for a whole trajectory and a training time:
+\begin{equation}
+B\sim\operatorname{Bernoulli}(\alpha),
+\qquad
+t\sim\omega,
+\qquad
+X_t=\Phi_t^B(Z),
+\qquad
+V_t=
+\begin{cases}
+\vold(t,X_t), & B=0,\\
+\vT(t,X_t), & B=1.
+\end{cases}
+\label{eq:a4-branch-sampling}
+\end{equation}
+The practical objective is
+\begin{equation}
+\mathcal L_{\mathrm{A4}}(\theta)
+=
+\E_{C,t,B,Z}
+\norm{\vtheta(t,X_t)-V_t}^2 .
+\label{eq:a4-two-source-loss}
+\end{equation}
+The norm in \eqref{eq:a4-two-source-loss} is an event sum.  A per-dimension implementation divides
+the entire loss, including the constant below, by $D$.
+
+\begin{proposition}[Two-source CFM identity]
+\label{prop:a4-cfm}
+Under \eqref{eq:a4-branch-sampling},
+$X_t\sim q_t$,
+\begin{equation}
+\Pr(B=1\mid X_t=x,t)=\gamma_t(x),
+\qquad
+\E[V_t\mid X_t=x,t]=u_t(x),
+\label{eq:a4-conditional-mean}
+\end{equation}
+and
+\begin{equation}
+\mathcal L_{\mathrm{A4}}(\theta)
+=
+\E_{C,t,X_t\sim q_t(\cdot\mid C)}
+\norm{\vtheta(t,X_t)-u_t(X_t)}^2
++\mathcal C_{\mathrm{var}},
+\label{eq:a4-cfm-decomposition}
+\end{equation}
+where
+\begin{equation}
+\mathcal C_{\mathrm{var}}
+=
+\E_{C,t,X_t\sim q_t(\cdot\mid C)}\!\left[
+  \gamma_t(X_t)(1-\gamma_t(X_t))
+  \norm{\vT(t,X_t)-\vold(t,X_t)}^2
+\right]
+\label{eq:a4-variance-constant}
+\end{equation}
+is independent of $\theta$.
+\end{proposition}
+
+\begin{proof}
+Marginalizing the branch label gives
+$X_t\sim(1-\alpha)\rho_{\mathrm{old},t}+\alpha\rho_{T,t}=q_t$.  Bayes' rule gives
+\eqref{eq:a4-marginal-responsibility}, and the conditional mean of the two possible velocity
+labels is \eqref{eq:a4-mixture-velocity}.  Finally write
+\[
+\vtheta-V_t=(\vtheta-u_t)+(u_t-V_t).
+\]
+Conditioned on $(t,X_t)$, the cross term vanishes because
+$\E[V_t-u_t\mid t,X_t]=0$.  The conditional variance of a two-point label is
+$\gamma_t(1-\gamma_t)\norm{\vT-\vold}^2$, proving the result.
+\end{proof}
+
+The analytic optimum contains the density responsibility $\gamma_t$, but training never evaluates
+it.  Regression on samples from the joint law $(B,X_t,V_t)$ learns the conditional mean
+implicitly.  This is the standard conditional-flow-matching mechanism~\cite{flowmatching}.
+
+\subsection{When the generated marginals are exactly the mixture}
+
+Suppose $q_t$ and the flux in \eqref{eq:a4-mixture-flux} are continuously differentiable, $q_t>0$
+on the relevant region, and $u_t$ is continuous in time, Lipschitz in state, and has at most
+linear growth.  Then the ODE
+\begin{equation}
+\dot X_t=u_t(X_t),
+\qquad
+X_0\sim\rho_{\mathrm{base}},
+\label{eq:a4-target-ode}
+\end{equation}
+has a unique flow, and its density is the unique classical solution of
+\eqref{eq:a4-continuity}.  Therefore
+\begin{equation}
+(\Phi_t^u)_\#\rho_{\mathrm{base}}=q_t
+=(1-\alpha)\rho_{\mathrm{old},t}+\alpha\rho_{T,t}.
+\label{eq:a4-exact-marginals}
+\end{equation}
+Under population optimization and sufficient model capacity, the square-loss minimizer equals
+$u_t$ almost everywhere under $\omega(t)q_t(x)\dd t\dd x$.  Arm A4 realizes the mixture path
+exactly when the fitted field admits a continuous/Lipschitz representative that equals $u_t$ on
+the region traversed by the target flow; equality of abstract $L^2$ equivalence classes alone is
+not enough to define an ODE.
+
+These regularity conditions are not automatic.  Where both component densities are positive,
+differentiating \eqref{eq:a4-marginal-responsibility} gives
+\begin{equation}
+\nabla\gamma_t
+=
+\gamma_t(1-\gamma_t)
+\left(
+  \nabla\log\rho_{T,t}
+  -\nabla\log\rho_{\mathrm{old},t}
+\right).
+\label{eq:a4-gamma-gradient}
+\end{equation}
+Low-overlap distributions can create a thin, stiff boundary where $u_t$ switches between the two
+source fields.
+
+\subsection{Exact contraction statements}
+
+\begin{proposition}[Contraction of the ideal marginal mixture]
+\label{prop:a4-contraction}
+Assume the displayed KL terms are finite and both source laws have finite $p$-th moments.  At
+every time $t$,
+\begin{align}
+\norm{q_t-\rho_{T,t}}_1
+&=(1-\alpha)
+  \norm{\rho_{\mathrm{old},t}-\rho_{T,t}}_1,
+\label{eq:a4-l1-contraction}\\
+\KL(q_t\Vert\rho_{T,t})
+&\le
+(1-\alpha)
+\KL(\rho_{\mathrm{old},t}\Vert\rho_{T,t}),
+\label{eq:a4-kl-contraction}\\
+W_p^p(q_t,\rho_{T,t})
+&\le
+(1-\alpha)
+W_p^p(\rho_{\mathrm{old},t},\rho_{T,t}),
+\qquad p\ge1.
+\label{eq:a4-wasserstein-contraction}
+\end{align}
+The first line is equivalently an exact total-variation contraction.  For $p=1$,
+\eqref{eq:a4-wasserstein-contraction} is an equality; for $p>1$ it need not be.
+\end{proposition}
+
+\begin{proof}
+The signed density difference is
+$q_t-\rho_{T,t}=(1-\alpha)(\rho_{\mathrm{old},t}-\rho_{T,t})$, proving
+\eqref{eq:a4-l1-contraction}.  Convexity of $r\mapsto r\log r$ gives
+\[
+\left(
+  (1-\alpha)\frac{\rho_{\mathrm{old},t}}{\rho_{T,t}}+\alpha
+\right)
+\log\!\left(
+  (1-\alpha)\frac{\rho_{\mathrm{old},t}}{\rho_{T,t}}+\alpha
+\right)
+\le
+(1-\alpha)
+\frac{\rho_{\mathrm{old},t}}{\rho_{T,t}}
+\log\frac{\rho_{\mathrm{old},t}}{\rho_{T,t}},
+\]
+which integrates against $\rho_{T,t}$ to \eqref{eq:a4-kl-contraction}.  For Wasserstein distance,
+mix an optimal
+coupling between $\rho_{\mathrm{old},t}$ and $\rho_{T,t}$ with weight $1-\alpha$ and the identity
+coupling of $\rho_{T,t}$ with itself with weight $\alpha$.  Its transport cost is
+$(1-\alpha)W_p^p(\rho_{\mathrm{old},t},\rho_{T,t})$, proving the upper bound.  The
+Kantorovich--Rubinstein dual formula gives equality at $p=1$.
+\end{proof}
+
+These are properties of the ideal mixture $q_t$.  A finite-capacity student, if a global
+population optimum is attained, returns the best $L^2(q_t)$ fit to $u_t$ and need not preserve
+them exactly.  If the fitted field $\widehat v$ is $L$-Lipschitz, the same coupling argument as
+Proposition~\ref{prop:gronwall} gives the practical error bound
+\begin{equation}
+W_2^2(\widehat\rho_t,q_t)
+\le
+t\int_0^t
+e^{2L(t-s)}
+\E_{X_s\sim q_s}
+\norm{\widehat v(s,X_s)-u_s(X_s)}^2\dd s .
+\label{eq:a4-capacity-bound}
+\end{equation}
+
+\subsection{Cost and the branch-selection distinction}
+
+Exact A4 sampling requires states from both $\rho_{\mathrm{old},t}$ and $\rho_{T,t}$.  In
+practice this means complete teacher trajectories for an $\alpha$ fraction of examples, or cached
+teacher trajectories reused across sampled training times.  Evaluating the teacher field only on
+old states does not create samples from the teacher marginal and reduces A4 back to an
+old-occupancy field objective.
+
+Choosing $B$ once per trajectory gives the path-law mixture used in
+\eqref{eq:a4-branch-sampling}.  Choosing independent branches at every small Euler step instead
+has conditional mean field
+\begin{equation}
+\bar v=(1-\alpha)\vold+\alpha\vT,
+\label{eq:a4-rapid-switch}
+\end{equation}
+and converges, as switching variance vanishes with the step size, to the arithmetic-average ODE
+of Arm A1.  In general,
+\begin{equation}
+\bar v-u_t
+=(\alpha-\gamma_t)(\vT-\vold),
+\label{eq:a4-average-gap}
+\end{equation}
+so the two constructions coincide only in special cases such as equal marginals or equal fields.
+
+%% ============================================================
+\section*{Synthesis}
+\addcontentsline{toc}{section}{Synthesis}
+%% ============================================================
+
+\begin{center}
+\begin{tabular}{@{}
+  >{\raggedright\arraybackslash}p{0.08\textwidth}
+  >{\raggedright\arraybackslash}p{0.23\textwidth}
+  >{\raggedright\arraybackslash}p{0.27\textwidth}
+  >{\raggedright\arraybackslash}p{0.31\textwidth}
+@{}}
+\toprule
+Arm & mathematical object & exact statement & principal boundary\\
+\midrule
+A0 & old-occupancy field MSE
+& exact weighted regression / finite-capacity least-squares fit
+& no explicit trust region; no distribution objective\\
+\addlinespace
+A1 & quadratic field geometry
+& exact field barycenter and trust-ball projection; local Euler transport view
+& one on-policy step only scales A0; not a density mixture\\
+\addlinespace
+A2 & forward-target predictive risk
+& exact posterior only for a declared shared-covariance residual model
+& not a state-density ratio; calibration changes the surrogate\\
+\addlinespace
+A3 & stochastic one-step transition mixture
+& exact mixture-KL first derivative at the old policy
+& requires SDE covariance and $T_g=1$; high-dimensional overlap collapse\\
+\addlinespace
+A4 & mixture of ODE time marginals
+& exact marginal path under population fitting and ODE regularity
+& requires teacher trajectories, capacity, and a regular mixture velocity\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The five arms answer different questions rather than forming a single ranking.  A0 is the cheapest
+ODE baseline.  A1 is the appropriate deterministic trust-region baseline.  A2 adds inexpensive,
+solver-agnostic evidence about teacher predictive competence.  A3 is the strict transition-level
+probability-mixture construction when an SDE is acceptable.  A4 is the strict deterministic
+probability-mixture comparator at the marginal level, paid for with teacher trajectories.
+
+For practical ODE distillation, the main comparison should therefore keep these roles separate:
+\begin{enumerate}[leftmargin=1.6em]
+\item compare A0 and one-step A1 at a matched effective teacher-gradient scale, because
+      Proposition~\ref{prop:a1-first-step} predicts equality otherwise;
+\item test A1 with an actually enforced field RMS budget or multiple frozen-old inner updates;
+\item compare A2 against an ungated target with the same timestep and norm normalization;
+\item retain A3 as the stochastic local-mixture reference and log its joint/per-dimension gap and
+      responsibility saturation;
+\item use A4 on a smaller scale as the exact marginal-mixture comparator.
+\end{enumerate}
+
+\begin{tcolorbox}[colback=gray!5,colframe=gray!55,title=Main formal conclusion]
+There is no nontrivial deterministic continuation of the SDE transition-responsibility gate.
+What transfers to ODEs is the rescaled quadratic control geometry (A1), not the likelihood ratio.
+An exact deterministic probability mixture is still possible, but it lives at the level of ODE
+time marginals and is trained by two-source conditional flow matching (A4).
+\end{tcolorbox}
+
+\begin{thebibliography}{9}
+
+\bibitem{flowmatching}
+Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le.
+\newblock Flow Matching for Generative Modeling.
+\newblock \emph{International Conference on Learning Representations}, 2023.
+\newblock \url{https://arxiv.org/abs/2210.02747}.
+
+\bibitem{diffusionopd}
+Quanhao Li, Junqiu Yu, Kaixun Jiang, et al.
+\newblock DiffusionOPD: A Unified Perspective of On-Policy Distillation in Diffusion Models.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2605.15055}.
+
+\bibitem{topd}
+Zhengpeng Xie, Li Lyna Zhang, Zeke Xie, and Mao Yang.
+\newblock Trust Region Policy Distillation.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2607.04751}.
+
+\bibitem{flowdppo}
+Bowen Ping, Xiangxin Zhou, Penghui Qi, Minnan Luo, Liefeng Bo, and Tianyu Pang.
+\newblock Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2606.11025}.
+
+\end{thebibliography}
+
+\end{document}
