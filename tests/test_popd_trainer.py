@@ -80,22 +80,40 @@ class TestPOPDTrainerCache(unittest.TestCase):
                 timestep_indices=[0],
             )
 
-    def test_diagnostics_keep_per_sample_timestep_values_and_global_quantiles(self) -> None:
+    def test_only_gate_and_joint_kl_are_broken_out_per_timestep(self) -> None:
+        """Per-step series are restricted to the two keys that need a trajectory view.
+
+        Every diagnostic expands into four statistics, so breaking all of them out per trained
+        transition produced hundreds of series per epoch. The gate and the joint KL earn a
+        per-step view because both vary by orders of magnitude along the denoising axis; the rest
+        are only logged pooled.
+        """
         trainer = self._trainer()
         trainer.accelerator = SimpleNamespace(gather=lambda values: values)
         loss_info = defaultdict(list)
         gamma = torch.tensor([0.1, 0.5, 0.9])
         trainer._append_popd_diagnostics(
             loss_info,
-            {"gamma": gamma, "teacher_old_gap_rms": torch.ones(3)},
+            {
+                "gamma": gamma,
+                "teacher_old_kl_joint": torch.tensor([1.0, 2.0, 3.0]),
+                "ungated_mean_kl": torch.ones(3),
+            },
             timestep_index=2,
         )
         self.assertEqual(loss_info["popd/gamma/t2"][0].shape, (3,))
-        self.assertEqual(loss_info["popd/teacher_old_gap_rms/t2"][0].shape, (3,))
+        self.assertEqual(loss_info["popd/teacher_old_kl_joint/t2"][0].shape, (3,))
+        self.assertNotIn("popd/ungated_mean_kl/t2", loss_info)
+        # Pooled series still carry every diagnostic that was passed in.
+        self.assertEqual(loss_info["popd/ungated_mean_kl"][0].shape, (3,))
 
         quantiles = trainer._gather_popd_gamma_quantiles(loss_info)
         torch.testing.assert_close(quantiles["popd/gamma_p50"], torch.tensor(0.5))
-        torch.testing.assert_close(quantiles["popd/gamma/t2_p90"], torch.tensor(0.82))
+        self.assertEqual(
+            sorted(quantiles),
+            ["popd/gamma_p01", "popd/gamma_p10", "popd/gamma_p50", "popd/gamma_p90",
+             "popd/gamma_p99"],
+        )
 
 
 class TestPOPDScheduleAlignment(unittest.TestCase):

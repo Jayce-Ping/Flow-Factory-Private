@@ -134,6 +134,7 @@ class XOPDTrainer(BaseTrainer):
         self._is_popd = self.xopd_target_mode == "p_opd"
         self.popd_alpha = float(ta.popd_alpha) if self._is_popd else 0.5
         self.popd_temperature = float(ta.popd_temperature) if self._is_popd else 1.0
+        self.popd_verbose_diagnostics = bool(ta.popd_verbose_diagnostics)
 
         # 'v' (raw velocity), 'x0' (clean-latent) and 'x0_norm' (self-normalized x0) d_k all recover
         # v from the ODE Euler mean (mu = x_t + v*dt); that identity only holds under ODE, so require
@@ -3130,8 +3131,17 @@ class XOPDTrainer(BaseTrainer):
             )
         return caches
 
-    @staticmethod
+    # Only these two diagnostics are broken out per trained transition. Everything the gate does
+    # depends on where in the trajectory the transition sits -- K varies by four decades along the
+    # denoising axis against roughly 30% between samples at a fixed step (see
+    # docs/xopd/popd_exact_sum_gate_saturation.tex) -- so the joint KL and the gate need a
+    # per-step view while the rest are readable in aggregate. Expanding all of them per step is
+    # what turned ten diagnostics into several hundred logged series.
+    _POPD_PER_STEP_KEYS = ("teacher_old_kl_joint", "gamma")
+
+    @classmethod
     def _append_popd_diagnostics(
+        cls,
         loss_info: Dict[str, List[torch.Tensor]],
         diagnostics: Dict[str, torch.Tensor],
         *,
@@ -3140,25 +3150,26 @@ class XOPDTrainer(BaseTrainer):
         """Accumulate detached global and per-timestep P-OPD scalar diagnostics."""
         for name, values in diagnostics.items():
             loss_info[f"popd/{name}"].append(values)
-            timestep_key = f"popd/{name}/t{timestep_index}"
-            # Preserve per-sample values so reduce_loss_info reports true
-            # min/max/mean/std independently for every trained transition.
-            loss_info[timestep_key].append(values)
+            if name in cls._POPD_PER_STEP_KEYS:
+                # Per-sample values, so reduce_loss_info reports true min/max/mean/std for this
+                # transition rather than a mean of means.
+                loss_info[f"popd/{name}/t{timestep_index}"].append(values)
 
     def _gather_popd_gamma_quantiles(
         self,
         loss_info: Dict[str, List[torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
-        """Gather per-sample gamma values and compute true global quantiles."""
+        """Gather per-sample gamma values and compute true global quantiles.
+
+        Quantiles are computed for the pooled gate only. The per-step gate is already summarized
+        by its mean and standard deviation, and per-step quantiles multiplied the logged series by
+        five for information that the pooled distribution plus the per-step means already carry.
+        """
         quantile_metrics: Dict[str, torch.Tensor] = {}
-        gamma_keys = [
-            key for key in loss_info if key == "popd/gamma" or key.startswith("popd/gamma/t")
-        ]
-        for key in gamma_keys:
-            local = torch.cat(loss_info[key]).detach()
-            gathered = self.accelerator.gather(local)
-            for quantile_name, value in compute_popd_quantiles(gathered).items():
-                quantile_metrics[f"{key}_{quantile_name}"] = value
+        local = torch.cat(loss_info["popd/gamma"]).detach()
+        gathered = self.accelerator.gather(local)
+        for quantile_name, value in compute_popd_quantiles(gathered).items():
+            quantile_metrics[f"popd/gamma_{quantile_name}"] = value
         return quantile_metrics
 
     def _validation_d_k_per_timestep(
@@ -3437,6 +3448,7 @@ class XOPDTrainer(BaseTrainer):
                             transition_variance=popd_cache.transition_variance,
                             dt=popd_cache.dt,
                             responsibility=popd_cache.responsibility,
+                            verbose=self.popd_verbose_diagnostics,
                         )
                         self._append_popd_diagnostics(
                             loss_info,

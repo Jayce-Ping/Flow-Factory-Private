@@ -2611,6 +2611,16 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    popd_verbose_diagnostics: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Log every P-OPD diagnostic instead of the ten essential ones. Each diagnostic "
+                "becomes four statistics globally, so the full set is several hundred series per "
+                "epoch; enable only when debugging the sampler or the gate."
+            )
+        },
+    )
     popd_temperature: float = field(
         default=1.0,
         metadata={

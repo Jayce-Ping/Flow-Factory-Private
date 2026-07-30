@@ -104,6 +104,13 @@ def fetch(run_path: str) -> Dict:
 
 def _series(data: Dict, field: str) -> Tuple[List[int], List[float]]:
     steps = data["steps"]
+    missing = [s for s in steps if f"{field}_mean" not in data["per_step"][s]]
+    if missing:
+        raise KeyError(
+            f"run {data['run']!r} has no per-step values for {field!r} (missing at steps "
+            f"{missing!r}). Long runs log only the essential diagnostics; re-run the probe with "
+            "train.popd_verbose_diagnostics: true, which the diag config already sets."
+        )
     return steps, [data["per_step"][s][f"{field}_mean"] for s in steps]
 
 

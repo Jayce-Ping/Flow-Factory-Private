@@ -96,6 +96,7 @@ train:
   xopd_target_mode: "p_opd"
   popd_alpha: 0.5                         # neutral prior for the probe; the real run's alpha is set from measured K
   popd_temperature: 1.0                   # EXACT latent sum -- the case under test
+  popd_verbose_diagnostics: true          # probe: log every diagnostic; the long runs log only the essential ten
   kl_type: "x-based"
   kl_beta: 0.0
 

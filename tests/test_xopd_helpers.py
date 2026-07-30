@@ -360,15 +360,66 @@ class TestPOPDResponsibility(unittest.TestCase):
             responsibility=result,
         )
         torch.testing.assert_close(metrics["old_innovation_rms"], torch.ones(1))
-        torch.testing.assert_close(metrics["teacher_old_gap_l2"], torch.tensor([2.0]))
-        torch.testing.assert_close(
-            metrics["teacher_old_gap_rms"],
-            torch.tensor([2.0**0.5]),
-        )
         torch.testing.assert_close(metrics["teacher_old_kl_joint"], torch.tensor([0.5]))
-        torch.testing.assert_close(metrics["teacher_old_kl_per_dim"], torch.tensor([0.25]))
         torch.testing.assert_close(metrics["behavior_drift_rms"], torch.zeros(1))
+        # K = (D/2) w^2 is the identity the temperature is calibrated from, so the whitened
+        # per-dimension gap has to be reported and has to be consistent with the joint KL.
+        torch.testing.assert_close(
+            metrics["teacher_old_gap_whitened_rms"],
+            torch.tensor([(2.0 / 4.0) ** 0.5]),
+        )
+        event_dim = next_latents.shape[1]
+        torch.testing.assert_close(
+            metrics["teacher_old_kl_joint"],
+            0.5 * event_dim * metrics["teacher_old_gap_whitened_rms"].square(),
+        )
         self.assertTrue(all(not value.requires_grad for value in metrics.values()))
+
+    def test_default_diagnostics_are_the_essential_ten_and_verbose_restores_the_rest(self) -> None:
+        mu_old = torch.zeros(1, 2)
+        mu_teacher = torch.tensor([[2.0, 0.0]])
+        next_latents = torch.tensor([[2.0, -2.0]])
+        variance = torch.tensor([4.0])
+        common = dict(
+            next_latents=next_latents,
+            mu_old=mu_old,
+            mu_teacher=mu_teacher,
+            mu_student=mu_old,
+            transition_variance=variance,
+            dt=torch.tensor([-0.25]),
+            responsibility=compute_popd_responsibility(
+                next_latents=next_latents,
+                mu_old=mu_old,
+                mu_teacher=mu_teacher,
+                transition_variance=variance,
+                alpha=0.5,
+                temperature=1.0,
+            ),
+        )
+        essential = compute_popd_diagnostics(**common)
+        self.assertEqual(
+            sorted(essential),
+            [
+                "behavior_drift_rms",
+                "event_dim",
+                "gamma",
+                "gamma_gt_099",
+                "gamma_lt_001",
+                "gated_mean_kl",
+                "log_rho_sum",
+                "old_innovation_rms",
+                "teacher_old_gap_whitened_rms",
+                "teacher_old_kl_joint",
+                "ungated_mean_kl",
+            ],
+        )
+        verbose = compute_popd_diagnostics(**common, verbose=True)
+        self.assertLess(len(essential), len(verbose))
+        self.assertTrue(set(essential).issubset(verbose))
+        for dropped in ("alpha", "temperature", "teacher_old_kl_per_dim",
+                        "gate_logit", "student_teacher_gap_whitened_rms"):
+            self.assertIn(dropped, verbose)
+            self.assertNotIn(dropped, essential)
 
 
 class TestPOPDBehaviorTransition(unittest.TestCase):

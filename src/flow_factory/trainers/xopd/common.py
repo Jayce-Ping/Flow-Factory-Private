@@ -529,8 +529,36 @@ def compute_popd_diagnostics(
     transition_variance: torch.Tensor,
     dt: torch.Tensor,
     responsibility: POPDResponsibility,
+    verbose: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Compute detached per-sample P-OPD scale and sampler diagnostics.
+
+    Every returned key is a per-sample tensor, which the reducer expands into four statistics
+    and logs once globally and once per trained timestep. Thirty keys therefore became several
+    hundred metrics per epoch, which is unreadable, so the default set is the ten that are
+    actually load-bearing:
+
+    * ``old_innovation_rms``, ``behavior_drift_rms`` -- the two self-validating checks. Cheap
+      insurance that keeps a broken covariance from being mistaken for a saturated gate.
+    * ``teacher_old_kl_joint``, ``teacher_old_gap_whitened_rms``, ``log_rho_sum`` -- the joint KL
+      that drives the gate, its scale-free per-dimension form, and the ratio itself.
+    * ``gamma``, ``gamma_lt_001``, ``gamma_gt_099`` -- the gate and how often it is pinned.
+    * ``ungated_mean_kl``, ``gated_mean_kl`` -- the objective with and without the gate.
+
+    What was dropped and why: constants already in the config (``alpha``, ``temperature``,
+    ``event_dim``, ``temperature_over_event_dim``); exact restatements of another key
+    (``teacher_old_kl_per_dim`` is the joint over D, ``effective_gate`` is ``gamma``,
+    ``tempered_log_ratio`` and ``gate_logit`` are affine in ``log_rho_sum``, ``log_rho_per_dim``
+    is ``log_rho_sum`` over D); scheduler quantities that never move within a run
+    (``transition_std``, ``transition_variance``, ``abs_dt``); un-whitened or absolute magnitudes
+    superseded by their whitened form (``teacher_old_gap_rms``, ``teacher_old_gap_l2``,
+    ``next_latent_rms``, ``mu_*_rms``, ``teacher_innovation_rms``, ``teacher_pull_rms``); and
+    ``student_teacher_gap_rms`` / ``student_teacher_gap_whitened_rms``, which are numerically
+    IDENTICAL to their ``teacher_old`` counterparts here -- the diagnostics run during the replay
+    pass at ``theta = theta_old``, where the student mean IS the behavior mean, so those keys can
+    never show the student closing on the teacher and reading them as progress is a trap.
+
+    Set ``verbose`` to restore the full set when debugging the sampler or the gate itself.
 
     Args:
         next_latents: Observed behavior transition.
@@ -540,6 +568,7 @@ def compute_popd_diagnostics(
         transition_variance: Shared scalar covariance value per sample.
         dt: Scheduler timestep delta per sample.
         responsibility: Detached output from :func:`compute_popd_responsibility`.
+        verbose: Emit every diagnostic instead of the essential subset.
 
     Returns:
         Mapping of metric names to detached finite tensors of shape ``(B,)``.
@@ -594,44 +623,52 @@ def compute_popd_diagnostics(
         behavior_drift = student - old
         ungated_mean_kl = (student_teacher_gap.square() / (2.0 * variance_b)).flatten(1).mean(dim=1)
         metrics = {
-            "transition_std": transition_std,
-            "transition_variance": variance,
-            "abs_dt": delta.abs(),
-            "next_latent_rms": _event_rms(observed),
-            "mu_old_rms": _event_rms(old),
-            "mu_teacher_rms": _event_rms(teacher),
-            "mu_student_rms": _event_rms(student),
             "old_innovation_rms": _event_rms((observed - old) / std_b),
-            "teacher_innovation_rms": _event_rms((observed - teacher) / std_b),
             "behavior_drift_rms": _event_rms(behavior_drift / std_b),
-            "teacher_old_gap_rms": _event_rms(teacher_old_gap),
-            "teacher_old_gap_l2": _event_l2(teacher_old_gap),
             "teacher_old_gap_whitened_rms": _event_rms(teacher_old_gap / std_b),
             "teacher_old_kl_joint": responsibility.teacher_old_kl_joint,
-            "teacher_old_kl_per_dim": responsibility.teacher_old_kl_per_dim,
             "log_rho_sum": responsibility.log_ratio_sum,
-            "log_rho_per_dim": responsibility.log_ratio_per_dim,
-            "tempered_log_ratio": responsibility.tempered_log_ratio,
-            "gate_logit": responsibility.gate_logit,
             "gamma": gamma,
             "gamma_lt_001": (gamma < 0.01).float(),
             "gamma_gt_099": (gamma > 0.99).float(),
-            "gate_entropy": F.softplus(responsibility.gate_logit)
-            - gamma * responsibility.gate_logit,
-            "student_teacher_gap_rms": _event_rms(student_teacher_gap),
-            "student_teacher_gap_whitened_rms": _event_rms(student_teacher_gap / std_b),
             "ungated_mean_kl": ungated_mean_kl,
             "gated_mean_kl": gamma * ungated_mean_kl,
-            "effective_gate": gamma,
-            "teacher_pull_rms": _event_rms(gamma_b * (old - teacher) / variance_b),
+            # Constant within a run, but kept because the calibration identity K = (D/2) w^2 is
+            # unreadable without it and D cannot be recovered from a wandb run's config alone.
             "event_dim": torch.full_like(gamma, float(responsibility.event_dim)),
-            "alpha": torch.full_like(gamma, responsibility.alpha),
-            "temperature": torch.full_like(gamma, responsibility.temperature),
-            "temperature_over_event_dim": torch.full_like(
-                gamma,
-                responsibility.temperature / float(responsibility.event_dim),
-            ),
         }
+        if verbose:
+            metrics.update(
+                {
+                    "transition_std": transition_std,
+                    "transition_variance": variance,
+                    "abs_dt": delta.abs(),
+                    "next_latent_rms": _event_rms(observed),
+                    "mu_old_rms": _event_rms(old),
+                    "mu_teacher_rms": _event_rms(teacher),
+                    "mu_student_rms": _event_rms(student),
+                    "teacher_innovation_rms": _event_rms((observed - teacher) / std_b),
+                    "teacher_old_gap_rms": _event_rms(teacher_old_gap),
+                    "teacher_old_gap_l2": _event_l2(teacher_old_gap),
+                    "teacher_old_kl_per_dim": responsibility.teacher_old_kl_per_dim,
+                    "log_rho_per_dim": responsibility.log_ratio_per_dim,
+                    "tempered_log_ratio": responsibility.tempered_log_ratio,
+                    "gate_logit": responsibility.gate_logit,
+                    "gate_entropy": F.softplus(responsibility.gate_logit)
+                    - gamma * responsibility.gate_logit,
+                    "student_teacher_gap_rms": _event_rms(student_teacher_gap),
+                    "student_teacher_gap_whitened_rms": _event_rms(student_teacher_gap / std_b),
+                    "effective_gate": gamma,
+                    "teacher_pull_rms": _event_rms(gamma_b * (old - teacher) / variance_b),
+                    "event_dim": torch.full_like(gamma, float(responsibility.event_dim)),
+                    "alpha": torch.full_like(gamma, responsibility.alpha),
+                    "temperature": torch.full_like(gamma, responsibility.temperature),
+                    "temperature_over_event_dim": torch.full_like(
+                        gamma,
+                        responsibility.temperature / float(responsibility.event_dim),
+                    ),
+                }
+            )
 
     for name, value in metrics.items():
         value = value.detach()

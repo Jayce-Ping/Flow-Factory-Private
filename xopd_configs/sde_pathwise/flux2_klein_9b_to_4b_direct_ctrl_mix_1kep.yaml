@@ -1,27 +1,23 @@
-# P-OPD: FLUX.2-klein-base-9B (teacher) -> FLUX.2-klein-base-4B (student), geneval+ocr mixture.
+# CONTROL for the P-OPD 9B -> 4B arm: teacher as the only target, no mixture with the student.
 #
-# The teacher is matched through a gate rather than unconditionally. For the behavior transition
-# y ~ pi_old with shared covariance sigma^2 I,
+# xopd_target_mode: direct removes the responsibility gate and nothing else. Every other field --
+# the Flow-SDE sampler and its noise level, the four trained transitions per rollout, the xt loss
+# space, the covariance normalization, the 1:1 geneval+ocr mixture, the batch geometry, the
+# optimizer and the eval suite -- is identical to
+# flux2_klein_9b_to_4b_popd_mix_1kep.yaml. This is what makes the pair interpretable: the gated
+# arm differs from the ODE baselines in the sampler, the loss space AND the gate at once, so
+# without this control a difference cannot be credited to the gate.
 #
-#   log rho = log[ N(y | mu_teacher, sigma^2) / N(y | mu_old, sigma^2) ]
-#   gamma   = sigmoid( logit(alpha) + log rho / T )
-#   loss    = mean_batch( stop_grad(gamma) * KL_mean(mu_student || mu_teacher) )
+# It is also the reference for reading the training loss. Each epoch redraws 4 of 27 transitions
+# whose joint KL spans four decades, so train/loss jumps by two orders of magnitude between
+# epochs on step selection alone and is not a learning curve in either arm. What IS comparable is
+# train/loss/{k} and train/d_k/{k} at a FIXED k, and the held-out eval/{set}/d_k that runs every
+# eval; the gate multiplies the loss by gamma, so only the ungated per-step series can be compared
+# across the two arms directly.
 #
-# so a transition where the teacher is implausible under the student's own transition density
-# contributes less. That is the whole point of the method, and it only works if gamma actually
-# varies: T sets which regime the gate lives in, and T is NOT a free guess.
-#
-# alpha and popd_temperature below come from the probe run flux2_klein_9b_to_4b_popd_diag_t1.yaml
-# (see scripts/xopd_analysis/calibrate_popd_gate.py). Because log rho ~ N(-K, 2K) exactly under
-# the behavior policy, measuring the joint KL K once determines the gate distribution for every
-# (alpha, T); T is set to the measured K so the median gate sits mid-range and its spread comes
-# from K varying across transitions, and alpha centers that median at 0.5.
-#
-# Everything else follows the 32B->4B mix baseline (flux2_klein_32b_to_4b_l1_geneval_enh_ocr_mixed
-# _vmse_1kep.yaml): same 1:1 domain exposure, same 512px train/eval, same six-test-set eval suite,
-# one optimizer step per epoch. It necessarily differs where P-OPD requires it -- a stochastic
-# sampler (the density ratio is undefined under ODE), the transition space, and a
-# covariance-normalized KL rather than a bare velocity MSE.
+# Equivalently this is the temperature axis taken to its other end: at T = D the responsibility is
+# constant at alpha, which is the ungated objective scaled by a factor -- see
+# docs/xopd/popd_exact_sum_gate_saturation.tex.
 launcher: "accelerate"
 config_file: config/deepspeed/deepspeed_zero2.yaml  # 9B teacher (~18GB bf16) + 4B LoRA student; ZeRO-2 is the proven multi-node path here
 num_processes: 8                          # overridden to 8 * num_machines by the 4-node launcher
@@ -51,7 +47,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "flux2klein_9b_to_4b_popd_mix_1kep"
+  run_name: "flux2klein_9b_to_4b_direct_ctrl_mix_1kep"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -83,11 +79,9 @@ train:
 
   # --- P-OPD target: responsibility-gated, covariance-normalized transition KL ---
   pathwise_coef: 1.0
-  normalize_d_k: true                     # required: the gate multiplies a KL, not a bare MSE
-  xopd_dk_space: "xt"                     # required: the density ratio lives on the transition, not on velocity
-  xopd_target_mode: "p_opd"
-  popd_alpha: 0.731                       # logit(alpha) = K/T = 1, so the median gate sits at 0.5
-  popd_temperature: 107.0                 # = measured mean joint KL K (probe w10kj2v8)
+  normalize_d_k: true                     # matched to the gated arm: covariance-normalized transition KL
+  xopd_dk_space: "xt"                     # matched to the gated arm
+  xopd_target_mode: "direct"            # THE ONLY DELTA vs the P-OPD arm
   kl_type: "x-based"
   kl_beta: 0.0
 
@@ -116,7 +110,7 @@ train:
   seed: 42
 
 scheduler:
-  dynamics_type: "Flow-SDE"               # P-OPD needs a stochastic transition; ODE has no density ratio
+  dynamics_type: "Flow-SDE"               # matched to the gated arm (a control on ODE would confound the sampler)
   noise_level: 0.7
   num_sde_steps: 4                        # trained transitions per rollout (drawn fresh each epoch)
   sde_steps: null
