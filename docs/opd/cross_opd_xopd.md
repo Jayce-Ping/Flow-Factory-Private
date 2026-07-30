@@ -137,14 +137,29 @@ The implementation always computes the joint event-dimension sum first:
   mixture KL;
 - `1 < temperature < D` is an explicit effective-dimension compromise.
 
-For `y ~ pi_old`,
-`E[log rho] = -KL(pi_old || pi_teacher)`. The joint KL grows with latent
-dimension, resolution and teacher/student gap, so the exact sum can concentrate
-at `gamma_T ~= 0` and remove nearly all teacher signal. Latent mean is much more
-stable across resolution, but often keeps `gamma_T` near `alpha`, reducing the
-adaptive gate to an almost constant loss multiplier and weakening protection
-against a globally incompatible teacher. A first calibration sweep should
-compare `temperature in {1, sqrt(D), D}` without changing any other variable.
+For `y ~ pi_old`, `log rho ~ N(-K, 2K)` exactly, where
+`K = KL(pi_old || pi_teacher)` is logged as `popd/teacher_old_kl_joint`. Both
+ends of the axis have now been measured on a 9B -> 4B probe, and the outcome is
+recorded in
+[`docs/xopd/popd_exact_sum_gate_saturation.tex`](../xopd/popd_exact_sum_gate_saturation.tex):
+
+- `temperature = 1` (exact sum) does NOT train. 75% of transitions fall below
+  `gamma = 0.01` and `grad_norm` reaches only 2.2e-5. The cause is dimension
+  aggregation: `K = (D/2) * w^2` where `w` is the per-dimension mean gap in units
+  of `sigma_tr`, so at `D = 131072` an open gate needs agreement to
+  `sqrt(2/D) = 0.4%` of one noise standard deviation in every coordinate. `K`
+  grows linearly in `D`, so this gets worse with resolution and improves only
+  quadratically with a better teacher.
+- `temperature = D` (latent mean) is stable and inert: `gamma` spans 0.499 to
+  0.501, so the run is the ungated objective scaled by `alpha`.
+- `temperature = mean(K)` with `alpha = sigmoid(mean(K)/T)` centers the median
+  gate at 0.5 and is what the 9B -> 4B run uses (`T = 107`, `alpha = 0.731`).
+
+Because `K` varies by 1.2e4 along the denoising axis but only ~30% between
+samples at a fixed step, a single global temperature acts mainly as a weighting
+along the trajectory. Run
+`scripts/xopd_analysis/calibrate_popd_gate.py --run-name <probe>` to get the
+recommendation and the per-step profile from a short probe rather than sweeping.
 
 #### P-OPD diagnostics
 
