@@ -29,15 +29,20 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 from typing import Dict, List, Optional
 
 DEFAULT_ENTITY_PROJECT = "315229706-xi-an-jiaotong-university-/Flow-Factory-XOPD"
 
 # Metrics the probe is expected to expose, and what each one is worth.
 _SAMPLER_CHECKS = {
-    "popd/old_innovation_rms": (1.0, 0.15, "transition variance matches how y was drawn"),
-    "popd/behavior_drift_rms": (0.0, 0.05, "replay reproduces the rollout mean"),
+    "train/popd/old_innovation_rms": (1.0, 0.15, "transition variance matches how y was drawn"),
+    "train/popd/behavior_drift_rms": (0.0, 0.05, "replay reproduces the rollout mean"),
 }
+
+
+# The trainer logs P-OPD diagnostics under the training prefix.
+PREFIX = "train/popd"
 
 
 def _mean_key(base: str) -> str:
@@ -103,6 +108,51 @@ def _gate_quantiles(
     }
 
 
+def _print_timestep_profile(run, joint_kl: float, temperature: float, alpha: float) -> None:
+    """Show K and the resulting loss weight along the denoising axis.
+
+    This is the table that actually decides the temperature. K is a strong function of the
+    trajectory position, mostly through the scheduler rather than through the teacher: with
+    mu = x + v*dt and variance std^2*|dt|, the joint KL carries a factor |dt| / std^2 that grows
+    by orders of magnitude toward the end of the trajectory. Between-step variation therefore
+    dwarfs the between-sample variation within a step, so one global temperature acts as a
+    weighting along the denoising axis, and the temperature chooses where along it the teacher is
+    matched. The last column is the quantity that matters: gamma_t * K_t is the loss weight the
+    step actually receives, and reading it is the only way to see that an ungated run concentrates
+    almost everything on the final steps.
+    """
+    pattern = re.compile(r"^train/popd/teacher_old_kl_joint/t(\d+)_mean$")
+    steps = []
+    for key in run.summary.keys():
+        matched = pattern.match(key)
+        if matched:
+            index = int(matched.group(1))
+            steps.append((index, float(run.summary[key])))
+    if not steps:
+        print("\nno per-timestep P-OPD keys found; skipping the trajectory profile.")
+        return
+    steps.sort()
+    prior_logit = math.log(alpha) - math.log1p(-alpha)
+    print("\nalong the denoising axis (K per trained step, and the loss weight it receives):")
+    print(
+        f"  {'step':>6}{'K':>12}{'gamma @ T=1':>13}{'gamma @ rec':>13}"
+        f"{'weight ungated':>16}{'weight @ rec':>14}"
+    )
+    for index, value in steps:
+        gamma_one = _sigmoid(-value)
+        gamma_rec = _sigmoid(prior_logit - value / temperature)
+        print(
+            f"  {index:>6}{value:>12.4g}{gamma_one:>13.4f}{gamma_rec:>13.4f}"
+            f"{value * alpha:>16.4g}{value * gamma_rec:>14.4g}"
+        )
+    weights = [value * _sigmoid(prior_logit - value / temperature) for _, value in steps]
+    raw = [value for _, value in steps]
+    print(
+        f"  spread of the loss weight across steps: ungated {max(raw) / max(min(raw), 1e-12):.0f}x, "
+        f"at the recommendation {max(weights) / max(min(weights), 1e-12):.0f}x"
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-name", required=True, help="wandb display name of the probe run")
@@ -131,37 +181,37 @@ def main(argv: Optional[List[str]] = None) -> None:
     run = max(runs, key=lambda r: r.created_at)
 
     keys = [
-        _mean_key("popd/teacher_old_kl_joint"),
-        "popd/teacher_old_kl_joint_std",
-        "popd/teacher_old_kl_joint_min",
-        "popd/teacher_old_kl_joint_max",
-        _mean_key("popd/teacher_old_kl_per_dim"),
-        _mean_key("popd/log_rho_sum"),
-        "popd/log_rho_sum_std",
-        _mean_key("popd/event_dim"),
-        _mean_key("popd/gamma"),
-        "popd/gamma_p50",
-        _mean_key("popd/gamma_lt_001"),
-        _mean_key("popd/gamma_gt_099"),
-        _mean_key("popd/ungated_mean_kl"),
-        _mean_key("popd/gated_mean_kl"),
-        _mean_key("popd/old_innovation_rms"),
-        _mean_key("popd/behavior_drift_rms"),
+        _mean_key("train/popd/teacher_old_kl_joint"),
+        "train/popd/teacher_old_kl_joint_std",
+        "train/popd/teacher_old_kl_joint_min",
+        "train/popd/teacher_old_kl_joint_max",
+        _mean_key("train/popd/teacher_old_kl_per_dim"),
+        _mean_key("train/popd/log_rho_sum"),
+        "train/popd/log_rho_sum_std",
+        _mean_key("train/popd/event_dim"),
+        _mean_key("train/popd/gamma"),
+        "train/popd/gamma_p50",
+        _mean_key("train/popd/gamma_lt_001"),
+        _mean_key("train/popd/gamma_gt_099"),
+        _mean_key("train/popd/ungated_mean_kl"),
+        _mean_key("train/popd/gated_mean_kl"),
+        _mean_key("train/popd/old_innovation_rms"),
+        _mean_key("train/popd/behavior_drift_rms"),
         "train/grad_norm",
         "train/loss",
     ]
     collected = _fetch_history(run, keys)
 
-    joint_kl_series = _require(collected, _mean_key("popd/teacher_old_kl_joint"), run.name)
+    joint_kl_series = _require(collected, _mean_key("train/popd/teacher_old_kl_joint"), run.name)
     joint_kl = sum(joint_kl_series) / len(joint_kl_series)
-    event_dim = _require(collected, _mean_key("popd/event_dim"), run.name)[0]
-    log_rho_series = _require(collected, _mean_key("popd/log_rho_sum"), run.name)
+    event_dim = _require(collected, _mean_key("train/popd/event_dim"), run.name)[0]
+    log_rho_series = _require(collected, _mean_key("train/popd/log_rho_sum"), run.name)
     log_rho = sum(log_rho_series) / len(log_rho_series)
 
-    sd_series = collected.get("popd/teacher_old_kl_joint_std") or []
+    sd_series = collected.get("train/popd/teacher_old_kl_joint_std") or []
     joint_kl_sd = sum(sd_series) / len(sd_series) if sd_series else 0.0
-    min_series = collected.get("popd/teacher_old_kl_joint_min") or []
-    max_series = collected.get("popd/teacher_old_kl_joint_max") or []
+    min_series = collected.get("train/popd/teacher_old_kl_joint_min") or []
+    max_series = collected.get("train/popd/teacher_old_kl_joint_max") or []
 
     print(f"probe run: {run.name}  ({run.url})")
     print(f"  steps read              : {len(joint_kl_series)}")
@@ -184,7 +234,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     relative = abs(log_rho + joint_kl) / max(joint_kl, 1e-12)
     verdict = "consistent" if relative < 0.25 else "INCONSISTENT -- investigate before training"
     print(f"  relative deviation      : {relative:.3f}  ({verdict})")
-    measured_sd = collected.get("popd/log_rho_sum_std") or []
+    measured_sd = collected.get("train/popd/log_rho_sum_std") or []
     if measured_sd:
         print(
             f"  measured sd[log rho]    : {sum(measured_sd) / len(measured_sd):.4g}   "
@@ -242,8 +292,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         f"from the draw: {final['draw_sd']:.3f})"
     )
 
-    observed_gamma = collected.get(_mean_key("popd/gamma")) or []
-    dead = collected.get(_mean_key("popd/gamma_lt_001")) or []
+    _print_timestep_profile(run, joint_kl, recommended_t, recommended_alpha)
+
+    observed_gamma = collected.get(_mean_key("train/popd/gamma")) or []
+    dead = collected.get(_mean_key("train/popd/gamma_lt_001")) or []
     if observed_gamma:
         print(
             f"\nprobe's own gate at T=1: mean gamma={sum(observed_gamma) / len(observed_gamma):.4g}"
