@@ -46,11 +46,11 @@ train:
   donor_base_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
   donor_rl_lora_path: "Tencent-Hunyuan-Multimodal-RL/FLUX2-klein-base-9b-GenEval2-Multi-Reward"
   donor_vae_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
-  donor_guidance_scale: 4.0
+  donor_guidance_scale: 1.0
   assume_shared_vae: true
 
-  # Recipient guidance-distilled field and donor policy-shift target.
-  guidance_scale: 4.0
+  # No-CFG baseline: match the donor's Flow-DPPO training condition.
+  guidance_scale: 1.0
   fdopd_lambda: 0.25
   fdopd_loss_space: "v"  # Options: v, xt. ODE requires v.
   normalize_d_k: false
@@ -105,14 +105,14 @@ eval:
   resolution: 1024
   per_device_batch_size: 1
   num_inference_steps: 40
-  guidance_scale: 4.0
+  guidance_scale: 1.0
   eval_freq: 5
   seed: 42
   test_sets:
-    - name: "geneval_gs4"
+    - name: "geneval_gs1"
       dataset_dir: "dataset/geneval"
       split: "test"
-      guidance_scale: 4.0
+      guidance_scale: 1.0
       eval_reward_names: ["geneval", "pick_score"]
 
 rewards:
