@@ -19,6 +19,9 @@ import unittest
 import torch
 
 from flow_factory.hparams.training_args import XOPDTrainingArguments
+from flow_factory.models.flux.flux2_klein import Flux2KleinSample
+from flow_factory.samples import BaseSample
+from flow_factory.trainers.xopd import common as xopd_common
 from flow_factory.trainers.xopd.common import (
     align_l0_inner_steps,
     compute_per_step_kl,
@@ -34,6 +37,7 @@ from flow_factory.trainers.xopd.common import (
     validate_l1_one_step_per_epoch,
     validate_popd_configuration,
     validate_source_ratio,
+    validate_xopd_target_configuration,
 )
 
 
@@ -163,6 +167,7 @@ class TestXOPDTrainingArguments(unittest.TestCase):
     def test_popd_defaults_preserve_direct_xopd(self) -> None:
         args = XOPDTrainingArguments(teacher_model_name_or_path="/tmp/teacher")
         self.assertEqual(args.xopd_target_mode, "direct")
+        self.assertEqual(args.marginal_cfm_alpha, 0.5)
         self.assertEqual(args.popd_alpha, 0.5)
         self.assertEqual(args.popd_temperature, 1.0)
 
@@ -172,6 +177,7 @@ class TestXOPDTrainingArguments(unittest.TestCase):
             xopd_target_mode="direct",
             popd_alpha=0.0,
             popd_temperature=0.0,
+            marginal_cfm_alpha=float("nan"),
         )
         self.assertEqual(args.xopd_target_mode, "direct")
 
@@ -190,6 +196,64 @@ class TestXOPDTrainingArguments(unittest.TestCase):
                     xopd_target_mode="p_opd",
                     popd_temperature=temperature,
                 )
+
+    def test_marginal_cfm_accepts_alpha_endpoints(self) -> None:
+        for alpha in (0.0, 0.5, 1.0):
+            with self.subTest(alpha=alpha):
+                args = XOPDTrainingArguments(
+                    trainer_type="xopd",
+                    teacher_model_name_or_path="/tmp/teacher",
+                    xopd_target_mode="marginal_cfm",
+                    marginal_cfm_alpha=alpha,
+                )
+                self.assertEqual(args.marginal_cfm_alpha, alpha)
+
+    def test_marginal_cfm_rejects_invalid_alpha(self) -> None:
+        invalid = (True, "0.5", -0.1, 1.1, float("nan"), float("inf"), float("-inf"))
+        for alpha in invalid:
+            with self.subTest(alpha=alpha), self.assertRaises((TypeError, ValueError)):
+                XOPDTrainingArguments(
+                    trainer_type="xopd",
+                    teacher_model_name_or_path="/tmp/teacher",
+                    xopd_target_mode="marginal_cfm",
+                    marginal_cfm_alpha=alpha,
+                )
+
+    def test_marginal_cfm_rejects_non_xopd_trainers(self) -> None:
+        for trainer_type in ("xpdm", "xdmd"):
+            with (
+                self.subTest(trainer_type=trainer_type),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "trainer_type",
+                ),
+            ):
+                XOPDTrainingArguments(
+                    trainer_type=trainer_type,
+                    teacher_model_name_or_path="/tmp/teacher",
+                    xopd_target_mode="marginal_cfm",
+                )
+
+    def test_invalid_target_mode_lists_every_supported_mode(self) -> None:
+        with self.assertRaises(ValueError) as context:
+            XOPDTrainingArguments(
+                trainer_type="xopd",
+                teacher_model_name_or_path="/tmp/teacher",
+                xopd_target_mode="unsupported",
+            )
+        message = str(context.exception)
+        for mode in ("direct", "p_opd", "marginal_cfm"):
+            self.assertIn(mode, message)
+
+    def test_popd_remains_independent_from_marginal_cfm_alpha(self) -> None:
+        args = XOPDTrainingArguments(
+            trainer_type="xopd",
+            teacher_model_name_or_path="/tmp/teacher",
+            xopd_target_mode="p_opd",
+            popd_alpha=0.25,
+            marginal_cfm_alpha=float("nan"),
+        )
+        self.assertEqual(args.popd_alpha, 0.25)
 
 
 class TestPOPDConfiguration(unittest.TestCase):
@@ -237,6 +301,418 @@ class TestPOPDConfiguration(unittest.TestCase):
             kwargs = {**base, **override}
             with self.subTest(override=override), self.assertRaises(ValueError):
                 validate_popd_configuration(**kwargs)
+
+    def test_rejects_other_target_modes_with_legacy_error_contract(self) -> None:
+        with self.assertRaisesRegex(ValueError, "'direct' or 'p_opd'"):
+            validate_popd_configuration(
+                target_mode="marginal_cfm",
+                dynamics_type="ODE",
+                noise_level=0.0,
+                xopd_dk_space="v",
+                normalize_d_k=False,
+                is_cross_vae=False,
+                pixel_loss=False,
+            )
+
+
+class TestXOPDTargetConfiguration(unittest.TestCase):
+    def _validate(self, **overrides) -> None:
+        configuration = {
+            "target_mode": "marginal_cfm",
+            "dynamics_type": "ODE",
+            "noise_level": 0.0,
+            "xopd_dk_space": "v",
+            "normalize_d_k": False,
+            "is_cross_vae": False,
+            "pixel_loss": False,
+            "vae_transport": "identity",
+        }
+        configuration.update(overrides)
+        validate_xopd_target_configuration(**configuration)
+
+    def test_accepts_marginal_cfm_same_vae_ode_configuration(self) -> None:
+        self._validate()
+
+    def test_rejects_invalid_marginal_cfm_configuration_matrix(self) -> None:
+        invalid = (
+            ({"dynamics_type": "Flow-SDE"}, "dynamics_type='ODE'", "dynamics_type='Flow-SDE'"),
+            ({"noise_level": 0.1}, "noise_level == 0", "noise_level=0.1"),
+            ({"noise_level": float("nan")}, "finite", "noise_level=nan"),
+            ({"xopd_dk_space": "xt"}, "xopd_dk_space='v'", "xopd_dk_space='xt'"),
+            ({"normalize_d_k": True}, "normalize_d_k=False", "normalize_d_k=True"),
+            ({"is_cross_vae": True}, "is_cross_vae=False", "is_cross_vae=True"),
+            ({"pixel_loss": True}, "pixel_loss=False", "pixel_loss=True"),
+        )
+        for override, expected, received in invalid:
+            with (
+                self.subTest(override=override),
+                self.assertRaises((TypeError, ValueError)) as context,
+            ):
+                self._validate(**override)
+            message = str(context.exception)
+            self.assertIn(expected, message)
+            self.assertIn(received, message)
+
+    def test_marginal_cfm_requires_identity_transport(self) -> None:
+        for vae_transport in ("linear", "pixel", "hsct", "flow", "unknown"):
+            with self.subTest(vae_transport=vae_transport):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "expected vae_transport='identity'",
+                ) as context:
+                    self._validate(vae_transport=vae_transport)
+                self.assertIn(f"got vae_transport={vae_transport!r}", str(context.exception))
+
+    def test_dispatcher_preserves_direct_and_popd_validation(self) -> None:
+        self._validate(
+            target_mode="direct",
+            dynamics_type="Flow-SDE",
+            noise_level=float("nan"),
+            xopd_dk_space="x0_norm",
+            normalize_d_k=True,
+            is_cross_vae=True,
+            pixel_loss=True,
+            vae_transport="flow",
+        )
+        self._validate(
+            target_mode="p_opd",
+            dynamics_type="Flow-SDE",
+            noise_level=0.7,
+            xopd_dk_space="xt",
+            normalize_d_k=True,
+            is_cross_vae=False,
+            pixel_loss=False,
+            vae_transport="flow",
+        )
+
+
+class TestMarginalCFMBranches(unittest.TestCase):
+    def test_draw_is_deterministic_cpu_bool_and_tracks_alpha(self) -> None:
+        first = xopd_common.draw_marginal_cfm_branches(
+            100_000,
+            alpha=0.37,
+            seed=123,
+            epoch=4,
+            batch_index=5,
+        )
+        second = xopd_common.draw_marginal_cfm_branches(
+            100_000,
+            alpha=0.37,
+            seed=123,
+            epoch=4,
+            batch_index=5,
+        )
+        different_batch = xopd_common.draw_marginal_cfm_branches(
+            100_000,
+            alpha=0.37,
+            seed=123,
+            epoch=4,
+            batch_index=6,
+        )
+
+        self.assertEqual(first.shape, (100_000,))
+        self.assertEqual(first.dtype, torch.bool)
+        self.assertEqual(first.device.type, "cpu")
+        self.assertTrue(torch.equal(first, second))
+        self.assertFalse(torch.equal(first, different_batch))
+        self.assertAlmostEqual(first.float().mean().item(), 0.37, delta=0.005)
+
+    def test_draw_honors_exact_alpha_boundaries(self) -> None:
+        old = xopd_common.draw_marginal_cfm_branches(
+            8,
+            alpha=0,
+            seed=1,
+            epoch=2,
+            batch_index=3,
+        )
+        teacher = xopd_common.draw_marginal_cfm_branches(
+            8,
+            alpha=1,
+            seed=1,
+            epoch=2,
+            batch_index=3,
+        )
+        self.assertFalse(old.any())
+        self.assertTrue(teacher.all())
+
+    def test_draw_rejects_invalid_batch_size_alpha_and_keys(self) -> None:
+        for batch_size in (True, 0, -1, 1.5):
+            with (
+                self.subTest(batch_size=batch_size),
+                self.assertRaises((TypeError, ValueError)) as context,
+            ):
+                xopd_common.draw_marginal_cfm_branches(
+                    batch_size,
+                    alpha=0.5,
+                    seed=1,
+                    epoch=2,
+                    batch_index=3,
+                )
+            self.assertIn("batch_size", str(context.exception))
+
+        for alpha in (True, "0.5", -0.1, 1.1, float("nan"), float("inf")):
+            with (
+                self.subTest(alpha=alpha),
+                self.assertRaises((TypeError, ValueError)) as context,
+            ):
+                xopd_common.draw_marginal_cfm_branches(
+                    4,
+                    alpha=alpha,
+                    seed=1,
+                    epoch=2,
+                    batch_index=3,
+                )
+            self.assertIn("alpha", str(context.exception))
+
+        for name in ("seed", "epoch", "batch_index"):
+            for invalid in (True, 1.5, "1"):
+                kwargs = {"seed": 1, "epoch": 2, "batch_index": 3}
+                kwargs[name] = invalid
+                with (
+                    self.subTest(name=name, invalid=invalid),
+                    self.assertRaises(TypeError) as context,
+                ):
+                    xopd_common.draw_marginal_cfm_branches(4, alpha=0.5, **kwargs)
+                self.assertIn(name, str(context.exception))
+
+
+class TestMarginalCFMCallbackMap(unittest.TestCase):
+    def test_normalizes_vector_and_identical_stacked_rows_with_sentinel(self) -> None:
+        callback_map = torch.tensor([2, -1, 0, 1], dtype=torch.int64)
+        normalized = xopd_common.normalize_callback_index_map(callback_map)
+        stacked = xopd_common.normalize_callback_index_map(
+            torch.stack((callback_map, callback_map.clone()))
+        )
+        torch.testing.assert_close(normalized, callback_map)
+        torch.testing.assert_close(stacked, callback_map)
+
+    def test_rejects_row_mismatch_dtype_shape_and_empty_maps(self) -> None:
+        with self.assertRaisesRegex(ValueError, "same callback_index_map"):
+            xopd_common.normalize_callback_index_map(
+                torch.tensor([[0, -1], [-1, 0]], dtype=torch.int64)
+            )
+
+        invalid = (
+            [0, 1],
+            torch.tensor([0.0, 1.0]),
+            torch.tensor([True, False]),
+            torch.tensor(1),
+            torch.zeros(1, 1, 1, dtype=torch.int64),
+            torch.empty(0, dtype=torch.int64),
+            torch.empty(0, 2, dtype=torch.int64),
+            torch.empty(2, 0, dtype=torch.int64),
+        )
+        for callback_map in invalid:
+            with (
+                self.subTest(callback_map=callback_map),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                xopd_common.normalize_callback_index_map(callback_map)
+
+    def test_resolves_valid_index_and_rejects_sentinel_or_out_of_range(self) -> None:
+        callback_map = torch.tensor([[2, -1, 0], [2, -1, 0]], dtype=torch.int32)
+        self.assertEqual(
+            xopd_common.resolve_marginal_cfm_callback_index(
+                callback_map,
+                timestep_index=0,
+                callback_count=3,
+            ),
+            2,
+        )
+
+        for timestep_index, callback_count, expected in (
+            (1, 3, "compact_index=-1"),
+            (0, 2, "callback_count=2"),
+        ):
+            with (
+                self.subTest(
+                    timestep_index=timestep_index,
+                    callback_count=callback_count,
+                ),
+                self.assertRaises(ValueError) as context,
+            ):
+                xopd_common.resolve_marginal_cfm_callback_index(
+                    callback_map,
+                    timestep_index=timestep_index,
+                    callback_count=callback_count,
+                )
+            message = str(context.exception)
+            self.assertIn(f"timestep_index={timestep_index}", message)
+            self.assertIn(expected, message)
+
+    def test_resolver_validates_timestep_and_callback_count(self) -> None:
+        callback_map = torch.tensor([0, -1], dtype=torch.int64)
+        for timestep_index in (True, -1, 2, 1.5):
+            with (
+                self.subTest(timestep_index=timestep_index),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                xopd_common.resolve_marginal_cfm_callback_index(
+                    callback_map,
+                    timestep_index=timestep_index,
+                    callback_count=1,
+                )
+        for callback_count in (True, -1, 1.5):
+            with (
+                self.subTest(callback_count=callback_count),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                xopd_common.resolve_marginal_cfm_callback_index(
+                    callback_map,
+                    timestep_index=0,
+                    callback_count=callback_count,
+                )
+
+    def test_real_flux2_klein_sample_stack_preserves_map_and_branch_shapes(self) -> None:
+        callback_map = torch.tensor([-1, 0, -1, 1], dtype=torch.int64)
+        samples = [
+            Flux2KleinSample(
+                extra_kwargs={
+                    "callback_index_map": callback_map,
+                    "marginal_cfm_branch": torch.tensor(False),
+                }
+            ),
+            Flux2KleinSample(
+                extra_kwargs={
+                    "callback_index_map": callback_map.clone(),
+                    "marginal_cfm_branch": torch.tensor(True),
+                }
+            ),
+        ]
+        batch = BaseSample.stack(samples)
+
+        self.assertEqual(batch["callback_index_map"].shape, (2, 4))
+        self.assertEqual(batch["marginal_cfm_branch"].shape, (2,))
+        torch.testing.assert_close(
+            xopd_common.normalize_callback_index_map(batch["callback_index_map"]),
+            callback_map,
+        )
+        torch.testing.assert_close(
+            batch["marginal_cfm_branch"],
+            torch.tensor([False, True]),
+        )
+
+
+class TestMarginalCFMVelocityLoss(unittest.TestCase):
+    def test_loss_is_fp32_event_mean_and_only_student_receives_gradients(self) -> None:
+        student = torch.tensor(
+            [[1.0, 3.0], [2.0, 6.0]],
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+        target = torch.tensor(
+            [[0.0, 1.0], [4.0, 2.0]],
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+        loss = xopd_common.compute_marginal_cfm_velocity_loss(student, target)
+
+        self.assertEqual(loss.shape, (2,))
+        self.assertEqual(loss.dtype, torch.float32)
+        torch.testing.assert_close(loss, torch.tensor([2.5, 10.0]))
+        loss.sum().backward()
+        self.assertIsNotNone(student.grad)
+        self.assertIsNone(target.grad)
+
+    def test_loss_rejects_type_shape_empty_event_and_nonfinite_inputs(self) -> None:
+        invalid_pairs = (
+            ([1.0], torch.ones(1, 1)),
+            (torch.ones(1, 1), [1.0]),
+            (torch.ones(2, 2), torch.ones(2, 3)),
+            (torch.ones(2), torch.ones(2)),
+            (torch.empty(0, 2), torch.empty(0, 2)),
+            (torch.empty(2, 0), torch.empty(2, 0)),
+            (torch.tensor([[float("inf")]]), torch.zeros(1, 1)),
+            (torch.zeros(1, 1), torch.tensor([[float("nan")]])),
+        )
+        for student, target in invalid_pairs:
+            with (
+                self.subTest(student=student, target=target),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                xopd_common.compute_marginal_cfm_velocity_loss(student, target)
+
+    def test_diagnostics_match_hand_computed_scales_and_are_detached(self) -> None:
+        student = torch.tensor(
+            [[1.0, 3.0], [2.0, 6.0]],
+            requires_grad=True,
+        )
+        target = torch.tensor(
+            [[0.0, 1.0], [4.0, 2.0]],
+            requires_grad=True,
+        )
+        teacher_branch_mask = torch.tensor([False, True])
+        metrics = xopd_common.compute_marginal_cfm_diagnostics(
+            student_noise_pred=student,
+            target_noise_pred=target,
+            teacher_branch_mask=teacher_branch_mask,
+        )
+
+        self.assertEqual(
+            set(metrics),
+            {
+                "teacher_branch_fraction",
+                "loss",
+                "target_velocity_rms",
+                "target_velocity_l2",
+                "student_target_gap_rms",
+            },
+        )
+        torch.testing.assert_close(
+            metrics["teacher_branch_fraction"],
+            torch.tensor([0.0, 1.0]),
+        )
+        torch.testing.assert_close(metrics["loss"], torch.tensor([2.5, 10.0]))
+        torch.testing.assert_close(
+            metrics["target_velocity_rms"],
+            torch.tensor([0.5**0.5, 10.0**0.5]),
+        )
+        torch.testing.assert_close(
+            metrics["target_velocity_l2"],
+            torch.tensor([1.0, 20.0**0.5]),
+        )
+        torch.testing.assert_close(
+            metrics["student_target_gap_rms"],
+            torch.tensor([2.5**0.5, 10.0**0.5]),
+        )
+        self.assertTrue(all(value.shape == (2,) for value in metrics.values()))
+        self.assertTrue(all(not value.requires_grad for value in metrics.values()))
+        torch.testing.assert_close(
+            metrics["loss"][~teacher_branch_mask],
+            torch.tensor([2.5]),
+        )
+        torch.testing.assert_close(
+            metrics["loss"][teacher_branch_mask],
+            torch.tensor([10.0]),
+        )
+
+        old_only = xopd_common.compute_marginal_cfm_diagnostics(
+            student_noise_pred=student,
+            target_noise_pred=target,
+            teacher_branch_mask=torch.zeros(2, dtype=torch.bool),
+        )
+        self.assertEqual(old_only["loss"][torch.ones(2, dtype=torch.bool)].shape, (2,))
+        self.assertEqual(old_only["loss"][torch.zeros(2, dtype=torch.bool)].shape, (0,))
+
+    def test_diagnostics_validates_branch_mask(self) -> None:
+        student = torch.zeros(2, 3)
+        target = torch.ones(2, 3)
+        invalid_masks = (
+            [False, True],
+            torch.tensor([0, 1]),
+            torch.tensor([[False, True]]),
+            torch.tensor([True]),
+        )
+        for teacher_branch_mask in invalid_masks:
+            with (
+                self.subTest(teacher_branch_mask=teacher_branch_mask),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                xopd_common.compute_marginal_cfm_diagnostics(
+                    student_noise_pred=student,
+                    target_noise_pred=target,
+                    teacher_branch_mask=teacher_branch_mask,
+                )
 
 
 class TestPOPDTransitionVariance(unittest.TestCase):
@@ -416,8 +892,13 @@ class TestPOPDResponsibility(unittest.TestCase):
         verbose = compute_popd_diagnostics(**common, verbose=True)
         self.assertLess(len(essential), len(verbose))
         self.assertTrue(set(essential).issubset(verbose))
-        for dropped in ("alpha", "temperature", "teacher_old_kl_per_dim",
-                        "gate_logit", "student_teacher_gap_whitened_rms"):
+        for dropped in (
+            "alpha",
+            "temperature",
+            "teacher_old_kl_per_dim",
+            "gate_logit",
+            "student_teacher_gap_whitened_rms",
+        ):
             self.assertIn(dropped, verbose)
             self.assertNotIn(dropped, essential)
 

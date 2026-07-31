@@ -140,7 +140,7 @@
 \title{\textbf{Arm A4: Marginal-Mixture Conditional Flow Matching}\\[0.35em]
 \large From probability paths to a Flow-Factory implementation}
 \author{Jayce-Ping}
-\date{2026-07-30}
+\date{2026-07-31}
 
 \begin{document}
 \maketitle
@@ -161,11 +161,11 @@ student onto that branch's velocity.
 This tutorial starts from the ODE and continuity equation, derives the exact two-source CFM
 identity, illustrates the construction with five diagrams, and distinguishes A4 from direct
 teacher regression, arithmetic field interpolation, SDE P-OPD, and per-step branch switching.
-The second half maps the mathematics to the current same-VAE XOPD implementation for
-FLUX.2-Klein.  It proposes a concrete design based on pre-rollout Bernoulli routing, one ODE
-trajectory per sample, rollout-time \texttt{noise\_pred} capture, and a single student velocity
-MSE pass.  A4 is not implemented at the time of writing; all proposed interfaces are labeled
-accordingly.
+The second half maps the mathematics to the implemented same-VAE XOPD path for
+FLUX.2-Klein: pre-rollout Bernoulli routing, one ODE trajectory per sample, rollout-time
+\texttt{noise\_pred} capture, student-conditioning restoration, separate state/callback index
+maps, and a single student velocity-MSE pass.  It also records the implementation's validation,
+evaluation, logging, and distributed call-order invariants.
 \end{abstract}
 
 \tableofcontents
@@ -399,7 +399,7 @@ elements.  Two common losses are
 \label{eq:sum-mean-rms}
 \end{equation}
 Multiplying the entire objective by $1/D$ does not change its population minimizer at a fixed
-shape, but it changes gradient and trust-radius scales.  The implementation proposed later uses
+shape, but it changes gradient and trust-radius scales.  The implementation uses
 the event mean for stable cross-resolution optimization and logs both RMS and L2 scales.
 
 \begin{lstlisting}[style=python,caption={Equivalent target, different optimization scale.}]
@@ -1020,7 +1020,7 @@ current P-OPD responsibility helper would implement A3 again, not A4.
 \label{sec:code-map}
 %% ============================================================
 
-\subsection{Current XOPD L1 data flow}
+\subsection{Direct/P-OPD L1 data flow and the A4 split}
 
 The relevant implementation lives in:
 \begin{center}
@@ -1047,8 +1047,8 @@ file / symbol & current role\\
 \end{tabular}
 \end{center}
 
-Current \texttt{sample()} always runs the student:
-\begin{lstlisting}[style=python,caption={Current XOPD L1 sampling, abbreviated from \texttt{trainer.py}.}]
+In direct and P-OPD modes, \texttt{sample()} runs the student:
+\begin{lstlisting}[style=python,caption={Direct/P-OPD L1 sampling, abbreviated from \texttt{trainer.py}.}]
 sample_kwargs = {
     **self.training_args,
     "compute_log_prob": False,
@@ -1062,10 +1062,11 @@ if self._is_popd:
 sample_batch = self.adapter.inference(**sample_kwargs)
 \end{lstlisting}
 
-Current optimization then calls \texttt{\_precompute\_teacher\_means}.  That pre-pass evaluates the
+Direct/P-OPD optimization then calls \texttt{\_precompute\_teacher\_means}.  That pre-pass evaluates the
 teacher at $X_t^{\mathrm{old}}$, followed by a student gradient pass at the same states.  It is
 correct for direct XOPD and transition P-OPD, but it does not sample $\rho_{T,t}$.
-Figure~\ref{fig:code-pipeline} shows the resulting structural difference from A4.
+Implemented A4 branches before this path and does not run that pre-pass.
+Figure~\ref{fig:code-pipeline} shows the structural difference.
 
 \subsection{The key callback already exists}
 
@@ -1180,7 +1181,7 @@ entry.
 
   % A4 column
   \begin{scope}[xshift=10.5cm]
-    \node[font=\bfseries] (atitle) {Proposed marginal CFM};
+    \node[font=\bfseries] (atitle) {Implemented marginal CFM};
     \node[decision,below=of atitle] (abranch) {sample $B$ once};
     \node[oldbox,below left=10mm and 8mm of abranch] (aold) {old rollout\\if $B=0$};
     \node[teacherbox,below right=10mm and 8mm of abranch] (ateacher) {teacher rollout\\if $B=1$};
@@ -1200,7 +1201,7 @@ entry.
   \end{scope}
 \end{tikzpicture}
 }
-\caption{Current XOPD queries the teacher on old states.  Proposed A4 routes each sample through
+\caption{Direct/P-OPD XOPD queries the teacher on old states.  Implemented A4 routes each sample through
 one source trajectory, captures that source's velocity, and removes the teacher pre-pass.}
 \label{fig:code-pipeline}
 \end{figure}
@@ -1221,14 +1222,17 @@ Failing to restore them would train the smaller student with teacher-encoder emb
 no longer match normal student inference.
 
 %% ============================================================
-\section{Proposed same-VAE XOPD implementation}
+\section{Implemented same-VAE XOPD path}
 \label{sec:implementation}
 %% ============================================================
 
-\begin{tcolorbox}[colback=yellow!5,colframe=yellow!45!black,title=Status]
-The code in this section is an implementation design, not a description of an existing
-\texttt{xopd\_target\_mode}.  Current accepted values are \texttt{direct} and \texttt{p\_opd}.
-The proposed name is \texttt{marginal\_cfm}.
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=Status]
+\raggedright
+A4 is implemented as \texttt{xopd\_target\_mode: marginal\_cfm}.
+The production path is in \path{src/flow_factory/trainers/xopd/trainer.py} and
+\path{src/flow_factory/trainers/xopd/common.py}.
+Focused coverage is in \path{tests/test_marginal_cfm_trainer.py},
+\path{tests/test_xopd_helpers.py}, and \path{tests/test_xopd_configs.py}.
 \end{tcolorbox}
 
 \subsection{Configuration}
@@ -1236,7 +1240,7 @@ The proposed name is \texttt{marginal\_cfm}.
 Use a dedicated alpha rather than overloading \texttt{popd\_alpha}; the latter is a transition
 mixture prior with different diagnostics and validity conditions.
 
-\begin{lstlisting}[style=yaml,caption={Proposed same-VAE A4 configuration.}]
+\begin{lstlisting}[style=yaml,caption={Implemented same-VAE A4 configuration.}]
 train:
   trainer_type: xopd
   xopd_target_mode: marginal_cfm
@@ -1256,47 +1260,39 @@ scheduler:
   noise_level: 0.0
 \end{lstlisting}
 
-Recommended fail-fast checks:
+The implementation enforces these fail-fast checks:
 \begin{enumerate}[leftmargin=1.6em]
 \item \texttt{dynamics\_type == "ODE"};
 \item $0\le\texttt{marginal\_cfm\_alpha}\le1$ and finite;
-\item same VAE / same latent state space; reject cross-VAE, HSCT, and pixel loss in the first
-      implementation;
+\item same VAE / same latent state space; reject cross-VAE transport and pixel loss;
 \item \texttt{xopd\_dk\_space == "v"} and \texttt{normalize\_d\_k == false};
 \item teacher and student rollout grids, latent shapes, and selected steps agree;
 \item every selected callback index is nonnegative and every target is finite.
 \end{enumerate}
 
-\paragraph{Initialization touch points.}
-The mode cannot be added only at the final loss dispatch.  A complete implementation must:
+\paragraph{Implemented touch points.}
+The mode is wired through the complete rollout/replay path:
 \begin{enumerate}[leftmargin=1.6em]
-\item extend the target-mode literal and add the A4 alpha field in the XOPD training arguments;
-\item add a marginal-CFM mode property in the trainer;
-\item refactor the currently unconditional P-OPD validator into target-mode-specific validation,
-      otherwise it rejects every mode except \texttt{direct}/\texttt{p\_opd};
-\item dispatch both \texttt{sample()} and \texttt{optimize()} to their A4 paths;
-\item update every canonical XOPD example that serializes the target-mode field, following the
-      hparams/example synchronization rule;
-\item disable or relabel the current direct-XOPD validation-$D_k$ evaluator in A4 mode, because it
+\item the target-mode literal and dedicated A4 alpha live in XOPD training arguments;
+\item the trainer derives \texttt{\_is\_marginal\_cfm} at initialization;
+\item target-mode-specific validation preserves direct and P-OPD behavior;
+\item A4 validation enforces the ODE, same-VAE, and \texttt{v}-space matrix;
+\item both \texttt{sample()} and \texttt{optimize()} dispatch through A4-specific target handling;
+\item canonical validation and matched smoke configs serialize the target fields;
+\item the direct-XOPD validation-$D_k$ evaluator is skipped in A4 mode, because it
       queries the teacher on student states rather than evaluating held-out marginal CFM.
 \end{enumerate}
 
 \subsection{Step 1: draw one branch before rollout}
 
-\begin{lstlisting}[style=python,caption={Proposed deterministic branch draw.}]
-def _draw_marginal_cfm_branches(
-    self,
-    batch_size: int,
-    batch_index: int,
-) -> torch.Tensor:
-    """Return one CPU bool branch label per complete trajectory."""
-    alpha = self.training_args.marginal_cfm_alpha
-    generator = create_generator(
-        self.training_args.seed,
-        self.epoch,
-        batch_index,
-    )
-    return torch.rand(batch_size, generator=generator) < alpha
+\begin{lstlisting}[style=python,caption={Implemented deterministic branch draw.}]
+branches = draw_marginal_cfm_branches(
+    batch_size,
+    alpha=self.training_args.marginal_cfm_alpha,
+    seed=self.training_args.seed,
+    epoch=self.epoch,
+    batch_index=batch_index,
+)
 \end{lstlisting}
 
 Draw the labels before calling \texttt{inference}.  Split the dataloader batch into old and
@@ -1320,12 +1316,13 @@ an always-call/padded collective design.
 
 \subsection{Step 2: route the two subsets and capture the source velocity}
 
-The batch-slicing and merge helpers below are proposed interfaces.  They must preserve all
-row-aligned tensor/list fields, handle empty subsets, and restore original row order before
-metadata stitching.  In particular, they must handle nested I2I inputs and restore positive and
-negative prompt embeddings plus text ids after teacher inference.
+\texttt{\_slice\_marginal\_cfm\_batch\_rows} preserves row-aligned tensor/list fields and shared
+objects, while \texttt{\_sample\_marginal\_cfm\_batch} handles empty subsets, restores original
+row order before metadata stitching, and offloads the merged samples through the normal sample
+lifecycle.  Nested I2I inputs and positive/negative prompt embeddings plus text ids are covered by
+the same routing and restoration path.
 
-\begin{lstlisting}[style=python,caption={Proposed A4 sampling skeleton.}]
+\begin{lstlisting}[style=python,caption={Implemented A4 sampling structure, abbreviated.}]
 def _sample_marginal_cfm_batch(
     self,
     batch: Dict[str, Any],
@@ -1333,7 +1330,13 @@ def _sample_marginal_cfm_batch(
     trajectory_indices: List[int],
 ) -> List[BaseSample]:
     batch_size = int(batch["prompt_embeds"].shape[0])
-    branches = self._draw_marginal_cfm_branches(batch_size, batch_index)
+    branches = draw_marginal_cfm_branches(
+        batch_size,
+        alpha=self.training_args.marginal_cfm_alpha,
+        seed=self.training_args.seed,
+        epoch=self.epoch,
+        batch_index=batch_index,
+    )
     result: List[Optional[BaseSample]] = [None] * batch_size
 
     for use_teacher in (False, True):
@@ -1343,7 +1346,9 @@ def _sample_marginal_cfm_batch(
         if row_indices.numel() == 0:
             continue
 
-        subset = slice_batch_rows(batch, row_indices)
+        subset = self._slice_marginal_cfm_batch_rows(
+            batch, row_indices, batch_size
+        )
         infer_kwargs = {
             **self.training_args,
             **subset,
@@ -1356,28 +1361,22 @@ def _sample_marginal_cfm_batch(
         }
 
         if use_teacher:
-            route_teacher_text_conditioning(
-                infer_kwargs,
-                subset,
-                device=self.accelerator.device,
-                teacher_guidance_scale=self.teacher_gs,
+            self._route_marginal_cfm_teacher_conditioning(
+                infer_kwargs, subset
             )
             infer_kwargs = filter_kwargs(
                 self.adapter.inference, **infer_kwargs
             )
-            with (
-                torch.no_grad(),
-                self.autocast(),
-                self.adapter.use_teacher_transformer(),
-            ):
+            with self.adapter.use_teacher_transformer():
                 subset_samples = self.adapter.inference(**infer_kwargs)
-            restore_student_conditioning(subset_samples, subset)
+            self._restore_marginal_cfm_student_conditioning(
+                subset_samples, subset
+            )
         else:
             infer_kwargs = filter_kwargs(
                 self.adapter.inference, **infer_kwargs
             )
-            with torch.no_grad(), self.autocast():
-                subset_samples = self.adapter.inference(**infer_kwargs)
+            subset_samples = self.adapter.inference(**infer_kwargs)
 
         expected_count = int(row_indices.numel())
         if len(subset_samples) != expected_count:
@@ -1418,13 +1417,11 @@ def _sample_marginal_cfm_batch(
 \paragraph{Teacher conditioning helpers.}
 The routing helper must fail if teacher-side positive conditioning is absent, and must also
 require teacher-side negative conditioning whenever teacher CFG is active:
-\begin{lstlisting}[style=python,caption={Exact teacher-conditioning replacement rules.}]
-def route_teacher_text_conditioning(
-    infer_kwargs: Dict[str, Any],
+\begin{lstlisting}[style=python,caption={Implemented teacher-conditioning replacement rules, abbreviated.}]
+def _route_marginal_cfm_teacher_conditioning(
+    self,
+    inference_kwargs: Dict[str, Any],
     subset: Dict[str, Any],
-    *,
-    device: torch.device,
-    teacher_guidance_scale: float,
 ) -> None:
     required = ("teacher_prompt_embeds", "teacher_text_ids")
     missing = [key for key in required if subset.get(key) is None]
@@ -1434,17 +1431,18 @@ def route_teacher_text_conditioning(
             f"missing_keys={missing!r}."
         )
 
-    infer_kwargs["prompt_embeds"] = subset[
+    device = self.accelerator.device
+    inference_kwargs["prompt_embeds"] = subset[
         "teacher_prompt_embeds"
     ].to(device)
-    infer_kwargs["text_ids"] = subset["teacher_text_ids"].to(device)
-    infer_kwargs.pop("prompt_ids", None)
+    inference_kwargs["text_ids"] = subset["teacher_text_ids"].to(device)
+    inference_kwargs.pop("prompt_ids", None)
 
     negative_keys = (
         "teacher_negative_prompt_embeds",
         "teacher_negative_text_ids",
     )
-    if teacher_guidance_scale > 1.0:
+    if self.teacher_gs > 1.0:
         missing_negative = [
             key for key in negative_keys if subset.get(key) is None
         ]
@@ -1452,22 +1450,22 @@ def route_teacher_text_conditioning(
             raise ValueError(
                 "marginal CFM teacher CFG requires negative teacher "
                 f"conditioning, missing_keys={missing_negative!r}, "
-                f"teacher_guidance_scale={teacher_guidance_scale}."
+                f"teacher_guidance_scale={self.teacher_gs}."
             )
-        infer_kwargs["negative_prompt_embeds"] = subset[
+        inference_kwargs["negative_prompt_embeds"] = subset[
             "teacher_negative_prompt_embeds"
         ].to(device)
-        infer_kwargs["negative_text_ids"] = subset[
+        inference_kwargs["negative_text_ids"] = subset[
             "teacher_negative_text_ids"
         ].to(device)
-        infer_kwargs.pop("negative_prompt_ids", None)
+        inference_kwargs.pop("negative_prompt_ids", None)
     else:
         for key in (
             "negative_prompt_embeds",
             "negative_text_ids",
             "negative_prompt_ids",
         ):
-            infer_kwargs.pop(key, None)
+            inference_kwargs.pop(key, None)
 \end{lstlisting}
 
 After inference, restore these student-side sample fields from the subset rows:
@@ -1552,7 +1550,7 @@ ordering:
 \]
 The student return-key helper must always request \texttt{noise\_pred} in A4 mode.
 
-\begin{lstlisting}[style=python,caption={Proposed A4 branch inside the existing optimizer shell.}]
+\begin{lstlisting}[style=python,caption={Implemented A4 branch inside the existing optimizer shell, abbreviated.}]
 with self.accelerator.accumulate(*self.adapter.trainable_components):
     # Build batched t, t_next, latents, and next_latents exactly as
     # the current _optimize_train_pass does.
@@ -1569,59 +1567,33 @@ with self.accelerator.accumulate(*self.adapter.trainable_components):
     student_out = self.adapter.forward(**forward_kwargs)
 
     if self._is_marginal_cfm:
-        if not 0 <= timestep_index < callback_index_map.numel():
-            raise IndexError(
-                "marginal CFM timestep index is outside the callback map: "
-                f"timestep_index={timestep_index}, "
-                f"map_length={callback_index_map.numel()}."
-            )
-        callback_compact_index = int(
-            callback_index_map[timestep_index].item()
+        callback_index = resolve_marginal_cfm_callback_index(
+            callback_index_map,
+            timestep_index=timestep_index,
+            callback_count=int(batch["noise_pred"].shape[1]),
         )
-        callback_count = int(batch["noise_pred"].shape[1])
-        if not 0 <= callback_compact_index < callback_count:
-            raise RuntimeError(
-                "marginal CFM callback step was not collected: "
-                f"timestep_index={timestep_index}, "
-                f"callback_compact_index={callback_compact_index}, "
-                f"callback_count={callback_count}."
-            )
-        velocity_target = batch["noise_pred"][
-            :, callback_compact_index
+        target_noise_pred = batch["noise_pred"][
+            :, callback_index
         ].detach()
         if student_out.noise_pred is None:
             raise RuntimeError(
                 "marginal CFM requires current student `noise_pred`; "
                 f"got None at timestep_index={timestep_index}."
             )
-        if student_out.noise_pred.shape != velocity_target.shape:
-            raise ValueError(
-                "marginal CFM velocity shape mismatch: "
-                f"student_shape={tuple(student_out.noise_pred.shape)}, "
-                f"target_shape={tuple(velocity_target.shape)}, "
-                f"timestep_index={timestep_index}."
-            )
-        if not torch.isfinite(velocity_target).all():
-            raise ValueError(
-                "marginal CFM target contains NaN/Inf: "
-                f"timestep_index={timestep_index}, "
-                "branch_ids="
-                f"{batch['marginal_cfm_branch'].tolist()}."
-            )
-        if not torch.isfinite(student_out.noise_pred).all():
-            raise ValueError(
-                "marginal CFM student output contains NaN/Inf: "
-                f"timestep_index={timestep_index}, "
-                "branch_ids="
-                f"{batch['marginal_cfm_branch'].tolist()}."
-            )
-
-        error = (
-            student_out.noise_pred.float()
-            - velocity_target.float()
+        d_k_grad = compute_marginal_cfm_velocity_loss(
+            student_out.noise_pred,
+            target_noise_pred,
         )
-        event_axes = tuple(range(1, error.ndim))
-        d_k_grad = error.square().mean(dim=event_axes)
+        diagnostics = compute_marginal_cfm_diagnostics(
+            student_noise_pred=student_out.noise_pred,
+            target_noise_pred=target_noise_pred,
+            teacher_branch_mask=batch["marginal_cfm_branch"],
+        )
+        self._append_marginal_cfm_diagnostics(
+            loss_info,
+            diagnostics,
+            batch["marginal_cfm_branch"],
+        )
     elif self._is_popd:
         # Existing P-OPD branch remains unchanged.
         d_k_grad = compute_popd_pathwise_term(...)
@@ -1632,8 +1604,7 @@ with self.accelerator.accumulate(*self.adapter.trainable_components):
     pathwise_loss = d_k_grad.mean()
     loss = self.pathwise_coef * pathwise_loss
 
-    # KEEP the current MoE/MoF auxiliary-loss blocks here.
-    loss = add_existing_auxiliary_terms(loss)
+    # The existing inline MoE/MoF auxiliary-loss blocks add to loss here.
     if self.enable_kl_loss:
         kl_div, kl_loss = self._compute_kl_anchor(
             student_out, forward_kwargs
@@ -1649,9 +1620,8 @@ with self.accelerator.accumulate(*self.adapter.trainable_components):
         # Keep the existing reduce/log/step bookkeeping.
 \end{lstlisting}
 
-\texttt{add\_existing\_auxiliary\_terms} and the two abbreviated pathwise helpers in this listing
-are explanatory placeholders, not current functions.  In the minimal patch, retain the existing
-inline blocks from \texttt{trainer.py} in the shown order.  The number of backward calls remains
+The P-OPD/direct branches and inline auxiliary blocks are abbreviated in the listing; the A4
+helper names are the production symbols.  The number of backward calls remains
 \[
 \texttt{num\_batches\_per\_epoch}
 \times
@@ -1661,13 +1631,13 @@ so the existing one-optimizer-step-per-epoch GAS invariant remains valid.
 
 \subsection{Dispatch changes}
 
-The high-level branch in \texttt{optimize()} should skip only target precomputation; every mode
+The high-level branch in \texttt{optimize()} skips only target precomputation; every mode
 then enters the shared optimizer shell:
-\begin{lstlisting}[style=python,caption={Proposed target-mode dispatch.}]
+\begin{lstlisting}[style=python,caption={Implemented target-mode dispatch, abbreviated.}]
 if self._is_marginal_cfm:
     mu_teacher_list = None
     popd_cache_list = None
-    callback_index_map = normalize_callback_map(
+    callback_index_map = normalize_callback_index_map(
         batch["callback_index_map"]
     )
 else:
@@ -1705,11 +1675,11 @@ For $B$ samples and $K$ trained steps:
 \toprule
 design & rollout forwards & optimize forwards & trajectory storage\\
 \midrule
-current direct XOPD
+direct XOPD
 & $B$ student trajectories
 & $BK$ teacher + $BK$ student
 & states\\
-proposed A4
+implemented A4
 & $(1-\alpha)B$ old + $\alpha B$ teacher trajectories
 & $BK$ student
 & states + $T_v$ velocities\\
@@ -1721,7 +1691,7 @@ dual-rollout A4
 \end{tabular}
 \end{center}
 
-The proposed design removes the teacher pre-pass but stores one velocity tensor for every callback
+The implemented design removes the teacher pre-pass but stores one velocity tensor for every callback
 step.  Do not assume $T_v=K$: the current trajectory-index expansion can collect neighboring
 positions and make $T_v$ approach $2K$.  Either introduce a separate callback-step selector or
 measure and report the actual compact callback length.  With all steps stored, callback storage
@@ -1734,7 +1704,7 @@ is roughly another trajectory-sized tensor.
 
 \subsection{Unit tests}
 
-The first implementation should add tests before trainer integration:
+The focused implementation tests cover:
 \begin{enumerate}[leftmargin=1.6em]
 \item \textbf{Branch frequency}: a large deterministic draw approaches $\alpha$ and is repeatable
       for the same seed/epoch/batch index.
@@ -1755,14 +1725,12 @@ The first implementation should add tests before trainer integration:
       device reload, shuffling, and stacking.
 \item \textbf{Optimizer integration}: MoE/MoF auxiliaries and the optional KL anchor contribute
       gradients before backward; GAS still yields one optimizer step per epoch.
-\item \textbf{Distributed call order}: every rank enters old/teacher collectives in the same order
-      for empty and non-empty subsets.
-\item \textbf{Toy marginal recovery}: a one-dimensional analytic old/teacher pair trained with
-      two-source CFM empirically reproduces samples from the target mixture.
+\item \textbf{Distributed call-order protocol}: the rank-independent branch draw and fixed
+      old-then-teacher subset order are deterministic, including empty subsets.
 \item \textbf{Shape/finite guards}: mismatched shape, NaN, or Inf raises an informative error.
 \end{enumerate}
 
-\begin{lstlisting}[style=python,caption={Representative helper-level tests, proposed.}]
+\begin{lstlisting}[style=python,caption={Representative implemented helper-level assertions.}]
 def test_marginal_cfm_loss_only_gradients_student():
     velocity_student = torch.tensor([[1.0, 2.0]], requires_grad=True)
     velocity_target = torch.tensor([[0.0, 4.0]], requires_grad=False)
@@ -1775,22 +1743,25 @@ def test_marginal_cfm_loss_only_gradients_student():
 
 
 def test_callback_map_shape_after_real_sample_stack():
-    # make_flux2_sample is a fixture that fills every required sample field.
     map_per_sample = torch.tensor([-1, -1, 0, -1])
     samples = [
-        make_flux2_sample(
-            callback_index_map=map_per_sample,
-            marginal_cfm_branch=torch.tensor(False),
+        Flux2KleinSample(
+            extra_kwargs={
+                "callback_index_map": map_per_sample,
+                "marginal_cfm_branch": torch.tensor(False),
+            },
         ),
-        make_flux2_sample(
-            callback_index_map=map_per_sample.clone(),
-            marginal_cfm_branch=torch.tensor(True),
+        Flux2KleinSample(
+            extra_kwargs={
+                "callback_index_map": map_per_sample.clone(),
+                "marginal_cfm_branch": torch.tensor(True),
+            },
         ),
     ]
 
     batch = BaseSample.stack(samples)
     assert batch["callback_index_map"].shape == (2, 4)
-    callback_map = normalize_callback_map(
+    callback_map = normalize_callback_index_map(
         batch["callback_index_map"]
     )
     assert torch.equal(callback_map, map_per_sample)
@@ -1799,12 +1770,16 @@ def test_callback_map_shape_after_real_sample_stack():
 
 \subsection{GPU smoke tests}
 
-Run three one-step-per-epoch smoke arms with identical prompt batches and selected timesteps:
-\begin{enumerate}[leftmargin=1.6em]
-\item $\alpha=0$: only old trajectories; the target is the frozen rollout velocity.
-\item $\alpha=1$: only teacher trajectories; this is teacher-trajectory CFM.
-\item $\alpha=0.5$: both branches appear globally and remain fixed within each trajectory.
-\end{enumerate}
+The checked-in pair holds the prompt source, model, timestep schedule, batch/GAS geometry, and
+optimizer settings fixed.  Only the target behavior changes:
+\begin{lstlisting}[style=yaml,caption={Matched eight-GPU smoke commands.}]
+ff-train xopd_configs/ode_pathwise/_TEST_9b_4b_marginal_cfm_smoke.yaml
+ff-train xopd_configs/ode_pathwise/_TEST_9b_4b_direct_ctrl_marginal_cfm_smoke.yaml
+\end{lstlisting}
+The A4 config uses $\alpha=0.5$; $\alpha=0$ and $\alpha=1$ routing boundaries are covered by CPU
+unit tests.  These commands are documented but were \textbf{NOT RUN locally} and are
+\textbf{not evidence of passing distributed validation}.  The real smoke requires an eight-GPU
+host.
 Check:
 \begin{itemize}[leftmargin=1.5em]
 \item exactly one optimizer step per epoch;
@@ -1819,27 +1794,36 @@ Check:
 
 \subsection{Diagnostics}
 
-Log detached, globally aggregated values:
+The shared \texttt{reduce\_loss\_info} reducer preserves scalar keys and expands every
+per-sample vector into \texttt{\_min}, \texttt{\_max}, \texttt{\_mean}, and \texttt{\_std}
+series.  The overall objective and matching term therefore remain the scalar
+\path{train/loss} and \path{train/d_k} keys; there is no
+\path{train/marginal_cfm/loss}.  In the table, A4 base names are under
+\path{train/marginal_cfm/}; ``four stats'' means all four suffixes above.
 \begin{center}
 \begin{tabular}{@{}
-  >{\raggedright\arraybackslash}p{0.47\textwidth}
-  >{\raggedright\arraybackslash}p{0.45\textwidth}
+  >{\raggedright\arraybackslash}p{0.42\textwidth}
+  >{\raggedright\arraybackslash}p{0.50\textwidth}
 @{}}
 \toprule
 metric & purpose\\
 \midrule
-\path{marginal_cfm/teacher_branch_fraction}
+\path{train/loss}, \path{train/d_k}
+& scalar overall objective and CFM matching term\\
+\path{train/loss/\{ti\}}, \path{train/d_k/\{ti\}}
+& scalar per-timestep objective and matching term\\
+\texttt{callback\_count}
+& measure actual compact callback storage\\
+\texttt{teacher\_branch\_fraction} (four stats)
 & verify Bernoulli routing and distributed aggregation\\
-\path{marginal_cfm/loss_old}, \path{loss_teacher}
-& separate replay consistency from teacher fitting difficulty\\
-\path{marginal_cfm/target_velocity_rms}
+\texttt{loss\_old}, \texttt{loss\_teacher} (four stats)
+& branch-conditioned fitting difficulty; absent for an empty branch\\
+\texttt{target\_velocity\_rms} (four stats)
 & resolution-stable target scale\\
-\path{marginal_cfm/target_velocity_l2}
+\texttt{target\_velocity\_l2} (four stats)
 & full event scale\\
-\path{marginal_cfm/student_target_gap_rms}
+\texttt{student\_target\_gap\_rms} (four stats)
 & direct CFM fitting error\\
-\path{marginal_cfm/old_endpoint_rms}, \path{teacher_endpoint_rms}
-& detect branch/state-space mismatch\\
 \path{train/grad_norm}
 & distinguish small CFM error from optimizer clipping\\
 \bottomrule
@@ -1853,19 +1837,20 @@ estimate would be an optional research diagnostic, not part of the training algo
 
 \begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=Minimum correct same-VAE A4]
 \begin{enumerate}[leftmargin=1.5em]
-\item[$\square$] ODE-only, shared latent space, shared timestep grid.
-\item[$\square$] Draw one branch label per full trajectory before rollout.
-\item[$\square$] Run only the selected old or teacher trajectory for each row.
-\item[$\square$] Capture the selected source's CFG-combined \texttt{noise\_pred}.
-\item[$\square$] Restore student conditioning fields on teacher-trajectory samples.
-\item[$\square$] Align states with \texttt{latent\_index\_map} and targets with
+\item[$\checkmark$] ODE-only, shared latent space, shared timestep grid.
+\item[$\checkmark$] Draw one branch label per full trajectory before rollout.
+\item[$\checkmark$] Run only the selected old or teacher trajectory for each row.
+\item[$\checkmark$] Capture the selected source's CFG-combined \texttt{noise\_pred}.
+\item[$\checkmark$] Restore student conditioning fields on teacher-trajectory samples.
+\item[$\checkmark$] Align states with \texttt{latent\_index\_map} and targets with
       \texttt{callback\_index\_map}.
-\item[$\square$] Detach target velocities; backpropagate only through the current student.
-\item[$\square$] Skip the existing teacher-on-old-state pre-pass.
-\item[$\square$] Preserve accumulation, auxiliary losses, KL anchor, and optimizer boundaries.
-\item[$\square$] Preserve rank-synchronous old/teacher collective call order.
-\item[$\square$] Disable or relabel direct-XOPD validation-$D_k$ in A4 mode.
-\item[$\square$] Log per-branch counts, losses, RMS/L2 scales, and gradient norm.
+\item[$\checkmark$] Detach target velocities; backpropagate only through the current student.
+\item[$\checkmark$] Skip the existing teacher-on-old-state pre-pass.
+\item[$\checkmark$] Preserve accumulation, auxiliary losses, KL anchor, and optimizer boundaries.
+\item[$\checkmark$] Preserve rank-synchronous old/teacher collective call order.
+\item[$\checkmark$] Skip direct-XOPD validation-$D_k$ in A4 mode.
+\item[$\checkmark$] Log branch fraction, per-branch losses, callback count, RMS/L2 scales, and
+      gradient norm.
 \end{enumerate}
 \end{tcolorbox}
 

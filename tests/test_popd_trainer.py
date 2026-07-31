@@ -111,8 +111,13 @@ class TestPOPDTrainerCache(unittest.TestCase):
         torch.testing.assert_close(quantiles["popd/gamma_p50"], torch.tensor(0.5))
         self.assertEqual(
             sorted(quantiles),
-            ["popd/gamma_p01", "popd/gamma_p10", "popd/gamma_p50", "popd/gamma_p90",
-             "popd/gamma_p99"],
+            [
+                "popd/gamma_p01",
+                "popd/gamma_p10",
+                "popd/gamma_p50",
+                "popd/gamma_p90",
+                "popd/gamma_p99",
+            ],
         )
 
 
@@ -149,6 +154,7 @@ class TestPOPDScheduleAlignment(unittest.TestCase):
             num_xopd_steps=None,
         )
         trainer._is_popd = True
+        trainer._is_marginal_cfm = False
         trainer._is_ode = False
         trainer._cross_vae = False
         trainer.log_args = SimpleNamespace(verbose=False)

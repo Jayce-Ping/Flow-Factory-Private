@@ -75,19 +75,25 @@ from .common import (
     align_l0_inner_steps,
     build_forward_kwargs,
     cache_forward_signature,
+    compute_marginal_cfm_diagnostics,
+    compute_marginal_cfm_velocity_loss,
     compute_per_step_kl,
     compute_popd_diagnostics,
     compute_popd_gaussian_mean_kl,
     compute_popd_quantiles,
     compute_popd_responsibility,
     compute_transition_variance,
+    draw_marginal_cfm_branches,
     extract_i2i_condition_kwargs,
     extract_popd_behavior_transition,
     interleaved_source_iter,
     l0_loss_weight,
+    normalize_callback_index_map,
+    resolve_marginal_cfm_callback_index,
+    resolve_marginal_cfm_latent_index,
     validate_l1_one_step_per_epoch,
-    validate_popd_configuration,
     validate_source_ratio,
+    validate_xopd_target_configuration,
 )
 from .router_coldstart import (
     alignment_metrics,
@@ -132,6 +138,7 @@ class XOPDTrainer(BaseTrainer):
         self.student_gs = ta.student_guidance_scale
         self.xopd_target_mode = ta.xopd_target_mode
         self._is_popd = self.xopd_target_mode == "p_opd"
+        self._is_marginal_cfm = self.xopd_target_mode == "marginal_cfm"
         self.popd_alpha = float(ta.popd_alpha) if self._is_popd else 0.5
         self.popd_temperature = float(ta.popd_temperature) if self._is_popd else 1.0
         self.popd_verbose_diagnostics = bool(ta.popd_verbose_diagnostics)
@@ -180,7 +187,7 @@ class XOPDTrainer(BaseTrainer):
         self._pixel_loss = bool(ta.xopd_pixel_loss)
         self._hsct_hidden: Dict[int, torch.Tensor] = {}
         self._hsct_capture = False
-        validate_popd_configuration(
+        validate_xopd_target_configuration(
             target_mode=self.xopd_target_mode,
             dynamics_type=self.adapter.scheduler.dynamics_type,
             noise_level=self.adapter.scheduler.noise_level,
@@ -188,6 +195,7 @@ class XOPDTrainer(BaseTrainer):
             normalize_d_k=self.normalize_d_k,
             is_cross_vae=self._cross_vae,
             pixel_loss=self._pixel_loss,
+            vae_transport=ta.vae_transport,
         )
         if self._cross_vae:
             self._init_cross_vae_teacher()
@@ -987,7 +995,9 @@ class XOPDTrainer(BaseTrainer):
 
     def _student_return_kwargs_for_train(self) -> List[str]:
         keys = list(_STUDENT_RETURN_KWARGS)
-        if self.enable_kl_loss and self.training_args.kl_type == "v-based":
+        if self._is_marginal_cfm or (
+            self.enable_kl_loss and self.training_args.kl_type == "v-based"
+        ):
             keys.append("noise_pred")
         return keys
 
@@ -1026,8 +1036,11 @@ class XOPDTrainer(BaseTrainer):
         n_clusters = int(mof.config.num_experts)
         logger.info(
             "[mof-coldstart] start: experts=%d balanced=%s max_samples=%d steps=%d (world=%d)",
-            n_clusters, ma.mof_cluster_balanced, ma.mof_cluster_max_samples,
-            ma.mof_router_coldstart_steps, world_size,
+            n_clusters,
+            ma.mof_cluster_balanced,
+            ma.mof_cluster_max_samples,
+            ma.mof_router_coldstart_steps,
+            world_size,
         )
 
         # --- (a) gather this rank's shard of train prompts from the cache ---
@@ -1056,7 +1069,9 @@ class XOPDTrainer(BaseTrainer):
             sample = ds[i]
             pe = sample["prompt_embeds"]  # (L, D)
             if not isinstance(pe, torch.Tensor):
-                raise TypeError(f"prompt_embeds for source {src!r} idx {i} is {type(pe).__name__}, expected Tensor.")
+                raise TypeError(
+                    f"prompt_embeds for source {src!r} idx {i} is {type(pe).__name__}, expected Tensor."
+                )
             pe = pe.detach()
             pids = sample.get("prompt_ids", None)
             mask = None
@@ -1067,9 +1082,11 @@ class XOPDTrainer(BaseTrainer):
             pooled_list.append(pooled.cpu())
             sources_local.append(src)
         if not pooled_list:
-            raise RuntimeError(f"[mof-coldstart] rank {rank} gathered 0 prompts; check the train cache.")
-        prompt_seq_local = torch.stack(seq_list, dim=0)   # (m, L, D) fp16 CPU
-        pooled_local = torch.stack(pooled_list, dim=0)    # (m, D) fp32 CPU
+            raise RuntimeError(
+                f"[mof-coldstart] rank {rank} gathered 0 prompts; check the train cache."
+            )
+        prompt_seq_local = torch.stack(seq_list, dim=0)  # (m, L, D) fp16 CPU
+        pooled_local = torch.stack(pooled_list, dim=0)  # (m, D) fp32 CPU
 
         # --- gather pooled embeds (+ sources) across ranks ---
         if world_size > 1:
@@ -1092,11 +1109,16 @@ class XOPDTrainer(BaseTrainer):
         use_soft = getattr(ma, "mof_router_coldstart_label", "hard") == "soft"
         soft_T = float(getattr(ma, "mof_router_coldstart_temperature", 0.5))
         labels_all = torch.zeros(total_m, dtype=torch.long, device=device)
-        soft_all = torch.zeros(total_m, n_clusters, dtype=torch.float32, device=device) if use_soft else None
+        soft_all = (
+            torch.zeros(total_m, n_clusters, dtype=torch.float32, device=device)
+            if use_soft
+            else None
+        )
         metrics = None
         if is_main:
             lab, _, sim = balanced_spherical_kmeans(
-                X_all, n_clusters,
+                X_all,
+                n_clusters,
                 balanced=ma.mof_cluster_balanced,
                 pca_dim=ma.mof_cluster_pca_dim,
                 seed=int(self.training_args.seed),
@@ -1109,16 +1131,20 @@ class XOPDTrainer(BaseTrainer):
             logger.info(
                 "[mof-coldstart] clustering done: sizes=%s ARI=%.4f purity=%.4f (vs sources %s) "
                 "| target=%s%s -- source labels are DIAGNOSTIC ONLY (not used for clustering/CE)",
-                metrics["cluster_sizes"], metrics["ari"], metrics["purity"], metrics["sources"],
-                ("soft(T=%.3g)" % soft_T) if use_soft else "hard(one-hot)", "",
+                metrics["cluster_sizes"],
+                metrics["ari"],
+                metrics["purity"],
+                metrics["sources"],
+                ("soft(T=%.3g)" % soft_T) if use_soft else "hard(one-hot)",
+                "",
             )
         if world_size > 1:
             dist.broadcast(labels_all, src=0)
             if use_soft:
                 dist.broadcast(soft_all, src=0)
         m_local = prompt_seq_local.shape[0]
-        labels_local = labels_all[offset:offset + m_local].to("cpu")
-        soft_local = soft_all[offset:offset + m_local].to("cpu") if use_soft else None
+        labels_local = labels_all[offset : offset + m_local].to("cpu")
+        soft_local = soft_all[offset : offset + m_local].to("cpu") if use_soft else None
 
         # --- (c) data-parallel router cold-start (bypasses DeepSpeed/DDP engine) ---
         router = mof.router
@@ -1143,7 +1169,8 @@ class XOPDTrainer(BaseTrainer):
             ts = (t * 1000).to(rdtype)
             g = (
                 torch.full((b,), student_gs * 1000, device=device, dtype=rdtype)
-                if guidance_embeds else None
+                if guidance_embeds
+                else None
             )
             temb = router_time_embed(ts, g)
             dummy_latent = torch.zeros(b, 1, in_ch, device=device, dtype=rdtype)
@@ -1151,7 +1178,7 @@ class XOPDTrainer(BaseTrainer):
             # proper distribution (classify prompt into a cluster), independent of the train-time
             # gate_fn (softmax/sigmoid).
             logits = router(pe_batch, dummy_latent, temb)  # (b, N) raw logits
-            return torch.softmax(logits.float(), dim=-1)   # (b, N) probs
+            return torch.softmax(logits.float(), dim=-1)  # (b, N) probs
 
         log_f = None
         default_path = os.path.join(
@@ -1169,7 +1196,9 @@ class XOPDTrainer(BaseTrainer):
             logger.info(
                 "[mof-coldstart] step=%d ce=%.4f acc=%.4f maxprob=%.4f", step, ce, acc_v, maxprob
             )
-            log_f.write(json.dumps({"step": step, "ce": ce, "acc": acc_v, "maxprob": maxprob}) + "\n")
+            log_f.write(
+                json.dumps({"step": step, "ce": ce, "acc": acc_v, "maxprob": maxprob}) + "\n"
+            )
             log_f.flush()
 
         # Under FSDP the router is not its own wrap unit (TRANSFORMER_BASED_WRAP only wraps the
@@ -1185,15 +1214,24 @@ class XOPDTrainer(BaseTrainer):
         prepared = self.adapter.transformer
         unshard = (
             FSDP.summon_full_params(prepared, recurse=False, writeback=True, with_grads=True)
-            if isinstance(prepared, FSDP) else nullcontext()
+            if isinstance(prepared, FSDP)
+            else nullcontext()
         )
         with unshard:
             coldstart_router(
-                router_forward_fn, params, prompt_seq_local, labels_local,
-                steps=ma.mof_router_coldstart_steps, lr=ma.mof_router_coldstart_lr,
-                batch_size=ma.mof_router_coldstart_batch, world_size=world_size, device=device,
-                log_every=ma.mof_router_coldstart_log_every, log_cb=log_cb,
-                seed=int(self.training_args.seed), soft_targets=soft_local,
+                router_forward_fn,
+                params,
+                prompt_seq_local,
+                labels_local,
+                steps=ma.mof_router_coldstart_steps,
+                lr=ma.mof_router_coldstart_lr,
+                batch_size=ma.mof_router_coldstart_batch,
+                world_size=world_size,
+                device=device,
+                log_every=ma.mof_router_coldstart_log_every,
+                log_cb=log_cb,
+                seed=int(self.training_args.seed),
+                soft_targets=soft_local,
             )
 
             # --- (d) sync router replicas ---
@@ -1207,10 +1245,14 @@ class XOPDTrainer(BaseTrainer):
         if is_main and log_f is not None:
             summary = {"event": "summary", "steps": ma.mof_router_coldstart_steps}
             if metrics is not None:
-                summary.update({
-                    "ari": metrics["ari"], "purity": metrics["purity"],
-                    "cluster_sizes": metrics["cluster_sizes"], "sources": metrics["sources"],
-                })
+                summary.update(
+                    {
+                        "ari": metrics["ari"],
+                        "purity": metrics["purity"],
+                        "cluster_sizes": metrics["cluster_sizes"],
+                        "sources": metrics["sources"],
+                    }
+                )
             log_f.write(json.dumps(summary) + "\n")
             log_f.close()
         acc.wait_for_everyone()
@@ -1295,7 +1337,8 @@ class XOPDTrainer(BaseTrainer):
         super().evaluate()
         # Validation D_k on the gs=1.0 sets (held-out transition-matching loss),
         # written into the same sink so it shares the student/teacher eval step.
-        self._evaluate_validation_d_k()
+        if not self._is_marginal_cfm:
+            self._evaluate_validation_d_k()
         if self.accelerator.is_main_process:
             if self._teacher_baseline_scalars:
                 self._eval_log_sink.update(self._teacher_baseline_scalars)
@@ -1312,14 +1355,13 @@ class XOPDTrainer(BaseTrainer):
     ) -> List[BaseSample]:
         """XOPD override of the base student eval rollout.
 
-        For the no-CFG (gs=1.0) eval sets we roll out WITH ``trajectory_indices``
-        so the FULL trajectory is stored, and cache the resulting samples
-        (CPU-offloaded) on ``self._eval_rollout_cache`` so
+        For direct/P-OPD no-CFG (gs=1.0) eval sets we roll out WITH
+        ``trajectory_indices`` so the FULL trajectory is stored, and cache the
+        resulting samples (CPU-offloaded) on ``self._eval_rollout_cache`` so
         :meth:`_evaluate_validation_d_k` reuses this SINGLE rollout for the
-        per-timestep D_k instead of running an identical second rollout. The
-        final image is unchanged by trajectory storage, so the reward metrics are
-        identical to the base path. gs!=1.0 sets keep the base behavior exactly
-        (``trajectory_indices=None``, final image only, no cache).
+        per-timestep D_k instead of running an identical second rollout. Marginal
+        CFM skips validation D_k, so it requests only the final image and does not
+        cache trajectories. The reward protocol is unchanged.
 
         The cached samples are moved to CPU on purpose: with 3 gs=1.0 sets scored
         before the D_k pass runs, keeping every set's full trajectory resident on
@@ -1327,7 +1369,7 @@ class XOPDTrainer(BaseTrainer):
         (identical to the reward path under ``offload_samples_to_cpu``).
         """
         gs = float(getattr(merged_eval, "guidance_scale", 1.0))
-        store_traj = abs(gs - 1.0) <= 1e-6
+        store_traj = not self._is_marginal_cfm and abs(gs - 1.0) <= 1e-6
         trajectory_indices = None
         if store_traj:
             eval_steps = int(
@@ -2605,6 +2647,296 @@ class XOPDTrainer(BaseTrainer):
                 out[k] = v.to(device) if torch.is_tensor(v) else v
         return out
 
+    @staticmethod
+    def _slice_marginal_cfm_batch_rows(
+        batch: Dict[str, Any],
+        row_indices: torch.Tensor,
+        batch_size: int,
+    ) -> Dict[str, Any]:
+        """Slice row-aligned marginal-CFM values while preserving shared values."""
+        if not isinstance(batch, dict):
+            raise TypeError(
+                "expected dict batch for marginal CFM row slicing, "
+                f"got {type(batch).__name__}: {batch!r}."
+            )
+        if not isinstance(row_indices, torch.Tensor):
+            raise TypeError(
+                "expected torch.Tensor row_indices for marginal CFM row slicing, "
+                f"got {type(row_indices).__name__}: {row_indices!r}."
+            )
+        if row_indices.dtype != torch.long or row_indices.ndim != 1:
+            raise TypeError(
+                "expected one-dimensional torch.long row_indices for marginal CFM row slicing, "
+                f"got dtype={row_indices.dtype}, shape={tuple(row_indices.shape)}."
+            )
+        if row_indices.numel() < 1:
+            raise ValueError(
+                "expected nonempty row_indices for marginal CFM row slicing, "
+                f"got shape={tuple(row_indices.shape)}, batch_size={batch_size}."
+            )
+        if int(row_indices.min().item()) < 0 or int(row_indices.max().item()) >= batch_size:
+            raise ValueError(
+                "expected marginal CFM row_indices within batch bounds, "
+                f"got row_indices={row_indices.tolist()}, batch_size={batch_size}."
+            )
+
+        subset: Dict[str, Any] = {}
+        shared_types = (
+            str,
+            bytes,
+            int,
+            float,
+            bool,
+            tuple,
+            dict,
+            torch.Generator,
+            type(None),
+        )
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 0:
+                    subset[key] = value
+                    continue
+                if value.shape[0] != batch_size:
+                    raise ValueError(
+                        "expected row-aligned tensor leading dimension to match marginal CFM "
+                        f"batch_size for key={key!r}, got shape={tuple(value.shape)}, "
+                        f"batch_size={batch_size}."
+                    )
+                subset[key] = value.index_select(0, row_indices.to(value.device))
+                continue
+            if isinstance(value, list):
+                if len(value) != batch_size:
+                    raise ValueError(
+                        "expected row-aligned list length to match marginal CFM batch_size "
+                        f"for key={key!r}, got length={len(value)}, batch_size={batch_size}."
+                    )
+                subset[key] = [value[row] for row in row_indices.tolist()]
+                continue
+            if isinstance(value, shared_types):
+                subset[key] = value
+                continue
+            raise TypeError(
+                "unsupported marginal CFM batch value; expected row-aligned tensor/list "
+                f"or shared scalar/container for key={key!r}, got "
+                f"{type(value).__name__}: {value!r}."
+            )
+        return subset
+
+    def _route_marginal_cfm_teacher_conditioning(
+        self,
+        inference_kwargs: Dict[str, Any],
+        subset: Dict[str, Any],
+    ) -> None:
+        """Replace active inference conditioning with validated teacher fields."""
+        required_keys = ("teacher_prompt_embeds", "teacher_text_ids")
+        missing_keys = [key for key in required_keys if subset.get(key) is None]
+        if missing_keys:
+            raise ValueError(
+                "marginal CFM teacher rollout requires teacher conditioning, "
+                f"missing_keys={missing_keys!r}."
+            )
+        for key in required_keys:
+            if not isinstance(subset[key], torch.Tensor):
+                raise TypeError(
+                    "expected tensor teacher conditioning for marginal CFM rollout, "
+                    f"got key={key!r}, type={type(subset[key]).__name__}, "
+                    f"value={subset[key]!r}."
+                )
+
+        device = self.accelerator.device
+        inference_kwargs["prompt_embeds"] = subset["teacher_prompt_embeds"].to(device)
+        inference_kwargs["text_ids"] = subset["teacher_text_ids"].to(device)
+        inference_kwargs.pop("prompt_ids", None)
+
+        negative_keys = (
+            "teacher_negative_prompt_embeds",
+            "teacher_negative_text_ids",
+        )
+        if self.teacher_gs > 1.0:
+            missing_negative_keys = [key for key in negative_keys if subset.get(key) is None]
+            if missing_negative_keys:
+                raise ValueError(
+                    "marginal CFM teacher CFG requires negative teacher conditioning, "
+                    f"missing_keys={missing_negative_keys!r}, "
+                    f"teacher_guidance_scale={self.teacher_gs}."
+                )
+            for key in negative_keys:
+                if not isinstance(subset[key], torch.Tensor):
+                    raise TypeError(
+                        "expected tensor teacher CFG conditioning for marginal CFM rollout, "
+                        f"got key={key!r}, type={type(subset[key]).__name__}, "
+                        f"value={subset[key]!r}."
+                    )
+            inference_kwargs["negative_prompt_embeds"] = subset[
+                "teacher_negative_prompt_embeds"
+            ].to(device)
+            inference_kwargs["negative_text_ids"] = subset["teacher_negative_text_ids"].to(device)
+            inference_kwargs.pop("negative_prompt_ids", None)
+        else:
+            for key in (
+                "negative_prompt_embeds",
+                "negative_text_ids",
+                "negative_prompt_ids",
+            ):
+                inference_kwargs.pop(key, None)
+
+    @staticmethod
+    def _restore_marginal_cfm_student_conditioning(
+        samples: List[BaseSample],
+        subset: Dict[str, Any],
+    ) -> None:
+        """Restore student text conditioning after a teacher-source rollout."""
+        conditioning_keys = (
+            "prompt_ids",
+            "prompt_embeds",
+            "text_ids",
+            "negative_prompt_ids",
+            "negative_prompt_embeds",
+            "negative_text_ids",
+        )
+        sample_count = len(samples)
+        for key in conditioning_keys:
+            value = subset.get(key)
+            if value is None:
+                for sample in samples:
+                    setattr(sample, key, None)
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.ndim < 1 or value.shape[0] != sample_count:
+                    raise ValueError(
+                        "expected row-aligned tensor while restoring marginal CFM student "
+                        f"conditioning for key={key!r}, got shape={tuple(value.shape)}, "
+                        f"sample_count={sample_count}."
+                    )
+                row_values = list(value.unbind(dim=0))
+            elif isinstance(value, list):
+                if len(value) != sample_count:
+                    raise ValueError(
+                        "expected row-aligned list while restoring marginal CFM student "
+                        f"conditioning for key={key!r}, got length={len(value)}, "
+                        f"sample_count={sample_count}."
+                    )
+                row_values = value
+            else:
+                raise TypeError(
+                    "expected tensor, list, or None while restoring marginal CFM student "
+                    f"conditioning for key={key!r}, got {type(value).__name__}: {value!r}."
+                )
+            for sample, row_value in zip(samples, row_values):
+                setattr(sample, key, row_value)
+
+    def _sample_marginal_cfm_batch(
+        self,
+        batch: Dict[str, Any],
+        batch_index: int,
+        trajectory_indices: Any,
+    ) -> List[BaseSample]:
+        """Route one source rollout per row and merge samples to input order."""
+        prompt_embeds = batch.get("prompt_embeds") if isinstance(batch, dict) else None
+        if not isinstance(prompt_embeds, torch.Tensor):
+            raise TypeError(
+                "expected tensor batch['prompt_embeds'] to determine marginal CFM batch size, "
+                f"got {type(prompt_embeds).__name__}: {prompt_embeds!r}."
+            )
+        if prompt_embeds.ndim < 1 or prompt_embeds.shape[0] < 1:
+            raise ValueError(
+                "expected nonempty row-aligned batch['prompt_embeds'] for marginal CFM, "
+                f"got shape={tuple(prompt_embeds.shape)}."
+            )
+        batch_size = int(prompt_embeds.shape[0])
+        branches = draw_marginal_cfm_branches(
+            batch_size,
+            alpha=self.training_args.marginal_cfm_alpha,
+            seed=self.training_args.seed,
+            epoch=self.epoch,
+            batch_index=batch_index,
+        )
+        ordered_samples: List[Optional[BaseSample]] = [None] * batch_size
+
+        for use_teacher in (False, True):
+            row_indices = torch.nonzero(
+                branches == use_teacher,
+                as_tuple=False,
+            ).flatten()
+            if row_indices.numel() == 0:
+                continue
+
+            subset = self._slice_marginal_cfm_batch_rows(
+                batch,
+                row_indices,
+                batch_size,
+            )
+            inference_kwargs = {
+                **self.training_args,
+                **subset,
+                "compute_log_prob": False,
+                "trajectory_indices": trajectory_indices,
+                "extra_call_back_kwargs": ["noise_pred"],
+                "guidance_scale": self.teacher_gs if use_teacher else self.student_gs,
+            }
+            if use_teacher:
+                self._route_marginal_cfm_teacher_conditioning(
+                    inference_kwargs,
+                    subset,
+                )
+            inference_kwargs = filter_kwargs(
+                self.adapter.inference,
+                **inference_kwargs,
+            )
+            if use_teacher:
+                with self.adapter.use_teacher_transformer():
+                    subset_samples = self.adapter.inference(**inference_kwargs)
+            else:
+                subset_samples = self.adapter.inference(**inference_kwargs)
+
+            expected_count = int(row_indices.numel())
+            if len(subset_samples) != expected_count:
+                raise RuntimeError(
+                    "marginal CFM subset rollout count mismatch: "
+                    f"use_teacher={use_teacher}, expected={expected_count}, "
+                    f"received={len(subset_samples)}."
+                )
+            for subset_row, sample in enumerate(subset_samples):
+                if not isinstance(sample, BaseSample):
+                    original_row = int(row_indices[subset_row].item())
+                    raise TypeError(
+                        "expected BaseSample from marginal CFM subset rollout, "
+                        f"got row={original_row}, use_teacher={use_teacher}, "
+                        f"type={type(sample).__name__}: {sample!r}."
+                    )
+            if use_teacher:
+                self._restore_marginal_cfm_student_conditioning(
+                    subset_samples,
+                    subset,
+                )
+
+            for original_row, sample in zip(
+                row_indices.tolist(),
+                subset_samples,
+            ):
+                sample.extra_kwargs["marginal_cfm_branch"] = torch.tensor(
+                    use_teacher,
+                    dtype=torch.bool,
+                )
+                ordered_samples[original_row] = sample
+
+        missing_rows = [row for row, sample in enumerate(ordered_samples) if sample is None]
+        if missing_rows:
+            raise RuntimeError(
+                "marginal CFM rollout did not produce one sample per input row; "
+                f"missing_rows={missing_rows}, batch_size={batch_size}."
+            )
+        merged_samples = [sample for sample in ordered_samples if sample is not None]
+        if len(merged_samples) != batch_size:
+            raise RuntimeError(
+                "marginal CFM internal merge count mismatch after missing-row validation, "
+                f"expected={batch_size}, received={len(merged_samples)}."
+            )
+        stitch_batch_metadata(batch, merged_samples)
+        self._maybe_offload_samples_to_cpu(merged_samples)
+        return merged_samples
+
     # ===================== Stage L1: on-policy distillation =====================
     def sample(self) -> List[BaseSample]:
         """Generate student rollouts (full trajectory + on-policy log-probs)."""
@@ -2631,12 +2963,21 @@ class XOPDTrainer(BaseTrainer):
             )
 
         with torch.no_grad(), self.autocast():
-            for _ in tqdm(
+            for batch_index in tqdm(
                 range(self.training_args.num_batches_per_epoch),
                 desc=f"Epoch {self.epoch} Sampling (L1)",
                 disable=not self.show_progress_bar,
             ):
                 batch = next(data_iter)
+                if self._is_marginal_cfm:
+                    sample_batch = self._sample_marginal_cfm_batch(
+                        batch,
+                        batch_index,
+                        trajectory_indices,
+                    )
+                    samples.extend(sample_batch)
+                    continue
+
                 sample_kwargs = {
                     **self.training_args,
                     # Nothing reads per-step log-probs: they existed for the REINFORCE
@@ -2694,6 +3035,15 @@ class XOPDTrainer(BaseTrainer):
             batch = BaseSample.stack(batch_samples)
             latents_index_map = batch["latent_index_map"]
             num_timesteps = batch["timesteps"].shape[1]
+            callback_index_map = None
+            if self._is_marginal_cfm:
+                if "callback_index_map" not in batch:
+                    raise KeyError(
+                        "Marginal CFM rollout is missing batch['callback_index_map']; "
+                        f"available keys={sorted(batch.keys())!r}. Ensure sample() collects "
+                        "noise_pred callbacks at the selected training timesteps."
+                    )
+                callback_index_map = normalize_callback_index_map(batch["callback_index_map"])
 
             # Per-batch selective teacher guidance: draw this micro-batch's k steps (fixed
             # count) so the pre-pass and the grad pass use the SAME steps; None => per-epoch
@@ -2704,23 +3054,27 @@ class XOPDTrainer(BaseTrainer):
                 else None
             )
 
-            mu_teacher_list = self._precompute_teacher_means(
-                batch=batch,
-                latents_index_map=latents_index_map,
-                num_timesteps=num_timesteps,
-                timestep_indices=batch_steps,
-            )
             step_indices = batch_steps if batch_steps is not None else self._train_timestep_indices
-            popd_cache_list = (
-                self._precompute_popd_step_caches(
+            if self._is_marginal_cfm:
+                mu_teacher_list = None
+                popd_cache_list = None
+            else:
+                mu_teacher_list = self._precompute_teacher_means(
                     batch=batch,
                     latents_index_map=latents_index_map,
-                    mu_teacher_list=mu_teacher_list,
-                    timestep_indices=step_indices,
+                    num_timesteps=num_timesteps,
+                    timestep_indices=batch_steps,
                 )
-                if self._is_popd
-                else None
-            )
+                popd_cache_list = (
+                    self._precompute_popd_step_caches(
+                        batch=batch,
+                        latents_index_map=latents_index_map,
+                        mu_teacher_list=mu_teacher_list,
+                        timestep_indices=step_indices,
+                    )
+                    if self._is_popd
+                    else None
+                )
 
             loss_info = self._optimize_train_pass(
                 batch=batch,
@@ -2730,6 +3084,7 @@ class XOPDTrainer(BaseTrainer):
                 popd_cache_list=popd_cache_list,
                 loss_info=loss_info,
                 timestep_indices=batch_steps,
+                callback_index_map=callback_index_map,
             )
 
     # =============================== L1 helpers ===============================
@@ -3172,6 +3527,24 @@ class XOPDTrainer(BaseTrainer):
             quantile_metrics[f"popd/gamma_{quantile_name}"] = value
         return quantile_metrics
 
+    @staticmethod
+    def _append_marginal_cfm_diagnostics(
+        loss_info: Dict[str, List[torch.Tensor]],
+        diagnostics: Dict[str, torch.Tensor],
+        teacher_branch_mask: torch.Tensor,
+    ) -> None:
+        """Accumulate detached marginal-CFM diagnostics without empty branch metrics."""
+        for name, values in diagnostics.items():
+            if name != "loss":
+                loss_info[f"marginal_cfm/{name}"].append(values)
+                continue
+            old_loss = values[~teacher_branch_mask]
+            teacher_loss = values[teacher_branch_mask]
+            if old_loss.numel() > 0:
+                loss_info["marginal_cfm/loss_old"].append(old_loss)
+            if teacher_loss.numel() > 0:
+                loss_info["marginal_cfm/loss_teacher"].append(teacher_loss)
+
     def _validation_d_k_per_timestep(
         self,
         batch: Dict[str, Any],
@@ -3207,8 +3580,7 @@ class XOPDTrainer(BaseTrainer):
                         f"validation D_k pass; requested return_kwargs={_TEACHER_RETURN_KWARGS!r}."
                     )
                 student_hidden = (
-                    self._hsct_h_list(forward_kwargs["latents"].shape[0])
-                    if self._is_hsct else None
+                    self._hsct_h_list(forward_kwargs["latents"].shape[0]) if self._is_hsct else None
                 )
 
                 mu_teacher = self._teacher_mean_dispatch(
@@ -3318,21 +3690,128 @@ class XOPDTrainer(BaseTrainer):
         batch: Dict[str, Any],
         latents_index_map: torch.Tensor,
         num_timesteps: int,
-        mu_teacher_list: List[torch.Tensor],
-        popd_cache_list: Optional[List[_POPDStepCache]],
         loss_info: Dict[str, List[torch.Tensor]],
+        mu_teacher_list: Optional[List[torch.Tensor]] = None,
+        popd_cache_list: Optional[List[_POPDStepCache]] = None,
         timestep_indices: Optional[List[int]] = None,
+        callback_index_map: Optional[torch.Tensor] = None,
     ) -> Dict[str, List[torch.Tensor]]:
         """Gradient main pass: per-timestep student forward + loss + backward.
 
-        ``timestep_indices`` MUST match the list passed to ``_precompute_teacher_means``
-        (so ``mu_teacher_list[k_idx]`` aligns with this step); defaults to the per-epoch
-        ``self._train_timestep_indices``.
+        Direct and P-OPD targets must align with ``timestep_indices``. Marginal CFM
+        instead resolves each rollout velocity callback through ``callback_index_map``.
         """
         device = self.accelerator.device
         step_indices = (
             timestep_indices if timestep_indices is not None else self._train_timestep_indices
         )
+        if self._is_marginal_cfm and self._is_popd:
+            raise ValueError(
+                "XOPD target mode flags are mutually exclusive, but both "
+                "_is_marginal_cfm and _is_popd are True."
+            )
+
+        target_noise_pred_callbacks = None
+        teacher_branch_mask = None
+        if self._is_marginal_cfm:
+            if callback_index_map is None:
+                raise ValueError(
+                    "Marginal CFM requires callback_index_map for velocity-target alignment, "
+                    f"got callback_index_map=None and timestep_indices={step_indices!r}."
+                )
+            if mu_teacher_list is not None:
+                raise ValueError(
+                    "Marginal CFM must not receive direct teacher means, "
+                    f"got teacher target count={len(mu_teacher_list)}."
+                )
+            if popd_cache_list is not None:
+                raise ValueError(
+                    "Marginal CFM must not receive P-OPD behavior caches, "
+                    f"got cache_count={len(popd_cache_list)}."
+                )
+            callback_index_map = normalize_callback_index_map(callback_index_map)
+            if "noise_pred" not in batch:
+                raise KeyError(
+                    "Marginal CFM requires tensor batch['noise_pred'] velocity callbacks, "
+                    f"available keys={sorted(batch.keys())!r}."
+                )
+            target_noise_pred_callbacks = batch["noise_pred"]
+            if not isinstance(target_noise_pred_callbacks, torch.Tensor):
+                raise TypeError(
+                    "Marginal CFM expected torch.Tensor for batch['noise_pred'], "
+                    f"got {type(target_noise_pred_callbacks).__name__}: "
+                    f"{target_noise_pred_callbacks!r}."
+                )
+            if target_noise_pred_callbacks.ndim < 3:
+                raise ValueError(
+                    "Marginal CFM expected batch['noise_pred'] shape (B,K,event...), "
+                    f"got shape={tuple(target_noise_pred_callbacks.shape)}."
+                )
+            if (
+                target_noise_pred_callbacks.shape[0] != batch["timesteps"].shape[0]
+                or target_noise_pred_callbacks.shape[1] < 1
+            ):
+                raise ValueError(
+                    "Marginal CFM velocity callbacks must align with the rollout batch and "
+                    "contain at least one callback: "
+                    f"noise_pred.shape={tuple(target_noise_pred_callbacks.shape)}, "
+                    f"timesteps.shape={tuple(batch['timesteps'].shape)}."
+                )
+            if not target_noise_pred_callbacks.is_floating_point():
+                raise TypeError(
+                    "Marginal CFM expected floating-point batch['noise_pred'], "
+                    f"got dtype={target_noise_pred_callbacks.dtype}, "
+                    f"shape={tuple(target_noise_pred_callbacks.shape)}."
+                )
+            if "marginal_cfm_branch" not in batch:
+                raise KeyError(
+                    "Marginal CFM rollout is missing batch['marginal_cfm_branch']; "
+                    f"available keys={sorted(batch.keys())!r}."
+                )
+            teacher_branch_mask = batch["marginal_cfm_branch"]
+            if not isinstance(teacher_branch_mask, torch.Tensor):
+                raise TypeError(
+                    "Marginal CFM expected torch.Tensor for batch['marginal_cfm_branch'], "
+                    f"got {type(teacher_branch_mask).__name__}: {teacher_branch_mask!r}."
+                )
+            expected_branch_shape = (int(target_noise_pred_callbacks.shape[0]),)
+            if teacher_branch_mask.dtype != torch.bool:
+                raise TypeError(
+                    "Marginal CFM expected torch.bool batch['marginal_cfm_branch'], "
+                    f"got dtype={teacher_branch_mask.dtype}, "
+                    f"shape={tuple(teacher_branch_mask.shape)}."
+                )
+            if teacher_branch_mask.shape != expected_branch_shape:
+                raise ValueError(
+                    "Marginal CFM branch labels must align one-to-one with the rollout batch, "
+                    f"expected shape={expected_branch_shape}, "
+                    f"got shape={tuple(teacher_branch_mask.shape)}."
+                )
+            if teacher_branch_mask.device != target_noise_pred_callbacks.device:
+                raise ValueError(
+                    "Marginal CFM branch labels and velocity callbacks must share a device, "
+                    f"got branch_device={teacher_branch_mask.device}, "
+                    f"target_device={target_noise_pred_callbacks.device}."
+                )
+            loss_info["marginal_cfm/callback_count"].append(
+                torch.tensor(
+                    float(target_noise_pred_callbacks.shape[1]),
+                    device=target_noise_pred_callbacks.device,
+                )
+            )
+        else:
+            if callback_index_map is not None:
+                raise ValueError(
+                    "Direct and P-OPD training must not receive the marginal-CFM callback map, "
+                    f"got callback_index_map shape={tuple(callback_index_map.shape)}."
+                )
+            if mu_teacher_list is None or len(mu_teacher_list) != len(step_indices):
+                raise ValueError(
+                    "Direct and P-OPD require one teacher target per training timestep, "
+                    f"got target_count={None if mu_teacher_list is None else len(mu_teacher_list)} "
+                    f"and timestep_indices={step_indices!r}."
+                )
+
         if self._is_popd and (popd_cache_list is None or len(popd_cache_list) != len(step_indices)):
             raise ValueError(
                 "P-OPD requires one behavior cache per training timestep, "
@@ -3356,17 +3835,33 @@ class XOPDTrainer(BaseTrainer):
                 )
             ):
                 with self.accelerator.accumulate(*self.adapter.trainable_components):
-                    t = batch["timesteps"][:, timestep_index]
+                    ti = int(timestep_index)
+                    t = batch["timesteps"][:, ti]
                     # Final timestep -> t_next=0, kept BATCHED (shape [B], like t):
                     # the I2I ragged fallback indexes t_next[idx] and a 0-dim
                     # scalar raises IndexError.
                     t_next = (
-                        batch["timesteps"][:, timestep_index + 1]
-                        if timestep_index + 1 < num_timesteps
+                        batch["timesteps"][:, ti + 1]
+                        if ti + 1 < num_timesteps
                         else torch.zeros_like(t)
                     )
-                    latents = batch["all_latents"][:, latents_index_map[timestep_index]]
-                    next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
+                    if self._is_marginal_cfm:
+                        latent_count = int(batch["all_latents"].shape[1])
+                        current_latent_index = resolve_marginal_cfm_latent_index(
+                            latents_index_map,
+                            timestep_index=ti,
+                            latent_count=latent_count,
+                        )
+                        next_latent_index = resolve_marginal_cfm_latent_index(
+                            latents_index_map,
+                            timestep_index=ti + 1,
+                            latent_count=latent_count,
+                        )
+                        latents = batch["all_latents"][:, current_latent_index]
+                        next_latents = batch["all_latents"][:, next_latent_index]
+                    else:
+                        latents = batch["all_latents"][:, latents_index_map[ti]]
+                        next_latents = batch["all_latents"][:, latents_index_map[ti + 1]]
 
                     forward_kwargs = self._build_forward_kwargs(
                         batch=batch,
@@ -3380,15 +3875,39 @@ class XOPDTrainer(BaseTrainer):
                     )
 
                     student_out = self.adapter.forward(**forward_kwargs)
-                    if student_out.next_latents_mean is None:
+                    if self._is_marginal_cfm and student_out.noise_pred is None:
+                        raise RuntimeError(
+                            "Marginal CFM student forward must return `noise_pred`; "
+                            f"got None at timestep_index={int(timestep_index)}."
+                        )
+                    if not self._is_marginal_cfm and student_out.next_latents_mean is None:
                         raise RuntimeError(
                             "Student forward must return `next_latents_mean` for XOPD; got None."
                         )
 
-                    mu_teacher = mu_teacher_list[k_idx]
-                    ti = int(timestep_index)
-
-                    if self._is_popd:
+                    if self._is_marginal_cfm:
+                        callback_index = resolve_marginal_cfm_callback_index(
+                            callback_index_map,
+                            timestep_index=ti,
+                            callback_count=int(target_noise_pred_callbacks.shape[1]),
+                        )
+                        target_noise_pred = target_noise_pred_callbacks[:, callback_index].detach()
+                        d_k_grad = compute_marginal_cfm_velocity_loss(
+                            student_out.noise_pred,
+                            target_noise_pred,
+                        )
+                        diagnostics = compute_marginal_cfm_diagnostics(
+                            student_noise_pred=student_out.noise_pred,
+                            target_noise_pred=target_noise_pred,
+                            teacher_branch_mask=teacher_branch_mask,
+                        )
+                        self._append_marginal_cfm_diagnostics(
+                            loss_info,
+                            diagnostics,
+                            teacher_branch_mask,
+                        )
+                    elif self._is_popd:
+                        mu_teacher = mu_teacher_list[k_idx]
                         if student_out.std_dev_t is None or student_out.dt is None:
                             raise RuntimeError(
                                 "P-OPD student forward must return `std_dev_t` and `dt`; "
@@ -3456,6 +3975,7 @@ class XOPDTrainer(BaseTrainer):
                             timestep_index=ti,
                         )
                     elif self._pixel_loss:
+                        mu_teacher = mu_teacher_list[k_idx]
                         # DECODE-space L1: D_S(mu_student) (grad -> LoRA) vs cached D_T(mu_teacher)
                         # pixels. Both faithful decoders land in the SAME RGB space, so the match
                         # is unbiased with NO base-point/displacement correction (unlike raw
@@ -3467,6 +3987,7 @@ class XOPDTrainer(BaseTrainer):
                             .mean(dim=tuple(range(1, student_px.ndim)))
                         )
                     else:
+                        mu_teacher = mu_teacher_list[k_idx]
                         d_k_grad = compute_per_step_kl(
                             mu_student=student_out.next_latents_mean,
                             mu_teacher=mu_teacher,

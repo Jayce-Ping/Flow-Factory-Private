@@ -13,10 +13,44 @@ transport between different ones.
 
 ```
 xopd_configs/
-├── ode_pathwise/     # dynamics_type=ODE  (deterministic pathwise distillation)
+├── ode_pathwise/     # dynamics_type=ODE  (direct pathwise or marginal CFM)
 ├── sde_pathwise/     # stochastic Gaussian transitions (P-OPD)
 └── cross_vae/        # heterogeneous VAE spaces (FLUX.2 teacher -> SD3.5 student) via a latent transport
 ```
+
+### ode_pathwise/ — A4 marginal-mixture CFM
+
+`xopd_target_mode: marginal_cfm` implements A4 as a deterministic,
+time-marginal probability mixture. For each input row it draws one Bernoulli
+branch before rollout, runs exactly one complete old-student or teacher ODE
+trajectory, stores the selected source's exact scheduler-space `noise_pred`,
+then regresses the current student velocity at those stored source states.
+The branch is fixed for the entire trajectory; redrawing it per denoising step
+would define a switching process, not A4.
+
+A4 does not evaluate a density ratio or a P-OPD responsibility. It currently
+requires:
+
+- `dynamics_type: ODE` with `noise_level: 0.0`;
+- same teacher/student VAE and latent space (`teacher_model_type: null`,
+  `vae_transport: identity`, and `assume_shared_vae_text_encoder: true`);
+- `xopd_dk_space: v`, `normalize_d_k: false`, and no pixel loss.
+
+The matched smoke pair keeps the model, prompts, timestep selection, batch
+geometry, gradient accumulation, and optimizer settings fixed. Only the target
+behavior changes:
+
+```bash
+# A4: sampled old/teacher trajectory-marginal target, alpha=0.5
+ff-train xopd_configs/ode_pathwise/_TEST_9b_4b_marginal_cfm_smoke.yaml
+
+# Matched direct control: teacher target evaluated on old-student states
+ff-train xopd_configs/ode_pathwise/_TEST_9b_4b_direct_ctrl_marginal_cfm_smoke.yaml
+```
+
+Both files request eight processes. These commands are documented but were
+**NOT RUN locally** and are **not evidence of passing distributed validation**;
+run them on an 8-GPU host.
 
 ### sde_pathwise/ — P-OPD
 

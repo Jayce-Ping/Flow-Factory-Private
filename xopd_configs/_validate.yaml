@@ -65,7 +65,8 @@ train:
   normalize_d_k: false                    # true: divide D_k by 2*sigma_bar^2; false: plain MSE
   kl_type: "x-based"                      # KL anchor type vs base. Options: x-based, v-based
   kl_beta: 0.0                            # KL anchor coefficient; 0 disables
-  xopd_target_mode: "direct"              # Options: direct, p_opd (p_opd requires SDE + xt + normalize_d_k=true)
+  xopd_target_mode: "direct"              # Options: direct, p_opd, marginal_cfm (marginal_cfm requires same-VAE ODE + v + normalize_d_k=false)
+  marginal_cfm_alpha: 0.5                 # A4 teacher-trajectory mixture prior in [0,1]; ignored unless xopd_target_mode=marginal_cfm
   popd_alpha: 0.5                         # P-OPD teacher mixture prior; strictly in (0,1)
   popd_temperature: 1.0                   # P-OPD: 1=joint latent-sum, D=latent-mean surrogate
 

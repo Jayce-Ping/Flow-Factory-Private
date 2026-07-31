@@ -189,6 +189,82 @@ The canonical configuration is
 This implements TOP-D's external proximal teacher for Gaussian flow
 transitions; it does not implement TOP-D's internal trust-region iterations.
 
+### A4 — marginal-mixture conditional flow matching
+
+`xopd_target_mode: marginal_cfm` is the implemented deterministic
+time-marginal mixture target:
+
+```yaml
+train:
+  xopd_target_mode: marginal_cfm
+  marginal_cfm_alpha: 0.5
+  xopd_dk_space: v
+  normalize_d_k: false
+scheduler:
+  dynamics_type: ODE
+  noise_level: 0.0
+```
+
+For each row, A4 draws one branch
+`B ~ Bernoulli(marginal_cfm_alpha)` before inference. The label is fixed for
+the complete trajectory:
+
+1. `B=0` runs one frozen old-student ODE; `B=1` runs one frozen teacher ODE.
+2. The selected rollout stores its states and the exact CFG-combined
+   scheduler input under the `noise_pred` callback.
+3. Teacher-branch samples retain teacher states and callback targets, but
+   their ordinary positive/negative conditioning fields are restored to the
+   student values before replay.
+4. At each selected timestep, the gradient-bearing student is evaluated at
+   the stored branch state and minimizes the event-mean MSE to that detached
+   callback target.
+
+This is exact two-source conditional flow matching for
+`(1-alpha) rho_old,t + alpha rho_teacher,t`: conditioning on the sampled state
+implicitly performs the posterior source averaging. A4 never computes a
+density ratio, transition likelihood, or P-OPD `gamma`. It also skips
+`_precompute_teacher_means`; the source velocity was already captured during
+rollout.
+
+`latent_index_map` selects stored state positions, while
+`callback_index_map` separately selects transition callbacks. They are not
+interchangeable. A `-1` sentinel, non-finite target, shape mismatch, or
+misaligned map raises rather than selecting a fallback.
+
+A4 is currently restricted to same-VAE/same-latent-space XOPD under a
+zero-noise ODE, with `xopd_dk_space: v`, `normalize_d_k: false`,
+`vae_transport: identity`, and pixel loss disabled. One rank-independent draw
+keeps the old-then-teacher subset call order identical across ranks; independent
+per-rank branch patterns would risk mismatched collectives.
+
+The usual student reward evaluation and frozen-teacher baseline evaluation
+remain available. The legacy validation `D_k` evaluator is deliberately
+skipped in A4 mode: it measures direct teacher-on-student-state transition
+matching, not held-out marginal CFM, so reporting it as A4 validation would be
+misleading.
+
+The overall optimization series remain `train/loss` and `train/d_k` (plus
+their per-timestep `train/loss/{ti}` and `train/d_k/{ti}` forms). There is no
+`train/marginal_cfm/loss` series. A4-specific diagnostics are:
+
+- scalar `train/marginal_cfm/callback_count`;
+- per-sample `teacher_branch_fraction`, branch-conditioned `loss_old` /
+  `loss_teacher` (only when that branch is present), `target_velocity_rms`,
+  `target_velocity_l2`, and `student_target_gap_rms`.
+
+`reduce_loss_info` expands every per-sample A4 diagnostic under
+`train/marginal_cfm/...` into four logged series with `_min`, `_max`, `_mean`,
+and `_std` suffixes. For example, the routed teacher fraction is
+`train/marginal_cfm/teacher_branch_fraction_mean`; the unsuffixed
+`callback_count`, `train/loss`, and `train/d_k` remain scalar series.
+
+The runnable 8-GPU smoke pair is
+`xopd_configs/ode_pathwise/_TEST_9b_4b_marginal_cfm_smoke.yaml` and its matched
+direct control
+`_TEST_9b_4b_direct_ctrl_marginal_cfm_smoke.yaml`.
+These commands are documented but were **NOT RUN locally** and are **not
+evidence of passing distributed validation**.
+
 ## Dual classifier-free guidance
 
 `teacher_guidance_scale` and `student_guidance_scale` are independent (default

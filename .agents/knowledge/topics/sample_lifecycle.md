@@ -87,20 +87,28 @@ Compared with the previous "eager precompute over ALL batches, then train all ba
 
 Train-inference consistency invariant is preserved: `ema_step()` runs once per outer epoch in `start()`, so all batches within a single `optimize()` call see the same EMA snapshot regardless of interleave timing. RNG consumption order changes (per-batch vs upfront), so noise sequences are not bit-identical to the eager design — regression tests must use statistical metrics rather than numeric diffs.
 
-## `extra_kwargs` Device Asymmetry (Caveat)
+## `extra_kwargs` Device Lifecycle
 
-`BaseSample.to(device, depth=1)` does NOT recurse into `extra_kwargs` (it is a `Dict[str, Any]` field). Actual device residency in the framework data flow:
+`BaseSample.to(device, depth=1)` delegates every dataclass field, including
+`extra_kwargs`, to `move_tensors_to_device(value, device, max_depth=depth)`.
+The default depth enters the `extra_kwargs` dictionary and moves each direct
+tensor value. A tensor hidden inside an additional nested container is beyond
+that depth and remains unchanged.
 
-| Field | Device | Source |
-|-------|--------|--------|
-| `extra_kwargs['rewards']` | CPU | `reward_processor.py` builds with `device='cpu'` |
-| `extra_kwargs['advantage']` | GPU (`accelerator.device`) | `advantage_processor.py` `_to_local` calls `.to(self.accelerator.device)` |
+Consequences for the framework data flow:
 
-`BaseSample.stack()` flattens `extra_kwargs` into the top-level batch dict via `to_dict()` (see `samples.py`), so `batch['advantage']` is directly accessible at GPU.
+- rollout callbacks stored directly in `extra_kwargs` (for example P-OPD
+  transition tensors and A4 `noise_pred`, callback maps, and branch labels)
+  offload to CPU and reload with the sample;
+- `rewards` are created on CPU after rollout offload, then move with the sample
+  when `optimize()` calls `sample.to(device)`;
+- `advantage` is created on `accelerator.device`; the later reload keeps it on
+  that device.
 
-Effect of the offload pipeline: `sample.to('cpu')` and `sample.to(device)` both leave `extra_kwargs` untouched. `advantage` remains on GPU regardless of the switch (a few bytes per sample, irrelevant); `rewards` remains on CPU. No change to current behaviour.
-
-If a future custom adapter stores large GPU tensors in `extra_kwargs`, either handle them adapter-side or refactor `BaseSample.to` to delegate to `move_tensors_to_device(value, device, max_depth=1)` in an independent PR (note: that refactor will start moving `extra_kwargs['advantage']` together with the sample, which is benign for the current data flow but is a contract change).
+`BaseSample.stack()` flattens `extra_kwargs` into the top-level batch dictionary
+through `to_dict()`, so values remain directly accessible as
+`batch['advantage']`, `batch['noise_pred']`, and similar keys. This behavior
+matches the recorded fix in `train_inference_consistency.md`.
 
 ## Cross-refs
 

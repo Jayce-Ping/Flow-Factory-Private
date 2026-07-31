@@ -31,6 +31,8 @@ from typing import Any, Callable, Dict, FrozenSet, Generator, List, Literal, Opt
 import torch
 import torch.nn.functional as F
 
+from ...utils.base import create_generator
+
 
 @dataclass(frozen=True)
 class POPDResponsibility:
@@ -250,6 +252,519 @@ def validate_popd_configuration(
             "P-OPD is defined on Gaussian latent transitions and does not support "
             f"pixel loss, got pixel_loss={pixel_loss!r}."
         )
+
+
+def validate_marginal_cfm_configuration(
+    *,
+    dynamics_type: str,
+    noise_level: float,
+    xopd_dk_space: str,
+    normalize_d_k: bool,
+    is_cross_vae: bool,
+    pixel_loss: bool,
+    vae_transport: str,
+) -> None:
+    """Validate the deterministic same-VAE assumptions required by marginal CFM.
+
+    Args:
+        dynamics_type: Scheduler dynamics used for source-branch rollouts.
+        noise_level: Scheduler noise scale.
+        xopd_dk_space: Distillation loss space.
+        normalize_d_k: Whether the distillation loss is covariance-normalized.
+        is_cross_vae: Whether teacher and student use different latent spaces.
+        pixel_loss: Whether the target is decoded to pixel space.
+        vae_transport: Latent-space transport mode.
+    """
+    if dynamics_type != "ODE":
+        raise ValueError(
+            "Marginal CFM requires dynamics_type='ODE', " f"got dynamics_type={dynamics_type!r}."
+        )
+    if isinstance(noise_level, bool) or not isinstance(noise_level, (int, float)):
+        raise TypeError(
+            "Marginal CFM requires finite numeric noise_level == 0, "
+            f"got {type(noise_level).__name__}: noise_level={noise_level!r}."
+        )
+    if not math.isfinite(float(noise_level)) or float(noise_level) != 0.0:
+        raise ValueError(
+            "Marginal CFM requires finite noise_level == 0, " f"got noise_level={noise_level!r}."
+        )
+    if xopd_dk_space != "v":
+        raise ValueError(
+            "Marginal CFM requires xopd_dk_space='v', " f"got xopd_dk_space={xopd_dk_space!r}."
+        )
+    if normalize_d_k is not False:
+        raise ValueError(
+            "Marginal CFM requires normalize_d_k=False, " f"got normalize_d_k={normalize_d_k!r}."
+        )
+    if is_cross_vae is not False:
+        raise ValueError(
+            "Marginal CFM requires the same VAE with is_cross_vae=False, "
+            f"got is_cross_vae={is_cross_vae!r}."
+        )
+    if pixel_loss is not False:
+        raise ValueError(
+            "Marginal CFM requires latent velocity matching with pixel_loss=False, "
+            f"got pixel_loss={pixel_loss!r}."
+        )
+    if vae_transport != "identity":
+        raise ValueError(
+            "Marginal CFM v1 requires same-VAE identity transport; expected "
+            "vae_transport='identity', "
+            f"got vae_transport={vae_transport!r}."
+        )
+
+
+def validate_xopd_target_configuration(
+    *,
+    target_mode: str,
+    dynamics_type: str,
+    noise_level: float,
+    xopd_dk_space: str,
+    normalize_d_k: bool,
+    is_cross_vae: bool,
+    pixel_loss: bool,
+    vae_transport: str,
+) -> None:
+    """Dispatch XOPD configuration validation according to the target mode.
+
+    Args:
+        target_mode: XOPD target mode.
+        dynamics_type: Scheduler dynamics used for rollout and replay.
+        noise_level: Scheduler noise scale.
+        xopd_dk_space: Distillation loss space.
+        normalize_d_k: Whether the distillation loss is covariance-normalized.
+        is_cross_vae: Whether teacher and student use different latent spaces.
+        pixel_loss: Whether the target is decoded to pixel space.
+        vae_transport: Latent-space transport mode.
+    """
+    if target_mode == "direct":
+        return
+    if target_mode == "p_opd":
+        validate_popd_configuration(
+            target_mode=target_mode,
+            dynamics_type=dynamics_type,
+            noise_level=noise_level,
+            xopd_dk_space=xopd_dk_space,
+            normalize_d_k=normalize_d_k,
+            is_cross_vae=is_cross_vae,
+            pixel_loss=pixel_loss,
+        )
+        return
+    if target_mode == "marginal_cfm":
+        validate_marginal_cfm_configuration(
+            dynamics_type=dynamics_type,
+            noise_level=noise_level,
+            xopd_dk_space=xopd_dk_space,
+            normalize_d_k=normalize_d_k,
+            is_cross_vae=is_cross_vae,
+            pixel_loss=pixel_loss,
+            vae_transport=vae_transport,
+        )
+        return
+    raise ValueError(
+        "XOPD target mode must be 'direct', 'p_opd', or 'marginal_cfm', "
+        f"got target_mode={target_mode!r}."
+    )
+
+
+def draw_marginal_cfm_branches(
+    batch_size: int,
+    *,
+    alpha: float,
+    seed: int,
+    epoch: int,
+    batch_index: int,
+) -> torch.Tensor:
+    """Draw deterministic marginal-CFM teacher branches on CPU.
+
+    Args:
+        batch_size: Number of trajectory-level branch labels to draw.
+        alpha: Teacher-branch probability in the inclusive interval ``[0, 1]``.
+        seed: Base random seed.
+        epoch: Current training epoch.
+        batch_index: Batch index within the epoch.
+
+    Returns:
+        A CPU boolean tensor of shape ``(batch_size,)``. ``True`` selects the teacher branch.
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError(
+            "expected positive int batch_size for marginal CFM branches, "
+            f"got {type(batch_size).__name__}: batch_size={batch_size!r}."
+        )
+    if batch_size <= 0:
+        raise ValueError(
+            f"expected batch_size > 0 for marginal CFM branches, got batch_size={batch_size}."
+        )
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError(
+            "expected finite numeric alpha in [0, 1] for marginal CFM branches, "
+            f"got {type(alpha).__name__}: alpha={alpha!r}."
+        )
+    if not math.isfinite(float(alpha)) or not 0.0 <= float(alpha) <= 1.0:
+        raise ValueError(
+            f"expected finite alpha in [0, 1] for marginal CFM branches, got alpha={alpha!r}."
+        )
+    for name, value in (("seed", seed), ("epoch", epoch), ("batch_index", batch_index)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                f"expected int {name} for marginal CFM branches, "
+                f"got {type(value).__name__}: {name}={value!r}."
+            )
+
+    if float(alpha) == 0.0:
+        return torch.zeros(batch_size, dtype=torch.bool)
+    if float(alpha) == 1.0:
+        return torch.ones(batch_size, dtype=torch.bool)
+    generator = create_generator(seed, epoch, batch_index)
+    return torch.rand(batch_size, generator=generator) < float(alpha)
+
+
+def normalize_callback_index_map(callback_index_map: torch.Tensor) -> torch.Tensor:
+    """Normalize a callback index map to one validated trajectory map.
+
+    Args:
+        callback_index_map: Integral tensor of shape ``(T,)`` or stacked shape ``(B, T)``.
+            Stacked rows must be identical. Negative sentinels are preserved for the step
+            resolver to validate when that timestep is requested.
+
+    Returns:
+        The shared integral callback index map with shape ``(T,)``.
+    """
+    if not isinstance(callback_index_map, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor for callback_index_map, "
+            f"got {type(callback_index_map).__name__}: {callback_index_map!r}."
+        )
+    integral_dtypes = (
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    )
+    if callback_index_map.dtype not in integral_dtypes:
+        raise TypeError(
+            "expected integral torch.Tensor for callback_index_map, "
+            f"got dtype={callback_index_map.dtype}, shape={tuple(callback_index_map.shape)}."
+        )
+    if callback_index_map.ndim == 1:
+        if callback_index_map.shape[0] < 1:
+            raise ValueError(
+                "expected nonempty callback_index_map shape (T,), "
+                f"got shape={tuple(callback_index_map.shape)}."
+            )
+        return callback_index_map
+    if callback_index_map.ndim != 2:
+        raise ValueError(
+            "expected callback_index_map shape (T,) or (B,T), "
+            f"got shape={tuple(callback_index_map.shape)}."
+        )
+    if callback_index_map.shape[0] < 1 or callback_index_map.shape[1] < 1:
+        raise ValueError(
+            "expected nonempty callback_index_map shape (B,T), "
+            f"got shape={tuple(callback_index_map.shape)}."
+        )
+    normalized = callback_index_map[0]
+    if not torch.equal(callback_index_map, normalized.unsqueeze(0).expand_as(callback_index_map)):
+        raise ValueError(
+            "expected every stacked row to share the same callback_index_map, "
+            f"got shape={tuple(callback_index_map.shape)} and "
+            f"values={callback_index_map.detach().cpu().tolist()}."
+        )
+    return normalized
+
+
+def resolve_marginal_cfm_callback_index(
+    callback_index_map: torch.Tensor,
+    timestep_index: int,
+    callback_count: int,
+) -> int:
+    """Resolve one trajectory timestep to a collected marginal-CFM callback index.
+
+    Args:
+        callback_index_map: Integral callback map with shape ``(T,)`` or ``(B, T)``.
+        timestep_index: Original denoising-loop step index.
+        callback_count: Number of compact callback entries available for each sample.
+
+    Returns:
+        The compact callback index for ``timestep_index``.
+    """
+    callback_map = normalize_callback_index_map(callback_index_map)
+    if isinstance(timestep_index, bool) or not isinstance(timestep_index, int):
+        raise TypeError(
+            "expected int timestep_index for marginal CFM callback resolution, "
+            f"got {type(timestep_index).__name__}: timestep_index={timestep_index!r}."
+        )
+    if timestep_index < 0 or timestep_index >= callback_map.shape[0]:
+        raise ValueError(
+            "expected timestep_index within callback_index_map bounds, "
+            f"got timestep_index={timestep_index}, map_length={callback_map.shape[0]}, "
+            f"callback_count={callback_count!r}."
+        )
+    if isinstance(callback_count, bool) or not isinstance(callback_count, int):
+        raise TypeError(
+            "expected non-negative int callback_count for marginal CFM callback resolution, "
+            f"got {type(callback_count).__name__}: callback_count={callback_count!r}, "
+            f"timestep_index={timestep_index}."
+        )
+    if callback_count < 0:
+        raise ValueError(
+            "expected callback_count >= 0 for marginal CFM callback resolution, "
+            f"got callback_count={callback_count}, timestep_index={timestep_index}."
+        )
+
+    compact_index = int(callback_map[timestep_index].item())
+    if compact_index < 0 or compact_index >= callback_count:
+        raise ValueError(
+            "marginal CFM callback index is uncollected or out of range: "
+            f"timestep_index={timestep_index}, compact_index={compact_index}, "
+            f"callback_count={callback_count}, map_length={callback_map.shape[0]}."
+        )
+    return compact_index
+
+
+def resolve_marginal_cfm_latent_index(
+    latent_index_map: torch.Tensor,
+    timestep_index: int,
+    latent_count: int,
+) -> int:
+    """Resolve one trajectory position to a validated compact latent index.
+
+    Args:
+        latent_index_map: Integral map from trajectory positions to compact latent storage.
+        timestep_index: Trajectory position to resolve.
+        latent_count: Number of entries in the compact ``all_latents`` dimension.
+
+    Returns:
+        The validated compact latent index for ``timestep_index``.
+    """
+    if not isinstance(latent_index_map, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor for marginal CFM latent_index_map, "
+            f"got {type(latent_index_map).__name__}: {latent_index_map!r}."
+        )
+    integral_dtypes = (
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    )
+    if latent_index_map.dtype not in integral_dtypes:
+        raise TypeError(
+            "expected integral marginal CFM latent_index_map, "
+            f"got dtype={latent_index_map.dtype}, shape={tuple(latent_index_map.shape)}."
+        )
+    if latent_index_map.ndim != 1 or latent_index_map.shape[0] < 1:
+        raise ValueError(
+            "expected nonempty marginal CFM latent_index_map shape (T,), "
+            f"got shape={tuple(latent_index_map.shape)}."
+        )
+    if isinstance(timestep_index, bool) or not isinstance(timestep_index, int):
+        raise TypeError(
+            "expected int timestep_index for marginal CFM latent resolution, "
+            f"got {type(timestep_index).__name__}: timestep_index={timestep_index!r}."
+        )
+    if isinstance(latent_count, bool) or not isinstance(latent_count, int):
+        raise TypeError(
+            "expected positive int latent_count for marginal CFM latent resolution, "
+            f"got {type(latent_count).__name__}: latent_count={latent_count!r}, "
+            f"timestep_index={timestep_index!r}."
+        )
+    if latent_count < 1:
+        raise ValueError(
+            "expected latent_count >= 1 for marginal CFM latent resolution, "
+            f"got latent_count={latent_count}, timestep_index={timestep_index}, "
+            f"map_length={latent_index_map.shape[0]}."
+        )
+
+    map_length = int(latent_index_map.shape[0])
+    map_values = latent_index_map.detach().cpu().tolist()
+    if timestep_index < 0 or timestep_index >= map_length:
+        raise ValueError(
+            "marginal CFM timestep is outside latent_index_map bounds: "
+            f"timestep_index={timestep_index}, map_length={map_length}, "
+            f"valid_timestep_bounds=[0, {map_length}), latent_count={latent_count}, "
+            f"latent_index_map={map_values!r}."
+        )
+    compact_index = int(latent_index_map[timestep_index].item())
+    if compact_index < 0 or compact_index >= latent_count:
+        raise ValueError(
+            "marginal CFM latent index is uncollected or out of range: "
+            f"timestep_index={timestep_index}, compact_index={compact_index}, "
+            f"latent_count={latent_count}, map_length={map_length}, "
+            f"valid_compact_bounds=[0, {latent_count}), latent_index_map={map_values!r}."
+        )
+    return compact_index
+
+
+def _validate_marginal_cfm_velocity_tensors(
+    student_noise_pred: torch.Tensor,
+    target_noise_pred: torch.Tensor,
+) -> int:
+    """Validate marginal-CFM velocity tensors and return their batch size."""
+    if not isinstance(student_noise_pred, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor for student_noise_pred, "
+            f"got {type(student_noise_pred).__name__}: {student_noise_pred!r}."
+        )
+    if not isinstance(target_noise_pred, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor for target_noise_pred, "
+            f"got {type(target_noise_pred).__name__}: {target_noise_pred!r}."
+        )
+    if student_noise_pred.shape != target_noise_pred.shape:
+        raise ValueError(
+            "expected student_noise_pred and target_noise_pred to have the same shape, "
+            f"got student_shape={tuple(student_noise_pred.shape)}, "
+            f"target_shape={tuple(target_noise_pred.shape)}."
+        )
+    if student_noise_pred.device != target_noise_pred.device:
+        raise ValueError(
+            "expected student_noise_pred and target_noise_pred on the same device, "
+            f"got student_device={student_noise_pred.device}, "
+            f"target_device={target_noise_pred.device}."
+        )
+    if not student_noise_pred.is_floating_point() or not target_noise_pred.is_floating_point():
+        raise TypeError(
+            "expected floating-point marginal CFM velocity tensors, "
+            f"got student_dtype={student_noise_pred.dtype}, "
+            f"target_dtype={target_noise_pred.dtype}."
+        )
+    if student_noise_pred.ndim < 2:
+        raise ValueError(
+            "expected marginal CFM velocity shape (B, event...) with at least one event "
+            f"dimension, got shape={tuple(student_noise_pred.shape)}."
+        )
+    batch_size = int(student_noise_pred.shape[0])
+    event_size = math.prod(student_noise_pred.shape[1:])
+    if batch_size < 1 or event_size < 1:
+        raise ValueError(
+            "expected nonempty marginal CFM batch and event dimensions, "
+            f"got shape={tuple(student_noise_pred.shape)}, batch_size={batch_size}, "
+            f"event_size={event_size}."
+        )
+    for name, value in (
+        ("student_noise_pred", student_noise_pred),
+        ("target_noise_pred", target_noise_pred),
+    ):
+        finite = torch.isfinite(value.detach())
+        if not finite.all():
+            raise ValueError(
+                f"expected finite {name} for marginal CFM velocity matching, "
+                f"got shape={tuple(value.shape)}, dtype={value.dtype}, "
+                f"nonfinite_count={(~finite).sum().item()}."
+            )
+    return batch_size
+
+
+def compute_marginal_cfm_velocity_loss(
+    student_noise_pred: torch.Tensor,
+    target_noise_pred: torch.Tensor,
+) -> torch.Tensor:
+    """Compute per-sample marginal-CFM velocity MSE in float32.
+
+    Args:
+        student_noise_pred: Current student velocity prediction with shape ``(B, event...)``.
+        target_noise_pred: Rollout-source velocity target with the same shape.
+
+    Returns:
+        A float32 tensor of per-sample event-mean MSE values with shape ``(B,)``.
+    """
+    batch_size = _validate_marginal_cfm_velocity_tensors(
+        student_noise_pred,
+        target_noise_pred,
+    )
+    gap = student_noise_pred.float() - target_noise_pred.detach().float()
+    loss = gap.square().reshape(batch_size, -1).mean(dim=1)
+    if not torch.isfinite(loss.detach()).all():
+        raise ValueError(
+            "expected finite marginal CFM velocity loss after float32 event reduction, "
+            f"got values={loss.detach().cpu().tolist()}, "
+            f"student_shape={tuple(student_noise_pred.shape)}."
+        )
+    return loss
+
+
+def compute_marginal_cfm_diagnostics(
+    *,
+    student_noise_pred: torch.Tensor,
+    target_noise_pred: torch.Tensor,
+    teacher_branch_mask: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Compute detached per-sample marginal-CFM logging diagnostics.
+
+    Args:
+        student_noise_pred: Current student velocity prediction with shape ``(B, event...)``.
+        target_noise_pred: Rollout-source velocity target with the same shape.
+        teacher_branch_mask: Boolean teacher-source labels with shape ``(B,)``.
+
+    Returns:
+        Detached per-sample metrics. The mean of ``teacher_branch_fraction`` is the routed
+        teacher fraction. Callers can slice ``loss`` with the original branch mask and omit
+        empty branch reductions instead of fabricating default values.
+    """
+    batch_size = _validate_marginal_cfm_velocity_tensors(
+        student_noise_pred,
+        target_noise_pred,
+    )
+    if not isinstance(teacher_branch_mask, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor for teacher_branch_mask, "
+            f"got {type(teacher_branch_mask).__name__}: {teacher_branch_mask!r}."
+        )
+    if teacher_branch_mask.dtype != torch.bool:
+        raise TypeError(
+            "expected torch.bool teacher_branch_mask for marginal CFM diagnostics, "
+            f"got dtype={teacher_branch_mask.dtype}, shape={tuple(teacher_branch_mask.shape)}."
+        )
+    if teacher_branch_mask.shape != (batch_size,):
+        raise ValueError(
+            f"expected teacher_branch_mask shape ({batch_size},), "
+            f"got shape={tuple(teacher_branch_mask.shape)}."
+        )
+    if teacher_branch_mask.device != student_noise_pred.device:
+        raise ValueError(
+            "expected teacher_branch_mask on the velocity tensor device, "
+            f"got mask_device={teacher_branch_mask.device}, "
+            f"velocity_device={student_noise_pred.device}."
+        )
+
+    with torch.no_grad():
+        target = target_noise_pred.detach().float()
+        gap = student_noise_pred.detach().float() - target
+        metrics = {
+            "teacher_branch_fraction": teacher_branch_mask.detach().float(),
+            "loss": compute_marginal_cfm_velocity_loss(
+                student_noise_pred,
+                target_noise_pred,
+            ).detach(),
+            "target_velocity_rms": _event_rms(target),
+            "target_velocity_l2": _event_l2(target),
+            "student_target_gap_rms": _event_rms(gap),
+        }
+
+    for name, value in metrics.items():
+        if value.shape != (batch_size,):
+            raise ValueError(
+                f"expected marginal CFM diagnostic {name!r} shape ({batch_size},), "
+                f"got shape={tuple(value.shape)}."
+            )
+        if not torch.isfinite(value).all():
+            raise ValueError(
+                f"expected finite marginal CFM diagnostic {name!r}, "
+                f"got values={value.detach().cpu().tolist()}, "
+                f"student_shape={tuple(student_noise_pred.shape)}."
+            )
+        metrics[name] = value.detach()
+    return metrics
 
 
 def _batch_scalar(
@@ -845,9 +1360,9 @@ def compute_per_step_kl(
         x0_t = _to_clean_x0(mu_teacher, latents, sigma, dt)
         err = x0_s - x0_t
         spatial = tuple(range(1, err.ndim))
-        num = (err ** 2).mean(dim=spatial)                    # (B,) per-sample x0 MSE (numerator)
-        scale = err.abs().mean(dim=spatial).detach()          # (B,) sg(mean|x0_s - x0_t|)
-        return num / (scale + 1e-8)                           # eps floors the denominator as gap -> 0
+        num = (err**2).mean(dim=spatial)  # (B,) per-sample x0 MSE (numerator)
+        scale = err.abs().mean(dim=spatial).detach()  # (B,) sg(mean|x0_s - x0_t|)
+        return num / (scale + 1e-8)  # eps floors the denominator as gap -> 0
 
     if space != "xt":
         raise ValueError(f"space must be 'v', 'xt', 'x0' or 'x0_norm', got {space!r}.")
@@ -989,9 +1504,7 @@ def extract_i2i_condition_kwargs(
         ``predict_velocity``. Empty when the batch is T2I-only.
     """
     if not isinstance(batch, dict):
-        raise TypeError(
-            f"expected dict for batch, got {type(batch).__name__}: {batch!r}"
-        )
+        raise TypeError(f"expected dict for batch, got {type(batch).__name__}: {batch!r}")
 
     out: Dict[str, Any] = {}
 

@@ -37,6 +37,27 @@ If rollout and training `forward()` diverge, `ratio` deviates from 1.0 at epoch 
 5. **Scheduler state mismatch**: `step_index` not matching (e.g., dual-scheduler models).
 6. **`num_inference_steps` changed**: invalidates sigma schedule, all trajectory timesteps are wrong.
 
+## XOPD A4 marginal-CFM invariants
+
+- The rollout `noise_pred` callback is the exact CFG-combined scheduler input
+  that advanced the selected old or teacher trajectory. It is the detached CFM
+  target; do not recompute it during optimization.
+- State positions and transition outputs use separate maps:
+  `latent_index_map` selects `all_latents`, while `callback_index_map` selects
+  `noise_pred`. Validate each map and reject `-1` at every trained step.
+- Teacher-branch trajectories keep teacher states and targets, but replay must
+  restore the ordinary positive/negative prompt embeddings and text ids from
+  the student dataloader row. Otherwise the gradient-bearing student sees
+  teacher conditioning that normal inference never uses.
+- Branch draws exclude rank and the subset loop always orders old before
+  teacher. Every rank must enter the same non-empty branch calls in the same
+  order; rank-local patterns can create mismatched collectives and deadlock.
+
+Code refs: `trainers/xopd/trainer.py:_sample_marginal_cfm_batch`,
+`_restore_marginal_cfm_student_conditioning`, and
+`_optimize_train_pass`; `trainers/xopd/common.py` callback/latent index
+resolvers.
+
 ## Where in Code
 
 - Rollout: `adapter.inference()` -> `forward()` -> `scheduler.step()` -> `sample.log_probs[i]`
