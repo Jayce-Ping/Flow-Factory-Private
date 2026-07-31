@@ -194,9 +194,10 @@ class FlowDirectOPDTrainer(BaseTrainer):
             if component is not None and hasattr(component, "requires_grad_"):
                 component.requires_grad_(False)
         donor.eval()
-        donor.on_load_components("transformers", device=self.accelerator.device)
         donor.off_load_text_encoders()
         donor.off_load_vae()
+        self.donor_adapter = donor
+        self._load_donor_transformer()
         return donor
 
     @staticmethod
@@ -317,17 +318,36 @@ class FlowDirectOPDTrainer(BaseTrainer):
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
 
-    def _offload_donor_transformer(self) -> None:
-        if self.donor_adapter is not None and self.training_args.fdopd_offload_donor_during_rollout:
-            self.donor_adapter.off_load_components("transformers")
+    def _move_donor_transformer(self, device) -> None:
+        """Place the donor transformer, bypassing the adapter's group device helpers.
 
-    def _load_donor_transformer(self) -> None:
+        on_load_components / off_load_components skip anything registered in the adapter's
+        ``_components``, on the assumption that a registered module is accelerator-managed and
+        must not be moved by hand. Attaching a LoRA registers the transformer there, so for the
+        donor -- which carries the RL LoRA and is never prepared by the accelerator -- both helpers
+        become silent no-ops and the weights stay wherever loading left them, on CPU. The donor's
+        first forward then fails with a device mismatch far from the cause.
+        """
         if self.donor_adapter is None:
             raise RuntimeError("Flow Direct-OPD donor adapter is not initialized.")
-        self.donor_adapter.on_load_components(
-            "transformers",
-            device=self.accelerator.device,
-        )
+        names = self.donor_adapter._resolve_component_names("transformers")
+        if not names:
+            raise RuntimeError(
+                "Flow Direct-OPD donor exposes no transformer component; "
+                f"pipeline={type(self.donor_adapter.pipeline).__name__!r}."
+            )
+        for name in names:
+            component = self.donor_adapter.get_component(name)
+            if component is None:
+                raise RuntimeError(f"Flow Direct-OPD donor component {name!r} is missing.")
+            component.to(device)
+
+    def _offload_donor_transformer(self) -> None:
+        if self.donor_adapter is not None and self.training_args.fdopd_offload_donor_during_rollout:
+            self._move_donor_transformer("cpu")
+
+    def _load_donor_transformer(self) -> None:
+        self._move_donor_transformer(self.accelerator.device)
 
     def evaluate(self) -> None:
         """Evaluate the recipient without retaining the frozen donor on GPU."""
