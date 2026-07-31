@@ -1,0 +1,164 @@
+# ZERO-TRAINING ORACLE for Flow Direct-OPD, klein 9B donor -> klein 4B recipient, lambda=0.25.
+#
+# Trains nothing. Sampling integrates the composed field itself,
+#
+#   v = v_recipient_base + lambda_eff * (v_donor_rl - v_donor_base)
+#
+# which is the closed-loop form of what training regresses onto. A perfectly fitted recipient would
+# predict exactly this, so the rewards measured here are the CEILING for any amount of training at
+# this lambda. Section 7.1 of docs/xopd/flow_direct_opd_small_rl_delta_transfer.tex makes the
+# converse point: if the graft gives no reward-quality improvement, training toward the same field
+# cannot rescue the hypothesis.
+#
+# lambda_eff carries the same per-sample trust cap the training target uses, so this is the ceiling
+# of the target actually in use rather than of an uncapped variant. Run the three lambdas to trace
+# the ceiling as a function of transfer strength, which turns lambda from a guess into a
+# measurement -- worth doing before spending days of training, since the 4B run showed the recipient
+# absorbing only a few percent of the ask per hundred steps.
+#
+# Cost: one recipient 4B forward plus two donor 9B forwards per solver step, so roughly 5x a plain
+# recipient eval. Everything else -- test sets, rewards, per-tag breakdowns -- is the ordinary
+# evaluation path.
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml  # 4B LoRA recipient + frozen 9B donor fits easily; ZeRO-2 is the proven multi-node path on this cluster (FSDP deadlocks here)
+num_processes: 8                          # overridden to 8 * num_machines by the 4-node launcher
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "dataset/geneval"          # the prompt distribution the donor's RL shift was learned on
+  preprocessing_batch_size: 32            # both klein text encoders are resident here; still far smaller than the dev recipient's Mistral3
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+model:
+  finetune_type: "lora"                   # required: use_ref_parameters() recovers the recipient base by disabling this LoRA
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "ORACLE_fdopd_klein9b_to_4b_nocfg_lambda025"
+  project: "Flow-Factory-FDOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 0
+  save_model_only: true
+
+train:
+  trainer_type: "flow-direct-opd"
+  max_epochs: 1
+
+  # --- Frozen donor pair: one 9B backbone, RL LoRA toggled on and off ---
+  donor_model_type: "flux2-klein"
+  donor_base_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+  donor_rl_lora_path: "Tencent-Hunyuan-Multimodal-RL/FLUX2-klein-base-9b-GenEval2-Multi-Reward"
+  donor_vae_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  donor_guidance_scale: 1.0               # Flow-DPPO trains the donor without CFG, and the delta means what it means only at the conditioning it was learned under
+  assume_shared_vae: true                 # verified by the preflight: VAE weights are bit-identical
+
+  # --- Policy-shift target ---
+  guidance_scale: 1.0                     # recipient runs at the donor's scale so both fields are compared under the same conditioning
+  fdopd_lambda: 0.25
+  fdopd_oracle_eval: true                 # evaluate the composed field; do not train
+  fdopd_loss_space: "v"                   # ODE requires velocity-residual matching
+  normalize_d_k: false                    # invalid for v-space
+  fdopd_max_relative_delta_rms: 0.25      # cap the target shift at 25% of the recipient's own base velocity RMS.
+                                          # At 0.10 the cap, not lambda, set the transfer strength: the donor's shift is as
+                                          # large as the recipient's whole field (relative_delta_rms ~ 0.96 +- 0.99), so 54% of
+                                          # samples clipped and the realized ask was 8.4%. At 0.25 only samples whose shift
+                                          # EXCEEDS the recipient's own field are clipped (~35%), which is where a cap belongs:
+                                          # protecting the heavy tail (max observed 4.08) rather than throttling the median.
+  fdopd_trust_kl_per_dim: null            # mutually exclusive with the RMS cap
+  fdopd_compute_delta_fp32: true          # the delta is a small difference of two large bf16 fields
+  fdopd_offload_donor_during_rollout: true
+  pathwise_coef: 1.0
+
+  # --- Four stratified trajectory positions per micro-batch out of a 28-step rollout ---
+  fdopd_train_steps: null
+  num_fdopd_steps: 4
+  fdopd_resample_steps_per_batch: true
+  fdopd_step_sampling: "stratified"
+
+  resolution: 512                         # train and eval at 512 so the numbers sit alongside the existing 4B baselines
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 128        # 4 batches over 32 GPUs; GAS = 4 * num_fdopd_steps = 16 -> exactly one optimizer step per epoch
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4                   # the reference config's 1e-5 targets a 32B recipient; every LoRA run on this
+                                          # 4B student uses 1e-4. With Adam the per-step parameter movement is set by the
+                                          # learning rate rather than by the loss, so this -- not the trust cap -- is what
+                                          # decides how fast the recipient actually absorbs the shift: at 1e-5 it had taken up
+                                          # only ~4% of an 8.4% ask after 50 steps, a 0.4% change in the velocity field, and
+                                          # GenEval did not move by a single decision.
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.0
+  ema_update_interval: 1
+  ema_device: "cpu"
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: true
+  seed: 42
+
+  # The delta target is already anchored on the recipient base, so no extra anchor.
+  kl_type: "v-based"
+  kl_beta: 0.0
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# GenEval is the donor's own domain; OCR and PickScore are the collateral-damage watch. A shift
+# tuned for compositional alignment has no reason to preserve text rendering, and that is exactly
+# where the direct-imitation runs lost the most.
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 50
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1.0
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    weight: 1.0
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  # PaddleOCR runs out-of-process on CPU in the isolated `ocr` conda env.
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cpu"
+    dtype: float32
+    async_reward: false

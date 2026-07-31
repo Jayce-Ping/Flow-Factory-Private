@@ -19,9 +19,10 @@ from __future__ import annotations
 import copy
 import os
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 import tqdm as tqdm_
@@ -80,6 +81,8 @@ class FlowDirectOPDTrainer(BaseTrainer):
         self.donor_adapter = None
         self._fdopd_timestep_cache_epoch = None
         self._fdopd_timestep_cache: List[int] = []
+        self._oracle_donor_conditioning: Optional[Dict[str, torch.Tensor]] = None
+        self._oracle_trace: List[Dict[str, float]] = []
         super().__init__(**kwargs)
         self.training_args: FlowDirectOPDTrainingArguments
         ta = self.training_args
@@ -305,6 +308,17 @@ class FlowDirectOPDTrainer(BaseTrainer):
 
     def start(self) -> None:
         """Run recipient rollout, dense policy-shift supervision, and evaluation."""
+        if self.training_args.fdopd_oracle_eval:
+            # Measuring a ceiling, not training toward it: one evaluation under the composed field
+            # and nothing else. Sweeping fdopd_lambda over separate runs traces the ceiling as a
+            # function of transfer strength, which is what makes lambda a measured choice rather
+            # than a guess.
+            logger.info(
+                "Flow Direct-OPD oracle evaluation only (fdopd_oracle_eval=true): "
+                "integrating recipient_base + lambda_eff * (donor_rl - donor_base) with no training."
+            )
+            self.evaluate()
+            return
         while self.should_continue_training():
             self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
             if (
@@ -359,9 +373,140 @@ class FlowDirectOPDTrainer(BaseTrainer):
         self._move_donor_transformer(self.accelerator.device)
 
     def evaluate(self) -> None:
-        """Evaluate the recipient without retaining the frozen donor on GPU."""
+        """Evaluate the recipient, or the composed field when measuring the oracle ceiling."""
+        if self.training_args.fdopd_oracle_eval:
+            self._load_donor_transformer()
+            self._oracle_trace = []
+            with self._composed_velocity_field(), self._oracle_donor_conditioning_capture():
+                super().evaluate()
+            self._log_oracle_trace()
+            return
         self._offload_donor_transformer()
         super().evaluate()
+
+    def _log_oracle_trace(self) -> None:
+        """Report what the composed field asked for, averaged over every solver query."""
+        if not self._oracle_trace:
+            raise RuntimeError(
+                "Oracle evaluation produced no velocity compositions; the hook never ran."
+            )
+        names = sorted(self._oracle_trace[0])
+        summary = {
+            f"oracle/{name}": sum(row[name] for row in self._oracle_trace)
+            / len(self._oracle_trace)
+            for name in names
+        }
+        summary["oracle/solver_queries"] = float(len(self._oracle_trace))
+        logger.info(
+            "Flow Direct-OPD oracle field over %d solver queries at lambda=%s, cap=%s: %s",
+            len(self._oracle_trace),
+            self.training_args.fdopd_lambda,
+            self.training_args.fdopd_max_relative_delta_rms,
+            {name: round(value, 5) for name, value in summary.items()},
+        )
+        if self.accelerator.is_main_process:
+            self.log_data(summary, step=self.step)
+        self._oracle_trace = []
+
+    @contextmanager
+    def _composed_velocity_field(self) -> Iterator[None]:
+        """Integrate the training target itself, with no recipient training involved.
+
+        The recipient's own velocity predictor is replaced by
+
+            v = v_recipient_base + lambda_eff * (v_donor_rl - v_donor_base)
+
+        which is the closed-loop version of what training regresses onto, so sampling under it
+        measures the ceiling the recipient could reach if it fit the target perfectly. If this
+        field yields no improvement, no amount of training toward it will.
+
+        Substituting the velocity rather than the transition mean means the existing scheduler step
+        integrates the composed field, so log-probs, dt and the trajectory bookkeeping stay
+        consistent, and every test set, reward and per-tag breakdown works unchanged.
+        lambda_eff is computed on velocities with the same trust cap training uses, so the ceiling
+        corresponds to the target actually in use rather than to an uncapped variant.
+        """
+        adapter = self.adapter
+        original = adapter._predict_velocity
+
+        def composed(**kwargs):
+            conditioning = self._oracle_donor_conditioning
+            if conditioning is None:
+                raise RuntimeError(
+                    "Oracle evaluation reached the velocity hook without cached donor "
+                    "conditioning; _run_eval_inference_batches must stash it per batch."
+                )
+            with adapter.use_ref_parameters():
+                recipient_velocity = original(**kwargs)
+            self._sync_donor_scheduler(kwargs["latents"])
+            donor_kwargs = self._build_donor_velocity_kwargs(kwargs, conditioning)
+            donor_rl_velocity = self.donor_adapter._predict_velocity(**donor_kwargs)
+            with self.donor_adapter.use_ref_parameters():
+                donor_base_velocity = self.donor_adapter._predict_velocity(**donor_kwargs)
+            result = compose_fdopd_target(
+                recipient_base=recipient_velocity,
+                donor_base=donor_base_velocity,
+                donor_rl=donor_rl_velocity,
+                transfer_strength=self.training_args.fdopd_lambda,
+                compute_delta_fp32=self.training_args.fdopd_compute_delta_fp32,
+                max_relative_delta_rms=self.training_args.fdopd_max_relative_delta_rms,
+            )
+            self._oracle_trace.append(
+                {
+                    name: float(value.mean().item())
+                    for name, value in fdopd_target_diagnostics(
+                        result,
+                        recipient_base=recipient_velocity,
+                    ).items()
+                }
+            )
+            return result.target.to(recipient_velocity.dtype)
+
+        adapter._predict_velocity = composed
+        try:
+            yield
+        finally:
+            adapter._predict_velocity = original
+
+    def _build_donor_velocity_kwargs(
+        self,
+        recipient_kwargs: Dict[str, Any],
+        conditioning: Dict[str, torch.Tensor],
+    ) -> Dict[str, Any]:
+        """Swap recipient text conditioning for the donor's and use the donor's own CFG."""
+        donor_kwargs = dict(recipient_kwargs)
+        donor_kwargs.update(conditioning)
+        donor_kwargs["guidance_scale"] = self.donor_guidance_scale
+        if self.donor_guidance_scale <= 1.0:
+            donor_kwargs.pop("negative_prompt_embeds", None)
+            donor_kwargs.pop("negative_text_ids", None)
+        return donor_kwargs
+
+    @contextmanager
+    def _oracle_donor_conditioning_capture(self) -> Iterator[None]:
+        """Stash each eval batch's donor conditioning where the velocity hook can reach it.
+
+        The eval loop filters its kwargs against ``adapter.inference``'s signature and then calls
+        it once per batch, so wrapping that call is the one place where the batch is in hand and
+        the recipient's own generation has not started. The wrapper takes ``**kwargs`` so the
+        filtering keeps the donor's cached embeddings instead of dropping them.
+        """
+        adapter = self.adapter
+        original = adapter.inference
+
+        def inference_with_donor_conditioning(**kwargs):
+            self._oracle_donor_conditioning = self._build_donor_text_conditioning(kwargs)
+            # Taking **kwargs is what keeps the donor embeddings alive through the caller's
+            # signature filtering, but it also lets through everything else the caller holds, so
+            # the real signature has to be applied here instead.
+            return original(**filter_kwargs(original, **kwargs))
+
+        adapter.inference = inference_with_donor_conditioning
+        try:
+            yield
+        finally:
+            adapter.inference = original
+            self._oracle_donor_conditioning = None
 
     def sample(self) -> List[BaseSample]:
         """Generate fresh recipient on-policy trajectories."""

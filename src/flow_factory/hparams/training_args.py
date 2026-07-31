@@ -3090,6 +3090,17 @@ class FlowDirectOPDTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Optional SDE target-to-recipient-base KL budget in nats/dimension."},
     )
+    fdopd_oracle_eval: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Evaluate the composed field itself and train nothing. Sampling integrates "
+                "recipient_base + lambda_eff * (donor_rl - donor_base), the closed-loop form of the "
+                "training target, which measures the ceiling a perfectly fitted recipient could "
+                "reach. Sweep fdopd_lambda across runs to trace that ceiling."
+            )
+        },
+    )
     fdopd_verbose_diagnostics: bool = field(
         default=False,
         metadata={

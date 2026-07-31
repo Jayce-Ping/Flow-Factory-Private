@@ -17,6 +17,7 @@
 from contextlib import contextmanager, nullcontext
 from types import MethodType, SimpleNamespace
 
+
 import pytest
 import torch
 
@@ -224,6 +225,113 @@ def test_trainer_rejects_unsupported_recipient_configuration(
 
     with pytest.raises(ValueError, match="recipient"):
         FlowDirectOPDTrainer._validate_recipient_configuration(model_args, adapter)
+
+
+def test_oracle_hook_integrates_the_capped_composed_field() -> None:
+    """The oracle must substitute exactly the field training regresses onto.
+
+    A perfect recipient would predict recipient_base + lambda_eff * (donor_rl - donor_base), so
+    sampling under that field is the ceiling. lambda_eff has to carry the same trust cap training
+    uses, otherwise the ceiling belongs to a target nobody is training toward.
+    """
+    from contextlib import nullcontext
+
+    recipient_velocity = torch.full((1, 4), 2.0)
+    donor_base_velocity = torch.zeros(1, 4)
+    donor_rl_velocity = torch.full((1, 4), 1.0)
+
+    trainer = FlowDirectOPDTrainer.__new__(FlowDirectOPDTrainer)
+    trainer.adapter = SimpleNamespace(
+        _predict_velocity=lambda **kwargs: recipient_velocity,
+        use_ref_parameters=nullcontext,
+    )
+    trainer.donor_adapter = SimpleNamespace(
+        _predict_velocity=lambda **kwargs: (
+            donor_base_velocity if trainer._in_ref else donor_rl_velocity
+        ),
+        use_ref_parameters=lambda: _ref_toggle(trainer),
+    )
+    trainer._in_ref = False
+    trainer._oracle_donor_conditioning = {"prompt_embeds": torch.zeros(1, 2), "text_ids": None}
+    trainer._oracle_trace = []
+    trainer.donor_guidance_scale = 1.0
+    trainer._sync_donor_scheduler = lambda latents: None
+    trainer.training_args = SimpleNamespace(
+        fdopd_lambda=0.25,
+        fdopd_compute_delta_fp32=True,
+        fdopd_max_relative_delta_rms=None,
+    )
+
+    with trainer._composed_velocity_field():
+        composed = trainer.adapter._predict_velocity(latents=torch.zeros(1, 4))
+
+    # delta is 1.0 per dimension, so the uncapped field is 2.0 + 0.25 * 1.0.
+    torch.testing.assert_close(composed, torch.full((1, 4), 2.25))
+
+    # With a cap of 5% of the recipient's RMS (2.0), the shift may only reach 0.1.
+    trainer.training_args = SimpleNamespace(
+        fdopd_lambda=0.25,
+        fdopd_compute_delta_fp32=True,
+        fdopd_max_relative_delta_rms=0.05,
+    )
+    with trainer._composed_velocity_field():
+        capped = trainer.adapter._predict_velocity(latents=torch.zeros(1, 4))
+    torch.testing.assert_close(capped, torch.full((1, 4), 2.10))
+
+    # The hook must refuse to run without the donor conditioning rather than silently
+    # feeding the donor the recipient's embeddings.
+    trainer._oracle_donor_conditioning = None
+    with trainer._composed_velocity_field():
+        with pytest.raises(RuntimeError, match="donor conditioning"):
+            trainer.adapter._predict_velocity(latents=torch.zeros(1, 4))
+
+
+def test_oracle_conditioning_capture_does_not_widen_the_inference_signature() -> None:
+    """The capture wrapper must hand the real inference only what it accepts.
+
+    The wrapper takes **kwargs so the caller's signature filtering keeps the donor embeddings,
+    which means everything else the caller holds arrives too; without re-filtering, ordinary eval
+    keys like `resolution` reach an inference that never declared them.
+    """
+    seen = {}
+
+    def real_inference(prompt=None, prompt_embeds=None):
+        seen.update(prompt=prompt, prompt_embeds=prompt_embeds)
+        return ["sample"]
+
+    trainer = FlowDirectOPDTrainer.__new__(FlowDirectOPDTrainer)
+    trainer.adapter = SimpleNamespace(inference=real_inference)
+    trainer.donor_guidance_scale = 1.0
+    trainer._oracle_donor_conditioning = None
+
+    with trainer._oracle_donor_conditioning_capture():
+        result = trainer.adapter.inference(
+            prompt=["a cat"],
+            prompt_embeds=torch.zeros(1, 2),
+            resolution=512,
+            teacher_prompt_embeds=torch.ones(1, 3),
+            teacher_text_ids=torch.zeros(1, 3),
+        )
+
+    assert result == ["sample"]
+    assert seen["prompt"] == ["a cat"]
+    # The donor conditioning was captured for the velocity hook rather than forwarded.
+    assert trainer._oracle_donor_conditioning is None  # cleared on exit
+    with trainer._oracle_donor_conditioning_capture():
+        trainer.adapter.inference(prompt=["x"], teacher_prompt_embeds=torch.ones(1, 3),
+                                  teacher_text_ids=torch.zeros(1, 3), resolution=512)
+        captured = trainer._oracle_donor_conditioning
+    torch.testing.assert_close(captured["prompt_embeds"], torch.ones(1, 3))
+
+
+@contextmanager
+def _ref_toggle(trainer) -> None:
+    """Stand in for use_ref_parameters on the stub donor."""
+    trainer._in_ref = True
+    try:
+        yield
+    finally:
+        trainer._in_ref = False
 
 
 @pytest.mark.parametrize("model_type", ["flux2", "flux2-klein"])
