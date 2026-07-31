@@ -44,7 +44,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "fdopd_klein9b_multi_to_klein4b"
+  run_name: "fdopd_klein9b_multi_to_klein4b_nocfg_lr1e-4_cap025"
   project: "Flow-Factory-FDOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -60,15 +60,20 @@ train:
   donor_base_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
   donor_rl_lora_path: "Tencent-Hunyuan-Multimodal-RL/FLUX2-klein-base-9b-GenEval2-Multi-Reward"
   donor_vae_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
-  donor_guidance_scale: 4.0               # the CFG the donor LoRA is documented to be used at; the delta is only meaningful at the scale it was learned for
+  donor_guidance_scale: 1.0               # Flow-DPPO trains the donor without CFG, and the delta means what it means only at the conditioning it was learned under
   assume_shared_vae: true                 # verified by the preflight: VAE weights are bit-identical
 
   # --- Policy-shift target ---
-  guidance_scale: 4.0                     # recipient runs at the donor's scale so both fields are compared under the same conditioning
+  guidance_scale: 1.0                     # recipient runs at the donor's scale so both fields are compared under the same conditioning
   fdopd_lambda: 0.25
   fdopd_loss_space: "v"                   # ODE requires velocity-residual matching
   normalize_d_k: false                    # invalid for v-space
-  fdopd_max_relative_delta_rms: 0.10      # cap the target shift at 10% of the recipient's own base velocity RMS
+  fdopd_max_relative_delta_rms: 0.25      # cap the target shift at 25% of the recipient's own base velocity RMS.
+                                          # At 0.10 the cap, not lambda, set the transfer strength: the donor's shift is as
+                                          # large as the recipient's whole field (relative_delta_rms ~ 0.96 +- 0.99), so 54% of
+                                          # samples clipped and the realized ask was 8.4%. At 0.25 only samples whose shift
+                                          # EXCEEDS the recipient's own field are clipped (~35%), which is where a cap belongs:
+                                          # protecting the heavy tail (max observed 4.08) rather than throttling the median.
   fdopd_trust_kl_per_dim: null            # mutually exclusive with the RMS cap
   fdopd_compute_delta_fp32: true          # the delta is a small difference of two large bf16 fields
   fdopd_offload_donor_during_rollout: true
@@ -89,7 +94,12 @@ train:
   num_inner_epochs: 1
   gradient_accumulation_steps: auto
 
-  learning_rate: 1.0e-5
+  learning_rate: 1.0e-4                   # the reference config's 1e-5 targets a 32B recipient; every LoRA run on this
+                                          # 4B student uses 1e-4. With Adam the per-step parameter movement is set by the
+                                          # learning rate rather than by the loss, so this -- not the trust cap -- is what
+                                          # decides how fast the recipient actually absorbs the shift: at 1e-5 it had taken up
+                                          # only ~4% of an 8.4% ask after 50 steps, a 0.4% change in the velocity field, and
+                                          # GenEval did not move by a single decision.
   adam_weight_decay: 1.0e-4
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8
@@ -120,13 +130,13 @@ eval:
   resolution: 512
   per_device_batch_size: 1
   num_inference_steps: 40
-  guidance_scale: 4.0
+  guidance_scale: 1.0
   eval_freq: 50
   seed: 42
   test_sets:
-    - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}
-    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
-    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
 
 rewards:
   - name: "geneval"
