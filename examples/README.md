@@ -10,7 +10,7 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 
 | Level | Description | Examples |
 |-------|-------------|---------|
-| `algorithm` | Training algorithm | `grpo`, `nft`, `awm`, `dgpo`, `dpo`, `crd` |
+| `algorithm` | Training algorithm | `grpo`, `nft`, `awm`, `dgpo`, `dpo`, `crd`, `flow_direct_opd` |
 | `finetune_type` | Parameter-efficient or full | `lora`, `full` |
 | `model_type` | Model family (underscore-separated) | `flux1`, `sd3_5`, `wan21`, `ltx2` |
 | `variant` | Config variant | `default.yaml`, `nocfg.yaml`, `t2v.yaml` |
@@ -22,6 +22,11 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 **Quick start**:
 ```bash
 ff-train examples/grpo/lora/flux1/default.yaml
+```
+
+Weak-to-strong policy-shift transfer:
+```bash
+ff-train examples/flow_direct_opd/lora/flux2/default.yaml
 ```
 
 ## Contributing

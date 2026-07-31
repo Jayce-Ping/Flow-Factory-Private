@@ -15,37 +15,36 @@
 # src/flow_factory/hparams/__init__.py
 
 from .args import Arguments
-
 from .data_args import DataArguments
+from .log_args import LogArguments
 from .model_args import ModelArguments
+from .reward_args import MultiRewardArguments, RewardArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
-    TestSetArguments,
-    EvaluationArguments,
-    TrainingArguments,
-    GRPOTrainingArguments,
-    NFTTrainingArguments,
-    MoFBaseTrainingArguments,
-    MoFNFTTrainingArguments,
-    MoFGRPOTrainingArguments,
-    MoFDMinTrainingArguments,
-    MoFKLMinTrainingArguments,
     AWMTrainingArguments,
-    DGPOTrainingArguments,
-    DPOTrainingArguments,
     CRDTrainingArguments,
+    DGPOTrainingArguments,
+    DiffusionOPDTrainingArguments,
+    DPOTrainingArguments,
+    EnsembleEvalTrainingArguments,
+    EvaluationArguments,
+    FlowDirectOPDTrainingArguments,
+    GRPOTrainingArguments,
+    MoFBaseTrainingArguments,
+    MoFDistillTrainingArguments,
+    MoFDMinTrainingArguments,
+    MoFGRPOTrainingArguments,
+    MoFKLMinTrainingArguments,
+    MoFNFTTrainingArguments,
+    NFTTrainingArguments,
     OPDTrainingArguments,
+    TeacherConfig,
+    TestSetArguments,
+    TrainingArguments,
     XOPDTrainingArguments,
     XPDMTrainingArguments,
-    MoFDistillTrainingArguments,
-    TeacherConfig,
-    DiffusionOPDTrainingArguments,
-    EnsembleEvalTrainingArguments,
     get_training_args_class,
 )
-from .reward_args import RewardArguments, MultiRewardArguments
-from .log_args import LogArguments
-
 
 __all__ = [
     "Arguments",
@@ -68,6 +67,7 @@ __all__ = [
     "CRDTrainingArguments",
     "OPDTrainingArguments",
     "XOPDTrainingArguments",
+    "FlowDirectOPDTrainingArguments",
     "XPDMTrainingArguments",
     "MoFDistillTrainingArguments",
     "TeacherConfig",

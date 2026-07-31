@@ -2975,6 +2975,244 @@ class XOPDTrainingArguments(TrainingArguments):
 
 
 @dataclass
+class FlowDirectOPDTrainingArguments(TrainingArguments):
+    r"""Training arguments for weak-to-strong Flow Direct-OPD.
+
+    The trainable recipient rolls out its own states. A frozen donor pair
+    (base plus an RL LoRA on the same base) supplies only the RL-induced
+    transition shift, which is added to the recipient base transition.
+    """
+
+    donor_model_type: str = field(
+        default="flux2-klein",
+        metadata={"help": "Model-adapter registry key for the frozen donor pair."},
+    )
+    donor_base_model_name_or_path: str = field(
+        default="",
+        metadata={"help": "Base-model path for the frozen small donor."},
+    )
+    donor_rl_lora_path: str = field(
+        default="",
+        metadata={"help": "LoRA checkpoint containing the donor's RL-induced policy shift."},
+    )
+    donor_vae_name_or_path: Optional[str] = field(
+        default="black-forest-labs/FLUX.2-klein-base-4B",
+        metadata={"help": "VAE source for donor repos that do not ship a VAE subfolder."},
+    )
+    donor_guidance_scale: float = field(
+        default=4.0,
+        metadata={"help": "CFG scale used for both donor-base and donor-RL forwards."},
+    )
+    assume_shared_vae: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Assert that donor and recipient use identical physical latent coordinates. "
+                "Flow Direct-OPD v1 has no cross-VAE transport."
+            )
+        },
+    )
+    fdopd_lambda: float = field(
+        default=0.25,
+        metadata={"help": "Nominal non-negative donor-shift transfer strength."},
+    )
+    fdopd_loss_space: Literal["v", "xt"] = field(
+        default="v",
+        metadata={
+            "help": "Recipient loss space: velocity residual ('v') or transition mean ('xt')."
+        },
+    )
+    normalize_d_k: bool = field(
+        default=False,
+        metadata={"help": "Normalize xt-space loss by transition covariance; invalid for v-space."},
+    )
+    pathwise_coef: float = field(
+        default=1.0,
+        metadata={"help": "Coefficient on the Flow Direct-OPD pathwise loss."},
+    )
+    kl_type: Literal["x-based", "v-based"] = field(
+        default="v-based",
+        metadata={"help": "Optional recipient-to-base anchor space."},
+    )
+    kl_beta: float = field(
+        default=0.0,
+        metadata={"help": "Optional recipient-to-base anchor coefficient."},
+    )
+    ema_decay: float = field(
+        default=0.0,
+        metadata={"help": "Disabled in Flow Direct-OPD v1 to avoid EMA weight swaps during eval."},
+    )
+    fdopd_max_relative_delta_rms: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional ODE trust cap on target-shift RMS divided by recipient-base "
+                "velocity RMS."
+            )
+        },
+    )
+    fdopd_trust_kl_per_dim: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional SDE target-to-recipient-base KL budget in nats/dimension."},
+    )
+    fdopd_compute_delta_fp32: bool = field(
+        default=True,
+        metadata={"help": "Subtract donor RL/base transition statistics in float32."},
+    )
+    fdopd_offload_donor_during_rollout: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Move the frozen donor transformer to CPU during recipient rollout and "
+                "evaluation, then reload it for the target pre-pass."
+            )
+        },
+    )
+    fdopd_train_steps: Optional[List[int]] = field(
+        default=None,
+        metadata={"help": "Optional candidate rollout-step indices for recipient distillation."},
+    )
+    num_fdopd_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Fixed number of candidate steps sampled per batch/epoch."},
+    )
+    fdopd_resample_steps_per_batch: bool = field(
+        default=False,
+        metadata={"help": "Redraw the fixed-size trained-step subset for each micro-batch."},
+    )
+    fdopd_step_sampling: Literal["uniform", "stratified"] = field(
+        default="uniform",
+        metadata={"help": "Sampling scheme for the trained-step subset."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not self.donor_base_model_name_or_path:
+            raise ValueError(
+                "Flow Direct-OPD requires `donor_base_model_name_or_path`, got "
+                f"{self.donor_base_model_name_or_path!r}."
+            )
+        if not self.donor_rl_lora_path:
+            raise ValueError(
+                "Flow Direct-OPD requires `donor_rl_lora_path`, got "
+                f"{self.donor_rl_lora_path!r}."
+            )
+        if not self.assume_shared_vae:
+            raise ValueError(
+                "Flow Direct-OPD v1 requires `assume_shared_vae=True`; cross-VAE "
+                "policy-shift transport is not implemented."
+            )
+        if (
+            isinstance(self.fdopd_lambda, bool)
+            or not isinstance(self.fdopd_lambda, (int, float))
+            or not math.isfinite(float(self.fdopd_lambda))
+            or float(self.fdopd_lambda) < 0.0
+        ):
+            raise ValueError(
+                "`fdopd_lambda` must be a finite number >= 0, got "
+                f"fdopd_lambda={self.fdopd_lambda!r}."
+            )
+        if (
+            isinstance(self.donor_guidance_scale, bool)
+            or not isinstance(self.donor_guidance_scale, (int, float))
+            or not math.isfinite(float(self.donor_guidance_scale))
+            or float(self.donor_guidance_scale) < 1.0
+        ):
+            raise ValueError(
+                "`donor_guidance_scale` must be a finite number >= 1, got "
+                f"donor_guidance_scale={self.donor_guidance_scale!r}."
+            )
+        if self.fdopd_loss_space == "v" and self.normalize_d_k:
+            raise ValueError(
+                "`normalize_d_k=True` is only meaningful for fdopd_loss_space='xt'; "
+                "got fdopd_loss_space='v'."
+            )
+        if self.fdopd_max_relative_delta_rms is not None:
+            if (
+                not math.isfinite(float(self.fdopd_max_relative_delta_rms))
+                or float(self.fdopd_max_relative_delta_rms) <= 0.0
+            ):
+                raise ValueError(
+                    "`fdopd_max_relative_delta_rms` must be finite and > 0 when set, "
+                    f"got {self.fdopd_max_relative_delta_rms!r}."
+                )
+        if self.fdopd_trust_kl_per_dim is not None:
+            if (
+                not math.isfinite(float(self.fdopd_trust_kl_per_dim))
+                or float(self.fdopd_trust_kl_per_dim) <= 0.0
+            ):
+                raise ValueError(
+                    "`fdopd_trust_kl_per_dim` must be finite and > 0 when set, "
+                    f"got {self.fdopd_trust_kl_per_dim!r}."
+                )
+        if (
+            self.fdopd_max_relative_delta_rms is not None
+            and self.fdopd_trust_kl_per_dim is not None
+        ):
+            raise ValueError(
+                "Flow Direct-OPD accepts at most one trust budget: set either "
+                "`fdopd_max_relative_delta_rms` or `fdopd_trust_kl_per_dim`, not both."
+            )
+        if not math.isfinite(float(self.pathwise_coef)) or self.pathwise_coef < 0.0:
+            raise ValueError(
+                f"`pathwise_coef` must be finite and >= 0, got {self.pathwise_coef!r}."
+            )
+        if not math.isfinite(float(self.kl_beta)) or self.kl_beta < 0.0:
+            raise ValueError(f"`kl_beta` must be finite and >= 0, got {self.kl_beta!r}.")
+        if self.num_inner_epochs != 1:
+            raise ValueError(
+                "Flow Direct-OPD requires num_inner_epochs == 1 so every update uses a "
+                f"fresh recipient rollout, got num_inner_epochs={self.num_inner_epochs}."
+            )
+        if float(self.ema_decay) != 0.0:
+            raise ValueError(
+                "Flow Direct-OPD v1 requires ema_decay=0 to avoid inference-time EMA "
+                f"weight swaps inside autocast, got ema_decay={self.ema_decay!r}."
+            )
+        if self.fdopd_train_steps is not None:
+            if not self.fdopd_train_steps:
+                raise ValueError("`fdopd_train_steps` must be non-empty when set.")
+            if any((not isinstance(i, int)) or i < 0 for i in self.fdopd_train_steps):
+                raise ValueError(
+                    "`fdopd_train_steps` must contain non-negative integers, got "
+                    f"{self.fdopd_train_steps!r}."
+                )
+            if len(set(self.fdopd_train_steps)) != len(self.fdopd_train_steps):
+                raise ValueError(
+                    "`fdopd_train_steps` must contain unique indices, got "
+                    f"{self.fdopd_train_steps!r}."
+                )
+        if self.num_fdopd_steps is not None:
+            if self.num_fdopd_steps < 1:
+                raise ValueError(
+                    "`num_fdopd_steps` must be >= 1 when set, got " f"{self.num_fdopd_steps!r}."
+                )
+            if self.fdopd_train_steps is not None and self.num_fdopd_steps > len(
+                self.fdopd_train_steps
+            ):
+                raise ValueError(
+                    "`num_fdopd_steps` cannot exceed len(fdopd_train_steps), got "
+                    f"{self.num_fdopd_steps} > {len(self.fdopd_train_steps)}."
+                )
+        if self.fdopd_resample_steps_per_batch and self.num_fdopd_steps is None:
+            raise ValueError("`fdopd_resample_steps_per_batch=True` requires `num_fdopd_steps`.")
+        if self.fdopd_step_sampling == "stratified" and self.num_fdopd_steps is None:
+            raise ValueError("`fdopd_step_sampling='stratified'` requires `num_fdopd_steps`.")
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        if self.num_fdopd_steps is not None:
+            return self.num_fdopd_steps
+        if self.fdopd_train_steps:
+            return len(self.fdopd_train_steps)
+        if args is not None and args.scheduler_args.dynamics_type != "ODE":
+            return args.scheduler_args.num_sde_steps
+        return self.num_inference_steps
+
+    def get_preprocess_guidance_scale(self) -> float:
+        return max(self.guidance_scale, self.donor_guidance_scale)
+
+
+@dataclass
 class XPDMTrainingArguments(XOPDTrainingArguments):
     r"""Pixel/latent-space one-step DENOISER MATCHING (docs/xopd/pixel_denoiser_matching.tex).
 
@@ -3083,7 +3321,9 @@ class XDMDTrainingArguments(XOPDTrainingArguments):
     )
     dmd_real_guidance_scale: float = field(
         default=4.0,
-        metadata={"help": "CFG for the ``real`` (32B teacher) score in the DMD gradient (Stage 3)."},
+        metadata={
+            "help": "CFG for the ``real`` (32B teacher) score in the DMD gradient (Stage 3)."
+        },
     )
     dmd_fake_guidance_scale: float = field(
         default=1.0,
@@ -3773,6 +4013,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "crd": CRDTrainingArguments,
     "opd": OPDTrainingArguments,
     "xopd": XOPDTrainingArguments,
+    "flow-direct-opd": FlowDirectOPDTrainingArguments,
     "xpdm": XPDMTrainingArguments,
     "xdmd": XDMDTrainingArguments,
     "diffusion-opd": DiffusionOPDTrainingArguments,

@@ -27,6 +27,8 @@
 
 - [MoF: Mixture-of-Flow Teacher Mixture](#mof-mixture-of-flow-teacher-mixture)
 
+- [Flow Direct-OPD: Weak-to-Strong Policy-Shift Transfer](#flow-direct-opd-weak-to-strong-policy-shift-transfer)
+
 - [References](#references)
 
 ## Overview
@@ -578,6 +580,47 @@ i.e. the squared norm of the convex combination of teacher task vectors `τ_k = 
 Configs: `mof_configs/klmin/geneval_pickscore_ocr_lut.yaml` (LUT) and `..._adaln_router.yaml` (router). Run: `ff-train mof_configs/klmin/geneval_pickscore_ocr_lut.yaml`.
 
 
+## Flow Direct-OPD: Weak-to-Strong Policy-Shift Transfer
+
+**Trainer:** `flow-direct-opd` (`flow_factory.trainers.fdopd`)
+
+Flow Direct-OPD transfers the policy change learned by reinforcement learning on a smaller donor
+model into a larger recipient. It does not imitate the donor RL checkpoint directly. Given donor
+base/RL outputs and the recipient base output at the same recipient-visited state,
+
+```text
+delta_donor = output_donor_rl - output_donor_base
+target = output_recipient_base + lambda_eff * delta_donor
+```
+
+The recipient rolls out its own trajectory, the frozen donor pair is queried on those states, and
+the trainable recipient regresses onto the detached target. A single donor backbone carries the RL
+LoRA; `use_ref_parameters()` disables that LoRA for the donor-base branch. The recipient base is
+likewise obtained by disabling the recipient LoRA.
+
+The implemented modes are:
+
+- `scheduler.dynamics_type: ODE` with `fdopd_loss_space: v`: velocity-residual matching, interpreted
+  as the deterministic control limit.
+- `Flow-SDE`, `Dance-SDE`, or `CPS` with `fdopd_loss_space: xt`: transition-mean matching under the
+  framework's existing Gaussian stochastic wrappers.
+
+DPM-SDE is not a runtime option in the current scheduler registry. Its formulation and the general
+non-Gaussian kernel derivation are documented in
+`docs/xopd/flow_direct_opd_small_rl_delta_transfer.tex`.
+
+Canonical config:
+
+```bash
+ff-train examples/flow_direct_opd/lora/flux2/default.yaml
+```
+
+The default experiment uses FLUX.2-dev as the LoRA recipient and the
+FLUX.2-klein-base-9B GenEval2 Multi-Reward LoRA as the donor RL checkpoint. Replacing
+`donor_rl_lora_path` with the Single-Reward repository gives the first policy-shift ablation.
+Run `scripts/fdopd_analysis/validate_flux2_compatibility.py` before allocating a 32B training job.
+
+
 ## References
 
 * <a name="ref1"></a>[1] [**Flow-GRPO:** Training Flow Matching Models via Online RL](https://arxiv.org/abs/2505.05470)
@@ -593,3 +636,4 @@ Configs: `mof_configs/klmin/geneval_pickscore_ocr_lut.yaml` (LUT) and `..._adaln
 * <a name="ref11"></a>[11] [**Diffusion-DPO**: Diffusion Model Alignment Using Direct Preference Optimization](https://arxiv.org/abs/2311.12908)
 * <a name="ref12"></a>[12] [**TDM-R1**: Reinforcing Few-Step Diffusion Models with Non-Differentiable Reward](https://arxiv.org/abs/2510.08425)
 * <a name="ref13"></a>[13] [**CRD**: Diffusion Reinforcement Learning via Centered Reward Distillation](https://arxiv.org/abs/2603.14128)
+* <a name="ref14"></a>[14] [**Direct-OPD**: Weak-to-Strong Generalization via Direct On-Policy Distillation](https://arxiv.org/abs/2607.05394)

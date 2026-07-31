@@ -15,30 +15,30 @@
 # src/flow_factory/models/flux/flux2.py
 from __future__ import annotations
 
+import logging
 import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
-from dataclasses import dataclass
-from PIL import Image
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+
 import numpy as np
-from accelerate import Accelerator
 import torch
+from accelerate import Accelerator
 from diffusers.pipelines.flux2.pipeline_flux2 import (
     Flux2Pipeline,
-    format_input,
     compute_empirical_mu,
+    format_input,
     retrieve_latents,
 )
 from diffusers.pipelines.flux2.system_messages import (
     SYSTEM_MESSAGE,
-    SYSTEM_MESSAGE_UPSAMPLING_T2I,
     SYSTEM_MESSAGE_UPSAMPLING_I2I,
+    SYSTEM_MESSAGE_UPSAMPLING_T2I,
 )
-import logging
+from PIL import Image
 
-from ..abc import BaseAdapter
-from ...samples import I2ISample
 from ...hparams import *
+from ...samples import I2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
@@ -47,22 +47,25 @@ from ...scheduler import (
 )
 from ...utils.base import filter_kwargs
 from ...utils.image import (
-    ImageSingle,
     ImageBatch,
+    ImageSingle,
     MultiImageBatch,
     is_image,
     is_image_batch,
     is_multi_image_batch,
     standardize_image_batch,
 )
-from ...utils.trajectory_collector import (
-    TrajectoryCollector,
-    CallbackCollector,
-    TrajectoryIndicesType,
-    create_trajectory_collector,
-    create_callback_collector,
-)
 from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    SchedulerAwareTrajectoryIndicesType,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+    resolve_scheduler_train_collection_indices,
+)
+from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
 
@@ -76,6 +79,10 @@ class Flux2Sample(I2ISample):
     # Obj vars
     latent_ids: Optional[torch.Tensor] = None
     text_ids: Optional[torch.Tensor] = None
+    teacher_prompt_embeds: Optional[torch.Tensor] = None
+    teacher_text_ids: Optional[torch.Tensor] = None
+    teacher_negative_prompt_embeds: Optional[torch.Tensor] = None
+    teacher_negative_text_ids: Optional[torch.Tensor] = None
     image_latents: Optional[torch.Tensor] = None
     image_latent_ids: Optional[torch.Tensor] = None
 
@@ -433,10 +440,12 @@ class Flux2Adapter(BaseAdapter):
         pipe = self.pipeline
         device = device if device is not None else pipe.vae.device
         dtype = pipe.vae.dtype
-        pixel_values = pipe.image_processor.preprocess(
-            images, height=height, width=width
-        ).to(device=device, dtype=dtype)
-        z = retrieve_latents(pipe.vae.encode(pixel_values), generator=generator, sample_mode="argmax")
+        pixel_values = pipe.image_processor.preprocess(images, height=height, width=width).to(
+            device=device, dtype=dtype
+        )
+        z = retrieve_latents(
+            pipe.vae.encode(pixel_values), generator=generator, sample_mode="argmax"
+        )
         z = pipe._patchify_latents(z)
         bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(z.device, z.dtype)
         bn_std = torch.sqrt(
@@ -451,11 +460,16 @@ class Flux2Adapter(BaseAdapter):
     def preprocess_func(
         self,
         prompt: List[str],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        guidance_scale: float = 4.0,
+        teacher_guidance_scale: float = 1.0,
+        donor_guidance_scale: Optional[float] = None,
         images: Optional[MultiImageBatch] = None,
         caption_upsample_temperature: Optional[float] = None,
         condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         max_sequence_length: int = 512,
         text_encoder_out_layers: Tuple[int, ...] = (10, 20, 30),
+        is_train: bool = True,
         generator: Optional[torch.Generator] = None,
         device: Optional[torch.device] = None,
     ) -> Dict[str, Union[List[Any], torch.Tensor]]:
@@ -464,10 +478,16 @@ class Flux2Adapter(BaseAdapter):
 
         Args:
             prompt: List of text prompts
+            negative_prompt: Optional negative prompt used by an auxiliary donor encoder.
+            guidance_scale: Recipient guidance scale used for evaluation-side donor caching.
+            teacher_guidance_scale: Donor CFG scale used for training-side text caching.
+            donor_guidance_scale: Flow Direct-OPD alias for teacher guidance. When set,
+                takes precedence over ``teacher_guidance_scale``.
             images: Optional images in various formats (MultiImageBatch)
             caption_upsample_temperature: Temperature for prompt upsampling
             max_sequence_length: Max sequence length for text encoder
             text_encoder_out_layers: Layers to extract from text encoder
+            is_train: Whether preprocessing the train split rather than an evaluation split.
             generator: Random generator for encoding (not used, kept for API consistency)
             device: Target device for output tensors. If None, uses the component's own device.
 
@@ -507,6 +527,18 @@ class Flux2Adapter(BaseAdapter):
             max_sequence_length=max_sequence_length,
             text_encoder_out_layers=text_encoder_out_layers,
         )
+        batch = self._apply_teacher_text_encoding(
+            batch=batch,
+            prompt=final_prompts,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            teacher_guidance_scale=(
+                donor_guidance_scale if donor_guidance_scale is not None else teacher_guidance_scale
+            ),
+            is_train=is_train,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
 
         # 4: Batch encode images if present
         if has_images:
@@ -522,6 +554,19 @@ class Flux2Adapter(BaseAdapter):
         return batch
 
     # ======================== Sampling / Inference ========================
+
+    def _resolve_collection_indices(
+        self,
+        trajectory_indices: SchedulerAwareTrajectoryIndicesType,
+        *,
+        num_inference_steps: int,
+    ) -> Tuple[TrajectoryIndicesType, TrajectoryIndicesType]:
+        """Resolve scheduler-selected stochastic steps after configuring the schedule."""
+        return resolve_scheduler_train_collection_indices(
+            trajectory_indices,
+            scheduler_train_indices=self.scheduler.train_timesteps,
+            num_inference_steps=num_inference_steps,
+        )
 
     # Since Flux.2 does not support ragged batches of condition images, we implement a single-sample inference method.
     @torch.no_grad()
@@ -539,6 +584,10 @@ class Flux2Adapter(BaseAdapter):
         prompt_ids: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
+        teacher_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_text_ids: Optional[torch.Tensor] = None,
+        teacher_negative_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_negative_text_ids: Optional[torch.Tensor] = None,
         # Image encoding arguments
         condition_images: Optional[MultiImageBatch] = None,
         image_latents: Optional[torch.Tensor] = None,
@@ -552,7 +601,7 @@ class Flux2Adapter(BaseAdapter):
         compute_log_prob: bool = False,
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = "all",
+        trajectory_indices: SchedulerAwareTrajectoryIndicesType = "all",
     ) -> List[Flux2Sample]:
         """
         Inference method for Flux.2 model for a single sample.
@@ -582,6 +631,10 @@ class Flux2Adapter(BaseAdapter):
             prompt_ids = encode_dict["prompt_ids"]
             prompt_embeds = encode_dict["prompt_embeds"]
             text_ids = encode_dict["text_ids"]
+            teacher_prompt_embeds = encode_dict.get("teacher_prompt_embeds")
+            teacher_text_ids = encode_dict.get("teacher_text_ids")
+            teacher_negative_prompt_embeds = encode_dict.get("teacher_negative_prompt_embeds")
+            teacher_negative_text_ids = encode_dict.get("teacher_negative_text_ids")
             # Potential issue: the following stack relies on uniform size of input condition images
             condition_images = (
                 encode_dict["condition_images"]  # List[List[torch.Tensor(3, H, W)]] with len B
@@ -602,6 +655,20 @@ class Flux2Adapter(BaseAdapter):
             prompt_ids = prompt_ids.to(device)
             prompt_embeds = prompt_embeds.to(device)
             text_ids = text_ids.to(device)
+            teacher_prompt_embeds = (
+                teacher_prompt_embeds.to(device) if teacher_prompt_embeds is not None else None
+            )
+            teacher_text_ids = teacher_text_ids.to(device) if teacher_text_ids is not None else None
+            teacher_negative_prompt_embeds = (
+                teacher_negative_prompt_embeds.to(device)
+                if teacher_negative_prompt_embeds is not None
+                else None
+            )
+            teacher_negative_text_ids = (
+                teacher_negative_text_ids.to(device)
+                if teacher_negative_text_ids is not None
+                else None
+            )
             image_latents = image_latents.to(device) if image_latents is not None else None
             image_latent_ids = image_latent_ids.to(device) if image_latent_ids is not None else None
 
@@ -628,6 +695,10 @@ class Flux2Adapter(BaseAdapter):
             device=device,
             mu=mu,
         )
+        trajectory_indices, callback_indices = self._resolve_collection_indices(
+            trajectory_indices,
+            num_inference_steps=num_inference_steps,
+        )
 
         # 4. Run diffusion process
         latent_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
@@ -637,7 +708,7 @@ class Flux2Adapter(BaseAdapter):
             log_prob_collector = create_trajectory_collector(
                 trajectory_indices, num_inference_steps
             )
-        callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
+        callback_collector = create_callback_collector(callback_indices, num_inference_steps)
 
         # Inside denoising loop in _inference, replace the inline transformer call with:
         for i, t in enumerate(timesteps):
@@ -713,6 +784,18 @@ class Flux2Adapter(BaseAdapter):
                 prompt_ids=prompt_ids[b],
                 prompt_embeds=prompt_embeds[b],
                 text_ids=text_ids[b],
+                teacher_prompt_embeds=(
+                    teacher_prompt_embeds[b] if teacher_prompt_embeds is not None else None
+                ),
+                teacher_text_ids=(teacher_text_ids[b] if teacher_text_ids is not None else None),
+                teacher_negative_prompt_embeds=(
+                    teacher_negative_prompt_embeds[b]
+                    if teacher_negative_prompt_embeds is not None
+                    else None
+                ),
+                teacher_negative_text_ids=(
+                    teacher_negative_text_ids[b] if teacher_negative_text_ids is not None else None
+                ),
                 # Condition images & latents
                 condition_images=(
                     condition_images[b] if condition_images is not None else None
@@ -755,6 +838,10 @@ class Flux2Adapter(BaseAdapter):
         prompt_ids: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
+        teacher_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_text_ids: Optional[torch.Tensor] = None,
+        teacher_negative_prompt_embeds: Optional[torch.Tensor] = None,
+        teacher_negative_text_ids: Optional[torch.Tensor] = None,
         # Encoded images
         condition_images: Optional[MultiImageBatch] = None,
         image_latents: Optional[Union[torch.Tensor, List[Union[None, torch.Tensor]]]] = None,
@@ -762,7 +849,7 @@ class Flux2Adapter(BaseAdapter):
         # Other arguments
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = "all",
+        trajectory_indices: SchedulerAwareTrajectoryIndicesType = "all",
     ) -> List[Flux2Sample]:
         """Batch inference for Flux2"""
         if isinstance(prompt, str):
@@ -791,6 +878,10 @@ class Flux2Adapter(BaseAdapter):
                 prompt_ids=prompt_ids,
                 prompt_embeds=prompt_embeds,
                 text_ids=text_ids,
+                teacher_prompt_embeds=teacher_prompt_embeds,
+                teacher_text_ids=teacher_text_ids,
+                teacher_negative_prompt_embeds=teacher_negative_prompt_embeds,
+                teacher_negative_text_ids=teacher_negative_text_ids,
                 # Encoded images
                 condition_images=condition_images,
                 image_latents=image_latents,
@@ -825,6 +916,24 @@ class Flux2Adapter(BaseAdapter):
                 prompt_embeds[idx].unsqueeze(0) if prompt_embeds is not None else None
             )
             this_text_ids = text_ids[idx].unsqueeze(0) if text_ids is not None else None
+            this_teacher_prompt_embeds = (
+                teacher_prompt_embeds[idx].unsqueeze(0)
+                if teacher_prompt_embeds is not None
+                else None
+            )
+            this_teacher_text_ids = (
+                teacher_text_ids[idx].unsqueeze(0) if teacher_text_ids is not None else None
+            )
+            this_teacher_negative_prompt_embeds = (
+                teacher_negative_prompt_embeds[idx].unsqueeze(0)
+                if teacher_negative_prompt_embeds is not None
+                else None
+            )
+            this_teacher_negative_text_ids = (
+                teacher_negative_text_ids[idx].unsqueeze(0)
+                if teacher_negative_text_ids is not None
+                else None
+            )
             # Image
             this_images = (
                 images[idx] if images is not None else None
@@ -851,6 +960,10 @@ class Flux2Adapter(BaseAdapter):
                 prompt_ids=this_prompt_ids,  # Keep batch dim as 1
                 prompt_embeds=this_prompt_embeds,
                 text_ids=this_text_ids,
+                teacher_prompt_embeds=this_teacher_prompt_embeds,
+                teacher_text_ids=this_teacher_text_ids,
+                teacher_negative_prompt_embeds=this_teacher_negative_prompt_embeds,
+                teacher_negative_text_ids=this_teacher_negative_text_ids,
                 # Encoded image
                 condition_images=this_condition_images,
                 image_latents=this_image_latents,

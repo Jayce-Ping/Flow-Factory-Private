@@ -1404,7 +1404,7 @@ transformer I/O & Flux2Transformer2DModel, 128 channels & output tensor geometry
 RoPE axes & $(32,32,32,32)$ for both & latent token coordinate convention is compatible\\
 VAE config & AutoencoderKLFlux2, 32 latent channels & same declared latent architecture\\
 text encoder & Qwen3 vs.\ Mistral3 & embeddings are not interchangeable\\
-joint attention dim & $7680$ vs.\ $15360$ & each model must use its own conditioning path\\
+joint attention dim & $12288$ vs.\ $15360$ & each model must use its own conditioning path\\
 \bottomrule
 \end{tabular}
 \end{center}

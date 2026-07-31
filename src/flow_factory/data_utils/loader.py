@@ -347,9 +347,7 @@ def _load_per_source_dataloaders(
         )
 
         if max_dataset_size is not None and len(dataset) > max_dataset_size:
-            dataset.processed_dataset = dataset.processed_dataset.select(
-                range(max_dataset_size)
-            )
+            dataset.processed_dataset = dataset.processed_dataset.select(range(max_dataset_size))
 
         sampler = get_data_sampler(
             dataset=dataset,
@@ -366,9 +364,7 @@ def _load_per_source_dataloaders(
             persistent_workers=data_args.dataloader_num_workers > 0,
         )
         result[source_name] = dl
-        logger.info(
-            f"Multi-dataset: source '{source_name}' → {len(dataset)} samples"
-        )
+        logger.info(f"Multi-dataset: source '{source_name}' → {len(dataset)} samples")
 
     return result
 
@@ -428,11 +424,14 @@ def get_dataloader(
         config.model_args.model_type,
         config.model_args.model_name_or_path,
     ]
-    teacher_model_name_or_path = getattr(
-        config.training_args, "teacher_model_name_or_path", None
-    )
+    teacher_model_name_or_path = getattr(config.training_args, "teacher_model_name_or_path", None)
     if teacher_model_name_or_path:
         extra_hash_strs.append(teacher_model_name_or_path)
+    donor_base_model_name_or_path = getattr(
+        config.training_args, "donor_base_model_name_or_path", None
+    )
+    if donor_base_model_name_or_path:
+        extra_hash_strs.append(donor_base_model_name_or_path)
 
     # Common dataset kwargs
     base_kwargs = {
