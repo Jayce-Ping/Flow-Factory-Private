@@ -3090,6 +3090,16 @@ class FlowDirectOPDTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Optional SDE target-to-recipient-base KL budget in nats/dimension."},
     )
+    fdopd_verbose_diagnostics: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Log every target diagnostic and expand more of them per trajectory position. "
+                "Each diagnostic becomes four statistics, and a per-step breakout multiplies that "
+                "by the number of denoising positions, so the default set is deliberately small."
+            )
+        },
+    )
     fdopd_compute_delta_fp32: bool = field(
         default=True,
         metadata={"help": "Subtract donor RL/base transition statistics in float32."},

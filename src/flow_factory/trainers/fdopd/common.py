@@ -211,16 +211,32 @@ def fdopd_target_diagnostics(
     result: FDOPDTarget,
     *,
     recipient_base: torch.Tensor,
+    verbose: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """Return detached per-sample target diagnostics."""
+    """Return detached per-sample target diagnostics.
+
+    Every key here is a per-sample tensor that the reducer expands into four statistics, so the
+    default set is kept to the quantities that cannot be derived from one another:
+
+    * ``delta_rms`` and ``recipient_base_rms`` -- the two magnitudes everything else is built from;
+    * ``relative_delta_rms`` -- how large the donor's RL shift is against the recipient's own field,
+      the scale-free number that decides whether the trust cap binds;
+    * ``relative_target_shift_rms`` -- what the recipient is actually asked to move, and the
+      quantity ``fdopd_max_relative_delta_rms`` bounds directly;
+    * ``lambda_eff`` and ``trust_clipped`` -- the realized transfer strength and how often the cap
+      is active.
+
+    Dropped from the default set: ``delta_l2``, which is ``delta_rms`` times a constant
+    sqrt(event_dim) and so carries no extra information while being incomparable across latent
+    shapes, and ``target_shift_rms``, whose relative form is the one the trust budget is expressed
+    in. Both return under ``verbose``.
+    """
     axes = _event_axes(recipient_base, name="recipient_base")
     recipient_rms = recipient_base.detach().float().square().mean(dim=axes).sqrt()
     diagnostics = {
         "delta_rms": result.delta_rms.detach(),
-        "delta_l2": result.delta_l2.detach(),
         "relative_delta_rms": result.relative_delta_rms.detach(),
         "recipient_base_rms": recipient_rms.detach(),
-        "target_shift_rms": result.target_shift_rms.detach(),
         "relative_target_shift_rms": (
             result.target_shift_rms / recipient_rms.clamp_min(1e-8)
         ).detach(),
@@ -229,6 +245,9 @@ def fdopd_target_diagnostics(
     }
     if result.unit_kl_per_dim is not None:
         diagnostics["unit_kl_per_dim"] = result.unit_kl_per_dim.detach()
+    if verbose:
+        diagnostics["delta_l2"] = result.delta_l2.detach()
+        diagnostics["target_shift_rms"] = result.target_shift_rms.detach()
     return diagnostics
 
 

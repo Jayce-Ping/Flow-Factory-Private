@@ -130,6 +130,15 @@ class FlowDirectOPDTrainer(BaseTrainer):
     # against 4B's 2560), so the donor's embeddings still have to be cached separately.
     _SUPPORTED_RECIPIENT_MODEL_TYPES = ("flux2", "flux2-klein")
 
+    # The only diagnostic broken out per trajectory position. The donor's RL shift is strongly
+    # trajectory-dependent -- measured on the klein 9B donor it falls by more than an order of
+    # magnitude from the first denoising steps to the last -- so its shape along the axis is worth
+    # a series. Everything else either shares that shape (lambda_eff and trust_clipped are
+    # deterministic functions of this ratio once the cap is set) or is a magnitude that only needs
+    # its pooled distribution. Expanding all of them per step made per-step keys 90% of the run's
+    # ~1000 logged series.
+    _FDOPD_PER_STEP_KEYS = ("relative_delta_rms",)
+
     @classmethod
     def _validate_recipient_configuration(cls, model_args, adapter) -> None:
         """Require a tested FLUX.2 LoRA recipient and safe FSDP loading mode."""
@@ -744,11 +753,18 @@ class FlowDirectOPDTrainer(BaseTrainer):
                         diagnostics = fdopd_target_diagnostics(
                             cache.target,
                             recipient_base=recipient_base_value,
+                            verbose=self.training_args.fdopd_verbose_diagnostics,
                         )
                         timestep_index = cache.timestep_index
                         for key, value in diagnostics.items():
                             loss_info[f"fdopd/{key}"].append(value)
-                            loss_info[f"fdopd/{key}/t{timestep_index}"].append(value)
+                            if key in self._FDOPD_PER_STEP_KEYS:
+                                # Batch mean, so one series per step instead of four. The pooled
+                                # key above already reports min/max/std; what a per-step view adds
+                                # is the SHAPE along the trajectory, and a mean shows that.
+                                loss_info[f"fdopd/{key}/t{timestep_index}"].append(
+                                    value.detach().float().mean()
+                                )
                         loss_info["d_k"].append(pathwise_loss.detach())
                         loss_info["loss"].append(loss.detach())
                         loss_info[f"d_k/{timestep_index}"].append(pathwise_loss.detach())

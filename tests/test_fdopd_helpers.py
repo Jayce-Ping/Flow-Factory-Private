@@ -139,6 +139,50 @@ def test_diagnostics_are_detached_per_sample_scalars() -> None:
     assert all(value.requires_grad is False for value in diagnostics.values())
 
 
+def test_default_diagnostics_drop_the_derivable_magnitudes() -> None:
+    """Each diagnostic costs four logged statistics, so redundant ones are off by default.
+
+    delta_l2 is delta_rms times a constant sqrt(event_dim), and the trust budget is expressed on
+    the relative shift rather than the absolute one, so neither adds information.
+    """
+    result = compose_fdopd_target(
+        recipient_base=torch.tensor([[1.0, 1.0]]),
+        donor_base=torch.zeros(1, 2),
+        donor_rl=torch.ones(1, 2),
+        transfer_strength=0.25,
+    )
+
+    default = fdopd_target_diagnostics(result, recipient_base=torch.ones(1, 2))
+    verbose = fdopd_target_diagnostics(result, recipient_base=torch.ones(1, 2), verbose=True)
+
+    assert sorted(default) == [
+        "delta_rms",
+        "lambda_eff",
+        "recipient_base_rms",
+        "relative_delta_rms",
+        "relative_target_shift_rms",
+        "trust_clipped",
+    ]
+    assert set(default).issubset(verbose)
+    assert sorted(set(verbose) - set(default)) == ["delta_l2", "target_shift_rms"]
+
+
+def test_per_step_breakout_names_a_diagnostic_that_exists() -> None:
+    """A typo here would silently drop every per-step series instead of failing."""
+    from flow_factory.trainers.fdopd.trainer import FlowDirectOPDTrainer
+
+    result = compose_fdopd_target(
+        recipient_base=torch.tensor([[1.0, 1.0]]),
+        donor_base=torch.zeros(1, 2),
+        donor_rl=torch.ones(1, 2),
+        transfer_strength=0.25,
+    )
+    default = fdopd_target_diagnostics(result, recipient_base=torch.ones(1, 2))
+
+    assert FlowDirectOPDTrainer._FDOPD_PER_STEP_KEYS
+    assert set(FlowDirectOPDTrainer._FDOPD_PER_STEP_KEYS).issubset(default)
+
+
 def test_scheduler_sync_copies_exact_recipient_grid() -> None:
     recipient = FlowMatchEulerDiscreteSDEScheduler(
         noise_level=0.7,
