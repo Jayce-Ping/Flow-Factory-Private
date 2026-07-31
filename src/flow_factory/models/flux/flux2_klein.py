@@ -531,6 +531,7 @@ class Flux2KleinAdapter(BaseAdapter):
         negative_prompt: Optional[Union[str, List[str]]] = None,
         guidance_scale: float = 4.0,
         teacher_guidance_scale: float = 1.0,
+        donor_guidance_scale: Optional[float] = None,
         images: Optional[MultiImageBatch] = None,
         condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         max_sequence_length: int = 512,
@@ -576,7 +577,13 @@ class Flux2KleinAdapter(BaseAdapter):
             prompt=prompt,
             negative_prompt=negative_prompt,
             guidance_scale=guidance_scale,
-            teacher_guidance_scale=teacher_guidance_scale,
+            # Flow Direct-OPD loads the donor's text encoder through the teacher slot and drives
+            # it at the donor's own CFG. Preprocess kwargs are filtered against this signature, so
+            # without the parameter the donor scale would be dropped and the train split would
+            # cache no donor negatives -- the donor forward then fails at the first pre-pass.
+            teacher_guidance_scale=(
+                donor_guidance_scale if donor_guidance_scale is not None else teacher_guidance_scale
+            ),
             is_train=is_train,
             max_sequence_length=max_sequence_length,
             device=device,

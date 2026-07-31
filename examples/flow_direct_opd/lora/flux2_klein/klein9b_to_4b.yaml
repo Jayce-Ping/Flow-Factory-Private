@@ -1,0 +1,152 @@
+# Flow Direct-OPD, strong-to-weak direction:
+# FLUX.2-klein-base-9B (base + Flow-DPPO GenEval2 Multi-Reward LoRA) -> FLUX.2-klein-base-4B.
+#
+# The recipient never imitates the donor. On states the 4B recipient visits itself,
+#
+#   delta  = donor_rl(x_t) - donor_base(x_t)          # what RL changed, measured against its OWN base
+#   target = recipient_base(x_t) + lambda_eff * delta
+#
+# so lambda = 0 leaves the recipient untouched and the donor's absolute quality never enters. That
+# distinction matters here: docs/xopd/9b_to_4b_teacher_regression.tex records that imitating this
+# same 9B directly costs the 4B student 13% GenEval and half its OCR, because the 9B base is no
+# better than the 4B base on those metrics. Only the RL displacement is worth transferring.
+#
+# Preflight for this pair (scripts/fdopd_analysis/validate_flux2_compatibility.py --recipient
+# black-forest-labs/FLUX.2-klein-base-4B) reports identical scheduler config, compatible
+# transformer geometry, and VAE weight parity to max_abs_diff = 0.0 -- donor and recipient share
+# the latent space exactly. They do NOT share text conditioning: both encoders are Qwen3, but the
+# 9B's is 4096 wide against the 4B's 2560, so the donor's embeddings are cached separately at
+# preprocessing time (the teacher_* keys) and the donor text encoder is offloaded before training.
+
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml  # 4B LoRA recipient + frozen 9B donor fits easily; ZeRO-2 is the proven multi-node path on this cluster (FSDP deadlocks here)
+num_processes: 8                          # overridden to 8 * num_machines by the 4-node launcher
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "dataset/geneval"          # the prompt distribution the donor's RL shift was learned on
+  preprocessing_batch_size: 32            # both klein text encoders are resident here; still far smaller than the dev recipient's Mistral3
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+model:
+  finetune_type: "lora"                   # required: use_ref_parameters() recovers the recipient base by disabling this LoRA
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "fdopd_klein9b_multi_to_klein4b"
+  project: "Flow-Factory-FDOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 50
+  save_model_only: true
+
+train:
+  trainer_type: "flow-direct-opd"
+  max_epochs: 1000
+
+  # --- Frozen donor pair: one 9B backbone, RL LoRA toggled on and off ---
+  donor_model_type: "flux2-klein"
+  donor_base_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+  donor_rl_lora_path: "Tencent-Hunyuan-Multimodal-RL/FLUX2-klein-base-9b-GenEval2-Multi-Reward"
+  donor_vae_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  donor_guidance_scale: 4.0               # the CFG the donor LoRA is documented to be used at; the delta is only meaningful at the scale it was learned for
+  assume_shared_vae: true                 # verified by the preflight: VAE weights are bit-identical
+
+  # --- Policy-shift target ---
+  guidance_scale: 4.0                     # recipient runs at the donor's scale so both fields are compared under the same conditioning
+  fdopd_lambda: 0.25
+  fdopd_loss_space: "v"                   # ODE requires velocity-residual matching
+  normalize_d_k: false                    # invalid for v-space
+  fdopd_max_relative_delta_rms: 0.10      # cap the target shift at 10% of the recipient's own base velocity RMS
+  fdopd_trust_kl_per_dim: null            # mutually exclusive with the RMS cap
+  fdopd_compute_delta_fp32: true          # the delta is a small difference of two large bf16 fields
+  fdopd_offload_donor_during_rollout: true
+  pathwise_coef: 1.0
+
+  # --- Four stratified trajectory positions per micro-batch out of a 28-step rollout ---
+  fdopd_train_steps: null
+  num_fdopd_steps: 4
+  fdopd_resample_steps_per_batch: true
+  fdopd_step_sampling: "stratified"
+
+  resolution: 512                         # train and eval at 512 so the numbers sit alongside the existing 4B baselines
+  num_inference_steps: 28
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 128        # 4 batches over 32 GPUs; GAS = 4 * num_fdopd_steps = 16 -> exactly one optimizer step per epoch
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-5
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.0
+  ema_update_interval: 1
+  ema_device: "cpu"
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: true
+  seed: 42
+
+  # The delta target is already anchored on the recipient base, so no extra anchor.
+  kl_type: "v-based"
+  kl_beta: 0.0
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# GenEval is the donor's own domain; OCR and PickScore are the collateral-damage watch. A shift
+# tuned for compositional alignment has no reason to preserve text rendering, and that is exactly
+# where the direct-imitation runs lost the most.
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 4.0
+  eval_freq: 50
+  seed: 42
+  test_sets:
+    - {name: geneval_gs4,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 4.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs4,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 4.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs4, dataset_dir: dataset/pickscore, split: test, guidance_scale: 4.0, eval_reward_names: [pick_score]}
+
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1.0
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    weight: 1.0
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  # PaddleOCR runs out-of-process on CPU in the isolated `ocr` conda env.
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cpu"
+    dtype: float32
+    async_reward: false

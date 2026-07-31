@@ -122,12 +122,21 @@ class FlowDirectOPDTrainer(BaseTrainer):
         self._validate_recipient_configuration(self.model_args, self.adapter)
         super()._initialization()
 
-    @staticmethod
-    def _validate_recipient_configuration(model_args, adapter) -> None:
-        """Require the tested FLUX.2 LoRA recipient and safe FSDP loading mode."""
-        if model_args.model_type != "flux2":
+    # Recipients whose preprocess_func caches donor text conditioning under the teacher_* keys
+    # that _build_donor_text_conditioning reads, and whose latents share the donor's VAE
+    # coordinates. 'flux2' is the weak-to-strong direction (9B donor -> 32B dev recipient);
+    # 'flux2-klein' is the strong-to-weak one (9B donor -> 4B recipient). Same family does not
+    # mean same conditioning: the klein text encoders differ in width (9B Qwen3 hidden 4096
+    # against 4B's 2560), so the donor's embeddings still have to be cached separately.
+    _SUPPORTED_RECIPIENT_MODEL_TYPES = ("flux2", "flux2-klein")
+
+    @classmethod
+    def _validate_recipient_configuration(cls, model_args, adapter) -> None:
+        """Require a tested FLUX.2 LoRA recipient and safe FSDP loading mode."""
+        if model_args.model_type not in cls._SUPPORTED_RECIPIENT_MODEL_TYPES:
             raise ValueError(
-                "Flow Direct-OPD v1 requires recipient model_type='flux2', got "
+                "Flow Direct-OPD requires recipient model_type in "
+                f"{list(cls._SUPPORTED_RECIPIENT_MODEL_TYPES)!r}, got "
                 f"recipient model_type={model_args.model_type!r}."
             )
         if model_args.finetune_type != "lora":

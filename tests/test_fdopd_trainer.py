@@ -204,7 +204,8 @@ def test_trainer_rejects_requested_steps_larger_than_rollout_pool() -> None:
     ("model_type", "finetune_type", "cpu_efficient"),
     [
         ("flux2", "full", False),
-        ("flux2-klein", "lora", False),
+        ("flux2-klein", "full", False),
+        ("sd3-5", "lora", False),
         ("flux2", "lora", True),
     ],
 )
@@ -223,3 +224,16 @@ def test_trainer_rejects_unsupported_recipient_configuration(
 
     with pytest.raises(ValueError, match="recipient"):
         FlowDirectOPDTrainer._validate_recipient_configuration(model_args, adapter)
+
+
+@pytest.mark.parametrize("model_type", ["flux2", "flux2-klein"])
+def test_trainer_accepts_both_flux2_lora_recipients(model_type: str) -> None:
+    """Both transfer directions are supported: 9B donor into 32B dev, and into 4B klein.
+
+    A klein recipient shares the donor's text encoder as well as its VAE, so the donor
+    conditioning cached under the teacher_* keys coincides with the recipient's own embeddings.
+    """
+    model_args = SimpleNamespace(model_type=model_type, finetune_type="lora")
+    adapter = SimpleNamespace(_is_fsdp_cpu_efficient_loading=lambda: False)
+
+    FlowDirectOPDTrainer._validate_recipient_configuration(model_args, adapter)
