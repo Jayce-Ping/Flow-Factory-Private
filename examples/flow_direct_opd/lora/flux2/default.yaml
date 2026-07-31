@@ -76,7 +76,12 @@ train:
   num_inner_epochs: 1
   gradient_accumulation_steps: auto
 
-  learning_rate: 1.0e-5
+  # LoRA recipient, so the update is a rank-64 adapter rather than 32B of weights. With Adam the
+  # per-step parameter movement is set by the learning rate rather than by the loss, and 1e-5 was
+  # measured to be too slow to move a recipient at all: on the 4B run it absorbed only ~4% of an
+  # 8.4% requested shift in 50 optimizer steps, a 0.4% change in the velocity field, and GenEval did
+  # not flip a single decision.
+  learning_rate: 1.0e-4
   adam_weight_decay: 1.0e-4
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8
