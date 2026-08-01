@@ -37,6 +37,8 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'rational_rewards_t2i': 'flow_factory.rewards.rational_rewards_t2i.RationalRewardsT2IRewardModel',
     'rational_rewards_edit': 'flow_factory.rewards.rational_rewards_edit.RationalRewardsEditRewardModel',
     'geditbench': 'flow_factory.rewards.geditbench.GEditBenchRewardModel',
+    'dependency_checklist': 'flow_factory.rewards.dependency_checklist.DependencyChecklistRewardModel',
+    'multiref_fidelity': 'flow_factory.rewards.multiref_fidelity.MultiReferenceFidelityRewardModel',
 }
 _REWARD_MODEL_REGISTRY = {k.lower(): v for k, v in _REWARD_MODEL_REGISTRY.items()}
 

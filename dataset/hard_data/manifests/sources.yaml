@@ -1,0 +1,81 @@
+manifest_version: 1
+policy:
+  license_review_required: true
+  immutable_revisions_required: true
+  benchmark_overlap_forbidden: true
+
+sources:
+  - id: pico_banana_400k
+    lane: edit
+    upstream: https://github.com/apple/pico-banana-400k
+    hf_repo: null
+    revision: null
+    expected_scale: 400000
+    use: [single_turn, multi_turn, preference, long_short_instructions]
+    redistribute_images: false
+    reconstruction:
+      metadata: https://ml-site.cdn-apple.com/datasets/pico-banana-300k/nb/jsonl/sft.jsonl
+      source_images: upstream URLs or official OpenImages archives
+      note: source images may not be mirrored for legal reasons
+    license_review_required: true
+
+  - id: anyedit
+    lane: edit
+    hf_repo: Bin1117/AnyEdit
+    revision: dafac7e8cb19f3d45a0768037bcaa43cc8ad80db
+    expected_scale: 2500000
+    use: [task_balanced_editing, implicit_editing, visual_conditioning]
+    redistribute_images: false
+    license_review_required: true
+
+  - id: hq_edit
+    lane: edit
+    hf_repo: UCSC-VLAA/HQ-Edit
+    revision: 8d0a51255d4ebc82152806e1f3891c85b8e4e037
+    expected_scale: 200000
+    use: [high_resolution_pairs, detailed_instructions]
+    redistribute_images: false
+    license_review_required: true
+
+  - id: macro_data
+    lane: multiref
+    hf_repo: Azily/Macro-Dataset
+    revision: 948f9a4b11ac545c4db95295e6ba828c976da790
+    expected_scale: 400000
+    use: [customization, illustration, spatial, temporal]
+    redistribute_images: false
+    license_review_required: true
+    excluded_split: eval
+
+  - id: multiref_train
+    lane: multiref
+    upstream: https://github.com/Dipsy0830/MultiRef-code
+    hf_repo: ONE-Lab/MultiRef-dataset
+    revision: 5383d34dee4dbb620b9d6546127275fb889797e0
+    expected_scale: 38000
+    use: [multi_condition, real_world_composition]
+    redistribute_images: false
+    license: cc-by-nc-4.0
+    license_review_required: true
+
+  - id: detailed_caption_sources
+    lane: t2i
+    upstream: [DOCCI, LocalizedNarratives, VisualGenome, Object365, OpenImages]
+    hf_repo:
+      docci: google/docci
+      localized_narratives: HuggingFaceM4/LocalizedNarratives
+    revision:
+      docci: a0a43eaf34676ffd008fb6565dd8c2ba00d09100
+      localized_narratives: 0f7c6fd10117019eba99feb9cad5422aa315fb51
+    expected_scale: null
+    use: [long_prompt_rewrite, scene_graph_rewrite, reasoning_rewrite]
+    redistribute_images: false
+    license: cc-by-4.0
+    license_review_required: true
+    reconstruction:
+      docci_descriptions: https://storage.googleapis.com/docci/data/docci_descriptions.jsonlines
+
+private_releases:
+  t2i: Tencent-Hunyuan-Multimodal-RL/Flow-Factory-HardData-T2I-v1
+  edit: Tencent-Hunyuan-Multimodal-RL/Flow-Factory-HardData-Edit-v1
+  multiref: Tencent-Hunyuan-Multimodal-RL/Flow-Factory-HardData-MultiRef-v1

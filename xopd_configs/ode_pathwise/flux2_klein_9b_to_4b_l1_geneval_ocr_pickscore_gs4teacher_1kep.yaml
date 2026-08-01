@@ -1,0 +1,139 @@
+# XOPD / direct OPD: FLUX.2-klein-base-9B -> FLUX.2-klein-base-4B.
+#
+# The teacher is queried with CFG=4 while the recipient rolls out and trains at
+# no-CFG (GS=1). Training mixes geneval, OCR and PickScore prompts 1:1:1.
+# Each domain keeps the established 128-prompt exposure per epoch:
+# 384 unique prompts / (32 GPUs * batch 4) = 3 global micro-batches, exactly
+# one per source. With 20 dense ODE steps, auto GAS = 3 * 20 = 60, so the
+# trainer performs exactly one optimizer update per epoch.
+
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/ocr"
+    - "dataset/pickscore"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "flux2klein_9b_to_4b_direct_mix3_teacher-gs4_student-gs1_steps20_1kep"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 50
+  save_model_only: true
+
+train:
+  trainer_type: "xopd"
+  max_epochs: 1000
+  fsdp_shard_teacher: false
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 4.0
+  student_guidance_scale: 1.0
+
+  l0_warmup_epochs: 0
+  l0_num_inference_steps: 50
+  l0_inner_steps: 4
+  l0_time_sampling: "logit_normal"
+  l0_weighting: "min_snr"
+  l0_snr_gamma: 5.0
+
+  # Standard direct XOPD transition-mean target.
+  xopd_target_mode: "direct"
+  xopd_dk_space: "xt"
+  pathwise_coef: 1.0
+  normalize_d_k: false
+  kl_type: "x-based"
+  kl_beta: 0.0
+
+  source_ratio: {geneval: 1, ocr: 1, pickscore: 1}
+
+  resolution: 512
+  num_inference_steps: 20
+  per_device_batch_size: 4
+  group_size: 1
+  unique_sample_num_per_epoch: 384
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: auto
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# Student evaluation is no-CFG on all three prompt domains. Domain rewards run
+# on their own datasets and PickScore runs everywhere to monitor visual quality.
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 40
+  guidance_scale: 1.0
+  eval_freq: 100
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1,   dataset_dir: dataset/geneval,   split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
+    - {name: ocr_gs1,       dataset_dir: dataset/ocr,       split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
+    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cpu"
+    dtype: float32
+    async_reward: false

@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import matplotlib
 
@@ -27,6 +27,14 @@ ENTITY_PROJECT = "315229706-xi-an-jiaotong-university-/Flow-Factory-XOPD"
 ARMS = {"P-OPD (gated)": "096do06e", "direct (ungated control)": "gljfjziu"}
 # The original dense-ODE 9B->4B baseline, eval at 1024px / 28 steps on dataset/geneval.
 DENSE_ODE_RUN = "ta1qvnuz"
+# The closest historical controlled pair: same base student, seed, direct dense-ODE objective,
+# prompt set, LoRA/optimizer/EMA, and eval protocol.  Only the teacher and memory-driven
+# micro-batch geometry differ; both still consume 128 unique prompts and take one update/epoch.
+MATCHED_ODE_RUNS = {
+    "9B teacher": "ta1qvnuz",
+    "32B teacher": "4wvzbt8g",
+}
+MATCHED_ODE_EPOCHS = [0, 20, 40, 60, 80]
 # Teacher baseline measured by two sibling runs of that era, same 1024px / 28-step eval.
 TEACHER_GENEVAL_GS1 = [0.3773, 0.3762]
 
@@ -83,6 +91,55 @@ def fetch_dense_ode(api) -> Dict[str, List[float]]:
         raise ValueError(f"run {DENSE_ODE_RUN!r} logged no GenEval evals.")
     # eval_freq 20 in that config, first point at epoch 0.
     return {"epochs": [20 * i for i in range(len(values))], "geneval": values}
+
+
+def fetch_matched_ode(api) -> Dict[str, Dict[str, Any]]:
+    """Fetch the common 0--80 epoch window of the matched 9B/32B dense-ODE pair."""
+    metric_keys = {
+        "geneval_gs1": "eval/geneval_gs1/reward_geneval_mean",
+        "geneval_gs4": "eval/geneval_gs4/reward_geneval_mean",
+        "loss": "train/loss",
+        "d_k": "train/d_k",
+        "grad_norm": "train/grad_norm",
+    }
+    result: Dict[str, Dict[str, Any]] = {}
+    for label, run_id in MATCHED_ODE_RUNS.items():
+        run = api.run(f"{ENTITY_PROJECT}/{run_id}")
+        config = dict(run.config)
+        curves: Dict[str, List[Dict[str, float]]] = {}
+        for name, key in metric_keys.items():
+            rows = run.history(keys=[key], pandas=False, samples=10_000)
+            points = []
+            epoch_stride = 20 if name.startswith("geneval_") else 1
+            for point_index, row in enumerate(rows):
+                value = row.get(key)
+                if value is None:
+                    continue
+                epoch = point_index * epoch_stride
+                if epoch <= MATCHED_ODE_EPOCHS[-1]:
+                    points.append({"epoch": epoch, "value": float(value)})
+            points.sort(key=lambda point: point["epoch"])
+            if not points:
+                raise ValueError(
+                    f"run {run_id!r} has no points for required metric {key!r} "
+                    f"in epochs 0--{MATCHED_ODE_EPOCHS[-1]}"
+                )
+            curves[name] = points
+        eval_epochs = [point["epoch"] for point in curves["geneval_gs1"]]
+        if eval_epochs != MATCHED_ODE_EPOCHS:
+            raise ValueError(
+                f"expected eval epochs {MATCHED_ODE_EPOCHS} for run {run_id!r}, "
+                f"got {eval_epochs}"
+            )
+        result[label] = {
+            "run_id": run_id,
+            "run_name": run.name,
+            "url": run.url,
+            "git_commit": run.metadata.get("git", {}).get("commit"),
+            "config": config,
+            "curves": curves,
+        }
+    return result
 
 
 def fetch_per_step_dk(api, run_id: str, test_set: str = "geneval_gs1") -> Dict[str, List[float]]:
@@ -204,10 +261,95 @@ def figure_below_the_teacher(dense: Dict, out_dir: str) -> str:
     return path
 
 
+def figure_matched_ode(matched: Dict[str, Dict[str, Any]], out_dir: str) -> str:
+    """The matched teacher-size ablation: identical start, opposite reward direction."""
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 8.0))
+    colors = {"9B teacher": "#b03a2e", "32B teacher": "#1f618d"}
+
+    ax = axes[0, 0]
+    for label, data in matched.items():
+        curve = data["curves"]["geneval_gs1"]
+        ax.plot(
+            [point["epoch"] for point in curve],
+            [point["value"] for point in curve],
+            "o-",
+            color=colors[label],
+            label=label,
+        )
+    ax.set_title("(a) GenEval at guidance scale 1")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("GenEval reward")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+
+    ax = axes[0, 1]
+    for label, data in matched.items():
+        curve = data["curves"]["geneval_gs4"]
+        ax.plot(
+            [point["epoch"] for point in curve],
+            [point["value"] for point in curve],
+            "o-",
+            color=colors[label],
+            label=label,
+        )
+    ax.set_title("(b) GenEval at guidance scale 4")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("GenEval reward")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 0]
+    for label, data in matched.items():
+        curve = data["curves"]["d_k"]
+        ax.plot(
+            [point["epoch"] for point in curve],
+            [point["value"] for point in curve],
+            color=colors[label],
+            label=label,
+        )
+    ax.set_title(r"(c) Training $d_k$: both objectives decrease")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel(r"$d_k$ (transition mean MSE)")
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 1]
+    for label, data in matched.items():
+        curve = data["curves"]["grad_norm"]
+        ax.plot(
+            [point["epoch"] for point in curve],
+            [point["value"] for point in curve],
+            color=colors[label],
+            label=label,
+        )
+    ax.set_title("(d) LoRA gradient norm")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("gradient norm")
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+
+    fig.suptitle(
+        "Matched dense-ODE teacher-size ablation: the same student moves in opposite quality directions",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    path = os.path.join(out_dir, "ode_9b_vs_32b_matched.pdf")
+    fig.savefig(path)
+    fig.savefig(path[: -len(".pdf")] + ".png", dpi=160)
+    plt.close(fig)
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default="docs/xopd/figures")
     parser.add_argument("--stats-json", default="docs/xopd/figures/9b_teacher_regression.json")
+    parser.add_argument(
+        "--matched-stats-json",
+        default="docs/xopd/figures/ode_9b_vs_32b_matched.json",
+    )
     args = parser.parse_args()
 
     import wandb
@@ -216,6 +358,7 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     arms = fetch_arms(api)
     dense = fetch_dense_ode(api)
+    matched = fetch_matched_ode(api)
     per_step = {label: fetch_per_step_dk(api, run_id) for label, run_id in ARMS.items()}
     with open(args.stats_json, "w") as handle:
         json.dump({"arms": arms, "dense_ode": dense, "per_step_dk": per_step,
@@ -224,6 +367,10 @@ def main() -> None:
     print("wrote", figure_reverse_separation(arms, per_step, args.out_dir))
     print("wrote", figure_below_the_teacher(dense, args.out_dir))
     print("wrote", args.stats_json)
+    with open(args.matched_stats_json, "w") as handle:
+        json.dump(matched, handle, indent=1, sort_keys=True)
+    print("wrote", figure_matched_ode(matched, args.out_dir))
+    print("wrote", args.matched_stats_json)
 
     for arm, data in arms.items():
         print(f"\n{arm}:")

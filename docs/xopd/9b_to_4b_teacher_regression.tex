@@ -205,6 +205,77 @@ independent measurements ($0.3773$, $0.3762$) taken under the same eval configur
 \label{fig:below}
 \end{figure}
 
+\subsection{A matched 32B control changes only the target and reverses the result}
+\label{ssec:matched-32b}
+
+The historical run \texttt{4wvzbt8g} is the missing control. It uses the 32B FLUX.2-dev teacher,
+but otherwise matches \texttt{ta1qvnuz}: the same base 4B student, seed 42, Geneval prompts,
+512px training, a dense 28-step ODE, direct transition-mean matching, LoRA rank 64 with
+$\alpha=128$, learning rate $10^{-4}$, EMA 0.9, 128 unique prompts and one optimizer update per
+epoch, and 1024px/28-step evaluation at guidance scales 1 and 4. The 32B teacher requires batch
+size 1 instead of 4 and gradient checkpointing, but gradient accumulation preserves the same
+128-prompt update. The runs used commits one day apart; the trainer change precomputes and
+offloads teacher text embeddings and does not alter the objective.
+
+\begin{table}[htbp]
+\centering
+\caption{The controlled ODE pair through their common epoch-80 window. Both losses decrease.
+The rewards move in opposite directions. Absolute $\dk$ values are not compared across teachers,
+because each teacher defines a different target gap.}
+\label{tab:matched-ode}
+\begin{tabular}{@{}lrrr@{\hspace{1.3em}}rrr@{}}
+\toprule
+& \multicolumn{3}{c}{$\dk$ (lower is closer)}
+& \multicolumn{3}{c}{GenEval reward (higher is better)}\\
+\cmidrule(r){2-4}\cmidrule(l){5-7}
+teacher & epoch 0 & epoch 80 & change
+& gs & epoch 0 & epoch 80 (change)\\
+\midrule
+9B  & $8.368$e-5 & $7.071$e-5 & $-15.5\%$
+    & 1 & $0.3760$ & $0.2303$ ($-38.7\%$)\\
+    &             &             &
+    & 4 & $0.7507$ & $0.6877$ ($-8.4\%$)\\
+\midrule
+32B & $2.170$e-4 & $1.596$e-4 & $-26.5\%$
+    & 1 & $0.3760$ & $0.7772$ ($+106.7\%$)\\
+    &             &             &
+    & 4 & $0.7507$ & $0.8093$ ($+7.8\%$)\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/ode_9b_vs_32b_matched.pdf}
+\caption{The matched teacher-size ablation. Both arms begin from exactly the same student reward
+and both reduce their own transition-matching loss. Only the teacher changes, and the quality
+direction reverses.}
+\label{fig:matched-ode}
+\end{figure}
+
+The fixed 18-image panels at each guidance scale give the same answer without using the reward
+model. We pair every prompt and seed, embed all images with CLIP and DINOv2, and measure LPIPS
+against the common epoch-0 base. At epoch 80 the 32B arm has moved \emph{farther}: LPIPS is
+$0.605$ against $0.294$ for the 9B arm, CLIP cosine to the base is $0.802$ against $0.889$, and
+DINOv2 cosine is $0.564$ against $0.702$. In 10,000 paired bootstrap resamples, the
+32B-minus-9B LPIPS difference is $0.311$ with 95\% CI $[0.246,0.373]$; the CLIP-cosine difference
+is $-0.087$ with CI $[-0.134,-0.041]$, and the DINOv2 difference is $-0.138$ with CI
+$[-0.229,-0.051]$. All three reject equal movement.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/ode_9b_vs_32b_image_drift.pdf}
+\caption{Image drift from the identical epoch-0 4B student on fixed prompts and seeds. The useful
+32B update is substantially larger than the harmful 9B update. Update magnitude alone cannot
+explain the regression.}
+\label{fig:image-drift}
+\end{figure}
+
+The phenomenon and conclusion are simple. The 9B arm moves less and gets worse. The 32B arm moves
+more and gets better. Therefore a trust region that only caps update size is not the missing
+ingredient. It can slow either direction, but cannot tell a useful teacher direction from a
+harmful one.
+
 \begin{tcolorbox}[colback=red!4!white,colframe=red!45!black,title={The student lands below BOTH endpoints, which is stronger than
 ``the teacher is worse''}]
 If the teacher merely scored lower, matching it should walk the student down \emph{toward} the
@@ -222,15 +293,11 @@ on the velocity field, and both are worse than they look.
 \end{tcolorbox}
 
 \begin{remark*}
-This does not identify \emph{which} property of the teacher's velocity field damages the student,
-only that moving toward it does. Two candidates are worth separating later: the teacher may be
-genuinely weaker on these metrics at these resolutions, or the loss may be dominated by the wrong
-part of the trajectory. The second is plausible and measurable --- the objective here is
-$\mathrm{MSE}(x_t)$ normalized by $2\str^2$, whose per-step weight grows as
-$\lvert\dt\rvert/\mathrm{std}^2$ and puts $59\%$ of the total on the final drawn step
-(\texttt{popd\_exact\_sum\_gate\_saturation.tex}, Fig.~4), while the 32B$\to$4B runs that DO
-improve use the unnormalized velocity MSE. So the arms differ from the known-good recipe in the
-teacher, the loss space and the sampler at once.
+The matched pair isolates the teacher, but not the damaging property of its velocity field. The
+remaining questions are local: whether the checkpoint update aligns with the teacher residual,
+whether only specific denoising steps are harmful, and whether the 9B and 32B residuals occupy
+different low-rank directions. The checkpoint probe in the next revision measures these quantities
+on the same base-student states, so on-policy state drift cannot confound the comparison.
 \end{remark*}
 
 %% ============================================================

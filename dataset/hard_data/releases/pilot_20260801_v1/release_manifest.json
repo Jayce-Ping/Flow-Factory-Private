@@ -1,0 +1,46 @@
+{
+  "asset_roots": {
+    "edit": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/sources/pico_banana/pilot2000/images",
+    "multiref": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/sources/multiref/pilot2000/images"
+  },
+  "benchmark_lock": {
+    "path": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/benchmarks/benchmark_lock.json",
+    "sha256": "af3163a55c158ea1aaf85a6d0c1580a9227d90f7d92bb1d0b890dae94302f135"
+  },
+  "constructor_model": "qwen3-vl-235b-a22b-instruct",
+  "contamination_index": {
+    "path": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/benchmarks/contamination.sqlite",
+    "sha256": "a6c6224fa24687314424f8e58deb8301e57de28868b03f7ece30da43e966be60"
+  },
+  "lanes": {
+    "edit": {
+      "qc_report": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/reports/edit_pilot1029_validation.json",
+      "qc_report_sha256": "fbb5e756b5666de7bf3031580ed5b75e4aff91dbbad0a57956cb043091025830",
+      "records": 1029,
+      "source_jsonl": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/candidates/edit_pilot1029_valid.jsonl",
+      "source_jsonl_sha256": "47cccdb9e9c74101b3a9178b912ef77dcfbb54695000f13f367aa91128318654",
+      "test_records": 65,
+      "train_records": 964
+    },
+    "multiref": {
+      "qc_report": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/reports/multiref_pilot2000_validation.json",
+      "qc_report_sha256": "23e967262e90f26258ab2f34adc669cc475af70a6048896cf81781b288db1c03",
+      "records": 2000,
+      "source_jsonl": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/candidates/multiref_pilot2000_valid.jsonl",
+      "source_jsonl_sha256": "604b4e02694e395abec34db274aed4bd1c1a3a5c064efc22b8c2514b1bd8567e",
+      "test_records": 95,
+      "train_records": 1905
+    },
+    "t2i": {
+      "qc_report": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/reports/t2i_pilot2000_validation.json",
+      "qc_report_sha256": "ac84fd7947dc57a396111b0b005884ddeb378b81845d1e5178b44eb736da0fff",
+      "records": 1998,
+      "source_jsonl": "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/hard_data/candidates/t2i_pilot2000_valid.jsonl",
+      "source_jsonl_sha256": "1734f23583edb159464d424070cfcc59fb24c69cff97fb0a655e72f03839b0c1",
+      "test_records": 97,
+      "train_records": 1901
+    }
+  },
+  "test_fraction": 0.05,
+  "version": "pilot-2026-08-01-v1"
+}

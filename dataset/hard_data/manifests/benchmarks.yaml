@@ -1,0 +1,97 @@
+manifest_version: 1
+policy:
+  allow_training: false
+  immutable_revisions_required: true
+  contamination_fields: [prompt, questions, reference_images]
+
+benchmarks:
+  - id: arena_t2i_hard
+    lane: t2i
+    hf_repo: lmarena-ai/Arena-T2I-Hard
+    revision: 1e5f734be5972bc3c60f189989f852c9527ffa5e
+    license: mit
+    size: 310
+    metric: dependency_aware_checklist
+    allow_training: false
+
+  - id: detailmaster
+    lane: t2i
+    hf_repo: datajuicer/DetailMaster
+    revision: 126edee9f5ea8b71371929daeeb448ac4c030752
+    license: apache-2.0
+    size: 4116
+    metric: detailmaster_four_axis_checklist
+    allow_training: false
+
+  - id: t2i_corebench
+    lane: t2i
+    hf_repo: lioooox/T2I-CoReBench
+    revision: 3aed46abac251c5ecf43488203c5c65d7af863a3
+    license: apache-2.0
+    size: 1080
+    metric: composition_reasoning_checklist
+    allow_training: false
+
+  - id: geditbench_v2
+    lane: edit
+    hf_repo: GEditBench-v2/GEditBench-v2
+    revision: 41dd1f303bb1cd8c949d7a5622d748d54484ffcc
+    license: unknown
+    license_review_required: true
+    size: 1200
+    metric: pvc_judge_and_viescore
+    allow_training: false
+
+  - id: ice_bench
+    lane: edit
+    hf_repo: ali-vilab/ICE-Bench
+    revision: 736c63e0633b6e4f2a966c5d954a492ac6780acb
+    license: mit
+    size: 6538
+    metric: ice_bench_11_metrics
+    allow_training: false
+
+  - id: kontext_bench
+    lane: edit
+    hf_repo: black-forest-labs/kontext-bench
+    revision: fb9b2cb88bb41632b81a02c4f98fa33b00941f92
+    license: mit
+    size: 1026
+    metric: human_preference_and_identity
+    allow_training: false
+
+  - id: multibanana
+    lane: multiref
+    hf_repo: kohsei/MultiBanana-Benchmark
+    revision: 6c682f06c8c8d4e6760d7804901c074866dc1da1
+    license: cc-by-nc-4.0
+    size: 3769
+    metric: multibanana_five_axis
+    allow_training: false
+
+  - id: multiref_bench
+    lane: multiref
+    hf_repo: ONE-Lab/MultiRef-benchmark
+    revision: 0b2845c842144e45eedd2afc613000c024c95972
+    license: cc-by-nc-4.0
+    size: 1990
+    metric: specialized_reference_fidelity
+    allow_training: false
+
+  - id: macro_bench
+    lane: multiref
+    hf_repo: Azily/Macro-Dataset
+    revision: 948f9a4b11ac545c4db95295e6ba828c976da790
+    license: cc-by-4.0
+    size: 4000
+    metric: macro_task_and_reference_count
+    allow_training: false
+
+  - id: omni_context
+    lane: multiref
+    hf_repo: OmniGen2/OmniContext
+    revision: 0f6aabbe8d3448d51184093372e980205d9980d3
+    license: apache-2.0
+    size: 400
+    metric: prompt_following_subject_consistency
+    allow_training: false
