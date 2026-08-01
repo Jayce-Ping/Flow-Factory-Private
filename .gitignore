@@ -83,6 +83,7 @@ debug_output/
 # ====================
 *.ipynb
 .ipynb_checkpoints/
+!docs/xopd/demos/mixture_of_density_demo.ipynb
 
 # ====================
 # Model checkpoints & weights

@@ -189,10 +189,12 @@ The canonical configuration is
 This implements TOP-D's external proximal teacher for Gaussian flow
 transitions; it does not implement TOP-D's internal trust-region iterations.
 
-### A4 — marginal-mixture conditional flow matching
+### A4 — Mixture-of-Density marginal CFM
 
 `xopd_target_mode: marginal_cfm` is the implemented deterministic
-time-marginal mixture target:
+time-marginal mixture target, presented as **Mixture-of-Density**. The
+CPU-only visual companion is the tracked
+[`Mixture-of-Density demo`](../xopd/demos/mixture_of_density_demo.ipynb).
 
 ```yaml
 train:

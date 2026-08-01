@@ -137,8 +137,8 @@
   panel/.style={draw=black!25,rounded corners=3pt,fill=black!1,inner sep=8pt},
 }
 
-\title{\textbf{Arm A4: Marginal-Mixture Conditional Flow Matching}\\[0.35em]
-\large From probability paths to a Flow-Factory implementation}
+\title{\textbf{Arm A4: Mixture-of-Density}\\[0.35em]
+\large Marginal-mixture conditional flow matching in Flow-Factory}
 \author{Jayce-Ping}
 \date{2026-07-31}
 
@@ -166,6 +166,11 @@ FLUX.2-Klein: pre-rollout Bernoulli routing, one ODE trajectory per sample, roll
 \texttt{noise\_pred} capture, student-conditioning restoration, separate state/callback index
 maps, and a single student velocity-MSE pass.  It also records the implementation's validation,
 evaluation, logging, and distributed call-order invariants.
+
+The reader-facing presentation name for this construction is \emph{Mixture-of-Density}.  The
+tracked CPU-only companion is
+\href{run:demos/mixture_of_density_demo.ipynb}
+{\texttt{mixture\_of\_density\_demo.ipynb}}.
 \end{abstract}
 
 \tableofcontents
