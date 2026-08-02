@@ -42,7 +42,10 @@ from .training_args import (
     TestSetArguments,
     TrainingArguments,
     XOPDTrainingArguments,
+    XOPDDMTrainingArguments,
     XPDMTrainingArguments,
+    XTDMTrainingArguments,
+    XTrajectoryDMTrainingArguments,
     get_training_args_class,
 )
 
@@ -67,6 +70,9 @@ __all__ = [
     "CRDTrainingArguments",
     "OPDTrainingArguments",
     "XOPDTrainingArguments",
+    "XTrajectoryDMTrainingArguments",
+    "XOPDDMTrainingArguments",
+    "XTDMTrainingArguments",
     "FlowDirectOPDTrainingArguments",
     "XPDMTrainingArguments",
     "MoFDistillTrainingArguments",

@@ -3422,6 +3422,157 @@ class XDMDTrainingArguments(XOPDTrainingArguments):
 
 
 @dataclass
+class XTrajectoryDMTrainingArguments(XOPDTrainingArguments):
+    r"""Shared args for trajectory distribution matching (Approach B / TDM).
+
+    See ``docs/xopd/approach_b_trajectory_dm_design.md`` and
+    ``docs/xopd/tdm_cross_model_design.md``. Online ``fake`` LoRA + manual-DP optimizer;
+    generator updates once per epoch. Same-arch teacher only in v1.
+    """
+
+    tdm_fake_ratio: int = field(
+        default=5,
+        metadata={
+            "help": (
+                "Two-timescale ratio: fake updates every micro-step; generator once per epoch. "
+                "Set unique_sample_num_per_epoch so num_batches_per_epoch == tdm_fake_ratio."
+            )
+        },
+    )
+    tdm_fake_lr: float = field(
+        default=1.0e-4,
+        metadata={"help": "LR for the manual-DP fake adapter optimizer (AdamW)."},
+    )
+    tdm_real_guidance_scale: float = field(
+        default=1.0,
+        metadata={"help": "CFG for the real (teacher) score in the DM gradient."},
+    )
+    tdm_fake_guidance_scale: float = field(
+        default=1.0,
+        metadata={"help": "CFG for the fake score (must be 1.0: no guidance for fake)."},
+    )
+    tdm_t_min: float = field(
+        default=0.02,
+        metadata={"help": "Lower clamp on sigma fraction for DM τ sampling."},
+    )
+    tdm_t_max: float = field(
+        default=0.98,
+        metadata={"help": "Upper clamp on sigma fraction for DM τ sampling."},
+    )
+    tdm_grad_norm: float = field(
+        default=10.0,
+        metadata={"help": "Grad-norm clip for the manual-DP fake adapter step."},
+    )
+    tdm_loss_metric: Literal["mse", "pseudo_huber"] = field(
+        default="mse",
+        metadata={
+            "help": (
+                "Generator surrogate: 'mse' = DMD2 stop-grad identity; "
+                "'pseudo_huber' = TDM/iCT Pseudo-Huber on the same residual."
+            )
+        },
+    )
+    tdm_pseudo_huber_c: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Pseudo-Huber c. None -> 0.00054 * sqrt(d) with d = numel per sample "
+                "(iCT / TDM default)."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.tdm_fake_ratio < 1:
+            raise ValueError(f"tdm_fake_ratio must be >= 1, got {self.tdm_fake_ratio!r}.")
+        if self.tdm_fake_guidance_scale != 1.0:
+            raise ValueError(
+                "Trajectory DM asserts no guidance for the fake score: "
+                f"tdm_fake_guidance_scale must be 1.0, got {self.tdm_fake_guidance_scale!r}."
+            )
+        if not (0.0 <= self.tdm_t_min < self.tdm_t_max <= 1.0):
+            raise ValueError(
+                f"require 0 <= tdm_t_min < tdm_t_max <= 1, got "
+                f"({self.tdm_t_min}, {self.tdm_t_max})."
+            )
+        if self.tdm_loss_metric not in ("mse", "pseudo_huber"):
+            raise ValueError(
+                f"tdm_loss_metric must be 'mse' or 'pseudo_huber', got {self.tdm_loss_metric!r}."
+            )
+        if self.tdm_pseudo_huber_c is not None and self.tdm_pseudo_huber_c <= 0.0:
+            raise ValueError(
+                f"tdm_pseudo_huber_c must be > 0 when set, got {self.tdm_pseudo_huber_c!r}."
+            )
+
+    def get_num_train_timesteps(self, args) -> int:
+        """No L1 transport trajectory; one generator update per batch."""
+        return 1
+
+
+@dataclass
+class XOPDDMTrainingArguments(XTrajectoryDMTrainingArguments):
+    r"""Approach B: OPD ODE grid + score-diff on trajectory states (``trainer_type: xopd_dm``)."""
+
+    opddm_grad_step_policy: Literal["random"] = field(
+        default="random",
+        metadata={
+            "help": (
+                "Which ODE step carries grad. v1 supports only 'random' "
+                "(uniform index, broadcast across ranks)."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.opddm_grad_step_policy != "random":
+            raise ValueError(
+                f"opddm_grad_step_policy v1 only supports 'random', "
+                f"got {self.opddm_grad_step_policy!r}."
+            )
+
+
+@dataclass
+class XTDMTrainingArguments(XTrajectoryDMTrainingArguments):
+    r"""Paper TDM on the XOPD teacher stack (``trainer_type: xtdm``)."""
+
+    tdm_sim_steps: int = field(
+        default=4,
+        metadata={"help": "K-step deterministic ODE grid for TDM (paper few-step generator)."},
+    )
+    tdm_match_policy: Literal["random_segment"] = field(
+        default="random_segment",
+        metadata={
+            "help": (
+                "v1: match one random non-overlapping segment per generator update "
+                "(memory-matched to Approach B / XDMD)."
+            )
+        },
+    )
+    # Paper default surrogate (overrides base ``mse``).
+    tdm_loss_metric: Literal["mse", "pseudo_huber"] = field(
+        default="pseudo_huber",
+        metadata={
+            "help": (
+                "Generator surrogate for TDM. Default 'pseudo_huber' (paper Eq. 11); "
+                "'mse' = DMD2 stop-grad identity."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.tdm_sim_steps < 1:
+            raise ValueError(f"tdm_sim_steps must be >= 1, got {self.tdm_sim_steps!r}.")
+        if self.tdm_match_policy != "random_segment":
+            raise ValueError(
+                f"tdm_match_policy v1 only supports 'random_segment', "
+                f"got {self.tdm_match_policy!r}."
+            )
+
+
+@dataclass
 class MoFDistillTrainingArguments(TrainingArguments):
     r"""Training arguments for MoF Distillation: distill weighted teacher mixture → student LoRA.
 
@@ -4072,6 +4223,8 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "flow-direct-opd": FlowDirectOPDTrainingArguments,
     "xpdm": XPDMTrainingArguments,
     "xdmd": XDMDTrainingArguments,
+    "xopd_dm": XOPDDMTrainingArguments,
+    "xtdm": XTDMTrainingArguments,
     "diffusion-opd": DiffusionOPDTrainingArguments,
     "ensemble-eval": EnsembleEvalTrainingArguments,
 }

@@ -217,9 +217,17 @@ distilling the very same deterministic teacher.
 
 \section{Extensions (for completeness)}
 \paragraph{TDM (Trajectory Distribution Matching).} Match $p_\theta$ to $p_{\real}$ not only at the
-endpoint but at several trajectory times $t\in\{0.75,0.5,0.25,0\}$, so the gradient acts on the
-whole latent sequence rather than the final sample; this constrains the transport \emph{dynamics},
-not just the terminal density.
+endpoint but at several trajectory times along a discrete ODE grid, so the gradient acts on
+trajectory marginals rather than only the terminal density (Luo et al., ICCV 2025). Practical
+surrogates use an online fake score, non-overlapping diffusion intervals $[t_i,t_{i+1}]$, and
+truncated differentiation through \emph{one} ODE step (no full BPTT). See
+\texttt{docs/xopd/tdm\_opd\_dm\_gradient\_relation.tex} and \texttt{tdm\_cross\_model\_design.md}
+(\texttt{trainer\_type: xtdm}).
+\paragraph{Approach~B (OPD grid + score difference).} Keep XOPD's multi-step ODE schedule but
+replace per-step field MSE by a DMD-style score-difference force on the sample state $x_{t_i}$
+with $\partial_\theta x_{t_i}$ through one Euler step. This is \emph{not} obtained by swapping
+residuals inside \texttt{compute\_per\_step\_kl} while keeping $x_t$ fixed. Design:
+\texttt{docs/xopd/approach\_b\_trajectory\_dm\_design.md} (\texttt{trainer\_type: xopd\_dm}).
 \paragraph{Transport-operator view.} A flow is an operator $\Phi_{1\to0}$. Merging teachers is a
 mixture of induced distributions $\Phi_S\approx\sum_i\pi_i\Phi_i$ (a distribution-level statement),
 and factorizing is a composition $\Phi_T\approx\Phi_K\circ\cdots\circ\Phi_1$; the linear

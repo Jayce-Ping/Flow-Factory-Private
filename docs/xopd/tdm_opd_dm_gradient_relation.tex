@@ -1,0 +1,123 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\xh}{\hat{x}_0}
+\newcommand{\real}{\mathrm{real}}
+\newcommand{\fake}{\mathrm{fake}}
+
+\newtheorem*{remark*}{Remark}
+
+\title{\textbf{OPD, Approach~B, and TDM: Jacobians for trajectory distribution matching}\\[0.3em]
+\large Why swapping MSE for a score difference is not enough, and how truncated
+$\partial_\theta x$ recovers reverse-KL along an ODE grid}
+\author{Jayce-Ping}
+\date{2026-08-02}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Companion to \texttt{dmd\_opd\_gradient\_relation.tex}. We contrast four objectives used
+in XOPD-family distillation: (i)~pointwise OPD field regression; (ii)~endpoint DMD on a
+consistency sampler; (iii)~\emph{Approach~B} --- OPD's ODE grid with a score-difference
+force on trajectory states; (iv)~Trajectory Distribution Matching (TDM). The critical
+invariants for (iii)--(iv) are an independent online fake score, differentiation through
+the sampler state ($\partial_\theta x_{t_i}$), and (for TDM) non-overlapping diffusion
+intervals. A residual swap that keeps OPD's fixed-$x_t$ Jacobian is \emph{not} reverse KL.
+\end{abstract}
+
+\section{Jacobian table}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{5.2cm}@{}}
+\toprule
+Objective & Differentiates & Match object \\
+\midrule
+OPD / \texttt{x0\_norm} & $\partial_\theta v_\theta$ at fixed $x_t$ & Teacher field (pointwise) \\
+XDMD (endpoint) & $\partial_\theta x0_G$ (one consistency step) & $p_\theta(x_0)$ vs $p_{\real}$ \\
+Approach~B (\texttt{xopd\_dm}) & $\partial_\theta x_{t_i}$ (one ODE step) & $p_\theta(x_{t_i})$ vs $p_{\real}$ on OPD grid \\
+TDM (\texttt{xtdm}) & $\partial_\theta x_{t_i}$ (one ODE step) & Marginal KL on non-overlapping $[t_i,t_{i+1}]$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Why residual swap $\neq$ KL}
+
+OPD at fixed $x_t$ minimizes $\E\norm{v_\theta(x_t)-v_\psi(x_t)}^2$ (or the $\xh$ form).
+Replacing the residual $v_\theta-v_\psi$ by $s_{\fake}-s_{\real}$ while still backpropagating
+only through the velocity \emph{output} yields a hybrid with no clean reverse-KL identity:
+the score difference is a force in $x$-space, not a field target at a pinned input.
+
+Genuine distribution matching (Diff-Instruct / DMD / TDM) uses
+\[
+\nabla_\theta\KL(p_\theta\|p_{\real})
+\approx \E\big[(s_{\fake}(x)-s_{\real}(x))\,\partial_\theta x\big],
+\]
+with $s_{\fake}\approx\nabla\log p_\theta$ trained online. Pinning $\fake\leftarrow$teacher
+zeros the signal; pinning $\fake\leftarrow$student biases the score and collapses toward
+reweighted field matching through $\partial_\theta x$.
+
+\section{Approach~B (ODE grid + score difference)}
+
+Keep the student as a multi-step flow on the OPD inference schedule $\{t_i\}$.
+At a randomly chosen index $i^\star$ (broadcast across ranks):
+\begin{enumerate}[leftmargin=1.4em]
+\item No-grad Euler rollout to $x_{t_{i^\star}}$.
+\item One differentiable ODE step producing $x$ (state carrying $\partial_\theta$).
+\item Diffuse $x_\tau=(1-\sigma_\tau)x+\sigma_\tau\varepsilon$ with $\tau$ in a band tied to
+the selected segment.
+\item Evaluate $\xh^{\real},\xh^{\fake}$ under \texttt{no\_grad}; form the DMD2
+self-normalized direction
+$\mathrm{grad}=(\xh-\xh^{\real})-(\xh-\xh^{\fake})$ (normalized by $\mean|\cdot|$).
+\item Stop-grad identity on the \emph{sample}:
+$\mathcal{L}=\tfrac12\norm{x-\sg(x-\mathrm{grad})}^2$, so
+$\partial\mathcal{L}/\partial x=\mathrm{grad}$.
+\end{enumerate}
+Memory is $O(1)$ transformer activations for the generator update (truncated BPTT).
+
+\section{TDM (Luo et al., ICCV 2025)}
+
+Paper objective (data-free, deterministic $K$-step generator):
+\[
+\mathcal{L}(\theta)=\sum_{i=0}^{K-1}\sum_{\tau\in[t_i,t_{i+1}]}\lambda_\tau\,
+\KL\big(p_{\theta,\tau|t_i}\,\|\,p_{\phi,\tau}\big).
+\]
+Intervals $[t_i,t_{i+1}]$ are \emph{non-overlapping} so one fake network can separate
+trajectory segments by timestep. Practical surrogate: Pseudo-Huber on
+$\norm{x_{t_i}-\sg(\tilde x_{t_i})}$ with
+$\tilde x_{t_i}=x_{t_i}+\lambda(s_{\real}-s_{\fake})$.
+Engineering (v1): match a \emph{random} segment per generator step (same memory as Approach~B);
+full sum over $i$ is optional later.
+
+\section{Shared engineering invariants}
+
+\begin{itemize}[leftmargin=1.4em]
+\item Independent online \texttt{fake} LoRA + manual data-parallel optimizer (outside ZeRO).
+\item Force acts on sample state $x$, never ``MSE$(v_\theta,v_{\mathrm{teacher}})$ with a score residual''.
+\item Autocast weight cache off while swapping teacher weights; DDP bypass for
+\texttt{no\_grad} weight swaps when applicable.
+\item Collective-safe random segment index (broadcast from rank 0).
+\item Eval uses the ODE sampler (multi-step flow), not XDMD's consistency schedule.
+\end{itemize}
+
+\section{Relation to capacity}
+
+Under infinite capacity, OPD, Approach~B, and TDM share the teacher field / induced
+trajectory as a common fixed point. Under a capacity gap, $L^2$ field projection and
+reverse-KL on trajectory marginals diverge: the latter is mode-seeking on the transported
+densities, which is why multi-time DM can outperform pure OPD for small students even when
+distilling the same deterministic teacher.
+
+\end{document}

@@ -46,6 +46,8 @@ _TRAINER_REGISTRY: Dict[str, str] = {
     "flow-direct-opd": "flow_factory.trainers.fdopd.trainer.FlowDirectOPDTrainer",
     "xpdm": "flow_factory.trainers.xopd.pdm_trainer.XPDMTrainer",
     "xdmd": "flow_factory.trainers.xopd.dmd_trainer.XDMDTrainer",
+    "xopd_dm": "flow_factory.trainers.xopd.traj_dm_trainer.XOPDDMTrainer",
+    "xtdm": "flow_factory.trainers.xopd.traj_dm_trainer.XTDMTrainer",
     "diffusion-opd": "flow_factory.trainers.diffusion_opd.DiffusionOPDTrainer",
     "ensemble-eval": "flow_factory.trainers.ensemble_eval.trainer.EnsembleEvalTrainer",
 }

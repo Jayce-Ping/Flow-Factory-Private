@@ -1,0 +1,131 @@
+# TDM SMOKE: paper Trajectory Distribution Matching (xtdm), same-arch 32B→4B.
+# Design: docs/xopd/tdm_cross_model_design.md
+# Single-node (num_processes 8) smoke:
+#   MASTER_PORT=29580 XOPD_WORKERS="" \
+#   bash scripts/xopd_cluster/run_4node_xopd.sh \
+#     xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_tdm_smoke.yaml
+
+# ===== Environment =====
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# ===== Data =====
+data:
+  dataset_dir: "dataset/geneval_enhanced"
+  dataset_dirs:
+    - "dataset/geneval_enhanced"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+# ===== Model =====
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "all-linear"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+# ===== Logging =====
+log:
+  run_name: "flux2klein_32b_to_4b_tdm_smoke"
+  project: "Flow-Factory-XOPD"
+  logging_backend: "wandb"
+  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
+  save_freq: 0
+  save_model_only: true
+
+# ===== Training (TDM / xtdm) =====
+train:
+  trainer_type: "xtdm"
+  max_epochs: 1
+  fsdp_shard_teacher: false
+
+  teacher_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  teacher_param_device: "cuda"
+  assume_shared_vae_text_encoder: true
+  eval_teacher_at_start: false
+
+  teacher_guidance_scale: 1.0
+  student_guidance_scale: 1.0
+
+  # --- TDM knobs ---
+  tdm_sim_steps: 4
+  tdm_match_policy: "random_segment"
+  tdm_fake_ratio: 6
+  tdm_fake_lr: 1.0e-4
+  tdm_real_guidance_scale: 1.0
+  tdm_fake_guidance_scale: 1.0
+  tdm_t_min: 0.02
+  tdm_t_max: 0.98
+  tdm_grad_norm: 10.0
+  tdm_loss_metric: "pseudo_huber"
+
+  l0_warmup_epochs: 0
+  pathwise_coef: 1.0
+  normalize_d_k: false
+  kl_beta: 0.0
+  xopd_dk_space: "v"
+
+  source_ratio: {geneval_enhanced: 1, ocr: 1}
+
+  resolution: 512
+  num_inference_steps: 4                  # align with tdm_sim_steps for eval clarity
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 1
+  num_inner_epochs: 1
+  gradient_accumulation_steps: 1
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.0
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+  seed: 42
+
+# ===== Scheduler =====
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  num_sde_steps: null
+  sde_steps: null
+  seed: 42
+
+# ===== Evaluation (OFF for smoke) =====
+eval:
+  resolution: 512
+  per_device_batch_size: 1
+  num_inference_steps: 4
+  guidance_scale: 1.0
+  eval_freq: 0
+  seed: 42
+  test_sets:
+    - {name: geneval_gs1, dataset_dir: dataset/geneval_enhanced, split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}
+
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    weight: 1
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
