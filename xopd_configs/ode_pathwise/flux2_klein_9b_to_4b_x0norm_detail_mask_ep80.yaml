@@ -1,5 +1,6 @@
 # 9B -> 4B validation of offline-calibrated harmful-detail masking.
-# Matched to the dense 28-step Geneval ODE audit, except the required OPD loss is
+# Uses a 1:1 Geneval/OCR prompt mix with the dense 28-step ODE audit geometry.
+# The required OPD loss is
 # MSE(x0_norm) and each sample-step is retained only when
 # RMS(v9-v4) * relu(-cos(grad(x0_4), grad(x0_9-x0_4))) <= its calibrated threshold.
 
@@ -11,7 +12,9 @@ mixed_precision: "bf16"
 
 data:
   dataset_dir: "dataset/geneval"
-  dataset_dirs: null
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/ocr"
   preprocessing_batch_size: 8
   dataloader_num_workers: 16
   force_reprocess: false
@@ -30,7 +33,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "flux2klein_9b_to_4b_x0norm_detailmask_ep80_20260802"
+  run_name: "flux2klein_9b_to_4b_x0norm_detailmask_geneval_ocr_ep80_20260802"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -60,6 +63,7 @@ train:
   kl_type: "x-based"
   kl_beta: 0.0
   xopd_target_mode: "direct"
+  source_ratio: {geneval: 1, ocr: 1}
 
   xopd_detail_mask_enabled: true
   xopd_detail_mask_threshold: 0.027123659585181516
@@ -97,7 +101,7 @@ train:
   num_inference_steps: 28
   per_device_batch_size: 4
   group_size: 1
-  unique_sample_num_per_epoch: 128
+  unique_sample_num_per_epoch: 256
   gradient_step_per_epoch: 1
   num_inner_epochs: 1
   gradient_accumulation_steps: auto
@@ -132,6 +136,8 @@ eval:
   test_sets:
     - {name: geneval_gs1, dataset_dir: dataset/geneval, split: test, guidance_scale: 1.0, eval_reward_names: [geneval]}
     - {name: geneval_gs4, dataset_dir: dataset/geneval, split: test, guidance_scale: 4.0, eval_reward_names: [geneval]}
+    - {name: ocr_gs1, dataset_dir: dataset/ocr, split: test, guidance_scale: 1.0, eval_reward_names: [ocr]}
+    - {name: ocr_gs4, dataset_dir: dataset/ocr, split: test, guidance_scale: 4.0, eval_reward_names: [ocr]}
 
 rewards:
   - name: "geneval"
@@ -139,5 +145,12 @@ rewards:
     weight: 1
     batch_size: 64
     device: "cuda"
+    dtype: float32
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    weight: 1
+    batch_size: 64
+    device: "cpu"
     dtype: float32
     async_reward: false
