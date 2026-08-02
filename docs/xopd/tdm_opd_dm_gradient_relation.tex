@@ -76,16 +76,19 @@ At a randomly chosen index $i^\star$ (broadcast across ranks):
 \begin{enumerate}[leftmargin=1.4em]
 \item No-grad Euler rollout to $x_{t_{i^\star}}$.
 \item One differentiable ODE step producing $x$ (state carrying $\partial_\theta$).
-\item Diffuse $x_\tau=(1-\sigma_\tau)x+\sigma_\tau\varepsilon$ with $\tau$ in a band tied to
-the selected segment.
+\item Diffuse $x_\tau=(1-\sigma_\tau)x+\sigma_\tau\varepsilon$ with $\tau$ in the
+\emph{non-overlapping} segment band $(\sigma(t_{i^\star+1}),\sigma(t_{i^\star})]$
+(same local-$\tau$ rule as TDM; clamped to $[t_{\min},t_{\max}]$).
 \item Evaluate $\xh^{\real},\xh^{\fake}$ under \texttt{no\_grad}; form the DMD2
 self-normalized direction
 $\mathrm{grad}=(\xh-\xh^{\real})-(\xh-\xh^{\fake})$ (normalized by $\mean|\cdot|$).
-\item Stop-grad identity on the \emph{sample}:
-$\mathcal{L}=\tfrac12\norm{x-\sg(x-\mathrm{grad})}^2$, so
-$\partial\mathcal{L}/\partial x=\mathrm{grad}$.
+\item Stop-grad identity / Pseudo-Huber on the \emph{sample} so
+$\partial\mathcal{L}/\partial x=\mathrm{grad}$ (up to Huber reweighting).
 \end{enumerate}
 Memory is $O(1)$ transformer activations for the generator update (truncated BPTT).
+Relative to TDM, Approach~B differs only by using the full OPD inference grid
+(\texttt{num\_inference\_steps}) instead of a fixed $K$-step grid
+(\texttt{tdm\_sim\_steps}).
 
 \section{TDM (Luo et al., ICCV 2025)}
 

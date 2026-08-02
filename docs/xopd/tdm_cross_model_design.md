@@ -27,9 +27,10 @@ Same-arch 大蒸小 stack as XDMD/XOPDDM: frozen 32B `real`, klein `fake` + `stu
 | $K$-step ODESolver student | `tdm_sim_steps` Euler ODE on RF schedule |
 | Real score $s_\phi$ | Teacher via `use_teacher_transformer` |
 | Fake score $s_\psi$ | LoRA `fake`, manual-DP AdamW |
-| Non-overlapping $[t_i,t_{i+1}]$ | $\tau$ sampled inside segment $i$ only |
-| Pseudo-Huber gen surrogate | `tdm_loss_metric: pseudo_huber` (default for `xtdm`) |
+| Non-overlapping $[t_i,t_{i+1}]$ | $\tau$ sampled inside segment $i$ only (shared with Approach B) |
+| Pseudo-Huber gen surrogate | `tdm_loss_metric: pseudo_huber` (default for both `xtdm` and `xopd_dm`) |
 | Sum over all segments | v1: `tdm_match_policy: random_segment` (memory) |
+| vs Approach B | **Only the ODE grid**: `tdm_sim_steps` vs `num_inference_steps` |
 | Sampling-steps-aware / unify-$K$ | **out of v1** |
 | Cross-VAE | **out of v1** |
 

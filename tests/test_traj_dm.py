@@ -98,13 +98,13 @@ class TestTrajDMRegistryAndConfigs(unittest.TestCase):
         self.assertEqual(args.tdm_loss_metric, "pseudo_huber")
         self.assertEqual(args.tdm_sim_steps, 4)
 
-    def test_opddm_defaults_mse(self) -> None:
+    def test_opddm_defaults_align_with_tdm_except_grid(self) -> None:
         args = XOPDDMTrainingArguments(
             trainer_type="xopd_dm",
             teacher_model_name_or_path="dummy/teacher",
             assume_shared_vae_text_encoder=True,
         )
-        self.assertEqual(args.tdm_loss_metric, "mse")
+        self.assertEqual(args.tdm_loss_metric, "pseudo_huber")
 
     def test_smoke_yamls_parse(self) -> None:
         config_dir = Path(__file__).resolve().parents[1] / "xopd_configs" / "ode_pathwise"

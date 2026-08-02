@@ -152,9 +152,28 @@ class XTrajectoryDMTrainer(XOPDTrainer):
     def _tdm_num_ode_steps(self) -> int:
         raise NotImplementedError
 
-    def _tdm_tau_frac_band(self, t_cur: torch.Tensor, t_next: torch.Tensor) -> Tuple[float, float]:
-        """Return ``(lo_frac, hi_frac)`` in ``[0,1]`` for DM noise sampling."""
-        raise NotImplementedError
+    def _tdm_tau_frac_band(
+        self, t_cur: torch.Tensor, t_next: torch.Tensor
+    ) -> Tuple[float, float]:
+        """Non-overlapping segment band for DM τ (shared by Approach B and TDM).
+
+        Sample σ ∈ (σ(t_next), σ(t_cur)] (scheduler timesteps decrease along the ODE),
+        then clamp to ``[tdm_t_min, tdm_t_max]``. Degenerate segments fall back to the
+        global clamp band. This keeps each trajectory segment's diffused queries in a
+        disjoint σ-interval so one fake score can separate them by timestep.
+        """
+        ta = self.training_args
+        sig_hi = float(flow_match_sigma(t_cur[0]).item())
+        sig_lo = float(flow_match_sigma(t_next[0]).item())
+        if sig_lo > sig_hi:
+            sig_lo, sig_hi = sig_hi, sig_lo
+        lo = max(float(ta.tdm_t_min), sig_lo)
+        hi = min(float(ta.tdm_t_max), sig_hi)
+        if lo >= hi:
+            lo, hi = float(ta.tdm_t_min), float(ta.tdm_t_max)
+        if hi - lo < 1e-4:
+            hi = min(1.0, lo + 1e-4)
+        return lo, hi
 
     def _tdm_generator_metric(self, x: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
         ta = self.training_args
@@ -498,42 +517,22 @@ class XTrajectoryDMTrainer(XOPDTrainer):
 
 
 class XOPDDMTrainer(XTrajectoryDMTrainer):
-    """Approach B: OPD ODE grid + score-diff force on ``x_ti`` (``trainer_type: xopd_dm``)."""
+    """Approach B: OPD ODE grid + local-segment score-diff (``trainer_type: xopd_dm``).
+
+    Same DM recipe as TDM (non-overlapping τ in the selected Euler segment + shared
+    surrogate metric); the only structural difference is the trajectory grid
+    (``num_inference_steps`` vs ``tdm_sim_steps``).
+    """
 
     def _tdm_num_ode_steps(self) -> int:
         return int(self.training_args.num_inference_steps)
 
-    def _tdm_tau_frac_band(
-        self, t_cur: torch.Tensor, t_next: torch.Tensor
-    ) -> Tuple[float, float]:
-        ta = self.training_args
-        return float(ta.tdm_t_min), float(ta.tdm_t_max)
-
 
 class XTDMTrainer(XTrajectoryDMTrainer):
-    """Paper TDM: K-step ODE, non-overlapping τ intervals, Pseudo-Huber (``xtdm``)."""
+    """Paper TDM: K-step ODE grid (``tdm_sim_steps``); same local-τ DM as Approach B."""
 
     def _tdm_num_ode_steps(self) -> int:
         from ...hparams.training_args import XTDMTrainingArguments
 
         ta: XTDMTrainingArguments = self.training_args  # type: ignore[assignment]
         return int(ta.tdm_sim_steps)
-
-    def _tdm_tau_frac_band(
-        self, t_cur: torch.Tensor, t_next: torch.Tensor
-    ) -> Tuple[float, float]:
-        """Non-overlapping band: σ ∈ (σ(t_next), σ(t_cur)] clamped to ``[tdm_t_min, tdm_t_max]``."""
-        ta = self.training_args
-        sig_hi = float(flow_match_sigma(t_cur[0]).item())
-        sig_lo = float(flow_match_sigma(t_next[0]).item())
-        if sig_lo > sig_hi:
-            sig_lo, sig_hi = sig_hi, sig_lo
-        lo = max(float(ta.tdm_t_min), sig_lo)
-        hi = min(float(ta.tdm_t_max), sig_hi)
-        if lo >= hi:
-            # Degenerate last step / clamp: fall back to global band.
-            lo, hi = float(ta.tdm_t_min), float(ta.tdm_t_max)
-        # Ensure a tiny open interval for Uniform.
-        if hi - lo < 1e-4:
-            hi = min(1.0, lo + 1e-4)
-        return lo, hi

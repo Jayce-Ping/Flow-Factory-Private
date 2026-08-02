@@ -48,17 +48,20 @@ for i in 0..sel-1:
     x ← ODE_Euler(student, x, t_i → t_{i+1})     # no_grad
 x_ti ← ODE_Euler(student, x, t_sel → t_{sel+1}) # WITH grad
 
-τ ~ U[clamp(σ(t_sel), t_min), clamp(σ(t_{sel+1}), t_max)]  # or band in scheduler units
+τ ~ U[σ(t_{sel+1}), σ(t_sel)] ∩ [tdm_t_min, tdm_t_max]   # local non-overlapping segment
 x_τ ← (1-σ_τ) * x_ti + σ_τ * ε
 
 # scores under no_grad
 x0_real ← teacher_x0(x_τ, τ);  x0_fake ← fake_x0(x_τ, τ)
 p_real = x_ti - x0_real;  p_fake = x_ti - x0_fake   # RF form of score residual
 grad = (p_real - p_fake) / mean|p_real|
-loss_G = 0.5 * MSE(x_ti, sg(x_ti - grad))
+loss_G = PseudoHuber(x_ti - sg(x_ti - grad))   # default; mse also available
 ```
 
 **Invariant:** force acts on `x_ti`, not on a velocity MSE vs teacher.
+
+**vs TDM:** same local-τ DM + default Pseudo-Huber; only the ODE grid differs
+(`num_inference_steps` vs `tdm_sim_steps`).
 
 ---
 

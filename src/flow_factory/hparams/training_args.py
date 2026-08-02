@@ -3512,7 +3512,12 @@ class XTrajectoryDMTrainingArguments(XOPDTrainingArguments):
 
 @dataclass
 class XOPDDMTrainingArguments(XTrajectoryDMTrainingArguments):
-    r"""Approach B: OPD ODE grid + score-diff on trajectory states (``trainer_type: xopd_dm``)."""
+    r"""Approach B: OPD ODE grid + local-segment DM (``trainer_type: xopd_dm``).
+
+    Same local non-overlapping τ band and default Pseudo-Huber surrogate as TDM;
+    differs from ``xtdm`` only by using ``num_inference_steps`` as the ODE grid
+    (vs ``tdm_sim_steps``).
+    """
 
     opddm_grad_step_policy: Literal["random"] = field(
         default="random",
@@ -3520,6 +3525,16 @@ class XOPDDMTrainingArguments(XTrajectoryDMTrainingArguments):
             "help": (
                 "Which ODE step carries grad. v1 supports only 'random' "
                 "(uniform index, broadcast across ranks)."
+            )
+        },
+    )
+    # Align with TDM so B vs TDM differs only by trajectory grid.
+    tdm_loss_metric: Literal["mse", "pseudo_huber"] = field(
+        default="pseudo_huber",
+        metadata={
+            "help": (
+                "Generator surrogate. Default 'pseudo_huber' (same as TDM); "
+                "'mse' = DMD2 stop-grad identity."
             )
         },
     )

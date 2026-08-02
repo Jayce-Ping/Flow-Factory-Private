@@ -68,7 +68,7 @@ train:
   tdm_t_min: 0.02
   tdm_t_max: 0.98
   tdm_grad_norm: 10.0
-  tdm_loss_metric: "mse"
+  tdm_loss_metric: "pseudo_huber"
   opddm_grad_step_policy: "random"
 
   l0_warmup_epochs: 0
