@@ -78,6 +78,7 @@ from .common import (
     compute_marginal_cfm_diagnostics,
     compute_marginal_cfm_velocity_loss,
     compute_per_step_kl,
+    compute_xopd_detail_mask,
     compute_popd_diagnostics,
     compute_popd_gaussian_mean_kl,
     compute_popd_quantiles,
@@ -142,6 +143,13 @@ class XOPDTrainer(BaseTrainer):
         self.popd_alpha = float(ta.popd_alpha) if self._is_popd else 0.5
         self.popd_temperature = float(ta.popd_temperature) if self._is_popd else 1.0
         self.popd_verbose_diagnostics = bool(ta.popd_verbose_diagnostics)
+        self.detail_mask_enabled = bool(ta.xopd_detail_mask_enabled)
+        self.detail_mask_threshold = float(ta.xopd_detail_mask_threshold)
+        self.detail_mask_step_thresholds = (
+            tuple(float(value) for value in ta.xopd_detail_mask_step_thresholds)
+            if ta.xopd_detail_mask_step_thresholds is not None
+            else None
+        )
 
         # 'v' (raw velocity), 'x0' (clean-latent) and 'x0_norm' (self-normalized x0) d_k all recover
         # v from the ODE Euler mean (mu = x_t + v*dt); that identity only holds under ODE, so require
@@ -153,6 +161,11 @@ class XOPDTrainer(BaseTrainer):
                 "(it recovers v via mu = x_t + v*dt). Got dynamics_type="
                 f"{self.adapter.scheduler.dynamics_type!r}. Use 'xt' for SDE, or set "
                 "scheduler.dynamics_type='ODE'."
+            )
+        if self.detail_mask_enabled and not self._is_ode:
+            raise ValueError(
+                "XOPD detail masking requires dynamics_type='ODE', "
+                f"got dynamics_type={self.adapter.scheduler.dynamics_type!r}."
             )
 
         # Cache adapter.forward signature once for cheap per-step kwarg filtering.
@@ -3999,7 +4012,69 @@ class XOPDTrainer(BaseTrainer):
                             sigma=self._noise_fraction(self.adapter, t),
                         )
 
-                    pathwise_loss = d_k_grad.mean()
+                    if self.detail_mask_enabled:
+                        threshold = (
+                            self.detail_mask_step_thresholds[ti]
+                            if self.detail_mask_step_thresholds is not None
+                            else self.detail_mask_threshold
+                        )
+                        detail_mask = compute_xopd_detail_mask(
+                            mu_student=student_out.next_latents_mean,
+                            mu_teacher=mu_teacher,
+                            latents=latents,
+                            sigma=self._noise_fraction(self.adapter, t),
+                            dt=student_out.dt,
+                            threshold=threshold,
+                        )
+                        local_kept = detail_mask.keep_mask.sum().to(
+                            device=d_k_grad.device,
+                            dtype=torch.float32,
+                        )
+                        global_kept = self.accelerator.reduce(
+                            local_kept,
+                            reduction="sum",
+                        )
+                        if float(global_kept.item()) == 0.0:
+                            pathwise_loss = d_k_grad.sum() * 0.0
+                        else:
+                            # DDP averages rank gradients. Multiplying the local retained-loss
+                            # sum by world_size/global_kept therefore produces the exact global
+                            # mean over retained samples, regardless of per-rank keep counts.
+                            pathwise_loss = (
+                                d_k_grad[detail_mask.keep_mask].sum()
+                                * float(self.accelerator.num_processes)
+                                / global_kept
+                            )
+                        loss_info["detail_mask/fraction"].append(
+                            (~detail_mask.keep_mask).float().mean()
+                        )
+                        loss_info["detail_mask/global_keep_fraction"].append(
+                            global_kept
+                            / float(
+                                self.accelerator.num_processes
+                                * detail_mask.keep_mask.shape[0]
+                            )
+                        )
+                        loss_info["detail_mask/gradient_alignment"].append(
+                            detail_mask.gradient_alignment.mean()
+                        )
+                        loss_info["detail_mask/velocity_gap_rms"].append(
+                            detail_mask.velocity_gap_rms.mean()
+                        )
+                        loss_info["detail_mask/harmful_score"].append(
+                            detail_mask.harmful_score.mean()
+                        )
+                        loss_info["detail_mask/threshold"].append(
+                            detail_mask.harmful_score.new_tensor(detail_mask.threshold)
+                        )
+                        loss_info[f"detail_mask/fraction/{ti}"].append(
+                            (~detail_mask.keep_mask).float().mean()
+                        )
+                        loss_info[f"detail_mask/harmful_score/{ti}"].append(
+                            detail_mask.harmful_score.mean()
+                        )
+                    else:
+                        pathwise_loss = d_k_grad.mean()
                     loss = self.pathwise_coef * pathwise_loss
 
                     # MoE load-balancing aux (only when the student is a weight-space MoE

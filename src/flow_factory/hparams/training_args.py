@@ -2729,6 +2729,34 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    xopd_detail_mask_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable detached sample-step masking for direct ODE x0_norm loss. "
+                "The harmful score is RMS(v_teacher-v_student) * "
+                "relu(-cos(grad(x0_student), grad(x0_teacher-x0_student)))."
+            )
+        },
+    )
+    xopd_detail_mask_threshold: float = field(
+        default=0.027123659585181516,
+        metadata={
+            "help": (
+                "Global non-negative harmful-score threshold used when no per-step "
+                "threshold is provided."
+            )
+        },
+    )
+    xopd_detail_mask_step_thresholds: Optional[List[float]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional harmful-score threshold for each rollout step. Its length must "
+                "equal num_inference_steps; values are indexed by the original trajectory step."
+            )
+        },
+    )
     xopd_pixel_loss: bool = field(
         default=False,
         metadata={
@@ -2867,6 +2895,59 @@ class XOPDTrainingArguments(TrainingArguments):
             raise ValueError(
                 f"`pathwise_coef` must be >= 0, got pathwise_coef={self.pathwise_coef!r}."
             )
+        if isinstance(self.xopd_detail_mask_threshold, bool) or not isinstance(
+            self.xopd_detail_mask_threshold, (int, float)
+        ):
+            raise TypeError(
+                "`xopd_detail_mask_threshold` must be a finite number >= 0, "
+                f"got {type(self.xopd_detail_mask_threshold).__name__}: "
+                f"{self.xopd_detail_mask_threshold!r}."
+            )
+        if (
+            not math.isfinite(float(self.xopd_detail_mask_threshold))
+            or float(self.xopd_detail_mask_threshold) < 0.0
+        ):
+            raise ValueError(
+                "`xopd_detail_mask_threshold` must be finite and >= 0, "
+                f"got {self.xopd_detail_mask_threshold!r}."
+            )
+        if self.xopd_detail_mask_step_thresholds is not None:
+            expected_steps = int(self.num_inference_steps)
+            if len(self.xopd_detail_mask_step_thresholds) != expected_steps:
+                raise ValueError(
+                    "`xopd_detail_mask_step_thresholds` must contain one value per rollout "
+                    f"step; expected {expected_steps}, got "
+                    f"{len(self.xopd_detail_mask_step_thresholds)}."
+                )
+            invalid_thresholds = [
+                (index, value)
+                for index, value in enumerate(self.xopd_detail_mask_step_thresholds)
+                if isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ]
+            if invalid_thresholds:
+                raise ValueError(
+                    "every `xopd_detail_mask_step_thresholds` value must be finite and >= 0; "
+                    f"invalid entries={invalid_thresholds!r}."
+                )
+        if self.xopd_detail_mask_enabled:
+            if self.xopd_target_mode != "direct":
+                raise ValueError(
+                    "xopd_detail_mask_enabled=True requires xopd_target_mode='direct', "
+                    f"got {self.xopd_target_mode!r}."
+                )
+            if self.xopd_dk_space != "x0_norm":
+                raise ValueError(
+                    "xopd_detail_mask_enabled=True requires xopd_dk_space='x0_norm', "
+                    f"got {self.xopd_dk_space!r}."
+                )
+            if self._cross_vae or self.xopd_pixel_loss:
+                raise ValueError(
+                    "xopd_detail_mask_enabled=True currently requires same-VAE latent loss; "
+                    f"got cross_vae={self._cross_vae}, xopd_pixel_loss={self.xopd_pixel_loss}."
+                )
         if self.xopd_target_mode not in ("direct", "p_opd", "marginal_cfm"):
             raise ValueError(
                 "`xopd_target_mode` must be 'direct', 'p_opd', or 'marginal_cfm', "

@@ -59,6 +59,17 @@ class POPDBehaviorTransition:
     dt: torch.Tensor
 
 
+@dataclass(frozen=True)
+class XOPDDetailMask:
+    """Detached per-sample diagnostics and keep decisions for detail masking."""
+
+    gradient_alignment: torch.Tensor
+    velocity_gap_rms: torch.Tensor
+    harmful_score: torch.Tensor
+    keep_mask: torch.Tensor
+    threshold: float
+
+
 def extract_popd_behavior_transition(
     batch: Dict[str, Any],
     *,
@@ -1382,6 +1393,154 @@ def compute_per_step_kl(
 
     sigma_bar_sq = sigma_bar_sq.clamp(min=1e-12)
     return diff_sq / (2.0 * sigma_bar_sq)
+
+
+def compute_xopd_detail_mask(
+    *,
+    mu_student: torch.Tensor,
+    mu_teacher: torch.Tensor,
+    latents: torch.Tensor,
+    sigma: torch.Tensor,
+    dt: torch.Tensor,
+    threshold: float,
+) -> XOPDDetailMask:
+    """Mask teacher corrections that strongly oppose the student's x0 gradients.
+
+    The detached per-sample score is
+    ``RMS(v_teacher-v_student) * relu(-cos(grad(x0_student), grad(delta_x0)))``.
+    Inputs must be packed square latents with shape ``(B, N, C)``.
+    """
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        raise TypeError(
+            f"expected numeric detail-mask threshold, got {type(threshold).__name__}: "
+            f"{threshold!r}"
+        )
+    if not math.isfinite(float(threshold)) or float(threshold) < 0.0:
+        raise ValueError(
+            f"expected finite detail-mask threshold >= 0, got threshold={threshold!r}"
+        )
+    _validate_same_event_shape(
+        mu_student,
+        {
+            "mu_teacher": mu_teacher,
+            "latents": latents,
+        },
+        reference_name="mu_student",
+    )
+    if mu_student.ndim != 3:
+        raise ValueError(
+            "XOPD detail mask requires packed latent shape (B,N,C), "
+            f"got shape={tuple(mu_student.shape)}."
+        )
+    token_count = int(mu_student.shape[1])
+    side = math.isqrt(token_count)
+    if side * side != token_count:
+        raise ValueError(
+            "XOPD detail mask requires a square packed token grid, "
+            f"got token_count={token_count}, shape={tuple(mu_student.shape)}."
+        )
+    batch_size = int(mu_student.shape[0])
+    sigma_per_sample = _batch_scalar(sigma, name="sigma", batch_size=batch_size)
+    dt_per_sample = _batch_scalar(dt, name="dt", batch_size=batch_size)
+    if (dt_per_sample.abs() < 1.0e-12).any():
+        raise ValueError(
+            "XOPD detail mask requires non-zero ODE dt, "
+            f"got dt={dt_per_sample.detach().cpu().tolist()}."
+        )
+
+    with torch.no_grad():
+        student = mu_student.detach().float()
+        teacher = mu_teacher.detach().float()
+        state = latents.detach().float()
+        x0_student = _to_clean_x0(
+            student,
+            state,
+            sigma_per_sample,
+            dt_per_sample,
+        )
+        x0_teacher = _to_clean_x0(
+            teacher,
+            state,
+            sigma_per_sample,
+            dt_per_sample,
+        )
+        base_grid = x0_student.reshape(batch_size, side, side, mu_student.shape[-1])
+        delta_grid = (x0_teacher - x0_student).reshape(
+            batch_size, side, side, mu_student.shape[-1]
+        )
+        base_dy = base_grid[:, 1:, :, :] - base_grid[:, :-1, :, :]
+        base_dx = base_grid[:, :, 1:, :] - base_grid[:, :, :-1, :]
+        delta_dy = delta_grid[:, 1:, :, :] - delta_grid[:, :-1, :, :]
+        delta_dx = delta_grid[:, :, 1:, :] - delta_grid[:, :, :-1, :]
+        numerator = (base_dy * delta_dy).flatten(1).sum(dim=1)
+        numerator = numerator + (base_dx * delta_dx).flatten(1).sum(dim=1)
+        base_norm_sq = base_dy.square().flatten(1).sum(dim=1)
+        base_norm_sq = base_norm_sq + base_dx.square().flatten(1).sum(dim=1)
+        delta_norm_sq = delta_dy.square().flatten(1).sum(dim=1)
+        delta_norm_sq = delta_norm_sq + delta_dx.square().flatten(1).sum(dim=1)
+        denominator = (base_norm_sq * delta_norm_sq).sqrt().clamp_min(1.0e-12)
+        gradient_alignment = numerator / denominator
+
+        dt_b = _broadcast_batch_scalar(dt_per_sample, student)
+        velocity_delta = (teacher - student) / dt_b
+        velocity_gap_rms = _event_rms(velocity_delta)
+        harmful_score = velocity_gap_rms * (-gradient_alignment).clamp_min(0.0)
+        keep_mask = harmful_score <= float(threshold)
+
+    outputs = {
+        "gradient_alignment": gradient_alignment,
+        "velocity_gap_rms": velocity_gap_rms,
+        "harmful_score": harmful_score,
+    }
+    for name, value in outputs.items():
+        if value.shape != (batch_size,) or not torch.isfinite(value).all():
+            raise ValueError(
+                f"expected finite XOPD detail-mask {name} shape ({batch_size},), "
+                f"got shape={tuple(value.shape)}, values={value.detach().cpu().tolist()}."
+            )
+    if keep_mask.shape != (batch_size,) or keep_mask.dtype != torch.bool:
+        raise TypeError(
+            "expected boolean XOPD detail keep mask with one value per sample, "
+            f"got shape={tuple(keep_mask.shape)}, dtype={keep_mask.dtype}."
+        )
+    return XOPDDetailMask(
+        gradient_alignment=gradient_alignment.detach(),
+        velocity_gap_rms=velocity_gap_rms.detach(),
+        harmful_score=harmful_score.detach(),
+        keep_mask=keep_mask.detach(),
+        threshold=float(threshold),
+    )
+
+
+def masked_per_sample_mean(
+    values: torch.Tensor,
+    keep_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Mean over retained samples, returning a differentiable zero if none remain."""
+    if not isinstance(values, torch.Tensor) or values.ndim != 1 or values.shape[0] < 1:
+        raise ValueError(
+            "expected non-empty per-sample values shape (B,), "
+            f"got {type(values).__name__} with shape={getattr(values, 'shape', None)}."
+        )
+    if not isinstance(keep_mask, torch.Tensor) or keep_mask.dtype != torch.bool:
+        raise TypeError(
+            "expected torch.bool keep_mask, "
+            f"got {type(keep_mask).__name__} with dtype={getattr(keep_mask, 'dtype', None)}."
+        )
+    if keep_mask.shape != values.shape or keep_mask.device != values.device:
+        raise ValueError(
+            "expected keep_mask to match per-sample values, "
+            f"got values shape/device={tuple(values.shape)}/{values.device}, "
+            f"mask shape/device={tuple(keep_mask.shape)}/{keep_mask.device}."
+        )
+    if not torch.isfinite(values.detach()).all():
+        raise ValueError(
+            f"expected finite per-sample values, got {values.detach().cpu().tolist()}."
+        )
+    kept = keep_mask.sum()
+    if int(kept.item()) == 0:
+        return values.sum() * 0.0
+    return values[keep_mask].mean()
 
 
 def l0_loss_weight(

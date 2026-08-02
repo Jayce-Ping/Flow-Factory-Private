@@ -25,6 +25,7 @@ from flow_factory.trainers.xopd import common as xopd_common
 from flow_factory.trainers.xopd.common import (
     align_l0_inner_steps,
     compute_per_step_kl,
+    compute_xopd_detail_mask,
     compute_popd_diagnostics,
     compute_popd_gaussian_mean_kl,
     compute_popd_quantiles,
@@ -34,6 +35,7 @@ from flow_factory.trainers.xopd.common import (
     extract_popd_behavior_transition,
     interleaved_source_iter,
     l0_loss_weight,
+    masked_per_sample_mean,
     validate_l1_one_step_per_epoch,
     validate_popd_configuration,
     validate_source_ratio,
@@ -66,6 +68,54 @@ class TestXOPDPerStepKL(unittest.TestCase):
         dt = torch.tensor([-0.25, -0.25])
         d_k = compute_per_step_kl(mu_s, mu_t, std_dev_t, dt, normalize=True)
         torch.testing.assert_close(d_k, torch.tensor([4.0, 4.0]))
+
+
+class TestXOPDDetailMask(unittest.TestCase):
+    def test_masks_large_anti_aligned_teacher_correction(self) -> None:
+        base = torch.tensor(
+            [
+                [[0.0], [1.0], [0.0], [1.0]],
+                [[0.0], [1.0], [0.0], [1.0]],
+            ]
+        )
+        delta_x0 = torch.stack((-base[0], base[1]))
+        mu_student = base.clone()
+        mu_teacher = base + 0.5 * delta_x0
+        result = compute_xopd_detail_mask(
+            mu_student=mu_student,
+            mu_teacher=mu_teacher,
+            latents=base,
+            sigma=torch.tensor([0.5, 0.5]),
+            dt=torch.tensor([-0.25, -0.25]),
+            threshold=1.0,
+        )
+        torch.testing.assert_close(
+            result.gradient_alignment,
+            torch.tensor([-1.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            result.velocity_gap_rms,
+            torch.tensor([2.0**0.5, 2.0**0.5]),
+        )
+        torch.testing.assert_close(
+            result.harmful_score,
+            torch.tensor([2.0**0.5, 0.0]),
+        )
+        self.assertEqual(result.keep_mask.tolist(), [False, True])
+
+    def test_masked_mean_excludes_masked_samples(self) -> None:
+        values = torch.tensor([2.0, 8.0], requires_grad=True)
+        loss = masked_per_sample_mean(values, torch.tensor([True, False]))
+        torch.testing.assert_close(loss, torch.tensor(2.0))
+        loss.backward()
+        torch.testing.assert_close(values.grad, torch.tensor([1.0, 0.0]))
+
+    def test_all_masked_mean_is_differentiable_zero(self) -> None:
+        values = torch.tensor([2.0, 8.0], requires_grad=True)
+        loss = masked_per_sample_mean(values, torch.tensor([False, False]))
+        torch.testing.assert_close(loss, torch.tensor(0.0))
+        loss.backward()
+        torch.testing.assert_close(values.grad, torch.tensor([0.0, 0.0]))
 
 
 class TestXOPDL0LossWeight(unittest.TestCase):
@@ -170,6 +220,34 @@ class TestXOPDTrainingArguments(unittest.TestCase):
         self.assertEqual(args.marginal_cfm_alpha, 0.5)
         self.assertEqual(args.popd_alpha, 0.5)
         self.assertEqual(args.popd_temperature, 1.0)
+
+    def test_detail_mask_requires_x0_norm(self) -> None:
+        with self.assertRaises(ValueError):
+            XOPDTrainingArguments(
+                teacher_model_name_or_path="/tmp/teacher",
+                xopd_detail_mask_enabled=True,
+                xopd_dk_space="xt",
+            )
+
+    def test_detail_mask_validates_per_step_threshold_count(self) -> None:
+        with self.assertRaises(ValueError):
+            XOPDTrainingArguments(
+                teacher_model_name_or_path="/tmp/teacher",
+                xopd_detail_mask_enabled=True,
+                xopd_dk_space="x0_norm",
+                num_inference_steps=28,
+                xopd_detail_mask_step_thresholds=[0.1, 0.2],
+            )
+
+    def test_detail_mask_accepts_x0_norm_thresholds(self) -> None:
+        args = XOPDTrainingArguments(
+            teacher_model_name_or_path="/tmp/teacher",
+            xopd_detail_mask_enabled=True,
+            xopd_dk_space="x0_norm",
+            num_inference_steps=2,
+            xopd_detail_mask_step_thresholds=[0.1, 0.2],
+        )
+        self.assertTrue(args.xopd_detail_mask_enabled)
 
     def test_direct_xopd_ignores_unused_popd_values(self) -> None:
         args = XOPDTrainingArguments(
