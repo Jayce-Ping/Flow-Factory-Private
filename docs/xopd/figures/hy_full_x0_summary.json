@@ -1,0 +1,417 @@
+{
+  "meta": {
+    "decoded_images": 256,
+    "samples": 16,
+    "steps": [
+      0,
+      4,
+      8,
+      12,
+      16,
+      20,
+      24,
+      27
+    ],
+    "vae_dtype": "float32"
+  },
+  "summary": {
+    "by_step": {
+      "0": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.9277766840532422,
+          "ci95_low": 0.8826484253630043,
+          "mean": 0.9059817530214787,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.8475569473579526,
+          "ci95_low": 0.7537067823112011,
+          "mean": 0.8032701201736927,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.2310779294813983,
+          "ci95_low": 0.15875304024666548,
+          "mean": 0.19392863102257252,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": -0.0013233819063697392,
+          "ci95_low": -0.031227791218566208,
+          "mean": -0.013240053391316698,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": 0.00010609892570959341,
+          "ci95_low": -0.00011329524084790947,
+          "mean": -8.108732597121538e-06,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": 0.0005801190517268055,
+          "ci95_low": -0.000979648771035379,
+          "mean": -0.00020199921696678597,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      },
+      "12": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.9601000397466123,
+          "ci95_low": 0.9142660406418145,
+          "mean": 0.9393934458494186,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.9289453053846956,
+          "ci95_low": 0.8799668378196657,
+          "mean": 0.9078559838235378,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.11606187181314452,
+          "ci95_low": 0.07648267566692084,
+          "mean": 0.09332998702302575,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": 0.0057937632829907606,
+          "ci95_low": -0.003412092251288616,
+          "mean": 0.0008612361267842557,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": 0.000142735877282388,
+          "ci95_low": -0.00015176644614006227,
+          "mean": -1.8759835880032008e-05,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": 0.0015429707297941252,
+          "ci95_low": -0.0009636637626939523,
+          "mean": 7.944437754843516e-05,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      },
+      "16": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.96494618980214,
+          "ci95_low": 0.9252850717864931,
+          "mean": 0.9468250796198845,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.9571761245839298,
+          "ci95_low": 0.93332140436396,
+          "mean": 0.9458271525800228,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.07626188201538751,
+          "ci95_low": 0.04529152100440115,
+          "mean": 0.058777900761924684,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": 0.004208686937640851,
+          "ci95_low": -0.0035851421784969177,
+          "mean": -0.00032653957997691327,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": -7.681029106295457e-05,
+          "ci95_low": -0.0003313897722566831,
+          "mean": -0.00019649065169418837,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": -0.0004179678011591651,
+          "ci95_low": -0.002146761193037682,
+          "mean": -0.0011934378128936227,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      },
+      "20": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.9830989710986614,
+          "ci95_low": 0.9407798470929265,
+          "mean": 0.965568371117115,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.9815293949097394,
+          "ci95_low": 0.973021059948951,
+          "mean": 0.9772736132144928,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.04060182271787198,
+          "ci95_low": 0.024458371494256427,
+          "mean": 0.03173241257900372,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": 0.0006246705065818024,
+          "ci95_low": -0.001110189884397757,
+          "mean": -0.00021053959226334797,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": 3.302946730540044e-07,
+          "ci95_low": -0.00015834466901428398,
+          "mean": -7.647344946914202e-05,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": 0.0001692050418976295,
+          "ci95_low": -0.0010023580206405416,
+          "mean": -0.0004139333994588832,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      },
+      "24": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.9924919686280191,
+          "ci95_low": 0.971220125630498,
+          "mean": 0.9834762029349804,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.9917501469142735,
+          "ci95_low": 0.9856331999413669,
+          "mean": 0.9888142608106136,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.0190334753227944,
+          "ci95_low": 0.010998481612477917,
+          "mean": 0.014646874566096812,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": 0.0009131154385487361,
+          "ci95_low": -0.0012088255975080792,
+          "mean": -0.00028301000478156386,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": -3.553136120464201e-05,
+          "ci95_low": -0.00013982918451962306,
+          "mean": -8.518356986955542e-05,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": -6.410111510633163e-05,
+          "ci95_low": -0.000699985210607336,
+          "mean": -0.000370668103138496,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      },
+      "27": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.9986912792548537,
+          "ci95_low": 0.9957303134724498,
+          "mean": 0.9973743371665478,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.9988348473794758,
+          "ci95_low": 0.998150487150997,
+          "mean": 0.9985086657106876,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.0028836174295975067,
+          "ci95_low": 0.0017849359937827103,
+          "mean": 0.0023069706548994873,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": 0.0005945069952712407,
+          "ci95_low": -0.00012420348306455692,
+          "mean": 0.0002086488235156052,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": -4.818379069980378e-06,
+          "ci95_low": -9.052256573683254e-05,
+          "mean": -4.0938086932088e-05,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": 7.409536685250968e-05,
+          "ci95_low": -0.0003643408118591364,
+          "mean": -0.00011548883162515594,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      },
+      "4": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.941375348996371,
+          "ci95_low": 0.8978869120590389,
+          "mean": 0.9245955757796764,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.8366570895537734,
+          "ci95_low": 0.6751209114678204,
+          "mean": 0.7643833011388779,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.21943085988750682,
+          "ci95_low": 0.14739225251832977,
+          "mean": 0.1806109007447958,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": 0.014508241182675748,
+          "ci95_low": -0.008850771207613914,
+          "mean": 0.003213490160986165,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": 5.952954909704865e-05,
+          "ci95_low": -3.063499298736656e-05,
+          "mean": 9.794951225543215e-06,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": 0.0006200747926304178,
+          "ci95_low": -0.00027251603443946234,
+          "mean": 9.827923491693223e-05,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      },
+      "8": {
+        "4b_hy_clip_cosine": {
+          "ci95_high": 0.9531215192750097,
+          "ci95_low": 0.9075181349180639,
+          "mean": 0.9350297972559929,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_dino_cosine": {
+          "ci95_high": 0.865322888456285,
+          "ci95_low": 0.7441792917437852,
+          "mean": 0.805687926709652,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "4b_hy_lpips": {
+          "ci95_high": 0.1780249694595113,
+          "ci95_low": 0.12061274182051421,
+          "mean": 0.14821313065476716,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_fft_high_frequency_change_vs_4b": {
+          "ci95_high": 0.01037464509998984,
+          "ci95_low": -0.0045828460820166,
+          "mean": 0.0032247443279787816,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_gradient_energy_change_vs_4b": {
+          "ci95_high": 0.0004872750658594921,
+          "ci95_low": -1.63091392681887e-05,
+          "mean": 0.00017272542582695346,
+          "observations": 16,
+          "prompt_clusters": 16
+        },
+        "hy_laplacian_variance_change_vs_4b": {
+          "ci95_high": 0.0028821710962989673,
+          "ci95_low": -0.00016287808839550428,
+          "mean": 0.0010014663664374304,
+          "observations": 16,
+          "prompt_clusters": 16
+        }
+      }
+    },
+    "global": {
+      "4b_hy_clip_cosine": {
+        "ci95_high": 0.9613619668292813,
+        "ci95_low": 0.9358161830343306,
+        "mean": 0.9497805703431368,
+        "observations": 128,
+        "prompt_clusters": 16
+      },
+      "4b_hy_dino_cosine": {
+        "ci95_high": 0.91397280060919,
+        "ci95_low": 0.8828369456459768,
+        "mean": 0.8989526280201972,
+        "observations": 128,
+        "prompt_clusters": 16
+      },
+      "4b_hy_lpips": {
+        "ci95_high": 0.10396347534529013,
+        "ci95_low": 0.07860668588378986,
+        "mean": 0.09044335100088574,
+        "observations": 128,
+        "prompt_clusters": 16
+      },
+      "hy_fft_high_frequency_change_vs_4b": {
+        "ci95_high": 0.0021098961553636347,
+        "ci95_low": -0.003881848517745142,
+        "mean": -0.0008190028911342143,
+        "observations": 128,
+        "prompt_clusters": 16
+      },
+      "hy_gradient_energy_change_vs_4b": {
+        "ci95_high": 2.3863198491307265e-05,
+        "ci95_low": -8.42363515163184e-05,
+        "mean": -3.0429243673703837e-05,
+        "observations": 128,
+        "prompt_clusters": 16
+      },
+      "hy_laplacian_variance_change_vs_4b": {
+        "ci95_high": 0.0001914226629386316,
+        "ci95_low": -0.00046051029602981554,
+        "mean": -0.00013954217314751823,
+        "observations": 128,
+        "prompt_clusters": 16
+      }
+    }
+  }
+}

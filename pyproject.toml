@@ -44,6 +44,7 @@ dependencies = [
 
     # Basic Utils
     "imageio[ffmpeg]>=2.37.2",
+    "h5py>=3.16.0",
     "numpy>=1.26.4",
     "pillow>=10.4.0",
     "einops>=0.8.0",
@@ -78,6 +79,7 @@ nvidia = [
 # Only imported lazily in viz code paths, never in the core train/inference path.
 viz = [
     "matplotlib>=3.7.0",
+    "scipy>=1.15.0",
 ]
 
 all = [

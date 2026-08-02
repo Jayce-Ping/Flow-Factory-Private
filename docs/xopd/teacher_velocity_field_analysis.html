@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Teacher velocity-field analysis</title>
+<style>
+:root{color-scheme:dark;--bg:#181818;--panel:#222;--line:#3a3a3a;--text:#e7e7e7;--muted:#aaa;--good:#55b685;--bad:#e06c75;--warn:#d9a441;--info:#62a9e8}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif}
+main{max-width:1400px;margin:auto;padding:28px}.muted{color:var(--muted)}h1{font-size:25px;margin:0}h2{font-size:18px;margin:28px 0 12px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.two{grid-template-columns:repeat(2,1fr)}
+.card{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:15px}.stat{font-size:25px;font-weight:650}.label{color:var(--muted);font-size:12px}
+.callout{border-left:3px solid var(--info);background:var(--panel);padding:13px 15px;border-radius:4px}.bad{border-color:var(--bad)}.good{border-color:var(--good)}
+canvas{width:100%;height:280px}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid var(--line);text-align:right}th:first-child,td:first-child{text-align:left}
+.neg{color:var(--bad)}.pos{color:var(--good)}code{background:#2c2c2c;padding:2px 5px;border-radius:4px}a{color:var(--info)}
+@media(max-width:900px){.grid,.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body><main>
+<h1>Why 9B and HY blur 4B while 32B improves it</h1>
+<p class="muted">128 prompts × 28 ODE steps. Every teacher is queried on the same 4B-visited state. HY uses DeepEP EP=16. Source: teacher_gap_v1.</p>
+<div class="callout"><b>The difference is direction, not update magnitude.</b> 32B makes the largest correction but reinforces spatial detail. The smaller 9B and HY corrections oppose existing x0 gradients and Laplacians.</div>
+
+<h2>Global field geometry</h2>
+<div class="grid">
+ <div class="card"><div class="stat neg">0.121</div><div class="label">RMS(v9 − v4)</div></div>
+ <div class="card"><div class="stat neg">0.161</div><div class="label">RMS(vHY − v4)</div></div>
+ <div class="card"><div class="stat pos">0.551</div><div class="label">RMS(v32 − v4)</div></div>
+ <div class="card"><div class="stat">0.464 / 0.203</div><div class="label">cos(ΔHY,Δ9) / cos(ΔHY,Δ32)</div></div>
+</div>
+<div class="grid two" style="margin-top:12px">
+ <div class="card"><b>Velocity gaps over denoising</b><canvas id="gaps"></canvas><div class="label">x: step · y: velocity RMS</div></div>
+ <div class="card"><b>Correction direction</b><canvas id="directions"></canvas><div class="label">x: step · y: cosine with 4B-relative correction</div></div>
+</div>
+
+<h2>Latent detail direction</h2>
+<div class="grid">
+ <div class="card"><div class="stat neg">−0.168</div><div class="label">9B gradient cosine</div></div>
+ <div class="card"><div class="stat neg">−0.212</div><div class="label">HY gradient cosine</div></div>
+ <div class="card"><div class="stat pos">+0.191</div><div class="label">32B gradient cosine</div></div>
+ <div class="card"><div class="stat neg">−0.219</div><div class="label">HY Laplacian cosine</div></div>
+</div>
+<div class="grid two" style="margin-top:12px">
+ <div class="card"><b>x0 detail-gradient alignment</b><canvas id="detail"></canvas><div class="label">Negative cancels existing local detail; positive reinforces it.</div></div>
+ <div class="card"><b>x0 total-variation shift</b><canvas id="tv"></canvas><div class="label">Teacher x0 minus 4B x0.</div></div>
+</div>
+
+<h2>FP32-VAE decoded x0</h2>
+<table><thead><tr><th>Metric</th><th>9B vs 4B</th><th>HY vs 4B</th><th>32B vs 4B</th></tr></thead><tbody>
+<tr><td>LPIPS</td><td>0.0614</td><td>0.0904</td><td>0.2672</td></tr>
+<tr><td>DINO cosine</td><td>0.9359</td><td>0.8990</td><td>0.7796</td></tr>
+<tr><td>CLIP cosine</td><td>0.9625</td><td>0.9498</td><td>0.8787</td></tr>
+<tr><td>Gradient-energy change</td><td class="neg">−6.90e−5</td><td class="neg">negative at steps 16/24/27</td><td class="pos">+6.07e−4</td></tr>
+<tr><td>Laplacian-variance change</td><td class="neg">−4.50e−4</td><td class="neg">−1.19e−3 at step 16</td><td class="pos">+4.34e−3</td></tr>
+</tbody></table>
+
+<h2>Interpretation</h2>
+<div class="grid two">
+ <div class="callout bad"><b>9B and HY</b><br>Both are relatively close to 4B, but their correction directions remove spatial derivative energy. HY is more aligned with 9B than with 32B and has even stronger latent anti-detail cosine.</div>
+ <div class="callout good"><b>32B</b><br>The correction is 4–5× larger, yet adds gradient/Laplacian detail and mid-trajectory high-frequency power. A magnitude-only trust region cannot separate these cases.</div>
+</div>
+
+<h2>Recommended selective-OPD metric</h2>
+<div class="card"><code>c = cos(grad(x0_student), grad(x0_teacher − x0_student))</code><br>
+Use a detached sample-step mask or soft gate. Keep samples in every microbatch and zero only their per-sample loss, preserving gradient accumulation and collective ordering. Always compare with a random mask at the same keep rate.</div>
+
+<h2>Artifacts</h2>
+<p class="muted">Full reports: <code>docs/xopd/teacher_velocity_field_analysis.md</code> and <code>docs/xopd/hy_teacher_field_analysis.md</code>. Shared tensors and analysis live under <code>.../xopd/diagnostics/teacher_gap_v1/</code>.</p>
+</main>
+<script>
+const gap9=[.106,.104,.106,.110,.114,.116,.119,.117,.117,.117,.117,.117,.117,.116,.114,.112,.111,.111,.110,.111,.113,.116,.120,.127,.137,.151,.171,.188];
+const gap32=[1.204,1.206,1.220,1.173,1.091,1.003,.894,.809,.728,.637,.570,.505,.445,.386,.350,.312,.284,.263,.246,.231,.223,.218,.213,.215,.221,.234,.254,.279];
+const cos9_32=[.034,.031,.037,.055,.072,.086,.107,.124,.137,.157,.166,.183,.208,.231,.244,.259,.285,.308,.335,.350,.373,.393,.421,.435,.458,.482,.505,.531];
+const d9=[-.442,-.373,-.339,-.282,-.216,-.193,-.160,-.174,-.170,-.174,-.181,-.180,-.177,-.177,-.174,-.163,-.150,-.139,-.128,-.117,-.107,-.094,-.089,-.079,-.072,-.069,-.053,-.035];
+const d32=[.276,.322,.326,.355,.358,.340,.315,.287,.248,.203,.184,.167,.154,.142,.134,.139,.137,.149,.146,.155,.156,.160,.137,.127,.105,.076,.038,.016];
+const tv9=[-.003,0,.0002,.0012,.0032,.0033,.0042,.0015,.0006,-.0005,-.0021,-.0029,-.0038,-.0049,-.0057,-.0054,-.0048,-.0043,-.0038,-.0033,-.0027,-.0019,-.0018,-.0013,-.0011,-.0014,-.0007,-.0005];
+const tv32=[.194,.199,.220,.240,.258,.278,.281,.285,.275,.243,.217,.187,.157,.126,.107,.089,.075,.066,.057,.052,.046,.043,.035,.031,.025,.019,.011,.004];
+function chart(id,series,zero=true){
+ const c=document.getElementById(id),ctx=c.getContext('2d'),dpr=devicePixelRatio||1;c.width=c.clientWidth*dpr;c.height=280*dpr;ctx.scale(dpr,dpr);
+ const W=c.clientWidth,H=280,p=34,vals=series.flatMap(s=>s.data),mn=zero?Math.min(0,...vals):Math.min(...vals),mx=Math.max(0,...vals),span=mx-mn||1;
+ ctx.strokeStyle='#444';ctx.beginPath();ctx.moveTo(p,p);ctx.lineTo(p,H-p);ctx.lineTo(W-p,H-p);ctx.stroke();
+ if(mn<0&&mx>0){let y=p+(mx/span)*(H-2*p);ctx.strokeStyle='#555';ctx.beginPath();ctx.moveTo(p,y);ctx.lineTo(W-p,y);ctx.stroke()}
+ series.forEach(s=>{ctx.strokeStyle=s.color;ctx.lineWidth=2;ctx.beginPath();s.data.forEach((v,i)=>{let x=p+i/(s.data.length-1)*(W-2*p),y=p+(mx-v)/span*(H-2*p);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()});
+ ctx.font='12px system-ui';series.forEach((s,i)=>{ctx.fillStyle=s.color;ctx.fillText(s.name,p+120*i,16)});
+}
+chart('gaps',[{name:'9B−4B',data:gap9,color:'#e06c75'},{name:'32B−4B',data:gap32,color:'#55b685'}]);
+chart('directions',[{name:'cos(Δ9,Δ32)',data:cos9_32,color:'#d9a441'}]);
+chart('detail',[{name:'9B',data:d9,color:'#e06c75'},{name:'32B',data:d32,color:'#55b685'}]);
+chart('tv',[{name:'9B',data:tv9,color:'#e06c75'},{name:'32B',data:tv32,color:'#55b685'}]);
+</script></body></html>
