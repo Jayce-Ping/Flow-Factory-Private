@@ -1,6 +1,6 @@
 # 2026-07-21 · MoF as velocity decomposition: capacity ceiling vs optimization gap
 
-Formal companion: [`../mof_velocity_decomposition_analysis.tex`](../mof_velocity_decomposition_analysis.tex)
+Formal companion: [`../core/mof/mof_velocity_decomposition_analysis.tex`](../core/mof/mof_velocity_decomposition_analysis.tex)
 (build with `pdflatex` when a TeX toolchain is available).
 
 ## Motivating observation & idea

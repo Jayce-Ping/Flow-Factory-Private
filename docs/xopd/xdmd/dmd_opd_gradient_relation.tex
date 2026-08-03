@@ -1,0 +1,256 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+\setlength{\emergencystretch}{3em}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\xh}{\hat{x}_0}
+\newcommand{\real}{\mathrm{real}}
+\newcommand{\fake}{\mathrm{fake}}
+
+\newtheorem*{remark*}{Remark}
+\newtheorem*{prop*}{Proposition}
+
+\title{\textbf{OPD vs.\ DMD: the loss/gradient relationship}\\[0.3em]
+\large Pointwise velocity regression vs.\ distribution matching for
+flow-matching distillation, and why they coincide only in the infinite-capacity limit}
+\author{Jayce-Ping}
+\date{2026-07-27}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We make precise the relationship between the \emph{pointwise} distillation loss used by
+DiffusionOPD / XOPD (velocity or clean-latent MSE, ``\texttt{xopd\_dk\_space}'') and the
+\emph{distribution-matching} loss of DMD/DMD2. Writing both gradients in the shared flow-matching
+$\xh$ parameterization, we show they carry the \emph{same} error signal $(\xh^\theta-\xh^\psi)$ but
+differ in (i) the Jacobian they backpropagate through --- $\partial_\theta v_\theta$ (the velocity
+output at a fixed input) for OPD vs.\ $\partial_\theta x$ (the generated sample, through the
+sampler) for DMD --- and (ii) whether the ``fake'' term is an \emph{independent, online} score of
+the student distribution. The two objectives share an optimum under infinite capacity, but under a
+capacity gap the $L^2$-optimal field differs from the $\KL$-optimal distribution. A corollary: DMD
+with the fake pinned to the teacher, or to the student's own one-step map, collapses to a
+(reweighted) MSE; genuine distribution matching requires the third, online fake-score network.
+This is exactly the piece the self-normalized \texttt{x0\_norm} space structurally lacks.
+\end{abstract}
+
+\section{Setup and notation}
+Rectified-flow / flow matching on a shared latent space. For a clean latent $x_0$, noise
+$\varepsilon\sim\N(0,I)$, and schedule $\sigma=\sigma(t)=t/T\in[0,1]$,
+\begin{equation}
+x_t=(1-\sigma)\,x_0+\sigma\,\varepsilon,\qquad
+v=\varepsilon-x_0,\qquad
+\xh(x_t)=x_t-\sigma\,v(x_t),
+\end{equation}
+so the velocity $v$ and the one-step clean estimate $\xh$ are interchangeable. The (frozen) teacher
+velocity field is $v_\psi$, the student is $v_\theta$; write
+$\xh^\theta=x_t-\sigma v_\theta$, $\xh^\psi=x_t-\sigma v_\psi$, hence
+\begin{equation}\label{eq:resid}
+\xh^\theta-\xh^\psi=-\sigma\,(v_\theta-v_\psi).
+\end{equation}
+The student induces a sample distribution $p_\theta$ (its ODE/consistency rollout); the teacher/target
+is $p_{\real}$.
+
+\section{OPD: pointwise field regression}
+DiffusionOPD / XOPD's per-step term $d_k$ is a plain MSE in one of four spaces
+(\texttt{xopd\_dk\_space}$\in\{v,\,xt,\,x0,\,x0\_norm\}$). Using \eqref{eq:resid}, at a
+\emph{given} $x_t$,
+\begin{align}
+L^{(v)}   &=\E\norm{v_\theta-v_\psi}^2,
+&\nabla_\theta L^{(v)}   &=2\,\E\!\big[(v_\theta-v_\psi)\,\partial_\theta v_\theta\big],\\
+L^{(x_0)} &=\E\norm{\xh^\theta-\xh^\psi}^2=\E\,\sigma^2\norm{v_\theta-v_\psi}^2,
+&\nabla_\theta L^{(x_0)} &=2\,\E\!\big[\sigma^2(v_\theta-v_\psi)\,\partial_\theta v_\theta\big],\\
+L^{(xt)}  &=\E\norm{\mu_\theta-\mu_\psi}^2\propto\E\,\Delta t^2\norm{v_\theta-v_\psi}^2,
+&\nabla_\theta L^{(xt)}  &=2\,\E\!\big[\Delta t^2(v_\theta-v_\psi)\,\partial_\theta v_\theta\big],
+\end{align}
+where $\mu=x_t+v\,\Delta t$ is the Euler transition mean. Thus the three ``geometric'' spaces are
+one gradient reweighted by $a(t)\in\{1,\Delta t^2,\sigma^2\}$ (the identity
+$\mathrm{MSE}(v):\mathrm{MSE}(xt):\mathrm{MSE}(x_0)=1:\Delta t^2:\sigma^2$). The
+self-normalized space divides the $x_0$ loss by a detached per-sample scale,
+\begin{equation}
+L^{(x0\_norm)}=\E\!\left[\frac{\norm{\xh^\theta-\xh^\psi}^2}
+{\sg\big(\overline{|\xh^\theta-\xh^\psi|}\big)+\epsilon}\right],
+\qquad
+\nabla_\theta L^{(x0\_norm)}=\E\!\left[\frac{2\sigma\,(v_\theta-v_\psi)\,\partial_\theta v_\theta}
+{\sg(\text{scale})}\right],
+\end{equation}
+which equalizes each step's gradient magnitude (DiffusionNFT/DMD-style adaptive reweighting) but
+does \emph{not} change the direction. \textbf{Two structural facts hold for every OPD variant:}
+\begin{enumerate}[leftmargin=1.6em]
+\item the \emph{target} is the teacher \emph{field} $v_\psi$ (equivalently $\xh^\psi$) evaluated at
+the \emph{same} input $x_t$; the error signal is $(v_\theta-v_\psi)\propto(\xh^\theta-\xh^\psi)$;
+\item the gradient backpropagates through $\partial_\theta v_\theta$ --- the velocity \emph{output}
+at a \emph{fixed} input $x_t$. It is behaviour-cloning of a vector field; the sampler is never
+differentiated.
+\end{enumerate}
+
+\section{DMD: distribution matching}
+DMD trains a generator $x=G_\theta(z,c)$ (few-step) to minimize $\KL(p_\theta\,\|\,p_{\real})$ via
+the variational-score-distillation gradient. With a Gaussian perturbation at level $t$, the score
+and the one-step clean estimate are related by
+$\nabla\log p_t(x_t)=-(x_t-\xh^{p})/\sigma^2$, so the score \emph{difference} between the target and
+the student's own distribution is
+\begin{equation}
+s_{\real}(x_t)-s_{\fake}(x_t)\;\propto\;\frac{\xh^{\fake}(x_t)-\xh^{\real}(x_t)}{\sigma^2},
+\end{equation}
+where $\xh^{\real}$ comes from the frozen teacher and $\xh^{\fake}$ from an \emph{online} score
+network trained (by denoising) to track the current $p_\theta$. The DMD gradient is
+\begin{equation}\label{eq:dmd}
+\nabla_\theta L_{\mathrm{DMD}}
+=\E_{t,\,x=G_\theta(z)}\!\Big[w(t)\,\big(s_{\fake}(x_t)-s_{\real}(x_t)\big)\;\partial_\theta x\Big].
+\end{equation}
+The DMD2 implementation realizes \eqref{eq:dmd} in $\xh$ space with a stop-gradient identity. With
+$p_{\real}=x-\xh^{\real}$, $p_{\fake}=x-\xh^{\fake}$, and the self-normalization
+$\mathrm{norm}=\overline{|p_{\real}|}$,
+\begin{equation}\label{eq:dmd2}
+g=\frac{p_{\real}-p_{\fake}}{\mathrm{norm}}=\frac{\xh^{\fake}-\xh^{\real}}{\mathrm{norm}},
+\qquad
+L_{\mathrm{DMD}}=\tfrac12\norm{x-\sg(x-g)}^2
+\;\Rightarrow\;
+\nabla_\theta L_{\mathrm{DMD}}=g\,\partial_\theta x .
+\end{equation}
+\textbf{Two structural facts:} (i) the direction is the \emph{difference of two scores}
+$\xh^{\fake}-\xh^{\real}$, moving $x$ \emph{away from} its own current density and \emph{toward} the
+target; (ii) the gradient backpropagates through $\partial_\theta x$ --- the generated \emph{sample}
+position, i.e.\ through the sampler.
+
+\section{The core relationship}
+Both gradients are ``(an $\xh$ residual) $\times$ (a Jacobian)''. Table~\ref{tab:cmp} lines them up.
+
+\begin{table}[ht]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+& \textbf{OPD} (MSE$(x_0)$/$x0\_norm$) & \textbf{DMD} \\
+\midrule
+error signal & $\xh^\theta-\xh^\psi$ (student$-$teacher, one point) & $\xh^{\fake}-\xh^{\real}$ (fake$-$real scores)\\
+Jacobian & $\partial_\theta \xh^\theta=-\sigma\,\partial_\theta v_\theta$ (velocity output) & $\partial_\theta x$ (generated sample, thru sampler)\\
+``fake'' role & --- (none) & \emph{independent online} score of $p_\theta$\\
+metric minimized & $L^2$ on the velocity \emph{field} & $\KL$ on the induced \emph{distribution}\\
+optimum & conditional-mean field & mode-seeking / sharper samples\\
+stability & stable, single fixed target & adversarial-flavored, two-timescale\\
+\bottomrule
+\end{tabular}
+\caption{OPD and DMD carry an $\xh$-residual times a Jacobian; they differ in the residual's second
+term, the Jacobian, and whether a third online network is present.}
+\label{tab:cmp}
+\end{table}
+
+\subsection[Differentiate with respect to v or x]
+{Differentiate w.r.t.\ $v$ or w.r.t.\ $x$}
+This is the crux the two objectives disagree on. OPD moves $\theta$ so the velocity \emph{output}
+$v_\theta(x_t)$ matches $v_\psi(x_t)$ at inputs $x_t$ drawn from the rollout, holding $x_t$ fixed in
+the backward pass. DMD moves $\theta$ so the \emph{sample} $x=G_\theta(z)$ shifts along
+$\xh^{\real}-\xh^{\fake}$, differentiating through the sampler ($\partial_\theta x$). Field-matching
+vs.\ sample-moving.
+
+\subsection[Reduction 1: fake equals teacher]
+{Reduction 1: fake $=$ teacher $\Rightarrow$ no signal}
+If the online fake is pinned to the teacher, $\xh^{\fake}=\xh^{\real}$ and \eqref{eq:dmd2} gives
+$g=0$: DMD is \emph{degenerate}. Note this is \emph{not} what $x0\_norm$ does: $x0\_norm$ keeps the
+\emph{OPD} residual $\xh^\theta-\xh^\psi$ (student$-$teacher) and only borrows DMD2's per-sample
+self-normalization. So
+\begin{equation*}
+\boxed{\parbox{0.92\linewidth}{\centering
+$x0\_norm=\text{OPD }x_0\text{ residual }+\text{ DMD2 self-normalization}$;\\[0.35em]
+it is \emph{not} distribution matching (no online fake, differentiates $v$, not $x$).}}
+\end{equation*}
+
+\subsection[Reduction 2: fake equals the student map]
+{Reduction 2: fake $=$ the student's own one-step map $\Rightarrow$ reweighted MSE}
+Suppose one ``cheaply'' sets $\xh^{\fake}=\xh^\theta$ (the student's own one-step clean prediction)
+and $\xh^{\real}=\xh^\psi$. Then the DMD direction becomes the OPD residual,
+\begin{equation}
+g=\frac{\xh^{\fake}-\xh^{\real}}{\mathrm{norm}}=\frac{\xh^\theta-\xh^\psi}{\mathrm{norm}},
+\end{equation}
+and \eqref{eq:dmd2} gives $\nabla_\theta L=g\,\partial_\theta x$, versus OPD's
+$\nabla_\theta L^{(x_0)}=(\xh^\theta-\xh^\psi)\,\partial_\theta\xh^\theta
+=-(\xh^\theta-\xh^\psi)\,\sigma\,\partial_\theta v_\theta$. \emph{Same error signal, different
+Jacobian} ($\partial_\theta x$ vs.\ $-\sigma\,\partial_\theta v_\theta$).
+
+\paragraph{Why ``biased'' (not a pejorative on MSE).}
+True DMD needs $s_{\fake}=\nabla\log p_\theta$, the score of the \emph{distribution of samples}
+produced by the generator $G_\theta$ (the pushforward of the noise prior under the sampler).
+Setting $\xh^{\fake}=\xh^\theta(x_t)$ substitutes a different object: the student's
+\emph{pointwise field} evaluated at $x_t$. These coincide only when $v_\theta$ is consistent
+with being the MMSE denoiser / score of its own induced $p_\theta$ (infinite capacity +
+consistency). In general --- and especially for a capacity-limited or few-step student being
+distilled toward $v_\psi$ --- $v_\theta$ approximates the \emph{teacher field}, not
+$\nabla\log p_\theta$. So $\xh^\theta$ is a \textbf{biased estimator of the fake score}:
+the KL identity fails even though the residual looks like an MSE. What remains is precisely
+a (self-)reweighted OPD residual, only routed through $\partial_\theta x$ instead of
+$\partial_\theta v_\theta$.
+
+\begin{prop*}[No free lunch]
+Replacing $\partial_\theta v_\theta$ by $\partial_\theta x$ (routing the same MSE residual through
+the sampler), or pinning the fake to teacher/student, does \emph{not} produce a distribution loss.
+Equation~\eqref{eq:dmd} equals the $\KL$ gradient only when $s_{\fake}=\nabla\log p_\theta$ is an
+\emph{independent, freshly trained} estimate of the student's own (moving) score. With
+fake$=$teacher the signal vanishes; with fake$=$student ($\xh^{\fake}\leftarrow\xh^\theta$) the
+fake score is biased for $\nabla\log p_\theta$, leaving a reweighted MSE routed through the
+rollout. Hence genuine DMD is irreducibly a \emph{three-network} system
+(real, online-fake, student); it cannot be obtained from OPD by an algebraic substitution.
+\end{prop*}
+
+\subsection{Why they agree only in the infinite-capacity limit}
+If the student can represent the teacher field exactly, the optimum $v_\theta^\star=v_\psi$ makes
+\emph{both} gradients vanish (OPD residual $=0$; then $p_\theta=p_{\real}$ so the DMD score
+difference $=0$): the objectives share this optimum, and pointwise matching a \emph{deterministic}
+teacher field is the principled thing to do (it is not the ``mode-averaging'' trap, because the
+per-input target is single-valued). Under a capacity gap the objectives diverge: OPD returns the
+$L^2$ projection onto the field (a conditional mean, whose \emph{induced} distribution can be
+blurred), whereas DMD returns the $\KL$-closest distribution (mode-seeking, sharper). The $L^2$
+metric on the velocity field is simply not the $\KL$ metric on the transported distribution, so for
+a capacity-limited student (small model / few steps) DMD can produce better samples even when
+distilling the very same deterministic teacher.
+
+\section{Extensions (for completeness)}
+\paragraph{TDM (Trajectory Distribution Matching).} Match $p_\theta$ to $p_{\real}$ not only at the
+endpoint but at several trajectory times along a discrete ODE grid, so the gradient acts on
+trajectory marginals rather than only the terminal density (Luo et al., ICCV 2025). Practical
+surrogates use an online fake score, non-overlapping diffusion intervals $[t_i,t_{i+1}]$, and
+truncated differentiation through \emph{one} ODE step (no full BPTT). See
+\path{docs/xopd/trajectory_dm/tdm_opd_dm_gradient_relation.tex} and \texttt{tdm\_cross\_model\_design.md}
+(\texttt{trainer\_type: xtdm}).
+\paragraph{Approach~B (OPD grid + score difference).} Keep XOPD's multi-step ODE schedule but
+replace per-step field MSE by a DMD-style score-difference force on the sample state $x_{t_i}$
+with $\partial_\theta x_{t_i}$ through one Euler step. This is \emph{not} obtained by swapping
+residuals inside \texttt{compute\_per\_step\_kl} while keeping $x_t$ fixed. Design:
+\path{docs/xopd/trajectory_dm/approach_b_trajectory_dm_design.md} (\texttt{trainer\_type: xopd\_dm}).
+\paragraph{Transport-operator view.} A flow is an operator $\Phi_{1\to0}$. Merging teachers is a
+mixture of induced distributions $\Phi_S\approx\sum_i\pi_i\Phi_i$ (a distribution-level statement),
+and factorizing is a composition $\Phi_T\approx\Phi_K\circ\cdots\circ\Phi_1$; the linear
+velocity combination $v=\sum_i w_i v_i$ is only a first-order surrogate for these, which is why
+velocity-space MSE and image/trajectory-space distribution matching are genuinely different.
+
+\section{Practical implications for XOPD}
+\begin{itemize}[leftmargin=1.4em]
+\item OPD's move \texttt{xt}$\to$\texttt{v}/\texttt{x0} fixed the per-step reweighting (removing the
+$\Delta t^2$ last-step dominance) and is stable and correct in the capacity limit; it is
+\emph{not} ``going backwards''.
+\item \texttt{x0\_norm} $=$ OPD residual $+$ DMD2 self-normalization: it equalizes per-step gradient
+magnitude but is still pointwise field regression --- no online fake, differentiates $v$ not $x$.
+\item To obtain a genuine distribution signal one must add the \emph{online fake-score} network and
+differentiate through the sampler ($\partial_\theta x$), i.e.\ the \texttt{XDMDTrainer} design
+(\texttt{docs/xopd/xdmd/dmd\_cross\_model\_design.md}): real $=$ 32B teacher, fake $=$ a second LoRA
+adapter tracking $p_\theta$, student $=$ the few-step generator; direction
+$\xh^{\fake}-\xh^{\real}$, applied by the stop-gradient identity \eqref{eq:dmd2}. That online fake
+is precisely the term \texttt{x0\_norm} lacks.
+\end{itemize}
+
+\end{document}

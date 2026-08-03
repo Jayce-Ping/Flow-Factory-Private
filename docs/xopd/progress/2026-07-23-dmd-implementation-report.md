@@ -1,6 +1,6 @@
 # DMD (cross-model) implementation report
 
-Date: 2026-07-23. Design: `docs/xopd/dmd_cross_model_design.md`. Reference: **tianweiy/DMD2**
+Date: 2026-07-23. Design: `docs/xopd/xdmd/dmd_cross_model_design.md`. Reference: **tianweiy/DMD2**
 (strictly aligned). Code: `src/flow_factory/trainers/xopd/dmd_trainer.py` (`XDMDTrainer`, registry
 `xdmd`). Status: **code complete; verified by CPU import + config parse + code review only. NO GPU
 smoke yet** (cluster busy). GPU-validation risks in §6.

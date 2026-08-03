@@ -17,9 +17,9 @@ Loss-space / timestep ablations vs the OCR specialist (all OCR data, otherwise i
 | full-timestep x0-MSE | `flux2_klein_32b_to_4b_l1_ocr_xspace_1kep.yaml` | xopd_dk_space="x0" |
 | full-timestep v-MSE | `flux2_klein_32b_to_4b_l1_ocr_vmse_1kep.yaml` | xopd_dk_space="v" |
 
-Theory: [`../per_timestep_loss_dominance_theory.tex`](../per_timestep_loss_dominance_theory.tex).
+Theory: [`../core/shared/per_timestep_loss_dominance_theory.tex`](../core/shared/per_timestep_loss_dominance_theory.tex).
 
-## Auto-relay on THIS cluster ([run_three_experts.sh](../../scripts/xopd_cluster/run_three_experts.sh))
+## Auto-relay on THIS cluster ([run_three_experts.sh](../../../scripts/xopd_cluster/run_three_experts.sh))
 **Superseded 2026-07-16** — see [`2026-07-16-loss-space-ablation-plan.md`](2026-07-16-loss-space-ablation-plan.md).
 
 Revised order: OCR (done) -> geneval_enhanced (done) -> **OCR v-MSE** (this cluster) in parallel with

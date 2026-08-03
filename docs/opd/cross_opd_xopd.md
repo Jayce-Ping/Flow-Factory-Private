@@ -14,7 +14,7 @@ import OPD internals.
 - Helpers: [`src/flow_factory/trainers/xopd/common.py`](../../src/flow_factory/trainers/xopd/common.py)
 - Args: `XOPDTrainingArguments` in [`src/flow_factory/hparams/training_args.py`](../../src/flow_factory/hparams/training_args.py)
 - Registry key: `trainer_type: "xopd"`
-- Example config: [`xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1.yaml`](../../xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1.yaml) (see [`xopd_configs/README.md`](../../xopd_configs/README.md) for the full config matrix)
+- Example config: [`xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1_geneval.yaml`](../../xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1_geneval.yaml) (see [`xopd_configs/README.md`](../../xopd_configs/README.md) for the full config matrix)
 
 ## Teacher mechanism (vs OPD)
 
@@ -64,7 +64,7 @@ still executes the negative branch in PDM mode because the scale controls state
 visitation, not the branch-aware pointwise loss.
 The derivation, target-mode compatibility matrix, config contract,
 distributed constraints, and ablation design are documented in
-[`docs/xopd/branch_aware_cfg_distillation.md`](../xopd/branch_aware_cfg_distillation.md).
+[`docs/xopd/core/cfg/branch_aware_cfg_distillation.md`](../xopd/core/cfg/branch_aware_cfg_distillation.md).
 
 ## Two stages (single run, switch on epoch)
 
@@ -162,7 +162,7 @@ For `y ~ pi_old`, `log rho ~ N(-K, 2K)` exactly, where
 `K = KL(pi_old || pi_teacher)` is logged as `popd/teacher_old_kl_joint`. Both
 ends of the axis have now been measured on a 9B -> 4B probe, and the outcome is
 recorded in
-[`docs/xopd/popd_exact_sum_gate_saturation.tex`](../xopd/popd_exact_sum_gate_saturation.tex):
+[`docs/xopd/core/p_opd/popd_exact_sum_gate_saturation.tex`](../xopd/core/p_opd/popd_exact_sum_gate_saturation.tex):
 
 - `temperature = 1` (exact sum) does NOT train. 75% of transitions fall below
   `gamma = 0.01` and `grad_norm` reaches only 2.2e-5. The cause is dimension
@@ -339,7 +339,7 @@ ODE timestep-subset selection is a future extension (everything routes through o
 ## Run
 
 ```bash
-ff-train xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1.yaml
+ff-train xopd_configs/ode_pathwise/flux2_klein_9b_to_4b_l1_geneval.yaml
 ```
 
 **Storage / HF cache (avoid network-FS lock failures):** put the HuggingFace

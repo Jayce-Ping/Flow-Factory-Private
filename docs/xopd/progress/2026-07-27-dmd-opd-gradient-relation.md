@@ -1,6 +1,6 @@
 # OPD vs DMD — loss/gradient relationship (companion note)
 
-Date: 2026-07-27. Full derivation: `docs/xopd/dmd_opd_gradient_relation.tex` (LaTeX source; the
+Date: 2026-07-27. Full derivation: `docs/xopd/xdmd/dmd_opd_gradient_relation.tex` (LaTeX source; the
 local `tex` conda env is currently broken — missing `mktexlsr.pl` — so the PDF was not built here).
 This note is the immediately-readable summary.
 
@@ -77,5 +77,5 @@ returns the `KL`-closest distribution (sharper). `L²`-on-field ≠ `KL`-on-dist
   regression.
 - `x0_norm` = OPD residual + DMD2 normalization; still pointwise field regression.
 - Genuine distribution signal ⇒ add the **online fake-score** net and differentiate through the
-  sampler (`∂_θ x`): the `XDMDTrainer` design (`docs/xopd/dmd_cross_model_design.md`). That online
+  sampler (`∂_θ x`): the `XDMDTrainer` design (`docs/xopd/xdmd/dmd_cross_model_design.md`). That online
   fake is exactly the term `x0_norm` structurally lacks.

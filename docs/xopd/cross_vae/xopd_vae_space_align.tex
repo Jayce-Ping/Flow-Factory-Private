@@ -1,0 +1,858 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont[AutoFakeBold=2,AutoFakeSlant=.2]{STSong}
+\setCJKsansfont{STHeiti}
+\setCJKmonofont{STSong}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pifont}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.5cm}
+\setlength{\emergencystretch}{3em}
+
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\Enc}{\mathcal{E}}
+\newcommand{\Dec}{\mathcal{D}}
+\newcommand{\Xspace}{\mathcal{X}}
+\newcommand{\Zt}{\mathcal{Z}_T}
+\newcommand{\Zs}{\mathcal{Z}_S}
+\newcommand{\Tmap}{\mathsf{T}}
+\newcommand{\push}{\#}
+\newcommand{\vT}{v_{T}}
+\newcommand{\vS}{v_{\theta}}
+\newcommand{\Jac}{\mathbf{J}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{assumption}{Assumption}
+
+\title{\textbf{跨 VAE 隐空间的 Cross-Model On-Policy Distillation}\\[0.3em]
+\large XOPD with Heterogeneous Latent Spaces：理论形式化与算法族\\[0.4em]
+\large 以 FLUX.2-dev (32B) $\to$ SD3.5 为参考实例}
+\author{Jayce-Ping}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+现有 XOPD 蒸馏器（\texttt{trainers/xopd/trainer.py}）建立在一个硬约束之上：
+teacher 与 student \emph{共享同一个 VAE 隐空间}（\texttt{load\_teacher\_transformer}
+显式断言 \texttt{teacher.in\_channels == student.in\_channels}）。当我们希望把
+FLUX.2-dev（其 VAE 隐空间 $\Zt$）蒸馏到 Stable Diffusion 3.5（隐空间 $\Zs$，
+通道数/分辨率/统计均不同）时，这个约束被打破：teacher 的 velocity 场与 transition
+分布都活在 $\Zt$ 中，而 student 的 rollout、loss、梯度都活在 $\Zs$ 中。
+
+本文把"跨 VAE 蒸馏"形式化为一个\textbf{隐空间传输映射} (latent transport map)
+$\Tmap:\Zt\to\Zs$ 的设计问题，并给出一个统一框架：XOPD 的两个 loss（L0
+velocity regression 与 L1 transition-KL）分别对 $\Tmap$ 提出\emph{不同强度}的要求
+——L0 只需在\emph{干净样本}上传输（sample transport），而 L1 需要传输整个
+\emph{velocity 场}（vector-field pushforward），后者只有当 $\Tmap$ 是可逆光滑映射、
+且其 Jacobian 行为良好时才成立。由此我们得到一个关键结论：\textbf{仿射/线性传输是
+唯一能让 L0 与 L1 同时精确成立的传输类}，因为它的 Jacobian 是常数、且保持 flow
+matching 的插值路径结构。
+
+在此框架下我们形式化并比较四类算法：(M1) pixel-space 桥接（decode-encode），
+(M2) 学习式 latent projector（线性 / 仿射 / 非线性），(M3) CV-VAE 式重建对齐
+(\href{https://arxiv.org/abs/2405.20279}{arXiv:2405.20279}，把对齐推到 VAE 训练阶段)，
+以及我们新提出的 (M4) 概率耦合 / 分布矩匹配、(M5) cycle-consistent 联合学习传输、
+(M6) shared-decoder 微调。对每种方法我们给出其对 L0/L1 的精确作用、有损性来源、
+可微性与梯度路径、训练开销，并用一个统一的\emph{传输一致性误差}
+$\delta_{\Tmap}$ 给出 loss 偏差的上界。最后给出与 \texttt{trainers/xopd} 现有代码
+对齐的实现设计（抽象出 \texttt{VAETransport}、放松 \texttt{in\_channels} 断言、
+传输在 L0/L1 中的插入点、config 接口与实现优先级），\textbf{本文不写生产代码，只做
+设计}。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%% ============================================================
+\section{Motivation 与问题设定}
+\label{sec:motivation}
+%% ============================================================
+
+\subsection{XOPD 回顾：共享隐空间假设}
+
+设 student 是一个在隐空间 $\Zs\subseteq\R^{d_S}$ 上的 flow-matching 模型，其
+velocity 场为 $\vS(z,t)$（$\theta$ 为可训练参数，实现中是 LoRA）。teacher 是一个
+冻结的大模型，velocity 场为 $\vT$。XOPD 的两个 loss（见
+\texttt{cross\_opd\_xopd.md}）为：
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{L0（velocity regression，off-policy）}：teacher 先 rollout 出干净
+隐变量 $z_0^{T}$，构造数据路径 $z_t=(1-\sigma_t)z_0^T+\sigma_t\,\epsilon$，然后在
+\emph{同一个} $z_t$ 上回归
+\begin{equation}
+\loss_{\mathrm{L0}}
+=\E_{t,\epsilon}\Big[\,w(t)\,\big\lVert \vS(z_t,t)-\vT(z_t,t)\big\rVert^2\,\Big].
+\label{eq:l0-shared}
+\end{equation}
+
+\item \textbf{L1（transition matching，on-policy）}：student 自己 rollout 轨迹
+$\{x_k\}$，对每个训练时间步计算 student / teacher 的转移高斯均值
+$\mu_\theta(x_k),\mu_T(x_k)$，以闭式高斯 KL（即 $D_k$）作为 pathwise loss：
+\begin{equation}
+D_k=\frac{\lVert \mu_\theta(x_k)-\mu_T(x_k)\rVert^2}{2\bar\sigma_k^2},
+\qquad
+\loss_{\mathrm{L1}}=\E\Big[\textstyle\sum_k D_k\Big]
+\;(+\,\text{REINFORCE}\,+\,\text{KL anchor}).
+\label{eq:l1-shared}
+\end{equation}
+\end{itemize}
+
+\eqref{eq:l0-shared} 与 \eqref{eq:l1-shared} 的共同前提是 $\vS$ 与 $\vT$
+\textbf{定义在同一个隐空间}：L0 在同一个 $z_t$ 上比较两者，L1 在 student 访问到的
+状态 $x_k\in\Zs$ 上查询 teacher 的均值 $\mu_T(x_k)$。代码用一行断言保证它：
+
+\begin{tcolorbox}[colback=red!4,colframe=red!50!black,title=\texttt{flux2\_klein.py:1363} 的硬约束]
+\small
+\begin{verbatim}
+student_in_channels = self.pipeline.transformer.config.in_channels
+teacher_in_channels = teacher.config.in_channels
+if teacher_in_channels != student_in_channels:
+    raise ValueError("... shared-latent-space assumption is violated ...")
+\end{verbatim}
+\end{tcolorbox}
+
+\subsection{跨 VAE 问题}
+
+记 teacher VAE 为 $(\Enc_T,\Dec_T)$、隐空间 $\Zt\subseteq\R^{d_T}$；student VAE 为
+$(\Enc_S,\Dec_S)$、隐空间 $\Zs\subseteq\R^{d_S}$；共享的像素空间为 $\Xspace$。
+$\Enc_T:\Xspace\to\Zt$，$\Dec_T:\Zt\to\Xspace$，student 同理。一般地
+\[
+d_T\neq d_S,\quad
+\Zt\not\cong\Zs,\quad
+\Enc_T\neq\Enc_S,
+\]
+通道数、空间下采样率、逐通道统计（FLUX.2 VAE 还带一个 BatchNorm 标准化层，见
+\texttt{decode\_latents}）都不同。直接把 $\vT$ 代入 \eqref{eq:l0-shared} 或把
+$\mu_T(x_k)$ 用于 \eqref{eq:l1-shared} 在类型上就不合法。
+
+\begin{tcolorbox}[colback=blue!4,colframe=blue!50!black,title=核心问题]
+我们需要一个\textbf{隐空间传输映射} $\Tmap:\Zt\to\Zs$，把 teacher 在 $\Zt$ 中产生
+的信号（干净样本 $z_0^T$、或整个 velocity 场 $\vT$）搬运到 $\Zs$ 中，使得 XOPD 的
+监督信号重新变得"类型合法且语义正确"。本文的全部内容就是：$\Tmap$ 应满足什么性质、
+有哪些构造法、各自对 L0/L1 的作用与代价。
+\end{tcolorbox}
+
+%% ============================================================
+\section{形式化：隐空间传输映射}
+\label{sec:formal}
+%% ============================================================
+
+\subsection{两种传输：样本传输 vs.\ 速度场传输}
+
+跨 VAE 蒸馏的微妙之处在于：L0 与 L1 需要的\emph{不是同一种}传输。
+
+\begin{definition}[语义一致性 / 像素锚定]
+我们称 $\Tmap:\Zt\to\Zs$ 是\textbf{像素一致}的，若对 teacher 隐变量 $z\in\Zt$，
+$\Tmap(z)$ 解码出的图像与 $z$ 解码出的图像一致：
+\begin{equation}
+\Dec_S\big(\Tmap(z)\big)\approx \Dec_T(z),
+\qquad\forall z\in\Zt.
+\label{eq:pixel-consistent}
+\end{equation}
+像素一致是所有合理传输的\emph{语义正确性}判据：两个隐变量"代表同一张图"。
+\end{definition}
+
+\begin{definition}[样本传输与速度场传输]
+\leavevmode
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{样本传输 (sample transport)}：只要求把\emph{干净样本} $z_0^T$ 搬到
+$\Zs$：$z_0^S=\Tmap(z_0^T)$。L0 只需要这个。
+\item \textbf{速度场传输 (vector-field pushforward)}：要求把整个 velocity 场
+$\vT$ 搬到 $\Zs$ 上的一个场 $(\Tmap_\push \vT)$，使其在 $\Zs$ 中生成的概率流与
+teacher 在 $\Zt$ 中的流经 $\Tmap$ 推前后一致。L1 需要这个。
+\end{itemize}
+\end{definition}
+
+\begin{remark}[隐变量\emph{不}服从高斯分布——四个分布的辨析]
+\label{rem:not-gaussian}
+本文从不假设 latent 服从高斯分布，这一点必须澄清，因为 VAE 语境里至少有四个分布被
+经常混淆，它们的高斯性截然不同：
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{逐图后验} $q(z\mid x)=\N(\mu_\phi(x),\mathrm{diag}\,\sigma_\phi^2(x))$：
+\emph{高斯}（reparameterization trick 构造使然，单张图）；
+\item \textbf{聚合后验/边际} $q(z)=\int q(z\mid x)\,p_{\mathrm{data}}(x)\,dx$：
+\emph{非高斯}（一张图一个分量的巨型混合，多峰、携带全部图像结构）；
+\item \textbf{干净隐变量} $z_0$ 的分布：\emph{非高斯}（$=$ 上面的边际，正是 flow 要去
+刻画的目标——若它高斯则生成平凡）；
+\item \textbf{噪声端} $z_1\sim\N(0,I)$：\emph{高斯}（flow matching 的 prior 端，定义）。
+\end{itemize}
+所以"干净图像/干净 latent 不服从高斯"是\textbf{正确}的：非高斯的是\emph{边际}
+$q(z_0)$。唯一天然高斯的是\emph{逐图后验}与\emph{噪声端}。此外，要让\emph{边际}接近
+$\N(0,I)$ 还需 KL 正则权重足够大且无 prior hole；而 FLUX.2 / SD3.5 这类扩散用 VAE 的
+KL 权重极小（$\sim 10^{-6}$，近乎纯自编码器以保重建保真度），其边际\textbf{比教科书
+VAE 离高斯更远}。FLUX.2 VAE 的 BatchNorm（\texttt{decode\_latents} 中
+$z\cdot\mathrm{std}+\mathrm{mean}$）只标准化\emph{逐通道一阶/二阶矩}，标准化 $\neq$
+高斯化——通道内形状、跨通道/跨空间依赖仍非高斯。
+
+\textbf{对本文的影响}：偏好线性传输的真正依据是\emph{几何}（Prop.~\ref{prop:affine}，
+见其后的 Rem.~\ref{rem:affine-geometry}），\textbf{不}依赖任何分布假设；L1 的逐步高斯
+KL（$D_k$）匹配的是\emph{条件}转移分布 $z_{k+1}\mid z_k$（由 SDE 加性噪声构造，本就
+高斯），与 $z_0$ 边际是否高斯无关。下面 M4（\S\ref{sec:methods}）只在边际\emph{恰好}
+近高斯时才升级为全局最优；一般情形它退化为\emph{矩匹配}初始化。
+\end{remark}
+
+\subsection{速度场的推前 (pushforward)}
+
+\begin{proposition}[ODE 流的推前]
+\label{prop:pushforward}
+设 $\Tmap:\Zt\to\Zs$ 为 $C^1$ 微分同胚，Jacobian 记为
+$\Jac_{\Tmap}(z)=\partial \Tmap/\partial z$。若 $z^T(t)$ 满足
+teacher 的概率流 ODE $\dot z^T=\vT(z^T,t)$，令 $z^S(t)=\Tmap\big(z^T(t)\big)$，则
+$z^S(t)$ 满足
+\begin{equation}
+\dot z^S
+=\underbrace{\Jac_{\Tmap}\!\big(\Tmap^{-1}(z^S)\big)\;
+\vT\big(\Tmap^{-1}(z^S),t\big)}_{\displaystyle =:(\Tmap_\push\vT)(z^S,t)}.
+\label{eq:pushforward}
+\end{equation}
+即推前速度场 $\Tmap_\push\vT$ 由链式法则 $\dot z^S=\Jac_{\Tmap}\dot z^T$ 给出。
+\end{proposition}
+
+\begin{proof}
+链式法则 $\dot z^S=\Jac_{\Tmap}(z^T)\dot z^T=\Jac_{\Tmap}(z^T)\vT(z^T,t)$，再代入
+$z^T=\Tmap^{-1}(z^S)$。
+\end{proof}
+
+\begin{corollary}[L1 需要 Jacobian 与可逆性]
+\label{cor:l1-hard}
+L1 在 student 状态 $x_k\in\Zs$ 上需要 teacher 的"意见"
+$(\Tmap_\push\vT)(x_k,t)$。由 \eqref{eq:pushforward}，这要求：(i) $\Tmap$ \emph{可逆}
+（取 $\Tmap^{-1}(x_k)$ 才能查询 teacher），(ii) $\Tmap$ \emph{可微}且 Jacobian 可得。
+对一般非线性 $\Tmap$ 这两点都昂贵；对像素桥接 $\Tmap=\Enc_S\circ\Dec_T$，$\Tmap^{-1}$
+无解析式、Jacobian 需 VJP/JVP，逐步代价极高。
+\end{corollary}
+
+\subsection{为什么线性 / 仿射传输是"甜区"}
+
+\begin{proposition}[仿射传输保持 flow-matching 路径与速度]
+\label{prop:affine}
+设 $\Tmap(z)=Az+b$（$A\in\R^{d_S\times d_T}$）。则：
+\begin{enumerate}[leftmargin=1.6em,label=(\alph*)]
+\item \textbf{保插值路径}：teacher 的 flow-matching 路径
+$z_t^T=(1-\sigma_t)z_0^T+\sigma_t\,\epsilon^T$ 经 $\Tmap$ 推前后仍是 student 空间里
+的一条 flow-matching 路径
+$z_t^S=(1-\sigma_t)\,\Tmap(z_0^T)+\sigma_t\,(A\epsilon^T)$，端点为
+$\Tmap(z_0^T)$ 与噪声 $A\epsilon^T$；
+\item \textbf{速度常数倍传输}：Jacobian $\Jac_{\Tmap}\equiv A$ 为常数，故
+$(\Tmap_\push\vT)(z^S,t)=A\,\vT(A^{+}(z^S-b),t)$（$A^{+}$ 为伪逆，$A$ 行满秩可逆时为
+逆），速度场的传输\emph{无需}逐点 Jacobian 计算。
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+(a) 直接代入：$\Tmap(z_t^T)=A\big((1-\sigma_t)z_0^T+\sigma_t\epsilon^T\big)+b
+=(1-\sigma_t)(Az_0^T+b)+\sigma_t(A\epsilon^T)+\big[(1-\sigma_t)+\sigma_t-1\big]b$，
+末项为 $0$。(b) 由 Prop.~\ref{prop:pushforward} 及 $\Jac_{\Tmap}\equiv A$。
+\end{proof}
+
+\begin{remark}[偏好线性传输是\emph{几何}结论，不依赖分布假设]
+\label{rem:affine-geometry}
+Prop.~\ref{prop:affine} 的两条性质对\textbf{任意}干净隐变量 $z_0^T$ 成立，证明只用了
+仿射映射的代数性质（$\Tmap$ 与凸组合可交换、Jacobian 为常数），\emph{完全没有}用到
+$z_0^T$ 服从高斯或任何特定分布（呼应 Rem.~\ref{rem:not-gaussian}）。这才是本文偏好
+线性传输的\textbf{真正理由}：它在计算上干净（速度场推前 $=A\vT$，无需逐点 Jacobian；
+插值路径保结构），与 latent 边际是否高斯无关。是否\emph{够用}（线性 $\delta_{\Tmap}$
+是否够小）是关于"同一批图训出的两个 VAE 隐空间是否近似线性可通"的\emph{经验}事实
+（参见 relative-representation 一类工作的经验观察），由 \S\ref{sec:formal} 的
+$\delta_{\Tmap}$ 实测判定，而非由高斯定理保证。
+\end{remark}
+
+\begin{remark}[非线性传输破坏路径结构]
+\label{rem:nonlinear-break}
+若 $\Tmap$ 非线性，则 $\Tmap\big((1-\sigma_t)z_0^T+\sigma_t\epsilon^T\big)\neq
+(1-\sigma_t)\Tmap(z_0^T)+\sigma_t\Tmap(\epsilon^T)$，即 teacher 的线性插值路径\emph{不}映成
+student 空间里的线性插值路径。于是 L0 中"在 $z_t$ 上比较速度"这一构造对非线性
+$\Tmap$ 失去了 flow-matching 的解析靶子；只能退化为样本传输 L0
+（见 \S\ref{sec:l0l1}）。这与 CV-VAE 选择\emph{冻结 VAE、用重建 loss 把两个隐空间
+"对齐成近似可线性互通"} 的动机一致。
+\end{remark}
+
+\subsection{传输一致性误差与 loss 偏差上界}
+
+\begin{definition}[传输一致性误差]
+\label{def:delta}
+定义传输在像素空间的往返重建误差
+\begin{equation}
+\delta_{\Tmap}
+=\E_{z\sim p_T}\big\lVert \Dec_S(\Tmap(z))-\Dec_T(z)\big\rVert,
+\label{eq:delta}
+\end{equation}
+其中 $p_T$ 是 teacher 在相关时刻的隐变量分布。$\delta_{\Tmap}=0$ 即严格像素一致
+\eqref{eq:pixel-consistent}。
+\end{definition}
+
+\begin{proposition}[L0 样本传输的偏差被 $\delta_{\Tmap}$ 控制]
+\label{prop:bound}
+设 student VAE 编码器 $\Enc_S$ 在像素空间 $L_E$-Lipschitz。用样本传输构造 L0 的
+干净靶子 $z_0^S=\Tmap(z_0^T)$，并与"理想靶子" $\bar z_0^S=\Enc_S(\Dec_T(z_0^T))$
+（即真正像素一致的 student 隐变量）相比，则
+\begin{equation}
+\E\big\lVert z_0^S-\bar z_0^S\big\rVert
+\le L_E\,\delta_{\Tmap}
++\E\big\lVert \Enc_S(\Dec_T(z_0^T))-\Enc_S(\Dec_S(\Tmap(z_0^T)))\big\rVert,
+\end{equation}
+其中第二项在 $\Tmap$ 像素一致（\eqref{eq:pixel-consistent} 成立）时为 $0$。
+因此 L0 监督靶子的偏差由传输的像素往返误差 $\delta_{\Tmap}$ 线性控制。
+\end{proposition}
+
+\begin{remark}
+Prop.~\ref{prop:bound} 给出了一个干净的工程判据：\textbf{任何传输方法的"有损性"都可
+以用 $\delta_{\Tmap}$（一个可离线测量的标量）来量化与比较}。这也是
+\S\ref{sec:methods} 中各方法横向对比的统一坐标。
+\end{remark}
+
+%% ============================================================
+\section{传输对 L0 与 L1 的作用（统一分析）}
+\label{sec:l0l1}
+%% ============================================================
+
+\subsection{L0：样本传输即可，且优先于速度传输}
+
+\begin{tcolorbox}[colback=green!4,colframe=green!50!black,title=关键洞察 1：L0 用样本传输绕开 teacher 速度]
+跨 VAE 下，L0 的最自然形式\textbf{不再回归 teacher 速度}，而是：
+\begin{enumerate}[leftmargin=1.5em]
+\item teacher 在 $\Zt$ 中 rollout 干净样本 $z_0^T$；
+\item 样本传输 $z_0^S=\Tmap(z_0^T)$（理想情形 $\Tmap=\Enc_S\circ\Dec_T$）；
+\item 在 student 空间做\emph{标准 flow matching}：$z_t^S=(1-\sigma_t)z_0^S+\sigma_t\epsilon$，
+回归到\emph{解析靶子}
+\begin{equation}
+\loss_{\mathrm{L0}}^{\times}
+=\E_{t,\epsilon}\Big[w(t)\big\lVert \vS(z_t^S,t)-(\epsilon-z_0^S)\big\rVert^2\Big].
+\label{eq:l0-cross}
+\end{equation}
+\end{enumerate}
+这只需要\emph{样本传输}（Def.~\ref{def:delta} 的 $\delta_{\Tmap}$ 控制其偏差，
+Prop.~\ref{prop:bound}），\textbf{不需要} teacher 速度场、不需要 $\Tmap$ 可逆或可微。
+代价：丢失了 teacher 速度场在中间 $t$ 上的"软"信息，退化为"teacher 当数据生成器"。
+\end{tcolorbox}
+
+\eqref{eq:l0-cross} 与现有 \eqref{eq:l0-shared} 的差别：现有版本用 $\vT(z_t,t)$ 作
+软靶子（teacher 在每个噪声水平上的意见）；跨 VAE 版本用解析 FM 靶子
+$(\epsilon-z_0^S)$。当 $\Tmap$ 像素一致时，两者在 $\sigma_t\to0$ 极限一致；中间 $t$
+的差异是"有损性"的来源之一。若坚持要软靶子，则需 \S\ref{sec:methods} 的线性传输
+(M2) 经 Prop.~\ref{prop:affine}(b) 把 $\vT$ 直接以 $A\vT$ 搬运。
+
+\subsection{L1：必须传输速度场，约束远强于 L0}
+
+L1 要在 student 自己访问的状态 $x_k^S\in\Zs$ 上得到 teacher 的转移均值。由
+Cor.~\ref{cor:l1-hard}，需要 $(\Tmap_\push\vT)(x_k^S)$，即可逆 + 可微 $\Tmap$。
+三种可行度：
+
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{线性/仿射 $\Tmap=Az+b$（最干净）}：由 Prop.~\ref{prop:affine}(b)，
+$\mu_T^S(x_k^S)=A\,\mu_T\big(A^{+}(x_k^S-b)\big)+b$（转移均值同样以仿射搬运）。
+$A$ 行满秩可逆时无偏；$d_S\neq d_T$ 时用伪逆，引入投影损失。
+\item \textbf{非线性 $\Tmap$（MLP，可行但贵）}：需要 $\Tmap^{-1}$（额外学一个逆网络
+或用可逆架构）与 JVP（autograd 的 \texttt{jvp}）来算 $\Jac_{\Tmap}\vT$。逐时间步
+代价 $\times$；且 Rem.~\ref{rem:nonlinear-break} 的路径破坏使闭式高斯 KL 的"同方差"
+假设近似成立的条件变差。
+\item \textbf{像素桥接 $\Tmap=\Enc_S\circ\Dec_T$（L1 最差）}：$\Tmap^{-1}$ 无解析式，
+Jacobian 需穿过两个 VAE 的 VJP，逐步 decode+encode 代价 + 有损 + 不可逆，
+\textbf{实践上不适合 L1}。
+\end{itemize}
+
+\begin{tcolorbox}[colback=green!4,colframe=green!50!black,title=关键洞察 2：L0/L1 对传输的要求是\emph{分层}的]
+\textbf{L0 只需样本传输}（任何像素一致的 $\Tmap$ 都行，包括有损的像素桥接）；
+\textbf{L1 需要速度场传输}（实际上要求仿射 $\Tmap$ 才干净）。因此一个自然的跨 VAE
+XOPD 方案是：\emph{用便宜的像素桥接跑 L0 warmup，用学习式线性传输跑 L1}，两阶段用
+不同的 $\Tmap$。这直接复用了 XOPD 已有的"L0 warmup $\to$ L1"两阶段开关。
+\end{tcolorbox}
+
+%% ============================================================
+\section{算法族：六种传输的形式化与对比}
+\label{sec:methods}
+%% ============================================================
+
+\subsection{M1：Pixel-space 桥接（decode-encode）}
+
+\begin{equation}
+\Tmap_{\mathrm{px}}=\Enc_S\circ\Dec_T,
+\qquad
+z_0^S=\Enc_S\big(\Dec_T(z_0^T)\big).
+\end{equation}
+\textbf{性质}：无需训练；像素一致性最好（$\delta_{\Tmap}$ 仅由两个 VAE 各自的重建
+误差贡献）。\textbf{用于 L0}：直接（关键洞察 1）。\textbf{用于 L1}：差
+（Cor.~\ref{cor:l1-hard}，不可逆 + 逐步 decode/encode 昂贵）。\textbf{代价}：每个
+teacher 样本一次 $\Dec_T$ + 一次 $\Enc_S$（L0 中每 batch 一次，可接受）。对应用户
+方法 1，是有损但最简单的 baseline。
+
+\subsection{M2：学习式 latent projector（线性 / 仿射 / 非线性）}
+
+学一个 $\Tmap_\phi:\Zt\to\Zs$，目标是像素一致：
+\begin{equation}
+\min_\phi\;
+\E_{z\sim p_T}\Big[\big\lVert \Dec_S(\Tmap_\phi(z))-\Dec_T(z)\big\rVert^2\Big]
+\;\;\Big(=\delta_{\Tmap_\phi}^2\text{ 的经验版}\Big),
+\label{eq:m2-train}
+\end{equation}
+或在配对数据上直接 latent-latent 回归
+$\E_{x}\lVert \Tmap_\phi(\Enc_T(x))-\Enc_S(x)\rVert^2$（更便宜，无需逐步解码）。
+\textbf{线性 $\Tmap_\phi(z)=Az+b$}：由 Prop.~\ref{prop:affine}，L0 \emph{和} L1 都
+干净（速度 $A\vT$、转移均值仿射搬运）；参数极少（$d_S\!\times\!d_T$），可闭式最小二乘
+初始化。\textbf{非线性 MLP}：$\delta$ 更小但 L1 需逆+JVP（\S\ref{sec:l0l1}）。
+对应用户方法 2，是本文推荐的\emph{L1 主力}。
+
+\subsection{M3：CV-VAE 式重建对齐（把对齐推到 VAE 训练阶段）}
+
+参考 \href{https://arxiv.org/abs/2405.20279}{CV-VAE (Zhao et al., 2024)}：与其在
+推理时传输 latent，不如\textbf{重训一个与 teacher VAE "隐空间兼容"的 student VAE}。
+CV-VAE 冻结预训练（image）VAE $(\Enc_i,\Dec_i)$，训练新（video）VAE
+$(\Enc_v,\Dec_v)$，加两个像素重建正则：
+\begin{equation}
+\loss_{\mathrm{reg}}^{\mathrm{dec}}=\big\lVert \psi(X)-\Dec_i(\Enc_v(X))\big\rVert^2,
+\quad
+\loss_{\mathrm{reg}}^{\mathrm{enc}}=\big\lVert X-\Dec_v(\Enc_i(\psi(X)))\big\rVert^2,
+\quad
+\loss=\loss_{\mathrm{AE}}+\lambda_1\loss_{\mathrm{reg}}^{\mathrm{dec}}
++\lambda_2\loss_{\mathrm{reg}}^{\mathrm{enc}},
+\label{eq:cvvae}
+\end{equation}
+（$\psi$ 是处理时序压缩的像素映射；他们消融出 decoder-only $\lambda_1{=}1,\lambda_2{=}0$
+最好）。\textbf{迁移到我们的设定}：把 teacher VAE 当"冻结的预训练 VAE"，重训/微调
+student VAE 使
+$\Dec_T(\Enc_S(x))\approx x$ 且 $\Dec_S(\Enc_T(x))\approx x$，则两个隐空间近似
+\emph{可互换}（$\Tmap\approx \mathrm{Id}$ 在通道对齐后），从源头消除传输需求。
+\textbf{代价}：要训一个 VAE 且会改变 student 的 decoder（影响最终采样质量）；属于
+"一次性重投资换取后续零传输开销"。\textbf{与 M1/M2 的关系}：M3 是把 $\delta_{\Tmap}$
+\emph{在 VAE 训练阶段}压到极小，使 M1/M2 的传输几乎无损。
+
+\subsection{M4（新提出）：概率耦合 / 分布矩匹配}
+
+M1--M3 都是\emph{点对点}（sample-level）传输。但 XOPD 的 L1 本质是分布匹配（高斯
+转移 KL）。我们提出在\emph{分布层面}对齐：不要求 $\Tmap(z_0^T)$ 与某个特定 student
+隐变量逐点相等，只要求\textbf{推前分布}匹配 student 的边际：
+\begin{equation}
+\Tmap^\star=\arg\min_{\Tmap}\;
+W_2\big(\Tmap_\push p_T,\;p_S\big)
+\quad\text{或}\quad
+\min_\Tmap \KL\big(\Tmap_\push p_T\,\|\,p_S\big),
+\label{eq:m4-ot}
+\end{equation}
+其中 $p_T=\Enc_{T\push}p_{\mathrm{data}}$、$p_S=\Enc_{S\push}p_{\mathrm{data}}$ 是两个
+VAE 在同一图像分布上的隐变量边际。\textbf{重要更正}：扩散用 VAE 的隐变量边际\emph{并不}
+服从高斯（Rem.~\ref{rem:not-gaussian}），故 \eqref{eq:m4-ot} 的解\emph{一般不是}仿射的，
+我们\textbf{不}声称"仿射是最优传输"。但可以退一步只对齐前两阶矩：取仿射
+$\Tmap(z)=Az+b$ 使推前的均值/协方差与 $p_S$ 匹配（$\Tmap_\push p_T$ 与 $p_S$ 同均值
+同协方差），其解为\textbf{矩匹配映射 (moment-matching map)}，由 teacher$\to$student 方向
+的 Bures 公式给出：
+\begin{equation}
+A=\Sigma_T^{-1/2}\big(\Sigma_T^{1/2}\Sigma_S\,\Sigma_T^{1/2}\big)^{1/2}\Sigma_T^{-1/2},
+\qquad
+b=\mu_S-A\,\mu_T,
+\label{eq:gaussian-ot}
+\end{equation}
+（$\mu_\bullet,\Sigma_\bullet$ 为两边际的均值/协方差，离线估计；通道数不同时在公共子空间上
+做。可验证 $A\Sigma_T A^\top=\Sigma_S$，即协方差精确对齐。）矩匹配\textbf{不需要}分布高斯
+——任何分布都有均值和协方差；它只在两边际\emph{恰好}近高斯时才升级为全局
+$W_2$-最优传输 \eqref{eq:m4-ot}。\textbf{贡献}：给出 M2 线性传输一个\emph{有原则、无需
+训练}的初始化（精确对齐二阶结构），并把"线性够不够"的判据交还给 $\delta_{\Tmap}$ 实测
+（Rem.~\ref{rem:affine-geometry}）——而非依赖一个对扩散 VAE 不成立的高斯假设。
+
+\subsection{M5（新提出）：cycle-consistent 联合学习传输}
+
+同时学正/逆传输 $\Tmap_\phi:\Zt\to\Zs$ 与 $\Tmap_\psi:\Zs\to\Zt$，加 cycle 一致性，
+直接满足 Cor.~\ref{cor:l1-hard} 对"可逆"的要求（无需对非线性 $\Tmap$ 求解析逆）：
+\begin{equation}
+\loss_{\mathrm{cyc}}
+=\underbrace{\E\lVert \Dec_S\Tmap_\phi(z^T)-\Dec_T(z^T)\rVert^2}_{\text{像素一致}}
++\beta\,\underbrace{\E\lVert \Tmap_\psi\Tmap_\phi(z^T)-z^T\rVert^2}_{\text{cycle}}
++\beta\,\E\lVert \Tmap_\phi\Tmap_\psi(z^S)-z^S\rVert^2 .
+\label{eq:m5}
+\end{equation}
+$\Tmap_\psi$ 提供 L1 所需的 $\Tmap^{-1}$（查询 teacher），Jacobian 经 autograd JVP。
+\textbf{代价/收益}：比 M2 线性更表达，比纯非线性 M2 多了可逆保证；适合 $\delta$ 难以
+被线性压低（两个 VAE 隐空间几何差异大）的情形。
+
+\subsection{M6（新提出）：shared-decoder 微调（最小侵入的 M3）}
+
+M3 重训整个 VAE 代价大。M6 只\textbf{冻结 student 的 $\Enc_S$、微调一个轻量
+"适配解码头"} 使 teacher 隐变量能被 student 解码器读出：学
+$\Dec_{S}^{\mathrm{adapt}}$ 使 $\Dec_S^{\mathrm{adapt}}(\Tmap(z^T))\approx\Dec_T(z^T)$，
+其余 student 组件不动。介于 M2（不碰 VAE）与 M3（重训 VAE）之间。
+
+\subsection{横向对比}
+
+\begin{table}[h]
+\centering\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+& \textbf{需训练} & \textbf{$\delta_{\Tmap}$（有损）} & \textbf{L0} & \textbf{L1} &
+\textbf{可逆/可微} & \textbf{额外开销} \\
+\midrule
+M1 pixel 桥接        & 否       & 中（2×VAE 重建） & \ding{51} & \ding{55}\,(贵+不可逆) & 否 & 每 batch decode+encode \\
+M2 线性 projector    & 是（小） & 低（矩匹配残差） & \ding{51} & \ding{51}\,(干净)      & 是（伪逆） & 一次矩阵乘 \\
+M2 非线性 projector  & 是（中） & 最低             & \ding{51} & $\triangle$\,(逆+JVP)  & 需额外逆网 & JVP/步 \\
+M3 CV-VAE 重训       & 是（大） & 训后极低         & \ding{51} & \ding{51}              & $\approx$Id & VAE 训练（一次性） \\
+M4 矩匹配（初始化）  & 闭式     & 低（二阶对齐）   & \ding{51} & \ding{51}\,(仿射)      & 是 & 离线估计 $\mu,\Sigma$ \\
+M5 cycle 双向        & 是（中） & 低               & \ding{51} & \ding{51}              & 显式可逆 & 两网+JVP \\
+M6 shared-decoder    & 是（小） & 低               & \ding{51} & \ding{51}              & --- & 解码头微调 \\
+M7 白化/AdaLN 仿射   & 闭式     & 低（对角二阶）   & \ding{51} & \ding{51}\,(干净)      & 解析可逆 & 逐通道 $\gamma,\beta$ \\
+\bottomrule
+\end{tabular}%
+}
+\caption{六种 VAE 隐空间传输方法对 XOPD L0/L1 的适配性对比。\ding{51}=干净适配，
+$\triangle$=可行但昂贵，\ding{55}=不适合。
+（外部相关：Cross-Space Bridge \href{https://arxiv.org/abs/2606.32020}{arXiv:2606.32020}
+学的是 student$\to$teacher 的 $Q$，服务 Teacher-space VSD/GAN，见
+\texttt{cross\_space\_distillation\_bridge.tex}；不宜直接填入上表的 L1 列。）}
+\end{table}
+
+\begin{tcolorbox}[colback=yellow!6,colframe=orange!60!black,title=推荐路线]
+\textbf{先做 M1（L0）+ M2-线性（L1），并用 M4 的矩匹配闭式
+\eqref{eq:gaussian-ot} 初始化 M2 的 $A,b$。} 理由：(i) M1 几乎零实现成本，立刻让
+L0 warmup 可跑通，验证"teacher 数据是否对 student 有用"这一最关键问题；(ii) M2-线性
+是唯一让 L1 干净成立的最小方案（几何结论，不依赖分布假设，Rem.~\ref{rem:affine-geometry}），
+且 M4 给了它无需训练的二阶矩对齐初始化；
+(iii) M3/M5/M6 作为后续提升项，当 $\delta_{\Tmap}$ 被测出过大（线性传输不足以对齐两个
+隐空间）时再投入。
+\end{tcolorbox}
+
+%% ============================================================
+\section{传输的初始化与 AdaLN 式可逆调制}
+\label{sec:init-adaln}
+%% ============================================================
+
+本节回应两个具体设计问题：(1) transport 权重应如何初始化——恒等映射是否合适？
+(2) 把 ODE 转成 SDE 后能否用 AdaLN 式的"高斯到高斯"全局调制来构造可逆传输？两个问题
+都指向同一个对象——\textbf{逐通道仿射（对角白化）传输}——但都需要先澄清一个分布前提。
+
+\subsection{初始化：恒等不是好默认，矩匹配才是"中性"初始化}
+
+\begin{proposition}[恒等初始化的失效模式]
+\label{prop:identity-bad}
+把线性传输 $\Tmap(z)=Az+b$ 初始化为恒等（$A=I,b=0$）在跨 VAE 下一般\textbf{不可用}：
+\begin{enumerate}[leftmargin=1.6em,label=(\alph*)]
+\item \textbf{维度不合法}：$C_T\neq C_S$ 时 $A=I$ 无定义（FLUX.2 与 SD3.5 通道数不同）；
+\item \textbf{尺度错位}：即使 $C_T=C_S$，两个 VAE 的 latent 一阶/二阶矩不同（SD3.5 用
+``scaling\_factor``/``shift\_factor``，FLUX.2 用 BatchNorm 标准化），$A=I$ 把 teacher
+latent 原样塞入 student 空间 $\Rightarrow$ OOD $\Rightarrow$ $\delta_{\Tmap}$ 巨大。
+\end{enumerate}
+\end{proposition}
+
+正确的"中性初始化"是\textbf{对角矩匹配（白化-再着色）}：对齐逐通道均值/标准差
+\begin{equation}
+A_{\mathrm{diag}}=\mathrm{diag}\!\Big(\tfrac{\sigma_S^{(c)}}{\sigma_T^{(c)}}\Big),
+\qquad
+b=\mu_S-A_{\mathrm{diag}}\,\mu_T,
+\label{eq:diag-mm}
+\end{equation}
+其中 $\mu_\bullet^{(c)},\sigma_\bullet^{(c)}$ 是两个 latent 边际的逐通道矩（离线估计，
+$C_T\neq C_S$ 时在前 $\min(C_T,C_S)$ 个通道上做、其余零填充）。
+
+\begin{remark}[为什么矩匹配是"恒等的正确推广"]
+\label{rem:mm-is-identity}
+\eqref{eq:diag-mm} 满足：当两个空间\emph{恰好相同}（同均值同方差）时
+$A_{\mathrm{diag}}=I,b=0$，自动退化为恒等。因此"该不该用恒等初始化"的精确答案是：
+\textbf{恒等只在退化（同空间）情形正确；一般情形应该用矩匹配——它在该退化时自己变成
+恒等}。这也正是 \S\ref{sec:methods} M4 闭式 \eqref{eq:gaussian-ot} 的对角特例：M4 的
+全协方差 Bures 解对齐二阶\emph{全}结构，\eqref{eq:diag-mm} 只对齐对角，更便宜、更稳。
+\end{remark}
+
+\begin{remark}[可训练非线性传输的"恒等初始化" = zero-init 残差]
+\label{rem:zero-init}
+若 transport 含可训练的\emph{非线性}部分 $g_\phi$，"do no harm" 初始化的正解不是把
+$g_\phi$ 设成恒等，而是 \textbf{zero-init 残差}：
+$\Tmap(z)=A_{\mathrm{diag}}z+b+g_\phi(z)$ 且 $g_\phi$ 末层零初始化（AdaLN-Zero /
+ControlNet zero-conv / LoRA-B 的思路）。则训练\emph{初始}时 $\Tmap$ 恰好等于良态的仿射
+baseline \eqref{eq:diag-mm}，非线性修正从 0 开始安全注入。这是想法 1 在非线性情形的正确
+落地，并自然衔接下一小节。
+\end{remark}
+
+\subsection[ODE to SDE 与 AdaLN 式调制]
+{ODE\,$\to$\,SDE 与 AdaLN 式调制：纠正前提，保留机制}
+
+\paragraph{前提纠正：SDE 的高斯性在转移核，不在边际。}
+"把 ODE 转成 SDE（Flow-SDE / CPS），中间步为高斯，于是两个 latent 空间的 latent 都是
+高斯"——这里要区分两个分布（与 Rem.~\ref{rem:not-gaussian} 同源）：
+\begin{itemize}[leftmargin=1.5em]
+\item \textbf{转移核} $p(z_{t+dt}\mid z_t)$：SDE 下\emph{是}高斯（加性高斯噪声）。XOPD 的
+$D_k$ 闭式高斯 KL 用的正是它——这\emph{不需要}把 ODE 转成 SDE，pathwise $D_k$ 在两种
+dynamics 下都良定义。
+\item \textbf{边际} $p(z_t)$，其中 $z_t=(1-\sigma_t)z_0+\sigma_t\epsilon$：\emph{非}高斯
+（非高斯的 $p(z_0)$ 与高斯卷积），仅 $\sigma_t\to1$ 时趋于高斯。
+\end{itemize}
+所以 \textbf{ODE\,$\to$\,SDE 并不会使 latent 边际变高斯}；"两个空间的 latent 都是高斯"
+这一前提\textbf{不成立}，"在两个高斯之间做变换"的字面表述需要放弃。
+
+\paragraph{机制是对的：AdaLN 调制 $\equiv$ 可逆逐通道仿射（白化传输）。}
+尽管前提不成立，想法 2 的\emph{机制}是有价值的：AdaLN 的逐通道 scale+shift
+$\Tmap(z)=\gamma\odot z+\beta$ 恰是 Prop.~\ref{prop:affine} 的对角仿射，且
+\begin{equation}
+\Tmap^{-1}(z')=(z'-\beta)\oslash\gamma
+\label{eq:adaln-inverse}
+\end{equation}
+\textbf{解析可逆}（$\gamma>0$），无需像 M5 那样单独学一个逆网络——这正好提供
+Cor.~\ref{cor:l1-hard} 要求的 L1 逆映射。换言之，\textbf{想法 2 独立地重新发现了"仿射
+调制是天然的可逆传输"}，且其参数恰由 \eqref{eq:diag-mm} 的矩匹配给出闭式初始化。我们把
+这个对象命名为 \textbf{M7：WhiteningTransport（对角 AdaLN 仿射）}，作为 M2-线性的
+对角特例：参数量 $2\min(C_T,C_S)$、可逆、零病态、矩匹配即得，是最稳的中性默认。
+
+\begin{proposition}[时间条件对仿射传输无增益]
+\label{prop:no-time-cond}
+VAE 的 encode/decode 是与扩散时间 $\sigma$ \emph{无关}的固定映射，故两个 latent 空间的
+关系本身与 $\sigma$ 无关。由 Prop.~\ref{prop:affine}(a)，一个\emph{静态}仿射
+$\Tmap(z)=Az+b$ 已把\emph{所有} $\sigma$ 的状态正确传输（插值路径整体被仿射搬运）。因此
+给仿射调制再加\emph{时间条件} $\gamma(\sigma),\beta(\sigma)$（AdaLN$(t)$）对仿射情形
+\textbf{没有收益}——时间条件只有当 transport 是\emph{非线性}（不同 $\sigma$ 的边际形状差
+异需要不同的非线性校正）时才可能有用。
+\end{proposition}
+
+\begin{remark}[一个细致的 caveat：均值干净，噪声需正交]
+\label{rem:orthogonal-noise}
+仿射传输对\emph{转移均值}的搬运是干净的（$D_k$ 用的就是均值，Prop.~\ref{prop:affine}(b)），
+所以 pathwise 蒸馏不受影响。但若还想让传输后的\emph{噪声}也匹配 student 的各向同性标准
+噪声，需要 $A$ 为正交矩阵（保协方差为各向同性）；而矩匹配/白化的 $A$ 一般\emph{非}正交，
+故传输后的路径分布只是\emph{近似} on-distribution。这\textbf{不}影响 mean-matching 的
+$D_k$ 使用，但它（而非时间条件）才是引入更富表达传输（M5 cycle / 正交约束）的真正动机。
+若将来上 SDE+REINFORCE，则噪声项进入 log-prob，正交性才变得重要。
+\end{remark}
+
+\begin{tcolorbox}[colback=blue!4,colframe=blue!50!black,title=两个想法的结论]
+\textbf{想法 1}：恒等初始化一般不可用（维度/尺度，Prop.~\ref{prop:identity-bad}）；正解是
+\emph{矩匹配}中性初始化 \eqref{eq:diag-mm}（同空间时自动退化为恒等，
+Rem.~\ref{rem:mm-is-identity}），非线性情形用 zero-init 残差
+（Rem.~\ref{rem:zero-init}）。\\
+\textbf{想法 2}：ODE$\to$SDE 不使 latent 边际高斯（前提需放弃），但 AdaLN 式逐通道仿射
+调制是\emph{天然可逆}的传输（\eqref{eq:adaln-inverse}）、由矩匹配闭式初始化——即新增的
+\textbf{M7 WhiteningTransport}。时间条件对仿射无增益（Prop.~\ref{prop:no-time-cond}），
+故无需真的转 SDE；静态对角仿射即可。
+\end{tcolorbox}
+
+
+%% ============================================================
+\section{实现设计（不写生产代码，只做架构）}
+\label{sec:impl}
+%% ============================================================
+
+\subsection{改动面}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item \textbf{放松硬约束}：\texttt{flux2\_klein.py:1363} 的 \texttt{in\_channels}
+断言改为"共享 VAE 时断言相等，跨 VAE 时要求配置了 \texttt{vae\_transport}"。
+\item \textbf{teacher VAE / 解码}：跨 VAE 时需要 teacher 的 $\Dec_T$（M1）或 teacher
+$\Enc_T$（M2 训练）。新增 \texttt{load\_teacher\_vae(...)}，与现有
+\texttt{load\_teacher\_text\_encoder} 一样\emph{仅预处理期常驻、之后 offload}（M1 的
+$\Dec_T$ 用于 L0 生成靶子，可在预处理把 $z_0^S$ 直接缓存）。
+\item \textbf{抽象 \texttt{VAETransport}}：一个小接口
+\begin{verbatim}
+class VAETransport(Protocol):
+    def transport_sample(z_T) -> z_S          # M1/M2: 样本传输 (L0)
+    def pushforward_velocity(v_T, z_S) -> v_S  # M2 线性: A v_T (L1)
+    def inverse(z_S) -> z_T                    # L1 查询 teacher 用
+\end{verbatim}
+实现：\texttt{PixelBridgeTransport}(M1)、\texttt{LinearTransport}(M2/M4)、
+\texttt{MLPTransport}(M2/M5)。
+\item \textbf{L0 插入点}（\path{trainer.py:_l0_epoch}）：teacher rollout 得
+$z_0^T$ 后，插入 $z_0^S=\Tmap.\texttt{transport\_sample}(z_0^T)$，其余 L0 不变
+（\eqref{eq:l0-cross}，回归解析靶子或传输后的 teacher 速度）。
+\item \textbf{L1 插入点}（\path{trainer.py:_teacher_next_latents_mean}）：teacher
+forward 前用 $\Tmap.\texttt{inverse}$ 把 student 状态映回 $\Zt$ 查询，再用
+\texttt{pushforward\_velocity} 把均值/速度映回 $\Zs$。
+\item \textbf{config}：\texttt{vae\_transport:
+\{type: pixel|linear|mlp|none,}\\
+\texttt{init: gaussian\_ot|lstsq|random, train: bool\}}；\texttt{none} 即现有共享-VAE 行为，
+完全向后兼容。
+\end{enumerate}
+
+\subsection{两阶段用不同传输（呼应关键洞察 2）}
+L0 用 \texttt{PixelBridgeTransport}（M1，无损训练、像素一致最好）；L1 用
+\texttt{LinearTransport}（M2，矩匹配 \eqref{eq:gaussian-ot} 初始化、可选继续训练）。两者
+共享同一个 teacher，互不冲突，且都走 XOPD 既有的 \texttt{use\_teacher\_transformer} +
+DDP-bypass + autocast-cache 关闭路径（见 \texttt{CLAUDE.md} 的不变量）。
+
+\subsection{先验证什么}
+按 \S\ref{sec:formal} 的 $\delta_{\Tmap}$：实现任何传输前，\textbf{先离线测量}
+$\delta_{\mathrm{px}}$（M1 桥接的像素往返误差）与矩匹配线性传输 \eqref{eq:gaussian-ot}
+的残差 $\delta_{\mathrm{linear}}$，作为"该任务是否可蒸馏 / 线性是否够用"的前置体检
+——若 $\delta_{\mathrm{px}}$ 已经很大（两个 VAE 语义不兼容），任何下游 XOPD 都救不回来，
+应优先 M3/M6 对齐 VAE；若 $\delta_{\mathrm{px}}$ 小但 $\delta_{\mathrm{linear}}$ 大
+（隐空间可互通但非线性关联），则线性 M2 不足，升级到非线性 M2 / M5。
+
+%% ============================================================
+\section{M3 深入：维度缺口、L1 逆映射瓶颈与 VAE 对齐（选定实现方向）}
+\label{sec:m3-deep}
+%% ============================================================
+
+§\ref{sec:methods} 把 M3 的动机表述为"把 $\delta_{\Tmap}$ 推到 VAE 训练阶段"。本节把它
+落实为\emph{精确的对齐目标、可逆性条件与 L1 无偏性证明}，动机来自一个比"$\delta_{\Tmap}$
+过大"更\textbf{结构化}的失败模式：当 $d_S<d_T$ 时，L1 所需的\emph{逆映射}本质欠定，\textbf{冻结的
+M2/M5 传输无论前向保真度多高都会在 on-policy L1 上崩溃}。这是 FLUX.2-klein$\to$SD3.5 实测的根因。
+
+\subsection[先导：same-VAE 传输收敛到 identity]
+{先导：same-VAE 传输收敛到 identity，残差为 $\delta_{\mathrm{VAE}}$}
+
+\begin{proposition}[same-VAE 拟合收敛到近恒等]
+\label{prop:samevae-identity}
+设 teacher 与 student 共享 VAE $(\Enc,\Dec)$，warm-up 配对取像素桥
+$z_S=\Enc(\Dec(z_T))=z_T+r(z_T)$，$r$ 为 VAE 隐变量\emph{往返残差}。将其分解为最优线性部分加
+非线性余项 $r(z)=Rz+c+e(z)$（$\E[e]=0$，$e\perp\{z,1\}$）。则最小二乘 LinearTransport 收敛到
+\[
+A^\star=I+R,\qquad b^\star=c,\qquad
+\delta_{\mathrm{VAE}}^2:=\min_{A,b}\E\lVert Az_T+b-z_S\rVert^2=\E\lVert e(z)\rVert^2 .
+\]
+理想无损 VAE（$r\equiv0$）退化为 $A^\star=I,b^\star=0,\delta_{\mathrm{VAE}}=0$。对角白化/矩匹配在
+同分布两端给 $\gamma{=}1,\beta{=}0$，亦为恒等（Rem.~\ref{rem:mm-is-identity}）。
+\end{proposition}
+\begin{proof}
+$z_S=z_T+Rz_T+c+e$。最小二乘投影到 $\{Az+b\}$：线性可解释部分 $z_T+Rz_T+c=(I+R)z_T+c$ 被精确
+拟合，正交余项 $e$ 进入残差。
+\end{proof}
+
+\begin{remark}[$\delta_{\mathrm{VAE}}$ 是跨 VAE recon 的隐含楼层 $\Rightarrow$ M3 必须动 VAE]
+\label{rem:vae-floor}
+跨 VAE 的 $z_S=\Enc_S(\Dec_T(z_T))$ 经 $\Dec_T,\Enc_S$ 两次有损往返，故经验残差
+\[
+\delta_{\Tmap}^2 \;\approx\; \underbrace{\delta_{\mathrm{VAE},T}^2+\delta_{\mathrm{VAE},S}^2}_{\text{两 VAE 各自往返}}+\underbrace{\delta_{\mathrm{align}}^2}_{\text{跨空间线性失配}} .
+\]
+即便把传输对齐到 $\Tmap=\mathrm{Id}$，recon 也降不到 $\delta_{\mathrm{VAE}}$ 以下，\emph{除非同时微调
+decoder}。这是 M3（动 VAE）相对 M2（仅学 $\Tmap$）不可替代的根本原因，也解释了实测中冷启动重建
+即便 MSE$\approx$0.1 仍\emph{目视模糊/带噪}。
+\end{remark}
+
+\subsection[L1 逆映射瓶颈]
+{L1 逆映射瓶颈：为何 $d_S<d_T$ 时冻结传输必崩}
+
+\begin{proposition}[欠定逆映射的 off-manifold 偏置]
+\label{prop:inverse-deficit}
+设 M2 仿射传输 $\Tmap(z)=Az+b$，$A\in\R^{d_S\times d_T}$ 行满秩，$d_S<d_T$。L1 在 student 状态
+$x_S$ 上查询 teacher 需 $x_T=\Tmap^{+}(x_S)=A^{+}(x_S-b)$（最小范数逆）。则：
+\begin{enumerate}[leftmargin=1.6em,label=(\alph*)]
+\item $\Tmap^{+}$ 把整个 $\Zs$ 映入仿射子空间 $\mathcal{U}=\mathrm{row}(A)+A^{+}(-b)$，$\dim\mathcal{U}=d_S$；
+\item teacher 速度场 $\vT$ 只在其训练支撑（数据流形 $\mathcal{M}_T\subset\Zt$，含各噪声层）附近
+有意义；当 $\dim\mathcal{M}_T>d_S$ 时，\emph{任何} $A$ 都无法令 $\mathcal{U}\supset\mathcal{M}_T$，
+故 $x_T=\Tmap^{+}(x_S)$ 系统性偏离 $\mathcal{M}_T$；
+\item 记 off-manifold 偏置 $\epsilon_{\mathrm{off}}(x_S)=\lVert \vT(\Tmap^{+}x_S)-\vT(\Pi_{\mathcal{M}_T}\Tmap^{+}x_S)\rVert$，
+则推前到 $\Zs$ 的 L1 靶子误差 $\ge \sigma_{\min}(A)\,\E[\epsilon_{\mathrm{off}}]$，\textbf{对任意冻结
+$(A,b)$ 不可消除}（信息缺口）。on-policy 下该误差每步把 student 拉偏，漂移 $\propto$ LR$\times$偏置
+$\Rightarrow$ 崩溃。
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(a) 行满秩右伪逆 $A^{+}=A^\top(AA^\top)^{-1}$，$\mathrm{im}(A^{+})=\mathrm{row}(A)$。(b) $\dim\mathcal{M}_T$
+由 teacher VAE 决定，与 $\mathcal{U}$ 无对齐约束；$d_S$ 维子空间无法包含更高维流形。(c) 链式
+$\Tmap_\push\vT(x_S)=A\,\vT(\Tmap^{+}x_S)$，与"真值"$A\,\vT(\Pi_{\mathcal{M}_T}\Tmap^{+}x_S)$ 之差经
+$A$ 放大，下界用 $A$ 的最小奇异值。\end{proof}
+
+\begin{remark}[经验验证]
+\label{rem:collapse-empirical}
+FLUX.2-klein$\to$SD3.5 实测。维度为
+$d_T{=}32{\times}32{\times}128{=}131072$、$d_S{=}64{\times}64{\times}16{=}65536$，
+$d_T{=}2d_S$。冻结 M2 线性 / conv（严格线性）/ M5（非线性+学习逆）在\emph{纯 L1} 上\textbf{无论
+学习率都崩溃}（geneval gs1 $0.326\!\to\!{<}0.01$，崩溃速率 $\propto$ LR：1e-4@20ep、1e-5@100ep）；把
+逆映射欠定从 $8{:}1$（$128{\to}16$）经 PixelShuffle 还原降到 $2{:}1$（$32{\to}16$）\emph{仍崩}；
+KL-to-base 锚定\emph{也}挡不住（on-policy 锚定随漂移移动）。\textbf{对照}：same-VAE（identity 传输、
+真 target、同超参）仅温和下降不崩（$0.379\!\to\!0.29$@40ep）。三者共同坐实 Prop.~\ref{prop:inverse-deficit}：
+崩溃源于跨 VAE 逆映射的 off-manifold 偏置，而非 L1 方法本身。\textbf{结论}：纯冻结传输（任何通道结构 /
+LR / 正则）救不了 $d_S<d_T$；必须用 M3 动 VAE。
+\end{remark}
+
+\subsection{M3 对齐目标与可逆性条件}
+
+M3 同时消除 Rem.~\ref{rem:vae-floor} 的 $\delta_{\mathrm{VAE}}$ 楼层与 Prop.~\ref{prop:inverse-deficit}
+的逆映射偏置。teacher VAE $(\Enc_T,\Dec_T)$ 冻结，微调 student VAE $(\Enc_S',\Dec_S')$（全量或 LoRA/
+adapter），取线性 $P:\Zt\to\Zs$、$Q:\Zs\to\Zt$。要求：
+
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{前向保真（编码对齐）}：$\Enc_S'(x)\approx P\,\Enc_T(x)$ 且 $\Dec_S'(P\,\Enc_T(x))\approx x$
+——两空间\emph{线性可互换}，$\Tmap{=}P$ 高保真且保 Prop.~\ref{prop:affine} 的 L1 干净性。
+\item \textbf{逆向 on-manifold（关键，解 Prop.~\ref{prop:inverse-deficit}）}：
+$\Dec_T(Q(z_S))\approx\Dec_S'(z_S)$——恢复的 teacher 隐变量\emph{解码出同一张图}，
+强制 $Q(z_S)\in\mathcal{M}_T$。只有 on-manifold 的 teacher 隐变量才解码成合法图像，故 decoder 一致性
+是把逆映射钉在流形上的\emph{充分}监督（相对 M5 仅用 latent-cycle 的本质增强）。
+\item \textbf{维度/流形条件}：要么 $d_S'{=}d_T$（取 $P$ 正交、$Q{=}P^\top$ 精确可逆）；要么 teacher
+流形固有维数 $\le d_S'$（则 $P$ 在 $\mathcal{M}_T$ 上可逆、$Q$ 落在流形内）。前者最稳，代价是改 student
+latent 通道数（牵动 transformer I/O）；后者保持 SD3.5 的 16 通道，靠 (ii) 把 $Q$ 训到流形上。
+\end{enumerate}
+
+\begin{proposition}[M3 对齐后 L1 无偏]
+\label{prop:m3-unbiased}
+若对齐达成 (i) $\Tmap{=}P$ 线性、(ii) $\Dec_T(Q(x_S))=\Dec_S(x_S)$ 误差 $\le\eta$（逆映射 on-manifold），
+则 cross-VAE L1 转移均值传输 $\mu_S=P\,\mu_T(Q(x_S))$ 相对 same-VAE 基准的偏差
+$\le \mathrm{Lip}(\vT)\,\eta+\delta_{\mathrm{align}}$，\textbf{与 $d_S<d_T$ 无关}（off-manifold 项消失）。
+即 M3 把 Prop.~\ref{prop:inverse-deficit} 的\emph{不可约信息缺口}替换为\emph{可训练压低}的对齐残差 $\eta$。
+\end{proposition}
+\begin{proof}
+(ii) $\Rightarrow Q(x_S)\in\mathcal{M}_T$（解码一致 $\Rightarrow$ 在 teacher 支撑内），故 $\vT(Q(x_S))$ 有意义，
+$\epsilon_{\mathrm{off}}\le\mathrm{Lip}(\vT)\,\eta$；(i) $\Rightarrow$ 推前为常 Jacobian $P$（Prop.~\ref{prop:affine}），
+无逐点 Jacobian 误差。两者相加。\end{proof}
+
+\subsection{M3 训练目标（CV-VAE + 逆映射 decoder 一致性）}
+在共享图像集 $\{x\}$ 上联合训练 $(\Enc_S',\Dec_S',P,Q)$（teacher VAE 冻结）：
+\begin{align}
+\loss_{\mathrm{AE}}  &= \lVert \Dec_S'(\Enc_S'(x))-x\rVert^2 + \mathrm{LPIPS} + \beta_{\mathrm{KL}}\KL, \label{eq:m3-ae}\\
+\loss_{\mathrm{fwd}} &= \lVert \Dec_S'(P\,\Enc_T(x))-x\rVert^2 + \lambda_\ell\lVert \Enc_S'(x)-P\,\Enc_T(x)\rVert^2, \label{eq:m3-fwd}\\
+\loss_{\mathrm{inv}} &= \lVert \Dec_T(Q\,\Enc_S'(x))-x\rVert^2 \quad(\text{逆映射 on-manifold，新增项}), \label{eq:m3-inv}\\
+\loss_{\mathrm{cyc}} &= \lVert QP\,\Enc_T(x)-\Enc_T(x)\rVert^2 + \lVert PQ\,\Enc_S'(x)-\Enc_S'(x)\rVert^2, \label{eq:m3-cyc}\\
+\loss &= \loss_{\mathrm{AE}} + \lambda_1\loss_{\mathrm{fwd}} + \lambda_2\loss_{\mathrm{inv}} + \lambda_3\loss_{\mathrm{cyc}} . \label{eq:m3-total}
+\end{align}
+$\loss_{\mathrm{AE}}$ 保 student 采样质量不退化；$\loss_{\mathrm{fwd}}$ 给前向高保真线性 $P$
+（替代 §\ref{sec:methods} M2 训出来的低保真 $A$）；$\loss_{\mathrm{inv}}$（teacher decoder 一致）是相对
+CV-VAE \eqref{eq:cvvae} 的\emph{新增}项，专门解 Prop.~\ref{prop:inverse-deficit} 的逆映射偏置；
+$P,Q$ 取线性以保 L1 干净（Prop.~\ref{prop:affine}）。当 $d_S'<d_T$ 时 $\loss_{\mathrm{inv}}$ 仍能把 $Q$
+训到流形上（流形固有维数 $\le d_S'$ 时无损）；若要彻底消除缺口则取 $d_S'{=}d_T$、$P$ 正交。
+
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=M3 落地建议（两档）]
+\textbf{档 A（轻，推荐先试）}：冻结 $\Enc_S$、$\Enc_T$、$\Dec_T$；只对 student \textbf{$\Dec_S$ 加 LoRA}
++ 学线性 $P,Q$，跑 \eqref{eq:m3-fwd}--\eqref{eq:m3-cyc}（省去重训 $\Enc_S$，$\loss_{\mathrm{AE}}$ 退化为
+正则）。即 §\ref{sec:methods} M6 + 逆映射一致性，最小侵入、不动 student transformer。
+\textbf{档 B（重，彻底）}：student VAE latent 升到 $d_S'{=}d_T$（32 通道），全量微调 $\Enc_S',\Dec_S'$
++ 适配 transformer I/O，$P$ 取正交 $\Rightarrow$ 逆映射精确、$\eta\to0$。
+先用 §\ref{sec:impl} 的 $\delta$ 体检（量 $\delta_{\mathrm{VAE}}$、$\delta_{\mathrm{align}}$、teacher 流形固有维数）
+决定是否需要档 B。
+\end{tcolorbox}
+
+%% ============================================================
+\section{结论}
+%% ============================================================
+
+跨 VAE 的 XOPD 归结为设计隐空间传输 $\Tmap:\Zt\to\Zs$。核心理论结论：
+\begin{itemize}[leftmargin=1.4em]
+\item L0 与 L1 对 $\Tmap$ 的要求\emph{分层}：L0 只需样本传输（任何像素一致 $\Tmap$），
+L1 需速度场推前（Prop.~\ref{prop:pushforward}），实际要求\emph{仿射}传输才干净
+（Prop.~\ref{prop:affine}）。
+\item 偏好仿射传输是\emph{几何}结论（Rem.~\ref{rem:affine-geometry}），\textbf{不}依赖
+latent 服从高斯——事实上扩散 VAE 的隐变量\emph{边际是非高斯}的
+（Rem.~\ref{rem:not-gaussian}）。M4 的闭式 \eqref{eq:gaussian-ot} 是\emph{矩匹配}初始化
+（对齐二阶结构），只在边际恰好近高斯时才升级为 $W_2$-最优传输。
+\item 所有方法的有损性可用单一\emph{经验}标量 $\delta_{\Tmap}$（\eqref{eq:delta}）量化
+比较；"线性够不够"由 $\delta_{\mathrm{linear}}$ 实测判定，而非高斯定理。
+\item 工程上：M1(L0)+M2 线性(L1)+M4 矩匹配初始化 是最小可行且理论自洽的首选；M3/M5/M6
+作为 $\delta$ 过大时的升级项。
+\item \textbf{$d_S<d_T$ 的结构性瓶颈（实测主因，§\ref{sec:m3-deep}）}：当 student latent 维数小于
+teacher 时，L1 on-policy 所需的逆映射本质欠定，把 student 状态映到 teacher 空间时\emph{系统性偏离
+teacher 数据流形}（Prop.~\ref{prop:inverse-deficit}），导致 teacher 给出有害 target、student 漂移崩溃。
+这\emph{不是} $\delta_{\Tmap}$ 大小问题，任何冻结传输（线性/conv/M5、任何 LR、KL 锚定）都救不了，
+same-VAE 对照不崩可佐证。唯一出路是 \textbf{M3 动 VAE}：用 \eqref{eq:m3-inv} 的 teacher-decoder 一致性
+把逆映射钉到流形上（Prop.~\ref{prop:m3-unbiased} 证明此时 L1 无偏，与 $d_S<d_T$ 无关），必要时把
+student latent 升到 $d_S{=}d_T$ 彻底消除缺口。
+\end{itemize}
+
+\end{document}

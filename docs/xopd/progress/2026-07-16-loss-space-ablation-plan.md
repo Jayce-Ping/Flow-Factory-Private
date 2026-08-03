@@ -7,7 +7,7 @@ default **MSE(xt)** (transition mean). Root cause matches the per-timestep domin
 MSE(xt) weights each step by `dt^2`, so the **last (cleanest) step dominates the whole optimizer
 update** and early/high-noise steps are under-trained. See
 [`2026-07-12-per-timestep-dk-dominance.md`](2026-07-12-per-timestep-dk-dominance.md) and
-[`../per_timestep_loss_dominance_theory.tex`](../per_timestep_loss_dominance_theory.tex).
+[`../core/shared/per_timestep_loss_dominance_theory.tex`](../core/shared/per_timestep_loss_dominance_theory.tex).
 
 Loss-space identity (ODE): `MSE(v) : MSE(xt) : MSE(x0) = 1 : dt^2 : sigma^2`.
 
@@ -50,7 +50,7 @@ WAIT_FOR=geneval_enh_ocr_mixed_vmse START_AT=8 STOP_AT=8 setsid bash \
 ## Phase 2 (deferred until the Phase-1 loss winner is picked)
 
 - **DMD** cross-model (32B→4B): `xopd_configs/ode_pathwise/flux2_klein_32b_to_4b_dmd_ocr_1kep.yaml`
-  (needs a GPU smoke first — see `docs/xopd/dmd_cross_model_design.md` +
+  (needs a GPU smoke first — see `docs/xopd/xdmd/dmd_cross_model_design.md` +
   `progress/2026-07-23-dmd-implementation-report.md`).
 - MoF-2 mix, mixed-data — resume as needed once the best single-4B d_k loss is known.
 

@@ -12,10 +12,10 @@ Author: Jayce-Ping
 
 ## Docs
 
-- [x] `docs/xopd/tdm_opd_dm_gradient_relation.tex`
-- [x] `docs/xopd/approach_b_trajectory_dm_design.md`
-- [x] `docs/xopd/tdm_cross_model_design.md`
-- [x] Expand `dmd_opd_gradient_relation.tex` §Extensions
+- [x] `docs/xopd/trajectory_dm/tdm_opd_dm_gradient_relation.tex`
+- [x] `docs/xopd/trajectory_dm/approach_b_trajectory_dm_design.md`
+- [x] `docs/xopd/trajectory_dm/tdm_cross_model_design.md`
+- [x] Expand `docs/xopd/xdmd/dmd_opd_gradient_relation.tex` §Extensions
 - [x] This progress note
 
 ## Code checklist
@@ -24,7 +24,7 @@ Author: Jayce-Ping
 - [x] `XTrajectoryDMTrainer` + `XOPDDMTrainer` + args + registry + smoke YAML
 - [x] `XTDMTrainer` + args + smoke YAML
 - [x] Pitfalls encoded: autocast cache (via `use_teacher_transformer`), unwrapped fake, broadcast sel, force on sample
-- [x] Learning primer: `docs/xopd/score_matching_fake_network_primer.md` + figures + `demos/score_matching_fake_toy.py`
+- [x] Learning primer: `docs/xopd/xdmd/score_matching_fake_network_primer.md` + figures + `demos/score_matching_fake_toy.py`
 
 ## Pitfalls (must not regress)
 

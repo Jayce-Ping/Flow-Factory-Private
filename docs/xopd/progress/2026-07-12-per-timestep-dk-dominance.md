@@ -8,7 +8,7 @@ FLUX.2-dev 32B → FLUX.2-klein-base-4B，XOPD 纯 L1，`num_inference_steps=28`
 `mean‖μ_student − μ_teacher‖²`）。下文「xt」为**实测**；「v」「x0」为按官方 FLUX.2-klein 28-step
 scheduler 的 ODE 精确换算（同一 underlying velocity gap）：
 `L_v,k = L_xt,k / Δt_k²`，`L_x0,k = (σ_k/Δt_k)² · L_xt,k`。
-详见 [`../per_timestep_loss_dominance_theory.tex`](../per_timestep_loss_dominance_theory.tex) §1、§4。
+详见 [`../core/shared/per_timestep_loss_dominance_theory.tex`](../core/shared/per_timestep_loss_dominance_theory.tex) §1、§4。
 
 指标：`train/d_k/{ti}` = 第 `ti` 步的 per-step loss（xt 空间下即上式 `L_xt`）。
 `mean_tail` = 最近 30% 已记录 optimizer step 的均值；`% of tail-sum` = 该步 `mean_tail` 占 28 步之和的比例。
@@ -16,7 +16,7 @@ scheduler 的 ODE 精确换算（同一 underlying velocity gap）：
 
 ## 图：每 timestep d_k（左：log-y 折线；右：占总 d_k 比例）
 
-![per-timestep d_k dominance](../figures/mixed_per_timestep_dk.png)
+![per-timestep d_k dominance](../core/shared/figures/mixed_per_timestep_dk.png)
 
 ## 表 1 · 每 timestep xt（实测）与 v / x0（换算）
 

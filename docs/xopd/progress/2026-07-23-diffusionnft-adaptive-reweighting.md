@@ -1,7 +1,7 @@
 # 2026-07-23 · DiffusionNFT-style adaptive self-normalized reweighting for the OPD d_k
 
 Formal analysis appended to
-[`../per_timestep_loss_dominance_theory.tex`](../per_timestep_loss_dominance_theory.tex) §"Adaptive
+[`../core/shared/per_timestep_loss_dominance_theory.tex`](../core/shared/per_timestep_loss_dominance_theory.tex) §"Adaptive
 self-normalized reweighting". Source: DiffusionNFT (ICLR 2026 Oral, `NVlabs/DiffusionNFT`,
 `scripts/train_nft_sd3.py`, arXiv 2509.16117).
 
