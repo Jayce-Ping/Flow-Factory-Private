@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teacher Velocity Field Analysis</title>
+<style>
+:root { --ink:#182028; --muted:#63717d; --line:#dfe5e8; --paper:#f3f6f7;
+  --card:#fff; --nine:#e05a47; --hy:#d99a2b; --thirtytwo:#35a36f; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--paper); color:var(--ink);
+  font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif; line-height:1.55; }
+main { width:min(1500px,96vw); margin:0 auto; padding:56px 0 80px; }
+.hero { padding:44px 48px; border-radius:24px; color:white;
+  background:linear-gradient(125deg,#16232d,#243946 60%,#315c59); }
+.eyebrow { text-transform:uppercase; letter-spacing:.12em; font-size:12px; opacity:.72; }
+h1 { margin:10px 0 12px; font-size:48px; line-height:1.05; }
+h2 { font-size:29px; margin:0 0 8px; }
+h3 { margin:0 0 8px; font-size:19px; }
+.lead { max-width:1000px; font-size:19px; color:#d8e6e8; }
+.section { margin-top:30px; background:var(--card); border:1px solid var(--line);
+  border-radius:20px; padding:34px 38px; box-shadow:0 7px 30px rgba(20,35,45,.05); }
+.subtitle { color:var(--muted); margin:0 0 22px; max-width:1000px; }
+.metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:28px; }
+.metric { border-radius:15px; padding:18px 20px; background:#f7f9fa; border:1px solid var(--line); }
+.metric strong { display:block; font-size:28px; }
+.metric.nine strong { color:var(--nine); } .metric.hy strong { color:var(--hy); }
+.metric.thirtytwo strong { color:var(--thirtytwo); }
+.metric small { color:var(--muted); }
+.chart { width:100%; display:block; border-radius:12px; background:white; }
+.grid-image { width:100%; display:block; border:1px solid var(--line); }
+.callouts { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:20px; }
+.callout { padding:17px 19px; border-left:4px solid var(--line); background:#f8fafb; }
+.callout.nine { border-color:var(--nine); } .callout.hy { border-color:var(--hy); }
+.callout.thirtytwo { border-color:var(--thirtytwo); }
+.formula { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; padding:18px 22px;
+  border-radius:12px; background:#16232d; color:#e5f0f1; overflow:auto; }
+.source { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+@media(max-width:850px) { .metrics,.callouts { grid-template-columns:1fr; }
+  h1 { font-size:36px; } .section,.hero { padding:26px; } }
+</style>
+</head>
+<body><main>
+<header class="hero">
+  <div class="eyebrow">Offline field audit · 128 prompts × 28 denoising steps</div>
+  <h1>Teacher Velocity Field Analysis</h1>
+  <p class="lead">Why 9B→4B and HY→4B blur while 32B→4B improves: all teachers
+  are queried on the same 4B-visited states, separating correction geometry from
+  rollout drift.</p>
+</header>
+
+<section class="section">
+  <h2>Visual training trajectories</h2>
+  <p class="subtitle">Matched GenEval gs=1 prompts. Student snapshots progress
+  left-to-right; teacher output is the final column.</p>
+  <img class="grid-image" src="assets/training_trajectories.jpg"
+       alt="9B and 32B student image trajectories with teacher references">
+  <p class="source">Student runs: ta1qvnuz (9B→4B), 4wvzbt8g (32B→4B).
+  Student: 1024px, 28 steps, epochs 0/20/40/60/80. 9B teacher: 28 steps.
+  32B teacher: same seed/gs=1/1024px, 40 steps from uilxegpn because the
+  historical 28-step run did not log teacher media.</p>
+</section>
+
+<section class="section">
+  <h2>Field geometry over the denoising trajectory</h2>
+  <p class="subtitle">The harmful teachers are not oversized versions of the
+  useful teacher. Their corrections are smaller and point in different directions.</p>
+  <img class="chart" src="assets/field_geometry.png" alt="Velocity gaps and correction agreement">
+  <div class="metrics">
+    <div class="metric nine"><small>9B velocity gap, RMS</small>
+      <strong>0.121 [0.118, 0.123]</strong></div>
+    <div class="metric hy"><small>HY velocity gap, RMS</small>
+      <strong>0.161 [0.158, 0.165]</strong></div>
+    <div class="metric thirtytwo"><small>32B velocity gap, RMS</small>
+      <strong>0.551 [0.536, 0.565]</strong></div>
+  </div>
+  <div class="callouts">
+    <div class="callout nine"><h3>9B is not “too strong”</h3>
+      Its correction RMS is roughly 4.6× smaller than 32B.</div>
+    <div class="callout hy"><h3>HY is 9B-like</h3>
+      cos(ΔHY, Δ9)=0.464,
+      versus cos(ΔHY, Δ32)=0.203.</div>
+    <div class="callout thirtytwo"><h3>Direction matters</h3>
+      cos(Δ9, Δ32)=0.250;
+      disagreement is strongest in early, high-noise steps.</div>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Direct latent signature of blur</h2>
+  <p class="subtitle">Negative alignment means the teacher correction cancels
+  spatial changes already present in the 4B clean prediction. Positive alignment reinforces them.</p>
+  <img class="chart" src="assets/blur_signature.png" alt="Gradient alignment and total-variation shift">
+  <div class="metrics">
+    <div class="metric nine"><small>9B gradient alignment</small>
+      <strong>-0.168 [-0.177, -0.159]</strong>
+      <small>TV shift -0.0015 [-0.0022, -0.0008]</small></div>
+    <div class="metric hy"><small>HY gradient alignment</small>
+      <strong>-0.212 [-0.221, -0.203]</strong>
+      <small>TV shift -0.0018 [-0.0027, -0.0009]</small></div>
+    <div class="metric thirtytwo"><small>32B gradient alignment</small>
+      <strong>+0.191 [0.181, 0.201]</strong>
+      <small>TV shift +0.1364 [0.1287, 0.1446]</small></div>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Offline threshold calibration from alignment and velocity gap</h2>
+  <p class="subtitle">A detached sample-step gate combines direction and magnitude.
+  The known-good 32B distribution defines the target 1% false-mask rate.</p>
+  <div class="formula">harmful_score = RMS(vT − v4) × max(0, −gradient_alignment)
+mask when harmful_score &gt; max(global_32B_q99, per_step_32B_q99)</div>
+  <img class="chart" src="assets/threshold_calibration.png"
+       alt="Harmful-score distributions, calibrated thresholds and mask rates">
+  <div class="metrics">
+    <div class="metric"><small>Global 32B q99 threshold</small>
+      <strong>0.027124</strong></div>
+    <div class="metric"><small>Global 9B mask rate</small>
+      <strong>24.9%</strong></div>
+    <div class="metric"><small>Global HY mask rate</small>
+      <strong>54.5%</strong>
+      <small>32B realized rate: 1.00%</small></div>
+  </div>
+</section>
+
+<section class="section">
+  <h2>Interpretation</h2>
+  <div class="callouts">
+    <div class="callout nine"><h3>9B→4B</h3>
+      The teacher is close in raw velocity magnitude but systematically anti-aligned
+      with x0 detail, explaining gradual blur despite tighter matching.</div>
+    <div class="callout hy"><h3>HY→4B</h3>
+      HY reproduces the same anti-detail signature and is geometrically closer to
+      9B than to the successful 32B teacher.</div>
+    <div class="callout thirtytwo"><h3>32B→4B</h3>
+      A much larger correction is beneficial because it reinforces spatial
+      gradients and raises one-step x0 total variation.</div>
+  </div>
+  <p class="source">Inputs: /apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/diagnostics/teacher_gap_v1/analysis/teacher_velocity_x0_analysis.json,
+  /apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/diagnostics/teacher_gap_v1/analysis/hy/hy_teacher_field_analysis.json, and
+  /apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/diagnostics/teacher_gap_v1/analysis/mask_thresholds/teacher_mask_thresholds.json.
+  Generated locally by <code>build.py</code>.</p>
+</section>
+</main></body></html>

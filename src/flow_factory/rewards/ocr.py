@@ -25,7 +25,10 @@ DEDICATED conda env and this class talks to it over a stdin/stdout pipe (see
 Setup (per node), matching flow_grpo (https://github.com/yifan123/flow_grpo):
 ```bash
 conda create -y -n ocr python=3.10
-/opt/conda/envs/ocr/bin/pip install paddlepaddle==2.6.2 paddleocr==2.9.1 python-Levenshtein
+/opt/conda/envs/ocr/bin/pip install \
+  paddlepaddle==2.6.2 paddleocr==2.9.1 python-Levenshtein \
+  protobuf==3.20.2 Cython==3.0.12 pyclipper==1.3.0.post6 \
+  lxml==5.3.1 python-docx==1.1.2 setuptools==75.8.0
 # pre-download PP-OCR weights into ~/.paddleocr:
 /opt/conda/envs/ocr/bin/python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=False, lang='en', use_gpu=False, show_log=False)"
 ```
@@ -126,6 +129,15 @@ class OCRRewardModel(PointwiseRewardModel):
         stderr_f = open(self._stderr_path, "wb")
         env = dict(os.environ)
         env["OMP_NUM_THREADS"] = env.get("OCR_OMP_NUM_THREADS", "4")  # bound CPU OCR threads per rank
+        # The training shell may inherit another conda env's native libraries (in this
+        # cluster, torch-base/lib). Loading PaddleOCR extensions against those libraries
+        # causes allocator crashes and zlib corruption. Isolate the worker to the native
+        # libraries adjacent to its own interpreter while leaving the trainer untouched.
+        ocr_prefix = os.path.dirname(os.path.dirname(os.path.realpath(self._ocr_python)))
+        env["LD_LIBRARY_PATH"] = env.get(
+            "OCR_LD_LIBRARY_PATH",
+            os.path.join(ocr_prefix, "lib"),
+        )
         proc = subprocess.Popen(
             [self._ocr_python, "-u", _WORKER_SCRIPT],
             stdin=subprocess.PIPE,

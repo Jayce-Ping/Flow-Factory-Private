@@ -140,7 +140,7 @@
 \title{\textbf{Arm A4: Mixture-of-Density}\\[0.35em]
 \large Marginal-mixture conditional flow matching in Flow-Factory}
 \author{Jayce-Ping}
-\date{2026-07-31}
+\date{2026-08-03}
 
 \begin{document}
 \maketitle
@@ -167,6 +167,13 @@ FLUX.2-Klein: pre-rollout Bernoulli routing, one ODE trajectory per sample, roll
 maps, and a single student velocity-MSE pass.  It also records the implementation's validation,
 evaluation, logging, and distributed call-order invariants.
 
+The note also analyzes whether the teacher prior should vary during training.  An outer-loop
+schedule $\alpha_k$ remains an exact marginal-mixture construction and contracts the ideal
+teacher discrepancy by $\prod_j(1-\alpha_j)$.  In contrast, naively replacing $\alpha$ by an ODE
+time-dependent $\alpha(t)$ changes the continuity equation and is not implemented by ordinary
+one-branch CFM.  Increasing, decreasing, and diagnostic-driven schedules are compared under
+finite optimization error and branch-sampling noise.
+
 The reader-facing presentation name for this construction is \emph{Mixture-of-Density}.  The
 tracked CPU-only companion is
 \href{run:demos/mixture_of_density_demo.ipynb}
@@ -183,7 +190,7 @@ tracked CPU-only companion is
 
 \subsection{Learning goals}
 
-After reading this note, the reader should be able to answer five questions:
+After reading this note, the reader should be able to answer six questions:
 \begin{enumerate}[leftmargin=1.6em]
 \item What distribution does A4 ask the student to generate?
 \item Why is the correct target velocity not the arithmetic average
@@ -193,6 +200,8 @@ After reading this note, the reader should be able to answer five questions:
 \item Which superficially similar implementations are actually A0, A1, or A3?
 \item Which exact methods, tensors, index maps, and invariants must change in
       \path{src/flow_factory/trainers/xopd/trainer.py}?
+\item When is a dynamic teacher prior mathematically valid, and when does annealing it prevent
+      convergence to the teacher?
 \end{enumerate}
 
 \subsection{Start with one conditional flow}
@@ -876,6 +885,274 @@ and rollout drift must be logged separately.
 \end{tcolorbox}
 
 %% ============================================================
+\section{Should the teacher weight change during training?}
+\label{sec:dynamic-alpha}
+%% ============================================================
+
+\subsection{First separate outer-loop time from ODE time}
+
+There are two different proposals that are both easily called ``dynamic alpha'':
+\begin{enumerate}[leftmargin=1.6em]
+\item an \emph{outer-loop schedule} $\alpha_k$, held fixed over the complete ODE path and all
+      timesteps of training iteration $k$;
+\item an \emph{ODE-time schedule} $\alpha(t)$ that changes between noise and data within one
+      trajectory.
+\end{enumerate}
+Only the first is an immediate extension of implemented A4.  At outer iteration $k$, define
+\begin{equation}
+q_{k,t}
+:=
+(1-\alpha_k)\rho_{k,t}
++\alpha_k\rho_{T,t},
+\qquad
+B_k\sim\operatorname{Bernoulli}(\alpha_k),
+\label{eq:scheduled-outer-mixture}
+\end{equation}
+where one $B_k$ is still fixed for a complete sampled trajectory.  Conditional on $k$,
+Propositions~\ref{prop:mixture-continuity} and~\ref{prop:a4-cfm} apply without modification.
+
+The same is \emph{not} true for a prior that changes with ODE time.  If
+\[
+q_t=(1-\alpha(t))\rho_{\mathrm{old},t}+\alpha(t)\rho_{T,t}
+\]
+and one uses the old source-mixture flux from \eqref{eq:a4-flux}, direct differentiation gives
+\begin{equation}
+\partial_tq_t+
+\nabla\!\cdot\left[
+  (1-\alpha(t))\rho_{\mathrm{old},t}\vold
+  +\alpha(t)\rho_{T,t}\vT
+\right]
+=
+\alpha'(t)\left(\rho_{T,t}-\rho_{\mathrm{old},t}\right),
+\label{eq:time-alpha-continuity-defect}
+\end{equation}
+which is generally nonzero.  A valid deterministic flow would need an additional transfer flux
+$J_t$ satisfying
+\begin{equation}
+\nabla\!\cdot J_t
+=-\alpha'(t)\left(\rho_{T,t}-\rho_{\mathrm{old},t}\right).
+\label{eq:time-alpha-transfer-flux}
+\end{equation}
+Equivalently, a stochastic construction would need a coherent branch-switching process rather
+than independent Bernoulli labels at different timesteps.  Neither correction is supplied by
+one-branch A4 CFM.
+
+\begin{tcolorbox}[colback=yellow!6,colframe=yellow!55!black,title=Safe meaning of a dynamic teacher weight]
+In the current algorithm, schedule $\alpha$ by \emph{outer optimizer epoch or outer policy
+refresh}, then keep that value fixed across ODE time $t$ and across every callback of a sampled
+trajectory.  Do not silently turn it into $\alpha(t)$ inside the denoising solver.
+\end{tcolorbox}
+
+\subsection{Exact contraction under an outer-loop schedule}
+
+Let
+\begin{equation}
+D_k(t):=\norm{\rho_{k,t}-\rho_{T,t}}_1.
+\end{equation}
+Under exact population fitting of \eqref{eq:scheduled-outer-mixture},
+\begin{equation}
+D_{k+1}(t)
+=(1-\alpha_k)D_k(t),
+\qquad
+D_K(t)
+=
+\left[\prod_{j=0}^{K-1}(1-\alpha_j)\right]D_0(t).
+\label{eq:scheduled-contraction}
+\end{equation}
+Thus the effective teacher mass accumulated by iteration $K$ is
+\begin{equation}
+A_{\mathrm{eff}}(K)
+:=
+1-\prod_{j=0}^{K-1}(1-\alpha_j).
+\label{eq:effective-teacher-mass}
+\end{equation}
+This quantity, not the final value $\alpha_{K-1}$ alone, controls ideal progress.
+
+If every $\alpha_k<1$, convergence to the teacher requires
+\begin{equation}
+\prod_{k=0}^{\infty}(1-\alpha_k)=0,
+\quad\text{equivalently}\quad
+\sum_{k=0}^{\infty}-\log(1-\alpha_k)=\infty.
+\label{eq:schedule-convergence-condition}
+\end{equation}
+When the schedule is bounded away from one, the familiar sufficient and essentially equivalent
+condition is $\sum_k\alpha_k=\infty$.  Important examples are:
+\begin{itemize}[leftmargin=1.5em]
+\item constant $\alpha_k=\alpha>0$: geometric contraction;
+\item harmonic decay $\alpha_k=c/(k+b)$: polynomial contraction and eventual convergence;
+\item exponential decay $\alpha_k=\alpha_0r^k$, $0<r<1$: finite total teacher mass, so the ideal
+      student generally stops short of the teacher;
+\item decay to a positive floor $\alpha_{\min}>0$: eventual geometric contraction.
+\end{itemize}
+
+In the exact model, schedules with the same multiset of $\alpha_k$ values have the same final
+product in \eqref{eq:scheduled-contraction}; front-loading or back-loading those values only
+changes the intermediate path.  Their practical behavior differs because optimization error,
+network capacity, and branch-sampling noise depend on the current student--teacher gap.
+
+\subsection{What alpha does to the optimization problem}
+
+For a fixed outer iteration, write the branch-conditioned stochastic gradients as $G_{\mathrm O}$
+and $G_{\mathrm T}$.  The A4 gradient has mean
+\begin{equation}
+\E[G]
+=(1-\alpha)\E[G_{\mathrm O}]
++\alpha\E[G_{\mathrm T}],
+\label{eq:alpha-gradient-mean}
+\end{equation}
+and the law of total variance contains the between-branch term
+\begin{equation}
+\operatorname{Var}(G)
+=
+(1-\alpha)\operatorname{Var}(G_{\mathrm O})
++\alpha\operatorname{Var}(G_{\mathrm T})
++\alpha(1-\alpha)
+\norm{\E[G_{\mathrm T}]-\E[G_{\mathrm O}]}^2.
+\label{eq:alpha-gradient-variance}
+\end{equation}
+At the beginning of an outer iteration the current student equals, or is close to, the frozen old
+student.  The old-branch gradient is then small and the teacher branch supplies most of the
+learning signal.  In the simplified limit $G_{\mathrm O}=0$ and deterministic $G_{\mathrm T}=g$,
+the signal magnitude is $\alpha\norm{g}$ while the branch standard deviation is
+$\sqrt{\alpha(1-\alpha)}\norm{g}$.  The single-sample signal-to-noise ratio is therefore
+\begin{equation}
+\sqrt{\frac{\alpha}{1-\alpha}}.
+\label{eq:bernoulli-gradient-snr}
+\end{equation}
+Reducing $\alpha$ reduces the expected update, but it does \emph{not} automatically make that
+update statistically smoother: it also makes teacher trajectories rarer.  With $N$ independent
+rows, only $N\alpha$ teacher rows are expected.  Very small $\alpha$ can produce empty teacher
+subsets, weak signal, and high run-to-run variation.  In the current rank-synchronous FSDP path,
+all ranks intentionally reuse the same branch pattern to preserve collective call order, so the
+effective number of independent routing rows is the local pattern size rather than a
+world-size-multiplied batch.  This makes small-alpha sampling noise especially relevant.
+
+The ideal distributional movement in one refresh is
+\begin{equation}
+\norm{q_{k,t}-\rho_{k,t}}_1
+=\alpha_k D_k(t).
+\label{eq:ideal-trust-step}
+\end{equation}
+This equation gives a precise interpretation of ``learning pressure'': it depends on both
+$\alpha_k$ and the remaining student--teacher discrepancy.  Increasing $\alpha_k$ can still keep
+the actual movement constant or decreasing if $D_k$ falls sufficiently fast.
+
+\subsection{Finite fitting error changes the answer}
+
+Let $\varepsilon_k(\alpha_k)$ summarize the discrepancy introduced by finite LoRA capacity,
+finite samples, timestep subsampling, and incomplete optimization.  A generic practical
+recursion is
+\begin{equation}
+D_{k+1}
+\le
+(1-\alpha_k)D_k+\varepsilon_k(\alpha_k).
+\label{eq:inexact-scheduled-recursion}
+\end{equation}
+Unrolling it yields
+\begin{equation}
+D_K
+\le
+\left[\prod_{j=0}^{K-1}(1-\alpha_j)\right]D_0
++
+\sum_{j=0}^{K-1}
+\varepsilon_j(\alpha_j)
+\prod_{\ell=j+1}^{K-1}(1-\alpha_\ell).
+\label{eq:inexact-scheduled-bound}
+\end{equation}
+This exposes the real tradeoff:
+\begin{itemize}[leftmargin=1.5em]
+\item larger $\alpha_k$ gives stronger ideal contraction;
+\item a large teacher jump can increase $\varepsilon_k(\alpha_k)$ when the target field is hard
+      for the student or optimizer;
+\item substantial teacher weight at later iterations attenuates errors accumulated earlier;
+\item annealing $\alpha_k$ toward zero preserves the old field, but also weakens correction of
+      both teacher discrepancy and earlier fitting error.
+\end{itemize}
+If fitting error were independent of alpha, larger alpha would always improve this bound.
+Annealing is justified only by evidence that the fitting or stability error grows enough with
+teacher pressure to dominate the stronger contraction.
+
+\subsection{Increasing teacher weight: a continuation interpretation}
+
+An increasing schedule is a valid homotopy or trust-region strategy:
+\begin{equation}
+0<\alpha_0\le\alpha_1\le\cdots\le\alpha_{\max}.
+\end{equation}
+Early mixtures remain close to the old student, so a limited-capacity LoRA adapter does not need
+to represent the full teacher displacement at once.  As the gap $D_k$ shrinks, alpha can grow
+while the actual step $\alpha_kD_k$ in \eqref{eq:ideal-trust-step} remains controlled.  This
+formalizes the useful part of the ``start with little teacher, then approach teacher'' intuition.
+
+The wording requires care: increasing alpha does not itself reduce teacher pressure; it increases
+the nominal teacher probability.  Pressure can nevertheless fall because the teacher and old
+fields have become closer.  A practical trust-region rule would estimate a gap statistic $M_k$,
+for example an exponential moving average of
+\texttt{student\_target\_gap\_rms} on teacher branches, and set
+\begin{equation}
+\alpha_{k+1}
+=
+\operatorname{clip}\left(
+  \frac{\delta}{M_k+\epsilon},
+  \alpha_{\min},
+  \alpha_{\max}
+\right),
+\label{eq:gap-adaptive-alpha}
+\end{equation}
+where $\delta$ is a desired update-pressure budget.  As $M_k$ decreases, the controller naturally
+raises teacher exposure.
+
+Potential disadvantages are slower early progress, too few teacher samples, and an abrupt late
+increase if the schedule is based only on iteration count.  A floor on expected teacher rows and
+slow, epoch-level updates with hysteresis are safer than per-batch reactions.
+
+\subsection{Decreasing teacher weight: stabilization with a bias cost}
+
+A decreasing schedule can make late updates more proximal to the current student:
+\begin{equation}
+\alpha_0\ge\alpha_1\ge\cdots\ge\alpha_{\min}.
+\end{equation}
+It can be useful when teacher-branch loss, gradient clipping, rollout failures, or fitting error
+increase late in training.  More old trajectories then act as a self-consistency anchor.
+
+However, decreasing alpha is not analogous to an ordinary learning-rate decay.  It changes the
+\emph{target distribution}.  If alpha decays too quickly to zero, condition
+\eqref{eq:schedule-convergence-condition} fails and even an ideal learner retains a nonzero
+teacher discrepancy.  This is exactly the wrong default if training is already stable: reducing
+teacher weight weakens the only force that moves the refreshed old student toward the teacher.
+
+Safer variants are:
+\begin{itemize}[leftmargin=1.5em]
+\item decay only after a measured instability event, with recovery when diagnostics normalize;
+\item decay to a positive floor rather than zero;
+\item use a harmonic tail if asymptotic teacher convergence is desired;
+\item decay the optimizer learning rate while keeping alpha fixed when the problem is ordinary
+      parameter-update noise rather than a bad target mixture.
+\end{itemize}
+
+\subsection{Recommendation and ablation design}
+
+\begin{tcolorbox}[colback=green!5,colframe=green!50!black,title=Recommended default]
+A dynamic schedule is \emph{not theoretically necessary}.  Start with the static
+$\alpha=0.5$ baseline because it has geometric ideal contraction, balanced branch coverage, and
+the simplest interpretation.  Add scheduling only after branch-conditioned loss, target-gap,
+gradient-norm, clipping, and evaluation curves identify either an excessive initial jump or a
+late stability problem.
+\end{tcolorbox}
+
+For a controlled study, compare:
+\begin{enumerate}[leftmargin=1.6em]
+\item static $\alpha=0.5$;
+\item increasing continuation, for example $0.1\rightarrow0.5$;
+\item decreasing stabilization with a floor, for example $0.5\rightarrow0.1$ rather than zero;
+\item a gap-adaptive trust-region schedule such as \eqref{eq:gap-adaptive-alpha}.
+\end{enumerate}
+Report both the schedule and $A_{\mathrm{eff}}(K)$ from
+\eqref{eq:effective-teacher-mass}.  Matching only the number of epochs is not a fair comparison:
+different schedules change ideal contraction, the number of teacher trajectories, and expected
+rollout cost.  At minimum, log the realized teacher branch count, teacher/old conditioned losses,
+teacher-branch target gap, gradient norm and clipping rate, and fixed student-only evaluation.
+
+%% ============================================================
 \section{Methods that look like A4 but are not A4}
 \label{sec:not-a4}
 %% ============================================================
@@ -1264,6 +1541,12 @@ scheduler:
   dynamics_type: ODE
   noise_level: 0.0
 \end{lstlisting}
+
+The implemented field is a single static scalar.  It is read for every branch draw but is not
+scheduled by epoch, optimizer step, or ODE time.  Section~\ref{sec:dynamic-alpha} is therefore
+theory and experiment design, not a claim that dynamic alpha is already supported.  A future
+outer-loop schedule must resolve one scalar $\alpha_k$ before branch sampling and keep it fixed
+for the full trajectory.
 
 The implementation enforces these fail-fast checks:
 \begin{enumerate}[leftmargin=1.6em]
@@ -1821,6 +2104,8 @@ metric & purpose\\
 & measure actual compact callback storage\\
 \texttt{teacher\_branch\_fraction} (four stats)
 & verify Bernoulli routing and distributed aggregation\\
+\texttt{scheduled alpha} and cumulative $A_{\mathrm{eff}}$
+& required if an outer-loop alpha schedule is implemented\\
 \texttt{loss\_old}, \texttt{loss\_teacher} (four stats)
 & branch-conditioned fitting difficulty; absent for an empty branch\\
 \texttt{target\_velocity\_rms} (four stats)

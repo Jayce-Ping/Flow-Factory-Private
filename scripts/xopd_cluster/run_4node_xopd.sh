@@ -29,6 +29,7 @@ EXTRA="$*"
 
 MASTER_IP=${MASTER_IP:-28.7.193.116}
 MASTER_PORT=${MASTER_PORT:-29540}
+HF_HOME=${HF_HOME:-/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/.cache/huggingface}
 # Worker IPs (ranks 1..N-1). Override with XOPD_WORKERS to run on fewer/more nodes,
 # e.g. XOPD_WORKERS="28.7.185.215" -> 2-node run (node0 rank0 + this worker rank1),
 # leaving the other nodes free for a vLLM judge / keepalive. NUM_MACHINES is derived.
@@ -45,6 +46,7 @@ EVAL_DEBUG=${FLOW_FACTORY_EVAL_DEBUG:-1}
 # no other shell refs inside, so nothing else is accidentally interpolated.
 read -r -d '' COMMON <<EOF || true
 export http_proxy=http://star-proxy.oa.com:3128 https_proxy=http://star-proxy.oa.com:3128
+export HF_HOME=${HF_HOME}
 # Never route intra-cluster traffic through the external proxy: the GEditBench eval reward's
 # OpenAI/httpx client must reach the vLLM judge (a bond1 IP, e.g. 28.7.195.15:8000) DIRECTLY,
 # otherwise every request is proxied to star-proxy and fails (that reward -> nan / eval hang).
