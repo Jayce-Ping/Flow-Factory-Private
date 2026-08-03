@@ -535,6 +535,7 @@ class Flux2Adapter(BaseAdapter):
             teacher_guidance_scale=(
                 donor_guidance_scale if donor_guidance_scale is not None else teacher_guidance_scale
             ),
+            force_teacher_negative=False,
             is_train=is_train,
             max_sequence_length=max_sequence_length,
             device=device,

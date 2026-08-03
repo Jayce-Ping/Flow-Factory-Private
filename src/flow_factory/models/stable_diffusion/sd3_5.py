@@ -201,6 +201,7 @@ class SD3_5Adapter(BaseAdapter):
             negative_prompt=negative_prompt,
             guidance_scale=guidance_scale,
             teacher_guidance_scale=teacher_guidance_scale,
+            force_teacher_negative=False,
             is_train=is_train,
             max_sequence_length=max_sequence_length,
             device=device,

@@ -45,6 +45,27 @@ Adapter additions in [`models/flux/flux2_klein.py`](../../src/flow_factory/model
 Because teacher and student **share the text encoder**, preprocessed
 `prompt_embeds` / `text_ids` are reused for both — no re-encoding.
 
+### CFG scales are not branch supervision
+
+`teacher_guidance_scale` and `student_guidance_scale` currently choose the
+teacher/student **CFG-composed** fields. The adapter returns only
+`v_negative + guidance_scale * (v_positive - v_negative)`; a scale of 1 skips
+the negative branch entirely. Therefore the current loss identifies neither
+branch separately, even when both scales are greater than 1.
+
+The XOPD-only branch-aware mode follows Positive--Direction Matching (PDM) from
+[Rethinking Classifier-Free Guidance in On-Policy Diffusion Distillation](https://arxiv.org/abs/2607.24731v2):
+it matches the positive prediction and the CFG conditional direction
+`v_positive - v_negative` separately while leaving rollout guidance unchanged.
+Enable it with `xopd_cfg_objective: pdm` and `xopd_pdm_lambda: 1.0`.
+It is implemented for L0, direct L1, and A4/marginal-CFM in same-VAE velocity
+space; P-OPD and cross-VAE combinations raise explicitly. A rollout scale of 1
+still executes the negative branch in PDM mode because the scale controls state
+visitation, not the branch-aware pointwise loss.
+The derivation, target-mode compatibility matrix, config contract,
+distributed constraints, and ablation design are documented in
+[`docs/xopd/branch_aware_cfg_distillation.md`](../xopd/branch_aware_cfg_distillation.md).
+
 ## Two stages (single run, switch on epoch)
 
 `XOPDTrainer.start()` branches on `self.epoch < l0_warmup_epochs`:

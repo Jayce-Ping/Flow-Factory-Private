@@ -70,6 +70,150 @@ class XOPDDetailMask:
     threshold: float
 
 
+@dataclass(frozen=True)
+class PDMVelocityLoss:
+    """Per-sample PDM objective and detached branch diagnostics."""
+
+    loss: torch.Tensor
+    positive_mse: torch.Tensor
+    negative_mse: torch.Tensor
+    direction_mse: torch.Tensor
+    positive_error_rms: torch.Tensor
+    negative_error_rms: torch.Tensor
+    direction_error_rms: torch.Tensor
+    composed_mse_at_teacher_gs: torch.Tensor
+    composed_mse_at_student_gs: torch.Tensor
+
+    def detached_diagnostics(self) -> Dict[str, torch.Tensor]:
+        return {
+            "positive_mse": self.positive_mse.detach(),
+            "negative_mse": self.negative_mse.detach(),
+            "direction_mse": self.direction_mse.detach(),
+            "positive_error_rms": self.positive_error_rms.detach(),
+            "negative_error_rms": self.negative_error_rms.detach(),
+            "direction_error_rms": self.direction_error_rms.detach(),
+            "composed_mse_at_teacher_gs": self.composed_mse_at_teacher_gs.detach(),
+            "composed_mse_at_student_gs": self.composed_mse_at_student_gs.detach(),
+            "nba_gap": (self.negative_error_rms - self.positive_error_rms).detach(),
+        }
+
+
+def compute_xopd_pdm_loss(
+    *,
+    student_positive: torch.Tensor,
+    student_negative: torch.Tensor,
+    teacher_positive: torch.Tensor,
+    teacher_negative: torch.Tensor,
+    pdm_lambda: float,
+    teacher_guidance_scale: float,
+    student_guidance_scale: float,
+) -> PDMVelocityLoss:
+    """Compute Positive--Direction Matching with float32 event-mean reductions."""
+    tensors = {
+        "student_positive": student_positive,
+        "student_negative": student_negative,
+        "teacher_positive": teacher_positive,
+        "teacher_negative": teacher_negative,
+    }
+    for name, value in tensors.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"expected torch.Tensor for {name}, got {type(value).__name__}: {value!r}."
+            )
+        if value.ndim < 2:
+            raise ValueError(
+                f"expected {name} with shape (B,event...), got shape={tuple(value.shape)}."
+            )
+        if not value.is_floating_point():
+            raise TypeError(
+                f"expected floating-point {name}, got dtype={value.dtype}, "
+                f"shape={tuple(value.shape)}."
+            )
+        if not torch.isfinite(value).all():
+            raise ValueError(
+                f"expected finite {name}, got non-finite values with "
+                f"shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}."
+            )
+    reference = student_positive
+    for name, value in tensors.items():
+        if value.shape != reference.shape:
+            raise ValueError(
+                "PDM branch predictions must share one shape, "
+                f"student_positive.shape={tuple(reference.shape)}, "
+                f"{name}.shape={tuple(value.shape)}."
+            )
+        if value.device != reference.device:
+            raise ValueError(
+                "PDM branch predictions must share one device, "
+                f"student_positive.device={reference.device}, {name}.device={value.device}."
+            )
+        if value.dtype != reference.dtype:
+            raise TypeError(
+                "PDM branch predictions must share one dtype, "
+                f"student_positive.dtype={reference.dtype}, {name}.dtype={value.dtype}."
+            )
+    if isinstance(pdm_lambda, bool) or not isinstance(pdm_lambda, (int, float)):
+        raise TypeError(
+            "expected finite numeric pdm_lambda > 0, "
+            f"got {type(pdm_lambda).__name__}: pdm_lambda={pdm_lambda!r}."
+        )
+    if not math.isfinite(float(pdm_lambda)) or float(pdm_lambda) <= 0.0:
+        raise ValueError(
+            f"expected finite pdm_lambda > 0, got pdm_lambda={pdm_lambda!r}."
+        )
+    for name, scale in (
+        ("teacher_guidance_scale", teacher_guidance_scale),
+        ("student_guidance_scale", student_guidance_scale),
+    ):
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            raise TypeError(
+                f"expected finite numeric {name}, got {type(scale).__name__}: {scale!r}."
+            )
+        if not math.isfinite(float(scale)):
+            raise ValueError(f"expected finite {name}, got {scale!r}.")
+
+    teacher_positive_f = teacher_positive.detach().float()
+    teacher_negative_f = teacher_negative.detach().float()
+    student_positive_f = student_positive.float()
+    student_negative_f = student_negative.float()
+    positive_error = teacher_positive_f - student_positive_f
+    negative_error = teacher_negative_f - student_negative_f
+    direction_error = (
+        teacher_positive_f
+        - teacher_negative_f
+        - (student_positive_f - student_negative_f)
+    )
+    event_dims = tuple(range(1, student_positive.ndim))
+
+    def event_mse(error: torch.Tensor) -> torch.Tensor:
+        return error.square().mean(dim=event_dims)
+
+    positive_mse = event_mse(positive_error)
+    negative_mse = event_mse(negative_error)
+    direction_mse = event_mse(direction_error)
+
+    def composed_mse(guidance_scale: float) -> torch.Tensor:
+        teacher_composed = teacher_negative_f + float(guidance_scale) * (
+            teacher_positive_f - teacher_negative_f
+        )
+        student_composed = student_negative_f + float(guidance_scale) * (
+            student_positive_f - student_negative_f
+        )
+        return event_mse(teacher_composed - student_composed)
+
+    return PDMVelocityLoss(
+        loss=positive_mse + float(pdm_lambda) * direction_mse,
+        positive_mse=positive_mse,
+        negative_mse=negative_mse,
+        direction_mse=direction_mse,
+        positive_error_rms=positive_mse.sqrt(),
+        negative_error_rms=negative_mse.sqrt(),
+        direction_error_rms=direction_mse.sqrt(),
+        composed_mse_at_teacher_gs=composed_mse(float(teacher_guidance_scale)),
+        composed_mse_at_student_gs=composed_mse(float(student_guidance_scale)),
+    )
+
+
 def extract_popd_behavior_transition(
     batch: Dict[str, Any],
     *,

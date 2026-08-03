@@ -91,6 +91,16 @@ LORA_ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
+
+@dataclass(frozen=True)
+class CFGVelocityPrediction:
+    """Positive, negative, and CFG-composed velocity predictions at one state."""
+
+    positive: torch.Tensor
+    negative: torch.Tensor
+    composed: torch.Tensor
+
+
 @dataclass
 class NamedParametersInfo:
     """Metadata for named parameters snapshot."""
@@ -2315,6 +2325,7 @@ class BaseAdapter(ABC):
         negative_prompt: Optional[Union[str, List[str]]],
         guidance_scale: float,
         teacher_guidance_scale: float,
+        force_teacher_negative: bool,
         is_train: bool,
         max_sequence_length: int,
         device: Optional[torch.device],
@@ -2330,6 +2341,8 @@ class BaseAdapter(ABC):
         if self._teacher_pipeline is None:
             return batch
         teacher_cfg = teacher_guidance_scale if is_train else guidance_scale
+        if is_train and force_teacher_negative:
+            teacher_cfg = max(float(teacher_cfg), 2.0)
         teacher = self.encode_teacher_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,

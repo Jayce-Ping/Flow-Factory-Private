@@ -15,12 +15,15 @@
 """Unit tests for Cross-OPD (XOPD) pure helpers and training-args validation."""
 
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import torch
 
 from flow_factory.hparams.training_args import XOPDTrainingArguments
-from flow_factory.models.flux.flux2_klein import Flux2KleinSample
+from flow_factory.models.flux.flux2_klein import Flux2KleinAdapter, Flux2KleinSample
 from flow_factory.samples import BaseSample
+from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.xopd import common as xopd_common
 from flow_factory.trainers.xopd.common import (
     align_l0_inner_steps,
@@ -31,6 +34,7 @@ from flow_factory.trainers.xopd.common import (
     compute_popd_quantiles,
     compute_popd_responsibility,
     compute_transition_variance,
+    compute_xopd_pdm_loss,
     extract_i2i_condition_kwargs,
     extract_popd_behavior_transition,
     interleaved_source_iter,
@@ -41,6 +45,116 @@ from flow_factory.trainers.xopd.common import (
     validate_source_ratio,
     validate_xopd_target_configuration,
 )
+
+
+class _BranchRecordingTransformer:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def cache_context(self, name):
+        return nullcontext()
+
+    def __call__(self, *, hidden_states, encoder_hidden_states, **kwargs):
+        self.calls.append(encoder_hidden_states)
+        value = encoder_hidden_states[:, : hidden_states.shape[1], : hidden_states.shape[2]]
+        return (value,)
+
+
+class _BranchRecordingScheduler:
+    noise_level = 0.0
+
+    def step(self, *, noise_pred, return_kwargs, **kwargs):
+        available = {
+            "noise_pred": noise_pred,
+            "next_latents_mean": noise_pred,
+            "std_dev_t": torch.zeros(noise_pred.shape[0], 1),
+            "dt": -torch.ones(noise_pred.shape[0], 1),
+        }
+        return SDESchedulerOutput.from_dict(
+            {key: available[key] for key in return_kwargs if key in available}
+        )
+
+
+class TestFlux2KleinCFGBranchOutput(unittest.TestCase):
+    def _adapter(self):
+        adapter = Flux2KleinAdapter.__new__(Flux2KleinAdapter)
+        adapter._components = {}
+        adapter.transformer = _BranchRecordingTransformer()
+        adapter.pipeline = SimpleNamespace(scheduler=_BranchRecordingScheduler())
+        adapter._unwrap = lambda module: module
+        return adapter
+
+    @staticmethod
+    def _kwargs():
+        return {
+            "t": torch.tensor([500.0]),
+            "t_next": torch.tensor([0.0]),
+            "latents": torch.zeros(1, 2, 3),
+            "latent_ids": torch.zeros(1, 2, 4),
+            "prompt_embeds": torch.ones(1, 2, 3),
+            "text_ids": torch.zeros(1, 2, dtype=torch.long),
+            "negative_prompt_embeds": torch.zeros(1, 2, 3),
+            "negative_text_ids": torch.zeros(1, 2, dtype=torch.long),
+            "guidance_scale": 1.0,
+            "compute_log_prob": False,
+        }
+
+    def test_composed_gs_one_uses_only_positive_forward(self) -> None:
+        adapter = self._adapter()
+        output = adapter._forward(**self._kwargs(), return_kwargs=["noise_pred"])
+        self.assertEqual(len(adapter.transformer.calls), 1)
+        torch.testing.assert_close(output.noise_pred, torch.ones(1, 2, 3))
+
+    def test_requested_branches_force_negative_forward_at_gs_one(self) -> None:
+        adapter = self._adapter()
+        output = adapter._forward(
+            **self._kwargs(),
+            return_kwargs=["positive_noise_pred", "negative_noise_pred"],
+        )
+        self.assertEqual(len(adapter.transformer.calls), 2)
+        torch.testing.assert_close(output.positive_noise_pred, torch.ones(1, 2, 3))
+        torch.testing.assert_close(output.negative_noise_pred, torch.zeros(1, 2, 3))
+
+
+class TestXOPDPDMLoss(unittest.TestCase):
+    def test_pdm_rejects_composed_error_cancellation(self) -> None:
+        teacher_positive = torch.zeros(2, 3)
+        teacher_negative = torch.zeros(2, 3)
+        student_positive = torch.full((2, 3), -1.0)
+        student_negative = torch.full((2, 3), -2.0)
+        result = compute_xopd_pdm_loss(
+            student_positive=student_positive,
+            student_negative=student_negative,
+            teacher_positive=teacher_positive,
+            teacher_negative=teacher_negative,
+            pdm_lambda=1.0,
+            teacher_guidance_scale=2.0,
+            student_guidance_scale=2.0,
+        )
+        torch.testing.assert_close(
+            result.composed_mse_at_teacher_gs,
+            torch.zeros(2),
+        )
+        torch.testing.assert_close(result.loss, torch.full((2,), 2.0))
+
+    def test_pdm_zero_loss_requires_matching_branches_and_backpropagates(self) -> None:
+        teacher_positive = torch.randn(2, 3)
+        teacher_negative = torch.randn(2, 3)
+        student_positive = teacher_positive.clone().requires_grad_(True)
+        student_negative = teacher_negative.clone().requires_grad_(True)
+        result = compute_xopd_pdm_loss(
+            student_positive=student_positive,
+            student_negative=student_negative,
+            teacher_positive=teacher_positive,
+            teacher_negative=teacher_negative,
+            pdm_lambda=0.5,
+            teacher_guidance_scale=4.0,
+            student_guidance_scale=1.0,
+        )
+        torch.testing.assert_close(result.loss, torch.zeros(2))
+        result.loss.mean().backward()
+        torch.testing.assert_close(student_positive.grad, torch.zeros_like(student_positive))
+        torch.testing.assert_close(student_negative.grad, torch.zeros_like(student_negative))
 
 
 class TestXOPDPerStepKL(unittest.TestCase):
@@ -213,6 +327,40 @@ class TestXOPDTrainingArguments(unittest.TestCase):
         self.assertEqual(args.guidance_scale, 1.0)
         # Preprocess must encode negatives if EITHER side uses CFG.
         self.assertEqual(args.get_preprocess_guidance_scale(), 4.0)
+
+    def test_pdm_forces_negative_preprocessing_at_rollout_gs_one(self) -> None:
+        args = XOPDTrainingArguments(
+            teacher_model_name_or_path="/tmp/teacher",
+            trainer_type="xopd",
+            xopd_cfg_objective="pdm",
+            xopd_pdm_lambda=1.0,
+            xopd_dk_space="v",
+            normalize_d_k=False,
+            teacher_guidance_scale=1.0,
+            student_guidance_scale=1.0,
+        )
+        self.assertEqual(args.guidance_scale, 1.0)
+        self.assertEqual(args.get_preprocess_guidance_scale(), 2.0)
+
+    def test_pdm_rejects_popd_and_non_velocity_loss(self) -> None:
+        with self.assertRaises(ValueError):
+            XOPDTrainingArguments(
+                teacher_model_name_or_path="/tmp/teacher",
+                trainer_type="xopd",
+                xopd_cfg_objective="pdm",
+                xopd_target_mode="p_opd",
+                xopd_dk_space="v",
+                normalize_d_k=False,
+            )
+        with self.assertRaises(ValueError):
+            XOPDTrainingArguments(
+                teacher_model_name_or_path="/tmp/teacher",
+                trainer_type="xopd",
+                xopd_cfg_objective="pdm",
+                xopd_target_mode="direct",
+                xopd_dk_space="xt",
+                normalize_d_k=False,
+            )
 
     def test_popd_defaults_preserve_direct_xopd(self) -> None:
         args = XOPDTrainingArguments(teacher_model_name_or_path="/tmp/teacher")

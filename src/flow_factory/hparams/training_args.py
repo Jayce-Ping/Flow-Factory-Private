@@ -2535,6 +2535,25 @@ class XOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    xopd_cfg_objective: Literal["composed", "pdm"] = field(
+        default="composed",
+        metadata={
+            "help": (
+                "XOPD CFG supervision objective. 'composed' preserves the existing "
+                "single CFG-composed target. 'pdm' matches the positive prediction and "
+                "positive-minus-negative CFG direction separately."
+            )
+        },
+    )
+    xopd_pdm_lambda: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Positive-direction matching coefficient lambda. Must be finite and > 0 "
+                "when xopd_cfg_objective='pdm'; ignored otherwise."
+            )
+        },
+    )
 
     # ---- L0: velocity regression warmup (teacher-generated data) ----
     l0_warmup_epochs: int = field(
@@ -2953,6 +2972,57 @@ class XOPDTrainingArguments(TrainingArguments):
                 "`xopd_target_mode` must be 'direct', 'p_opd', or 'marginal_cfm', "
                 f"got xopd_target_mode={self.xopd_target_mode!r}."
             )
+        if self.xopd_cfg_objective not in ("composed", "pdm"):
+            raise ValueError(
+                "`xopd_cfg_objective` must be 'composed' or 'pdm', "
+                f"got xopd_cfg_objective={self.xopd_cfg_objective!r}."
+            )
+        if self.xopd_cfg_objective == "pdm":
+            if isinstance(self.xopd_pdm_lambda, bool) or not isinstance(
+                self.xopd_pdm_lambda, (int, float)
+            ):
+                raise TypeError(
+                    "`xopd_pdm_lambda` must be a finite number > 0 for PDM, "
+                    f"got {type(self.xopd_pdm_lambda).__name__}: "
+                    f"xopd_pdm_lambda={self.xopd_pdm_lambda!r}."
+                )
+            if not math.isfinite(float(self.xopd_pdm_lambda)) or float(
+                self.xopd_pdm_lambda
+            ) <= 0.0:
+                raise ValueError(
+                    "`xopd_pdm_lambda` must be finite and > 0 for PDM, "
+                    f"got xopd_pdm_lambda={self.xopd_pdm_lambda!r}."
+                )
+            if str(self.trainer_type).lower() != "xopd":
+                raise ValueError(
+                    "xopd_cfg_objective='pdm' is implemented only for trainer_type='xopd', "
+                    f"got trainer_type={self.trainer_type!r}."
+                )
+            if self.xopd_target_mode == "p_opd":
+                raise ValueError(
+                    "xopd_cfg_objective='pdm' does not support xopd_target_mode='p_opd': "
+                    "gating PDM with the P-OPD responsibility would no longer be the exact "
+                    "local Gaussian mixture-KL surrogate."
+                )
+            if self._cross_vae or self.vae_transport != "identity" or self.xopd_pixel_loss:
+                raise ValueError(
+                    "xopd_cfg_objective='pdm' currently requires same-VAE identity transport "
+                    "and latent loss, got "
+                    f"cross_vae={self._cross_vae}, vae_transport={self.vae_transport!r}, "
+                    f"xopd_pixel_loss={self.xopd_pixel_loss!r}."
+                )
+            if self.xopd_dk_space != "v" or self.normalize_d_k is not False:
+                raise ValueError(
+                    "xopd_cfg_objective='pdm' requires velocity-space unnormalized loss: "
+                    "expected xopd_dk_space='v' and normalize_d_k=False, got "
+                    f"xopd_dk_space={self.xopd_dk_space!r}, "
+                    f"normalize_d_k={self.normalize_d_k!r}."
+                )
+            if self.xopd_detail_mask_enabled:
+                raise ValueError(
+                    "xopd_cfg_objective='pdm' does not support xopd_detail_mask_enabled=True; "
+                    "the existing mask is defined for composed x0_norm targets."
+                )
         if self.xopd_target_mode == "p_opd":
             if (
                 isinstance(self.popd_alpha, bool)
@@ -3082,11 +3152,13 @@ class XOPDTrainingArguments(TrainingArguments):
         return args.scheduler_args.num_sde_steps
 
     def get_preprocess_guidance_scale(self) -> float:
-        # Encode negative prompts when EITHER teacher or student uses CFG.
+        # PDM needs both branches even when both rollout scales are one.
+        branch_requirement = 2.0 if self.xopd_cfg_objective == "pdm" else 1.0
         return max(
             self.teacher_guidance_scale,
             self.student_guidance_scale,
             self.guidance_scale,
+            branch_requirement,
         )
 
 

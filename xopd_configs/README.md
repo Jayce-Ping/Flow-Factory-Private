@@ -36,6 +36,23 @@ requires:
   `vae_transport: identity`, and `assume_shared_vae_text_encoder: true`);
 - `xopd_dk_space: v`, `normalize_d_k: false`, and no pixel loss.
 
+Branch-aware A4 adds:
+
+```yaml
+train:
+  xopd_cfg_objective: pdm
+  xopd_pdm_lambda: 1.0
+```
+
+PDM supervises the positive velocity and positive-minus-negative CFG direction
+separately. `teacher_guidance_scale` / `student_guidance_scale` still choose
+the source trajectories; they do not appear in the pointwise PDM loss. Even
+when both are 1, PDM forces negative conditioning to be preprocessed and runs
+both branches. See
+[`_TEST_9b_4b_marginal_cfm_pdm_smoke.yaml`](ode_pathwise/_TEST_9b_4b_marginal_cfm_pdm_smoke.yaml)
+and
+[`docs/xopd/branch_aware_cfg_distillation.md`](../docs/xopd/branch_aware_cfg_distillation.md).
+
 The matched smoke pair keeps the model, prompts, timestep selection, batch
 geometry, gradient accumulation, and optimizer settings fixed. Only the target
 behavior changes:

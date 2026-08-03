@@ -84,6 +84,7 @@ from .common import (
     compute_popd_quantiles,
     compute_popd_responsibility,
     compute_transition_variance,
+    compute_xopd_pdm_loss,
     draw_marginal_cfm_branches,
     extract_i2i_condition_kwargs,
     extract_popd_behavior_transition,
@@ -123,6 +124,14 @@ class _POPDStepCache:
     responsibility: POPDResponsibility
 
 
+@dataclass(frozen=True)
+class _PDMBranchCache:
+    """Detached teacher/source CFG branches aligned to one training timestep."""
+
+    positive: torch.Tensor
+    negative: torch.Tensor
+
+
 class XOPDTrainer(BaseTrainer):
     """Cross-model on-policy distillation trainer (L0 velocity regression + L1)."""
 
@@ -137,12 +146,21 @@ class XOPDTrainer(BaseTrainer):
         self.xopd_dk_space = ta.xopd_dk_space
         self.teacher_gs = ta.teacher_guidance_scale
         self.student_gs = ta.student_guidance_scale
+        self.xopd_cfg_objective = ta.xopd_cfg_objective
+        self._is_pdm = self.xopd_cfg_objective == "pdm"
+        self.pdm_lambda = float(ta.xopd_pdm_lambda)
         self.xopd_target_mode = ta.xopd_target_mode
         self._is_popd = self.xopd_target_mode == "p_opd"
         self._is_marginal_cfm = self.xopd_target_mode == "marginal_cfm"
         self.popd_alpha = float(ta.popd_alpha) if self._is_popd else 0.5
         self.popd_temperature = float(ta.popd_temperature) if self._is_popd else 1.0
         self.popd_verbose_diagnostics = bool(ta.popd_verbose_diagnostics)
+        if self._is_pdm and not hasattr(self.adapter, "predict_cfg_velocity"):
+            raise TypeError(
+                "XOPD PDM requires an adapter exposing predict_cfg_velocity, "
+                f"got adapter={type(self.adapter).__name__}, "
+                f"trainer_type={ta.trainer_type!r}."
+            )
         self.detail_mask_enabled = bool(ta.xopd_detail_mask_enabled)
         self.detail_mask_threshold = float(ta.xopd_detail_mask_threshold)
         self.detail_mask_step_thresholds = (
@@ -1012,6 +1030,8 @@ class XOPDTrainer(BaseTrainer):
             self.enable_kl_loss and self.training_args.kl_type == "v-based"
         ):
             keys.append("noise_pred")
+        if self._is_pdm:
+            keys.extend(("positive_noise_pred", "negative_noise_pred"))
         return keys
 
     # =============================== Main loop ===============================
@@ -1799,44 +1819,89 @@ class XOPDTrainer(BaseTrainer):
                         prompt_batch, prefer_latents=True, device=device
                     )
                     with self.autocast():
-                        with torch.no_grad(), self.adapter.use_teacher_transformer():
-                            v_teacher = self.adapter.predict_velocity(
+                        if self._is_pdm:
+                            with torch.no_grad(), self.adapter.use_teacher_transformer():
+                                teacher_prediction = self.adapter.predict_cfg_velocity(
+                                    t=t,
+                                    latents=z_t,
+                                    latent_ids=latent_ids,
+                                    prompt_embeds=teacher_prompt_embeds,
+                                    text_ids=teacher_text_ids,
+                                    negative_prompt_embeds=teacher_neg_embeds,
+                                    negative_text_ids=teacher_neg_text_ids,
+                                    guidance_scale=self.teacher_gs,
+                                    **{
+                                        k: v
+                                        for k, v in i2i_kwargs.items()
+                                        if k in ("image_latents", "image_latent_ids")
+                                    },
+                                )
+                            student_prediction = self.adapter.predict_cfg_velocity(
                                 t=t,
                                 latents=z_t,
                                 latent_ids=latent_ids,
-                                prompt_embeds=teacher_prompt_embeds,
-                                text_ids=teacher_text_ids,
-                                negative_prompt_embeds=teacher_neg_embeds,
-                                negative_text_ids=teacher_neg_text_ids,
-                                guidance_scale=self.teacher_gs,
+                                prompt_embeds=student_prompt_embeds,
+                                text_ids=student_text_ids,
+                                negative_prompt_embeds=student_neg_embeds,
+                                negative_text_ids=student_neg_text_ids,
+                                guidance_scale=self.student_gs,
                                 **{
                                     k: v
                                     for k, v in i2i_kwargs.items()
                                     if k in ("image_latents", "image_latent_ids")
                                 },
                             )
-                        v_student = self.adapter.predict_velocity(
-                            t=t,
-                            latents=z_t,
-                            latent_ids=latent_ids,
-                            prompt_embeds=student_prompt_embeds,
-                            text_ids=student_text_ids,
-                            negative_prompt_embeds=student_neg_embeds,
-                            negative_text_ids=student_neg_text_ids,
-                            guidance_scale=self.student_gs,
-                            **{
-                                k: v
-                                for k, v in i2i_kwargs.items()
-                                if k in ("image_latents", "image_latent_ids")
-                            },
-                        )
+                            pdm = compute_xopd_pdm_loss(
+                                student_positive=student_prediction.positive,
+                                student_negative=student_prediction.negative,
+                                teacher_positive=teacher_prediction.positive,
+                                teacher_negative=teacher_prediction.negative,
+                                pdm_lambda=self.pdm_lambda,
+                                teacher_guidance_scale=self.teacher_gs,
+                                student_guidance_scale=self.student_gs,
+                            )
+                            per_sample_mse = pdm.loss
+                            for name, values in pdm.detached_diagnostics().items():
+                                loss_info[f"cfg_branch/{name}"].append(values)
+                        else:
+                            with torch.no_grad(), self.adapter.use_teacher_transformer():
+                                v_teacher = self.adapter.predict_velocity(
+                                    t=t,
+                                    latents=z_t,
+                                    latent_ids=latent_ids,
+                                    prompt_embeds=teacher_prompt_embeds,
+                                    text_ids=teacher_text_ids,
+                                    negative_prompt_embeds=teacher_neg_embeds,
+                                    negative_text_ids=teacher_neg_text_ids,
+                                    guidance_scale=self.teacher_gs,
+                                    **{
+                                        k: v
+                                        for k, v in i2i_kwargs.items()
+                                        if k in ("image_latents", "image_latent_ids")
+                                    },
+                                )
+                            v_student = self.adapter.predict_velocity(
+                                t=t,
+                                latents=z_t,
+                                latent_ids=latent_ids,
+                                prompt_embeds=student_prompt_embeds,
+                                text_ids=student_text_ids,
+                                negative_prompt_embeds=student_neg_embeds,
+                                negative_text_ids=student_neg_text_ids,
+                                guidance_scale=self.student_gs,
+                                **{
+                                    k: v
+                                    for k, v in i2i_kwargs.items()
+                                    if k in ("image_latents", "image_latent_ids")
+                                },
+                            )
+                            per_sample_mse = (
+                                (v_student.float() - v_teacher.float())
+                                .pow(2)
+                                .mean(dim=tuple(range(1, v_student.ndim)))
+                            )
 
                     w = l0_loss_weight(sigma, ta.l0_weighting, ta.l0_snr_gamma)  # (B,)
-                    per_sample_mse = (
-                        (v_student.float() - v_teacher.float())
-                        .pow(2)
-                        .mean(dim=tuple(range(1, v_student.ndim)))
-                    )  # (B,)
                     loss = (w * per_sample_mse).mean()
 
                     loss_info["l0_loss"].append(loss.detach())
@@ -2766,7 +2831,7 @@ class XOPDTrainer(BaseTrainer):
             "teacher_negative_prompt_embeds",
             "teacher_negative_text_ids",
         )
-        if self.teacher_gs > 1.0:
+        if self._is_pdm or self.teacher_gs > 1.0:
             missing_negative_keys = [key for key in negative_keys if subset.get(key) is None]
             if missing_negative_keys:
                 raise ValueError(
@@ -2885,7 +2950,11 @@ class XOPDTrainer(BaseTrainer):
                 **subset,
                 "compute_log_prob": False,
                 "trajectory_indices": trajectory_indices,
-                "extra_call_back_kwargs": ["noise_pred"],
+                "extra_call_back_kwargs": (
+                    ["positive_noise_pred", "negative_noise_pred"]
+                    if self._is_pdm
+                    else ["noise_pred"]
+                ),
                 "guidance_scale": self.teacher_gs if use_teacher else self.student_gs,
             }
             if use_teacher:
@@ -3070,8 +3139,19 @@ class XOPDTrainer(BaseTrainer):
             step_indices = batch_steps if batch_steps is not None else self._train_timestep_indices
             if self._is_marginal_cfm:
                 mu_teacher_list = None
+                pdm_teacher_list = None
+                popd_cache_list = None
+            elif self._is_pdm:
+                mu_teacher_list = None
+                pdm_teacher_list = self._precompute_teacher_cfg_branches(
+                    batch=batch,
+                    latents_index_map=latents_index_map,
+                    num_timesteps=num_timesteps,
+                    timestep_indices=batch_steps,
+                )
                 popd_cache_list = None
             else:
+                pdm_teacher_list = None
                 mu_teacher_list = self._precompute_teacher_means(
                     batch=batch,
                     latents_index_map=latents_index_map,
@@ -3094,6 +3174,7 @@ class XOPDTrainer(BaseTrainer):
                 latents_index_map=latents_index_map,
                 num_timesteps=num_timesteps,
                 mu_teacher_list=mu_teacher_list,
+                pdm_teacher_list=pdm_teacher_list,
                 popd_cache_list=popd_cache_list,
                 loss_info=loss_info,
                 timestep_indices=batch_steps,
@@ -3179,6 +3260,56 @@ class XOPDTrainer(BaseTrainer):
                 f"check return_kwargs={teacher_kwargs.get('return_kwargs')!r}."
             )
         return out.next_latents_mean.detach()
+
+    def _teacher_cfg_branches(
+        self,
+        forward_kwargs: Dict[str, Any],
+        teacher_text_cond: Dict[str, torch.Tensor],
+    ) -> _PDMBranchCache:
+        """Evaluate both detached teacher CFG branches at one student-space state."""
+        if self._cross_vae:
+            raise ValueError(
+                "XOPD PDM teacher branches require same-VAE identity transport, "
+                f"got cross_vae={self._cross_vae}, "
+                f"vae_transport={self.training_args.vae_transport!r}."
+            )
+        required = (
+            "prompt_embeds",
+            "text_ids",
+            "negative_prompt_embeds",
+            "negative_text_ids",
+        )
+        missing = [key for key in required if teacher_text_cond.get(key) is None]
+        if missing:
+            raise ValueError(
+                "XOPD PDM teacher query requires positive and negative conditioning, "
+                f"missing_keys={missing!r}, teacher_guidance_scale={self.teacher_gs!r}."
+            )
+        teacher_kwargs = dict(forward_kwargs)
+        teacher_kwargs.update(
+            {
+                key: teacher_text_cond[key]
+                for key in required
+            }
+        )
+        teacher_kwargs["guidance_scale"] = self.teacher_gs
+        teacher_kwargs["return_kwargs"] = [
+            "positive_noise_pred",
+            "negative_noise_pred",
+        ]
+        with self.adapter.use_teacher_transformer():
+            output = self.adapter.forward(**teacher_kwargs)
+        if output.positive_noise_pred is None or output.negative_noise_pred is None:
+            raise RuntimeError(
+                "XOPD PDM teacher forward did not return both CFG branches, "
+                f"positive_is_none={output.positive_noise_pred is None}, "
+                f"negative_is_none={output.negative_noise_pred is None}, "
+                f"return_kwargs={teacher_kwargs['return_kwargs']!r}."
+            )
+        return _PDMBranchCache(
+            positive=output.positive_noise_pred.detach(),
+            negative=output.negative_noise_pred.detach(),
+        )
 
     def _build_teacher_query(
         self,
@@ -3306,7 +3437,22 @@ class XOPDTrainer(BaseTrainer):
                 "prompt_embeds": batch["teacher_prompt_embeds"],
                 "text_ids": batch["teacher_text_ids"],
             }
-            if self.teacher_gs > 1.0:
+            if self._is_pdm or self.teacher_gs > 1.0:
+                missing_negative = [
+                    key
+                    for key in (
+                        "teacher_negative_prompt_embeds",
+                        "teacher_negative_text_ids",
+                    )
+                    if batch.get(key) is None
+                ]
+                if missing_negative:
+                    raise ValueError(
+                        "XOPD teacher query requires cached negative conditioning, "
+                        f"missing_keys={missing_negative!r}, is_pdm={self._is_pdm}, "
+                        f"teacher_guidance_scale={self.teacher_gs!r}, "
+                        f"available_keys={sorted(batch.keys())!r}."
+                    )
                 cond["negative_prompt_embeds"] = batch["teacher_negative_prompt_embeds"]
                 cond["negative_text_ids"] = batch["teacher_negative_text_ids"]
             return cond
@@ -3317,14 +3463,14 @@ class XOPDTrainer(BaseTrainer):
             prompts = [prompts]
         enc = self.teacher_adapter.encode_prompt(
             prompt=list(prompts),
-            guidance_scale=self.teacher_gs,
+            guidance_scale=max(self.teacher_gs, 2.0) if self._is_pdm else self.teacher_gs,
             device=self.accelerator.device,
         )
         cond = {
             "prompt_embeds": enc["prompt_embeds"],
             "text_ids": enc["text_ids"],
         }
-        if self.teacher_gs > 1.0 and "negative_prompt_embeds" in enc:
+        if (self._is_pdm or self.teacher_gs > 1.0) and "negative_prompt_embeds" in enc:
             cond["negative_prompt_embeds"] = enc["negative_prompt_embeds"]
             cond["negative_text_ids"] = enc["negative_text_ids"]
         return cond
@@ -3427,6 +3573,44 @@ class XOPDTrainer(BaseTrainer):
                 )
 
         return mu_teacher_list
+
+    def _precompute_teacher_cfg_branches(
+        self,
+        batch: Dict[str, Any],
+        latents_index_map: torch.Tensor,
+        num_timesteps: int,
+        timestep_indices: Optional[List[int]] = None,
+    ) -> List[_PDMBranchCache]:
+        """No-grad direct-XOPD pre-pass for positive and negative teacher velocities."""
+        if not self._is_pdm or self._is_marginal_cfm or self._is_popd:
+            raise ValueError(
+                "teacher CFG branch pre-pass requires direct XOPD PDM, got "
+                f"is_pdm={self._is_pdm}, is_marginal_cfm={self._is_marginal_cfm}, "
+                f"is_popd={self._is_popd}."
+            )
+        step_indices = (
+            timestep_indices if timestep_indices is not None else self._train_timestep_indices
+        )
+        branch_targets: List[_PDMBranchCache] = []
+        with torch.no_grad(), self.autocast():
+            teacher_text_cond = self._build_teacher_text_cond(batch)
+            for timestep_index in tqdm(
+                step_indices,
+                desc=f"Epoch {self.epoch} Teacher PDM pre-pass",
+                position=1,
+                leave=False,
+                disable=not self.show_progress_bar,
+            ):
+                _, _, forward_kwargs = self._l1_step_inputs(
+                    batch,
+                    latents_index_map,
+                    num_timesteps,
+                    timestep_index,
+                )
+                branch_targets.append(
+                    self._teacher_cfg_branches(forward_kwargs, teacher_text_cond)
+                )
+        return branch_targets
 
     def _precompute_popd_step_caches(
         self,
@@ -3583,10 +3767,41 @@ class XOPDTrainer(BaseTrainer):
                 t, latents, forward_kwargs = self._l1_step_inputs(
                     batch, latents_index_map, num_timesteps, timestep_index
                 )
+                if self._is_pdm:
+                    forward_kwargs["return_kwargs"] = [
+                        "positive_noise_pred",
+                        "negative_noise_pred",
+                    ]
 
                 self._hsct_capture = self._is_hsct
                 student_out = self.adapter.forward(**forward_kwargs)
                 self._hsct_capture = False
+                if self._is_pdm:
+                    if (
+                        student_out.positive_noise_pred is None
+                        or student_out.negative_noise_pred is None
+                    ):
+                        raise RuntimeError(
+                            "PDM validation student forward did not return both CFG branches, "
+                            f"positive_is_none={student_out.positive_noise_pred is None}, "
+                            f"negative_is_none={student_out.negative_noise_pred is None}, "
+                            f"timestep_index={timestep_index}."
+                        )
+                    teacher_branches = self._teacher_cfg_branches(
+                        forward_kwargs,
+                        teacher_text_cond,
+                    )
+                    pdm = compute_xopd_pdm_loss(
+                        student_positive=student_out.positive_noise_pred,
+                        student_negative=student_out.negative_noise_pred,
+                        teacher_positive=teacher_branches.positive,
+                        teacher_negative=teacher_branches.negative,
+                        pdm_lambda=self.pdm_lambda,
+                        teacher_guidance_scale=self.teacher_gs,
+                        student_guidance_scale=self.student_gs,
+                    )
+                    d_list.append(pdm.loss.detach())
+                    continue
                 if student_out.next_latents_mean is None:
                     raise RuntimeError(
                         "Student forward did not return `next_latents_mean` during the "
@@ -3705,6 +3920,7 @@ class XOPDTrainer(BaseTrainer):
         num_timesteps: int,
         loss_info: Dict[str, List[torch.Tensor]],
         mu_teacher_list: Optional[List[torch.Tensor]] = None,
+        pdm_teacher_list: Optional[List[_PDMBranchCache]] = None,
         popd_cache_list: Optional[List[_POPDStepCache]] = None,
         timestep_indices: Optional[List[int]] = None,
         callback_index_map: Optional[torch.Tensor] = None,
@@ -3725,6 +3941,9 @@ class XOPDTrainer(BaseTrainer):
             )
 
         target_noise_pred_callbacks = None
+        target_positive_callbacks = None
+        target_negative_callbacks = None
+        target_callback_reference = None
         teacher_branch_mask = None
         if self._is_marginal_cfm:
             if callback_index_map is None:
@@ -3737,45 +3956,69 @@ class XOPDTrainer(BaseTrainer):
                     "Marginal CFM must not receive direct teacher means, "
                     f"got teacher target count={len(mu_teacher_list)}."
                 )
+            if pdm_teacher_list is not None:
+                raise ValueError(
+                    "Marginal CFM PDM targets must come from rollout callbacks, not a "
+                    f"teacher pre-pass; got target_count={len(pdm_teacher_list)}."
+                )
             if popd_cache_list is not None:
                 raise ValueError(
                     "Marginal CFM must not receive P-OPD behavior caches, "
                     f"got cache_count={len(popd_cache_list)}."
                 )
             callback_index_map = normalize_callback_index_map(callback_index_map)
-            if "noise_pred" not in batch:
-                raise KeyError(
-                    "Marginal CFM requires tensor batch['noise_pred'] velocity callbacks, "
-                    f"available keys={sorted(batch.keys())!r}."
-                )
-            target_noise_pred_callbacks = batch["noise_pred"]
-            if not isinstance(target_noise_pred_callbacks, torch.Tensor):
-                raise TypeError(
-                    "Marginal CFM expected torch.Tensor for batch['noise_pred'], "
-                    f"got {type(target_noise_pred_callbacks).__name__}: "
-                    f"{target_noise_pred_callbacks!r}."
-                )
-            if target_noise_pred_callbacks.ndim < 3:
-                raise ValueError(
-                    "Marginal CFM expected batch['noise_pred'] shape (B,K,event...), "
-                    f"got shape={tuple(target_noise_pred_callbacks.shape)}."
-                )
-            if (
-                target_noise_pred_callbacks.shape[0] != batch["timesteps"].shape[0]
-                or target_noise_pred_callbacks.shape[1] < 1
-            ):
-                raise ValueError(
-                    "Marginal CFM velocity callbacks must align with the rollout batch and "
-                    "contain at least one callback: "
-                    f"noise_pred.shape={tuple(target_noise_pred_callbacks.shape)}, "
-                    f"timesteps.shape={tuple(batch['timesteps'].shape)}."
-                )
-            if not target_noise_pred_callbacks.is_floating_point():
-                raise TypeError(
-                    "Marginal CFM expected floating-point batch['noise_pred'], "
-                    f"got dtype={target_noise_pred_callbacks.dtype}, "
-                    f"shape={tuple(target_noise_pred_callbacks.shape)}."
-                )
+            callback_names = (
+                ("positive_noise_pred", "negative_noise_pred")
+                if self._is_pdm
+                else ("noise_pred",)
+            )
+            callback_tensors: Dict[str, torch.Tensor] = {}
+            for callback_name in callback_names:
+                if callback_name not in batch:
+                    raise KeyError(
+                        f"Marginal CFM requires tensor batch[{callback_name!r}] callback, "
+                        f"available keys={sorted(batch.keys())!r}, is_pdm={self._is_pdm}."
+                    )
+                callback_value = batch[callback_name]
+                if not isinstance(callback_value, torch.Tensor):
+                    raise TypeError(
+                        f"Marginal CFM expected torch.Tensor for batch[{callback_name!r}], "
+                        f"got {type(callback_value).__name__}: {callback_value!r}."
+                    )
+                if callback_value.ndim < 3:
+                    raise ValueError(
+                        "Marginal CFM expected callback shape (B,K,event...), "
+                        f"key={callback_name!r}, shape={tuple(callback_value.shape)}."
+                    )
+                if (
+                    callback_value.shape[0] != batch["timesteps"].shape[0]
+                    or callback_value.shape[1] < 1
+                ):
+                    raise ValueError(
+                        "Marginal CFM velocity callbacks must align with the rollout batch "
+                        "and contain at least one callback: "
+                        f"key={callback_name!r}, shape={tuple(callback_value.shape)}, "
+                        f"timesteps.shape={tuple(batch['timesteps'].shape)}."
+                    )
+                if not callback_value.is_floating_point():
+                    raise TypeError(
+                        "Marginal CFM expected floating-point callback, "
+                        f"key={callback_name!r}, dtype={callback_value.dtype}, "
+                        f"shape={tuple(callback_value.shape)}."
+                    )
+                callback_tensors[callback_name] = callback_value
+            target_callback_reference = callback_tensors[callback_names[0]]
+            if self._is_pdm:
+                target_positive_callbacks = callback_tensors["positive_noise_pred"]
+                target_negative_callbacks = callback_tensors["negative_noise_pred"]
+                if target_positive_callbacks.shape != target_negative_callbacks.shape:
+                    raise ValueError(
+                        "Marginal CFM PDM branch callbacks must share one shape, "
+                        f"positive.shape={tuple(target_positive_callbacks.shape)}, "
+                        f"negative.shape={tuple(target_negative_callbacks.shape)}."
+                    )
+            else:
+                target_noise_pred_callbacks = callback_tensors["noise_pred"]
             if "marginal_cfm_branch" not in batch:
                 raise KeyError(
                     "Marginal CFM rollout is missing batch['marginal_cfm_branch']; "
@@ -3787,7 +4030,7 @@ class XOPDTrainer(BaseTrainer):
                     "Marginal CFM expected torch.Tensor for batch['marginal_cfm_branch'], "
                     f"got {type(teacher_branch_mask).__name__}: {teacher_branch_mask!r}."
                 )
-            expected_branch_shape = (int(target_noise_pred_callbacks.shape[0]),)
+            expected_branch_shape = (int(target_callback_reference.shape[0]),)
             if teacher_branch_mask.dtype != torch.bool:
                 raise TypeError(
                     "Marginal CFM expected torch.bool batch['marginal_cfm_branch'], "
@@ -3800,16 +4043,16 @@ class XOPDTrainer(BaseTrainer):
                     f"expected shape={expected_branch_shape}, "
                     f"got shape={tuple(teacher_branch_mask.shape)}."
                 )
-            if teacher_branch_mask.device != target_noise_pred_callbacks.device:
+            if teacher_branch_mask.device != target_callback_reference.device:
                 raise ValueError(
                     "Marginal CFM branch labels and velocity callbacks must share a device, "
                     f"got branch_device={teacher_branch_mask.device}, "
-                    f"target_device={target_noise_pred_callbacks.device}."
+                    f"target_device={target_callback_reference.device}."
                 )
             loss_info["marginal_cfm/callback_count"].append(
                 torch.tensor(
-                    float(target_noise_pred_callbacks.shape[1]),
-                    device=target_noise_pred_callbacks.device,
+                    float(target_callback_reference.shape[1]),
+                    device=target_callback_reference.device,
                 )
             )
         else:
@@ -3818,12 +4061,32 @@ class XOPDTrainer(BaseTrainer):
                     "Direct and P-OPD training must not receive the marginal-CFM callback map, "
                     f"got callback_index_map shape={tuple(callback_index_map.shape)}."
                 )
-            if mu_teacher_list is None or len(mu_teacher_list) != len(step_indices):
-                raise ValueError(
-                    "Direct and P-OPD require one teacher target per training timestep, "
-                    f"got target_count={None if mu_teacher_list is None else len(mu_teacher_list)} "
-                    f"and timestep_indices={step_indices!r}."
-                )
+            if self._is_pdm:
+                if mu_teacher_list is not None:
+                    raise ValueError(
+                        "Direct XOPD PDM must not receive composed teacher means, "
+                        f"got target_count={len(mu_teacher_list)}."
+                    )
+                if pdm_teacher_list is None or len(pdm_teacher_list) != len(step_indices):
+                    raise ValueError(
+                        "Direct XOPD PDM requires one branch target per training timestep, "
+                        f"got target_count="
+                        f"{None if pdm_teacher_list is None else len(pdm_teacher_list)} "
+                        f"and timestep_indices={step_indices!r}."
+                    )
+            else:
+                if pdm_teacher_list is not None:
+                    raise ValueError(
+                        "Composed direct/P-OPD must not receive PDM branch targets, "
+                        f"got target_count={len(pdm_teacher_list)}."
+                    )
+                if mu_teacher_list is None or len(mu_teacher_list) != len(step_indices):
+                    raise ValueError(
+                        "Direct and P-OPD require one teacher target per training timestep, "
+                        f"got target_count="
+                        f"{None if mu_teacher_list is None else len(mu_teacher_list)} "
+                        f"and timestep_indices={step_indices!r}."
+                    )
 
         if self._is_popd and (popd_cache_list is None or len(popd_cache_list) != len(step_indices)):
             raise ValueError(
@@ -3888,11 +4151,22 @@ class XOPDTrainer(BaseTrainer):
                     )
 
                     student_out = self.adapter.forward(**forward_kwargs)
-                    if self._is_marginal_cfm and student_out.noise_pred is None:
-                        raise RuntimeError(
-                            "Marginal CFM student forward must return `noise_pred`; "
-                            f"got None at timestep_index={int(timestep_index)}."
-                        )
+                    if self._is_marginal_cfm:
+                        if self._is_pdm and (
+                            student_out.positive_noise_pred is None
+                            or student_out.negative_noise_pred is None
+                        ):
+                            raise RuntimeError(
+                                "Marginal CFM PDM student forward must return both CFG branches, "
+                                f"positive_is_none={student_out.positive_noise_pred is None}, "
+                                f"negative_is_none={student_out.negative_noise_pred is None}, "
+                                f"timestep_index={int(timestep_index)}."
+                            )
+                        if not self._is_pdm and student_out.noise_pred is None:
+                            raise RuntimeError(
+                                "Marginal CFM student forward must return `noise_pred`; "
+                                f"got None at timestep_index={int(timestep_index)}."
+                            )
                     if not self._is_marginal_cfm and student_out.next_latents_mean is None:
                         raise RuntimeError(
                             "Student forward must return `next_latents_mean` for XOPD; got None."
@@ -3902,23 +4176,73 @@ class XOPDTrainer(BaseTrainer):
                         callback_index = resolve_marginal_cfm_callback_index(
                             callback_index_map,
                             timestep_index=ti,
-                            callback_count=int(target_noise_pred_callbacks.shape[1]),
+                            callback_count=int(target_callback_reference.shape[1]),
                         )
-                        target_noise_pred = target_noise_pred_callbacks[:, callback_index].detach()
-                        d_k_grad = compute_marginal_cfm_velocity_loss(
-                            student_out.noise_pred,
-                            target_noise_pred,
-                        )
-                        diagnostics = compute_marginal_cfm_diagnostics(
-                            student_noise_pred=student_out.noise_pred,
-                            target_noise_pred=target_noise_pred,
-                            teacher_branch_mask=teacher_branch_mask,
-                        )
+                        if self._is_pdm:
+                            target_positive = target_positive_callbacks[
+                                :, callback_index
+                            ].detach()
+                            target_negative = target_negative_callbacks[
+                                :, callback_index
+                            ].detach()
+                            pdm = compute_xopd_pdm_loss(
+                                student_positive=student_out.positive_noise_pred,
+                                student_negative=student_out.negative_noise_pred,
+                                teacher_positive=target_positive,
+                                teacher_negative=target_negative,
+                                pdm_lambda=self.pdm_lambda,
+                                teacher_guidance_scale=self.teacher_gs,
+                                student_guidance_scale=self.student_gs,
+                            )
+                            d_k_grad = pdm.loss
+                            diagnostics = {
+                                "loss": pdm.loss.detach(),
+                                "teacher_branch_fraction": teacher_branch_mask.float(),
+                            }
+                            for name, values in pdm.detached_diagnostics().items():
+                                loss_info[f"cfg_branch/{name}"].append(values)
+                        else:
+                            target_noise_pred = target_noise_pred_callbacks[
+                                :, callback_index
+                            ].detach()
+                            d_k_grad = compute_marginal_cfm_velocity_loss(
+                                student_out.noise_pred,
+                                target_noise_pred,
+                            )
+                            diagnostics = compute_marginal_cfm_diagnostics(
+                                student_noise_pred=student_out.noise_pred,
+                                target_noise_pred=target_noise_pred,
+                                teacher_branch_mask=teacher_branch_mask,
+                            )
                         self._append_marginal_cfm_diagnostics(
                             loss_info,
                             diagnostics,
                             teacher_branch_mask,
                         )
+                    elif self._is_pdm:
+                        if (
+                            student_out.positive_noise_pred is None
+                            or student_out.negative_noise_pred is None
+                        ):
+                            raise RuntimeError(
+                                "Direct XOPD PDM student forward must return both CFG branches, "
+                                f"positive_is_none={student_out.positive_noise_pred is None}, "
+                                f"negative_is_none={student_out.negative_noise_pred is None}, "
+                                f"timestep_index={ti}."
+                            )
+                        target = pdm_teacher_list[k_idx]
+                        pdm = compute_xopd_pdm_loss(
+                            student_positive=student_out.positive_noise_pred,
+                            student_negative=student_out.negative_noise_pred,
+                            teacher_positive=target.positive,
+                            teacher_negative=target.negative,
+                            pdm_lambda=self.pdm_lambda,
+                            teacher_guidance_scale=self.teacher_gs,
+                            student_guidance_scale=self.student_gs,
+                        )
+                        d_k_grad = pdm.loss
+                        for name, values in pdm.detached_diagnostics().items():
+                            loss_info[f"cfg_branch/{name}"].append(values)
                     elif self._is_popd:
                         mu_teacher = mu_teacher_list[k_idx]
                         if student_out.std_dev_t is None or student_out.dt is None:

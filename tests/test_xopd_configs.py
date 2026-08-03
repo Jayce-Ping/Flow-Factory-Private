@@ -71,6 +71,27 @@ class TestA4MatchedSmokeConfigs(unittest.TestCase):
         a4_config["train"]["xopd_target_mode"] = "direct"
         self.assertEqual(a4_config, direct_config)
 
+    def test_a4_pdm_smoke_parses_and_forces_negative_preprocessing(self) -> None:
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "xopd_configs"
+            / "ode_pathwise"
+            / "_TEST_9b_4b_marginal_cfm_pdm_smoke.yaml"
+        )
+        with patch.dict(os.environ, {"WORLD_SIZE": "8"}):
+            args = Arguments.load_from_yaml(str(config_path))
+
+        self.assertEqual(args.training_args.xopd_target_mode, "marginal_cfm")
+        self.assertEqual(args.training_args.xopd_cfg_objective, "pdm")
+        self.assertEqual(args.training_args.xopd_pdm_lambda, 1.0)
+        self.assertEqual(args.training_args.teacher_guidance_scale, 1.0)
+        self.assertEqual(args.training_args.student_guidance_scale, 1.0)
+        self.assertEqual(args.training_args.get_preprocess_guidance_scale(), 2.0)
+        self.assertEqual(args.training_args.xopd_dk_space, "v")
+        self.assertFalse(args.training_args.normalize_d_k)
+        self.assertEqual(args.training_args.num_batches_per_epoch, 1)
+        self.assertEqual(args.training_args.gradient_accumulation_steps, 28)
+
 
 if __name__ == "__main__":
     unittest.main()

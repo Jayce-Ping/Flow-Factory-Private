@@ -29,7 +29,7 @@ from diffusers import DiffusionPipeline
 from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline, compute_empirical_mu, retrieve_latents
 import logging
 
-from ..abc import BaseAdapter
+from ..abc import BaseAdapter, CFGVelocityPrediction
 from ...samples import I2ISample
 from ...hparams import *
 from ...scheduler import (
@@ -532,6 +532,7 @@ class Flux2KleinAdapter(BaseAdapter):
         guidance_scale: float = 4.0,
         teacher_guidance_scale: float = 1.0,
         donor_guidance_scale: Optional[float] = None,
+        xopd_cfg_objective: str = "composed",
         images: Optional[MultiImageBatch] = None,
         condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         max_sequence_length: int = 512,
@@ -584,6 +585,7 @@ class Flux2KleinAdapter(BaseAdapter):
             teacher_guidance_scale=(
                 donor_guidance_scale if donor_guidance_scale is not None else teacher_guidance_scale
             ),
+            force_teacher_negative=is_train and xopd_cfg_objective == "pdm",
             is_train=is_train,
             max_sequence_length=max_sequence_length,
             device=device,
@@ -1272,7 +1274,7 @@ class Flux2KleinAdapter(BaseAdapter):
         return samples
 
     # ======================== Forward ========================
-    def _predict_velocity(
+    def _predict_velocity_components(
         self,
         t: torch.Tensor,
         latents: torch.Tensor,
@@ -1287,23 +1289,15 @@ class Flux2KleinAdapter(BaseAdapter):
         negative_text_ids: Optional[torch.Tensor] = None,
         guidance_scale: float = 4.0,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> torch.Tensor:
-        """Transformer velocity prediction at ``(latents, t)`` with optional CFG.
+        require_negative: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Compute positive and optional negative velocities without composing them.
 
-        Runs the conditional pass and, when ``guidance_scale > 1.0`` and
-        ``negative_prompt_embeds`` is given, the unconditional pass, returning
-        the CFG-combined velocity ``neg + s * (cond - neg)``. The forward runs on
+        The forward runs on
         ``self.transformer`` (the active component -- the DeepSpeed/DDP-wrapped
         student for grad sync, or the teacher when swapped in via
         :meth:`use_teacher_transformer`), while ``cache_context`` (a diffusers
         module method not forwarded by wrappers) runs on the unwrapped module.
-
-        Unlike :meth:`forward`, this does NOT run the scheduler step, so it does
-        not require ``t_next`` or a timestep on the scheduler grid -- suitable
-        for L0 velocity regression at random continuous ``t``.
-
-        Returns:
-            Predicted velocity ``noise_pred`` of shape ``(B, seq_len, C)``.
         """
         batch_size = latents.shape[0]
         transformer = self.transformer
@@ -1316,11 +1310,25 @@ class Flux2KleinAdapter(BaseAdapter):
         # hit the same instance; for the swapped teacher both are the teacher.
         cache_module = self._unwrap(transformer)
 
+        if require_negative and negative_prompt_embeds is None:
+            raise ValueError(
+                "CFG branch prediction requires negative_prompt_embeds, "
+                f"got None with guidance_scale={guidance_scale!r}, "
+                f"latents.shape={tuple(latents.shape)}."
+            )
+        if require_negative and negative_text_ids is None:
+            raise ValueError(
+                "CFG branch prediction requires negative_text_ids, "
+                f"got None with guidance_scale={guidance_scale!r}, "
+                f"latents.shape={tuple(latents.shape)}."
+            )
         if guidance_scale > 1.0 and negative_prompt_embeds is None:
             logger.warning(
                 "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` provided. Classifier-free guidance will be disabled."
             )
-        do_classifier_free_guidance = guidance_scale > 1.0 and negative_prompt_embeds is not None
+        do_classifier_free_guidance = require_negative or (
+            guidance_scale > 1.0 and negative_prompt_embeds is not None
+        )
 
         # 1. Prepare model input (concatenate condition latents for I2I)
         latent_model_input = latents.to(torch.float32)
@@ -1344,9 +1352,10 @@ class Flux2KleinAdapter(BaseAdapter):
             )[0]
 
         # Extract only target latent predictions (exclude condition image part)
-        noise_pred = noise_pred[:, : latents.shape[1]]
+        positive_noise_pred = noise_pred[:, : latents.shape[1]]
 
         # 3. CFG: unconditional forward pass
+        negative_noise_pred = None
         if do_classifier_free_guidance:
             with cache_module.cache_context("uncond"):
                 neg_noise_pred = transformer(
@@ -1360,10 +1369,90 @@ class Flux2KleinAdapter(BaseAdapter):
                     return_dict=False,
                 )[0]
 
-            neg_noise_pred = neg_noise_pred[:, : latents.shape[1]]
-            noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+            negative_noise_pred = neg_noise_pred[:, : latents.shape[1]]
 
-        return noise_pred
+        return positive_noise_pred, negative_noise_pred
+
+    @staticmethod
+    def _compose_cfg_velocity(
+        positive: torch.Tensor,
+        negative: Optional[torch.Tensor],
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        """Compose CFG while preserving the historical missing-negative fallback."""
+        if negative is None:
+            return positive
+        return negative + guidance_scale * (positive - negative)
+
+    def _predict_velocity(
+        self,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        text_ids: torch.Tensor,
+        image_latents: Optional[torch.Tensor] = None,
+        image_latent_ids: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_text_ids: Optional[torch.Tensor] = None,
+        guidance_scale: float = 4.0,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Return the historical CFG-composed velocity without a scheduler step."""
+        positive, negative = self._predict_velocity_components(
+            t=t,
+            latents=latents,
+            latent_ids=latent_ids,
+            prompt_embeds=prompt_embeds,
+            text_ids=text_ids,
+            image_latents=image_latents,
+            image_latent_ids=image_latent_ids,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
+            guidance_scale=guidance_scale,
+            joint_attention_kwargs=joint_attention_kwargs,
+        )
+        return self._compose_cfg_velocity(positive, negative, guidance_scale)
+
+    def predict_cfg_velocity(
+        self,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        text_ids: torch.Tensor,
+        image_latents: Optional[torch.Tensor] = None,
+        image_latent_ids: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_text_ids: Optional[torch.Tensor] = None,
+        guidance_scale: float = 4.0,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> CFGVelocityPrediction:
+        """Return both CFG branches and their rollout-scale composition."""
+        positive, negative = self._predict_velocity_components(
+            t=t,
+            latents=latents,
+            latent_ids=latent_ids,
+            prompt_embeds=prompt_embeds,
+            text_ids=text_ids,
+            image_latents=image_latents,
+            image_latent_ids=image_latent_ids,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
+            guidance_scale=guidance_scale,
+            joint_attention_kwargs=joint_attention_kwargs,
+            require_negative=True,
+        )
+        if negative is None:
+            raise RuntimeError(
+                "CFG branch prediction unexpectedly returned negative=None after "
+                f"require_negative=True, guidance_scale={guidance_scale!r}."
+            )
+        return CFGVelocityPrediction(
+            positive=positive,
+            negative=negative,
+            composed=self._compose_cfg_velocity(positive, negative, guidance_scale),
+        )
 
     def predict_velocity(
         self,
@@ -1449,12 +1538,9 @@ class Flux2KleinAdapter(BaseAdapter):
         Returns:
             SDESchedulerOutput containing requested outputs.
         """
-        # 1-3. Transformer velocity prediction (cond + optional CFG uncond).
-        # Factored into `_predict_velocity` so cross-model teacher distillation
-        # (XOPD) and L0 velocity regression can reuse the exact same CFG
-        # combination without running the scheduler step, and so a teacher
-        # transformer swapped in via `use_teacher_transformer` is honored.
-        noise_pred = self._predict_velocity(
+        branch_return_keys = {"positive_noise_pred", "negative_noise_pred"}
+        return_cfg_branches = bool(branch_return_keys.intersection(return_kwargs))
+        positive_noise_pred, negative_noise_pred = self._predict_velocity_components(
             t=t,
             latents=latents,
             latent_ids=latent_ids,
@@ -1466,9 +1552,16 @@ class Flux2KleinAdapter(BaseAdapter):
             negative_text_ids=negative_text_ids,
             guidance_scale=guidance_scale,
             joint_attention_kwargs=joint_attention_kwargs,
+            require_negative=return_cfg_branches,
+        )
+        noise_pred = self._compose_cfg_velocity(
+            positive_noise_pred,
+            negative_noise_pred,
+            guidance_scale,
         )
 
         # 4. Scheduler step
+        scheduler_return_kwargs = [key for key in return_kwargs if key not in branch_return_keys]
         output = self.scheduler.step(
             noise_pred=noise_pred,
             timestep=t,
@@ -1478,9 +1571,19 @@ class Flux2KleinAdapter(BaseAdapter):
             compute_log_prob=compute_log_prob,
             log_prob_reduction=log_prob_reduction,
             return_dict=True,
-            return_kwargs=return_kwargs,
+            return_kwargs=scheduler_return_kwargs,
             noise_level=noise_level,
         )
+        if "positive_noise_pred" in return_kwargs:
+            output.positive_noise_pred = positive_noise_pred
+        if "negative_noise_pred" in return_kwargs:
+            if negative_noise_pred is None:
+                raise RuntimeError(
+                    "Requested negative_noise_pred but the CFG negative branch was not computed, "
+                    f"guidance_scale={guidance_scale!r}, "
+                    f"negative_prompt_embeds={negative_prompt_embeds!r}."
+                )
+            output.negative_noise_pred = negative_noise_pred
         return output
 
     def forward(

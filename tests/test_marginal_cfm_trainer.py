@@ -123,6 +123,14 @@ class _RecordingAdapter:
                             (2, 3),
                             1.0 if self.active_source == "teacher" else -1.0,
                         ),
+                        "positive_noise_pred": torch.full(
+                            (2, 3),
+                            2.0 if self.active_source == "teacher" else -2.0,
+                        ),
+                        "negative_noise_pred": torch.full(
+                            (2, 3),
+                            0.5 if self.active_source == "teacher" else -0.5,
+                        ),
                     },
                 )
             )
@@ -173,6 +181,8 @@ class _OptimizationAdapter:
         noise_pred = self.weight.expand_as(latents)
         return SimpleNamespace(
             noise_pred=noise_pred,
+            positive_noise_pred=noise_pred,
+            negative_noise_pred=-noise_pred,
             next_latents_mean=torch.zeros_like(latents),
             std_dev_t=torch.zeros(latents.shape[0], 1),
             dt=-torch.ones(latents.shape[0], 1),
@@ -279,7 +289,7 @@ class TestMarginalCFMSample(unittest.TestCase):
             "__source__": "shared-dataset",
         }
 
-    def _trainer(self, batch, *, alpha=0.5, seed=1, marginal=True, popd=False):
+    def _trainer(self, batch, *, alpha=0.5, seed=1, marginal=True, popd=False, pdm=False):
         adapter = _RecordingAdapter()
         trainer = XOPDTrainer.__new__(XOPDTrainer)
         trainer.adapter = adapter
@@ -297,6 +307,8 @@ class TestMarginalCFMSample(unittest.TestCase):
         trainer.teacher_gs = 3.0
         trainer._is_marginal_cfm = marginal
         trainer._is_popd = popd
+        trainer._is_pdm = pdm
+        trainer.pdm_lambda = 1.0
         trainer._is_ode = True
         trainer._cross_vae = False
         trainer.epoch = 2
@@ -512,6 +524,27 @@ class TestMarginalCFMSample(unittest.TestCase):
                 batch["negative_text_ids"][row],
             )
 
+    def test_pdm_at_rollout_gs_one_keeps_both_branches_and_callbacks(self):
+        batch = self._batch()
+        trainer = self._trainer(batch, alpha=1.0, pdm=True)
+        trainer.teacher_gs = 1.0
+        trainer.student_gs = 1.0
+
+        samples = trainer.sample()
+
+        teacher_kwargs = trainer.adapter.calls[0]["kwargs"]
+        self.assertEqual(
+            teacher_kwargs["extra_call_back_kwargs"],
+            ["positive_noise_pred", "negative_noise_pred"],
+        )
+        torch.testing.assert_close(
+            teacher_kwargs["negative_prompt_embeds"],
+            batch["teacher_negative_prompt_embeds"],
+        )
+        stacked = BaseSample.stack(samples)
+        self.assertIn("positive_noise_pred", stacked)
+        self.assertIn("negative_noise_pred", stacked)
+
     def test_rejects_mismatched_or_unsupported_batch_values_before_inference(self):
         invalid_values = (
             ("prompt", ["prompt-0", "prompt-1", "prompt-2"]),
@@ -600,6 +633,7 @@ class TestMarginalCFMOptimization(unittest.TestCase):
         *,
         marginal=True,
         popd=False,
+        pdm=False,
         sync_on_accumulate_call=None,
         events=None,
     ):
@@ -629,13 +663,17 @@ class TestMarginalCFMOptimization(unittest.TestCase):
         )
         trainer._is_marginal_cfm = marginal
         trainer._is_popd = popd
+        trainer._is_pdm = pdm
         trainer._is_ode = True
         trainer._pixel_loss = False
         trainer._is_hsct = False
+        trainer.detail_mask_enabled = False
         trainer.pathwise_coef = 1.0
         trainer.normalize_d_k = False
         trainer.xopd_dk_space = "v"
         trainer.student_gs = 1.0
+        trainer.teacher_gs = 1.0
+        trainer.pdm_lambda = 1.0
         trainer.epoch = 0
         trainer.step = 0
         trainer.log_args = SimpleNamespace(verbose=False)
@@ -655,6 +693,8 @@ class TestMarginalCFMOptimization(unittest.TestCase):
         num_timesteps=1,
         branches=None,
         targets=None,
+        positive_targets=None,
+        negative_targets=None,
         callback_index_map=None,
     ):
         batch_size = 2
@@ -662,6 +702,10 @@ class TestMarginalCFMOptimization(unittest.TestCase):
             branches = torch.tensor([False, True])
         if targets is None:
             targets = torch.zeros(batch_size, num_timesteps, 2)
+        if positive_targets is None:
+            positive_targets = targets
+        if negative_targets is None:
+            negative_targets = targets
         if callback_index_map is None:
             callback_index_map = torch.arange(num_timesteps)
         return {
@@ -675,6 +719,8 @@ class TestMarginalCFMOptimization(unittest.TestCase):
             .expand(batch_size, -1),
             "all_latents": torch.zeros(batch_size, num_timesteps + 1, 2),
             "noise_pred": targets,
+            "positive_noise_pred": positive_targets,
+            "negative_noise_pred": negative_targets,
             "marginal_cfm_branch": branches,
             "callback_index_map": callback_index_map,
         }
@@ -866,6 +912,57 @@ class TestMarginalCFMOptimization(unittest.TestCase):
                     "loss/0",
                 ):
                     self.assertIn(key, loss_info)
+
+    def test_pdm_a4_uses_branch_callbacks_and_logs_identifiable_losses(self):
+        trainer = self._trainer(pdm=True)
+        positive_targets = torch.zeros(2, 1, 2, requires_grad=True)
+        negative_targets = torch.zeros(2, 1, 2, requires_grad=True)
+
+        loss_info = trainer._optimize_train_pass(
+            batch=self._batch(
+                positive_targets=positive_targets,
+                negative_targets=negative_targets,
+            ),
+            latents_index_map=torch.tensor([0, 1]),
+            num_timesteps=1,
+            mu_teacher_list=None,
+            pdm_teacher_list=None,
+            popd_cache_list=None,
+            callback_index_map=torch.tensor([0]),
+            loss_info=defaultdict(list),
+        )
+
+        self.assertIsNotNone(trainer.adapter.weight.grad)
+        self.assertIsNone(positive_targets.grad)
+        self.assertIsNone(negative_targets.grad)
+        self.assertIn("cfg_branch/positive_mse", loss_info)
+        self.assertIn("cfg_branch/negative_mse", loss_info)
+        self.assertIn("cfg_branch/direction_mse", loss_info)
+        self.assertIn("marginal_cfm/teacher_branch_fraction", loss_info)
+        self.assertIn("marginal_cfm/loss_old", loss_info)
+        self.assertIn("marginal_cfm/loss_teacher", loss_info)
+
+    def test_direct_pdm_uses_typed_teacher_branch_cache(self):
+        trainer = self._trainer(marginal=False, pdm=True)
+        target = xopd_trainer_module._PDMBranchCache(
+            positive=torch.zeros(2, 2),
+            negative=torch.zeros(2, 2),
+        )
+
+        loss_info = trainer._optimize_train_pass(
+            batch=self._batch(),
+            latents_index_map=torch.tensor([0, 1]),
+            num_timesteps=1,
+            mu_teacher_list=None,
+            pdm_teacher_list=[target],
+            popd_cache_list=None,
+            callback_index_map=None,
+            loss_info=defaultdict(list),
+        )
+
+        self.assertIsNotNone(trainer.adapter.weight.grad)
+        self.assertIn("cfg_branch/positive_mse", loss_info)
+        self.assertIn("cfg_branch/direction_mse", loss_info)
 
     def test_loss_order_and_sync_only_optimizer_step_preserve_shared_shell(self):
         events = []
