@@ -6,6 +6,9 @@ import hashlib
 import json
 import math
 import os
+import queue
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -71,7 +74,9 @@ def _sample_quantiles(value: torch.Tensor, max_values: int = 65_536) -> torch.Te
     return torch.quantile(finite, torch.tensor((0.01, 0.5, 0.99), device=finite.device))
 
 
-def tensor_summary(value: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _tensor_summary_tensors(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not isinstance(value, torch.Tensor):
         raise TypeError(
             f"expected torch.Tensor for activation summary, got {type(value).__name__}: "
@@ -111,11 +116,13 @@ def tensor_summary(value: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndar
         token_rms = finite_work.square().mean(dim=-1).sqrt()
         channel_mean = finite_work.mean(dim=reduction_dims)
         channel_std = finite_work.std(dim=reduction_dims, unbiased=False)
-    return (
-        _cpu_array(scalars, full=False),
-        _cpu_array(token_rms, full=False),
-        _cpu_array(channel_mean, full=False),
-        _cpu_array(channel_std, full=False),
+    return scalars, token_rms, channel_mean, channel_std
+
+
+def tensor_summary(value: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return tuple(
+        _cpu_array(tensor, full=False)
+        for tensor in _tensor_summary_tensors(value)
     )
 
 
@@ -199,6 +206,44 @@ class AtomicH5Shard:
     ) -> None:
         key = _safe_key(key)
         scalars, token_rms, channel_mean, channel_std = tensor_summary(value)
+        projected_array = None
+        projected_dtype = None
+        if value.ndim == 3 and projection_dim > 0:
+            projected = countsketch_projection(value.detach(), projection_dim, projection_seed)
+            projected_array = _cpu_array(projected, full=True)
+            projected_dtype = projected.dtype
+        full_array = _cpu_array(value, full=True) if store_full else None
+        self.write_prepared_activation(
+            key,
+            scalars=scalars,
+            token_rms=token_rms,
+            channel_mean=channel_mean,
+            channel_std=channel_std,
+            projected=projected_array,
+            projection_seed=projection_seed,
+            projection_input_channels=value.shape[-1],
+            projection_torch_dtype=projected_dtype,
+            full_value=full_array,
+            full_torch_dtype=value.dtype,
+        )
+
+    def write_prepared_activation(
+        self,
+        key: str,
+        *,
+        scalars: np.ndarray,
+        token_rms: np.ndarray,
+        channel_mean: np.ndarray,
+        channel_std: np.ndarray,
+        projected: Optional[np.ndarray],
+        projection_seed: int,
+        projection_input_channels: int,
+        projection_torch_dtype: Optional[torch.dtype],
+        full_value: Optional[np.ndarray],
+        full_torch_dtype: torch.dtype,
+    ) -> None:
+        """Write CPU-prepared activation arrays without touching CUDA."""
+        key = _safe_key(key)
         self._create_dataset(f"{key}/summary/scalars", scalars, full=False)
         self.handle[f"{key}/summary/scalars"].attrs["names"] = json.dumps(
             _SCALAR_NAMES
@@ -206,30 +251,35 @@ class AtomicH5Shard:
         self._create_dataset(f"{key}/summary/token_rms", token_rms, full=False)
         self._create_dataset(f"{key}/summary/channel_mean", channel_mean, full=False)
         self._create_dataset(f"{key}/summary/channel_std", channel_std, full=False)
-        if value.ndim == 3 and projection_dim > 0:
-            projected = countsketch_projection(value.detach(), projection_dim, projection_seed)
+        if projected is not None:
+            if projection_torch_dtype is None:
+                raise TypeError(
+                    f"expected projection dtype for prepared activation {key!r}"
+                )
             self._create_dataset(
                 f"{key}/projection",
-                _cpu_array(projected, full=True),
+                projected,
                 full=True,
             )
             self.handle[f"{key}/projection"].attrs["kind"] = "countsketch"
             self.handle[f"{key}/projection"].attrs["seed"] = projection_seed
-            self.handle[f"{key}/projection"].attrs["input_channels"] = value.shape[-1]
+            self.handle[f"{key}/projection"].attrs[
+                "input_channels"
+            ] = projection_input_channels
             self.handle[f"{key}/projection"].attrs["torch_dtype"] = str(
-                projected.dtype
+                projection_torch_dtype
             ).removeprefix("torch.")
             self.handle[f"{key}/projection"].attrs["storage_encoding"] = (
                 "bfloat16_uint16"
-                if projected.dtype == torch.bfloat16
+                if projection_torch_dtype == torch.bfloat16
                 else "numeric"
             )
-        if store_full:
+        if full_value is not None:
             full_key = f"{key}/full"
-            self._create_dataset(full_key, _cpu_array(value, full=True), full=True)
+            self._create_dataset(full_key, full_value, full=True)
             dataset = self.handle[full_key]
-            dataset.attrs["torch_dtype"] = str(value.dtype).removeprefix("torch.")
-            if value.dtype == torch.bfloat16:
+            dataset.attrs["torch_dtype"] = str(full_torch_dtype).removeprefix("torch.")
+            if full_torch_dtype == torch.bfloat16:
                 dataset.attrs["storage_encoding"] = "bfloat16_uint16"
             else:
                 dataset.attrs["storage_encoding"] = "numeric"
@@ -241,6 +291,27 @@ class AtomicH5Shard:
                 f"expected tensor or ndarray for {key!r}, got {type(value).__name__}"
             )
         self._create_dataset(key, array, full=False)
+
+    def write_tensor(self, key: str, value: torch.Tensor) -> None:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"expected tensor for {key!r}, got {type(value).__name__}: {value!r}"
+            )
+        self.write_prepared_tensor(
+            key,
+            _cpu_array(value, full=True),
+            torch_dtype=value.dtype,
+        )
+
+    def write_prepared_tensor(
+        self, key: str, value: np.ndarray, *, torch_dtype: torch.dtype
+    ) -> None:
+        self._create_dataset(key, value, full=True)
+        dataset = self.handle[_safe_key(key)]
+        dataset.attrs["torch_dtype"] = str(torch_dtype).removeprefix("torch.")
+        dataset.attrs["storage_encoding"] = (
+            "bfloat16_uint16" if torch_dtype == torch.bfloat16 else "numeric"
+        )
 
     def set_group_attrs(self, key: str, attrs: dict[str, Any]) -> None:
         group = self.handle.require_group(_safe_key(key))
@@ -273,6 +344,264 @@ class AtomicH5Shard:
     def abort(self) -> None:
         if not self._closed:
             self.handle.close()
+            self._closed = True
+
+
+@dataclass
+class _StagedArray:
+    value: torch.Tensor | np.ndarray
+    event: Optional[torch.cuda.Event]
+    bfloat16_bits: bool = False
+
+    def numpy(self) -> np.ndarray:
+        if self.event is not None:
+            self.event.synchronize()
+        if isinstance(self.value, np.ndarray):
+            return self.value
+        tensor = self.value.contiguous()
+        if self.bfloat16_bits:
+            if tensor.dtype != torch.bfloat16:
+                raise TypeError(
+                    "expected staged bfloat16 tensor for uint16 encoding, "
+                    f"got dtype={tensor.dtype}"
+                )
+            return tensor.view(torch.uint16).numpy()
+        return tensor.numpy()
+
+
+class AsyncAtomicH5Shard:
+    """Bounded single-writer queue that overlaps HDF5 writes with GPU forward."""
+
+    def __init__(
+        self,
+        final_path: Path,
+        attrs: Optional[dict[str, Any]] = None,
+        *,
+        queue_depth: int = 8,
+    ) -> None:
+        if not isinstance(queue_depth, int) or queue_depth <= 0:
+            raise ValueError(
+                f"expected positive integer queue_depth, got {queue_depth!r}"
+            )
+        self.final_path = final_path
+        self._writer = AtomicH5Shard(final_path, attrs=attrs)
+        self._queue: queue.Queue[tuple[str, tuple[Any, ...]]] = queue.Queue(
+            maxsize=queue_depth
+        )
+        self._error: Optional[BaseException] = None
+        self._closed = False
+        self._copy_streams: dict[int, torch.cuda.Stream] = {}
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"h5-writer-{final_path.name}",
+            daemon=False,
+        )
+        self._thread.start()
+
+    def _raise_worker_error(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(
+                f"asynchronous HDF5 writer failed for {self.final_path}: "
+                f"{type(self._error).__name__}: {self._error}"
+            ) from self._error
+
+    def _enqueue(self, kind: str, *payload: Any) -> None:
+        if self._closed:
+            raise RuntimeError(f"activation shard already closed: {self.final_path}")
+        while True:
+            self._raise_worker_error()
+            try:
+                self._queue.put((kind, payload), timeout=0.25)
+                return
+            except queue.Full:
+                continue
+
+    def _run(self) -> None:
+        while True:
+            kind, payload = self._queue.get()
+            event = payload[-1] if payload and isinstance(payload[-1], threading.Event) else None
+            try:
+                if self._error is not None:
+                    if kind in ("close", "abort"):
+                        self._writer.abort()
+                        return
+                    continue
+                if kind == "activation":
+                    key, prepared = payload
+                    resolved = dict(prepared)
+                    for name in (
+                        "scalars",
+                        "token_rms",
+                        "channel_mean",
+                        "channel_std",
+                        "projected",
+                        "full_value",
+                    ):
+                        staged = resolved[name]
+                        if isinstance(staged, _StagedArray):
+                            resolved[name] = staged.numpy()
+                    self._writer.write_prepared_activation(key, **resolved)
+                elif kind == "array":
+                    key, staged = payload
+                    self._writer.write_array(key, staged.numpy())
+                elif kind == "tensor":
+                    key, staged, torch_dtype = payload
+                    self._writer.write_prepared_tensor(
+                        key, staged.numpy(), torch_dtype=torch_dtype
+                    )
+                elif kind == "attrs":
+                    key, attrs = payload
+                    self._writer.set_group_attrs(key, attrs)
+                elif kind == "flush":
+                    self._writer.flush()
+                elif kind == "close":
+                    result, _ = payload
+                    result.update(self._writer.close())
+                    return
+                elif kind == "abort":
+                    self._writer.abort()
+                    return
+                else:
+                    raise ValueError(
+                        f"unknown async HDF5 command {kind!r} for {self.final_path}"
+                    )
+            except BaseException as error:
+                self._error = error
+                self._writer.abort()
+                if kind in ("close", "abort"):
+                    return
+            finally:
+                if event is not None:
+                    event.set()
+                self._queue.task_done()
+
+    def _stage_array(self, value: torch.Tensor, *, full: bool) -> _StagedArray:
+        detached = value.detach()
+        if detached.device.type != "cuda":
+            return _StagedArray(_cpu_array(detached, full=full), None)
+        device_index = detached.device.index
+        if device_index is None:
+            raise ValueError(
+                f"expected indexed CUDA tensor for async staging, got {detached.device}"
+            )
+        stream = self._copy_streams.get(device_index)
+        if stream is None:
+            stream = torch.cuda.Stream(device=detached.device)
+            self._copy_streams[device_index] = stream
+        stream.wait_stream(torch.cuda.current_stream(detached.device))
+        target_dtype = (
+            detached.dtype
+            if full and detached.dtype == torch.bfloat16
+            else torch.float16
+            if full
+            else torch.float32
+        )
+        with torch.cuda.stream(stream):
+            converted = detached.to(dtype=target_dtype).contiguous()
+            host = torch.empty(
+                converted.shape,
+                dtype=converted.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            host.copy_(converted, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+            detached.record_stream(stream)
+            converted.record_stream(stream)
+        return _StagedArray(
+            host,
+            event,
+            bfloat16_bits=full and target_dtype == torch.bfloat16,
+        )
+
+    def write_activation(
+        self,
+        key: str,
+        value: torch.Tensor,
+        *,
+        store_full: bool,
+        projection_dim: int,
+        projection_seed: int,
+    ) -> None:
+        key = _safe_key(key)
+        scalars, token_rms, channel_mean, channel_std = _tensor_summary_tensors(value)
+        projected_array: Optional[_StagedArray] = None
+        projected_dtype = None
+        if value.ndim == 3 and projection_dim > 0:
+            projected = countsketch_projection(
+                value.detach(), projection_dim, projection_seed
+            )
+            projected_array = self._stage_array(projected, full=True)
+            projected_dtype = projected.dtype
+        prepared = {
+            "scalars": self._stage_array(scalars, full=False),
+            "token_rms": self._stage_array(token_rms, full=False),
+            "channel_mean": self._stage_array(channel_mean, full=False),
+            "channel_std": self._stage_array(channel_std, full=False),
+            "projected": projected_array,
+            "projection_seed": projection_seed,
+            "projection_input_channels": value.shape[-1],
+            "projection_torch_dtype": projected_dtype,
+            "full_value": self._stage_array(value, full=True) if store_full else None,
+            "full_torch_dtype": value.dtype,
+        }
+        self._enqueue("activation", key, prepared)
+
+    def write_array(self, key: str, value: torch.Tensor | np.ndarray) -> None:
+        if isinstance(value, torch.Tensor):
+            staged = self._stage_array(value, full=False)
+        elif isinstance(value, np.ndarray):
+            staged = _StagedArray(np.array(value, copy=True), None)
+        else:
+            raise TypeError(
+                f"expected tensor or ndarray for {key!r}, got {type(value).__name__}"
+            )
+        self._enqueue("array", key, staged)
+
+    def write_tensor(self, key: str, value: torch.Tensor) -> None:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"expected tensor for {key!r}, got {type(value).__name__}: {value!r}"
+            )
+        self._enqueue(
+            "tensor",
+            key,
+            self._stage_array(value, full=True),
+            value.dtype,
+        )
+
+    def set_group_attrs(self, key: str, attrs: dict[str, Any]) -> None:
+        self._enqueue("attrs", key, dict(attrs))
+
+    def flush(self) -> None:
+        event = threading.Event()
+        self._enqueue("flush", event)
+        event.wait()
+        self._raise_worker_error()
+
+    def close(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        event = threading.Event()
+        if self._error is None:
+            self._enqueue("close", result, event)
+        else:
+            self._queue.put(("abort", (event,)))
+        event.wait()
+        self._thread.join()
+        self._closed = True
+        self._raise_worker_error()
+        return result
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        event = threading.Event()
+        try:
+            self._queue.put(("abort", (event,)))
+            event.wait()
+        finally:
+            self._thread.join()
             self._closed = True
 
 

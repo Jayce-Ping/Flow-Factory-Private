@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from flow_factory.diagnostics.activation_capture import (
+    AsyncAtomicH5Shard,
     AtomicH5Shard,
     Flux2ActivationCollector,
     countsketch_projection,
@@ -177,6 +178,30 @@ def test_bfloat16_full_tensor_is_stored_losslessly_as_uint16(tmp_path: Path):
         assert dataset.attrs["storage_encoding"] == "bfloat16_uint16"
         recovered = torch.from_numpy(dataset[()]).view(torch.bfloat16)
     torch.testing.assert_close(recovered, value)
+
+
+def test_async_writer_preserves_activation_and_array_data(tmp_path: Path):
+    value = torch.arange(24, dtype=torch.float32).reshape(1, 3, 8)
+    writer = AsyncAtomicH5Shard(tmp_path / "async.h5", queue_depth=2)
+    writer.set_group_attrs("sample", {"source": "test"})
+    writer.write_activation(
+        "sample/activation",
+        value,
+        store_full=True,
+        projection_dim=4,
+        projection_seed=17,
+    )
+    writer.write_array("sample/step", torch.tensor([3]))
+    writer.flush()
+    record = writer.close()
+
+    assert record["bytes"] > 0
+    with h5py.File(tmp_path / "async.h5", "r") as handle:
+        assert handle["sample"].attrs["source"] == "test"
+        assert handle["sample/step"][()].tolist() == [3.0]
+        recovered = torch.from_numpy(handle["sample/activation/full"][()])
+        torch.testing.assert_close(recovered, value.to(torch.float16))
+        assert handle["sample/activation/projection"].shape == (1, 3, 4)
 
 
 def test_probe_manifest_balances_sources_and_full_capture_ranks(tmp_path: Path):

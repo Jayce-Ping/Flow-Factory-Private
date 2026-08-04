@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from flow_factory.diagnostics.activation_capture import (
+    AsyncAtomicH5Shard,
     AtomicH5Shard,
     Flux2ActivationCollector,
     estimate_flux2_capture_bytes,
@@ -79,6 +80,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--summary-only", action="store_true")
+    parser.add_argument(
+        "--trajectory-only",
+        action="store_true",
+        help="Store only rollout/query tensors and scalar schedule metadata.",
+    )
+    parser.add_argument("--async-io", action="store_true")
+    parser.add_argument("--io-queue-depth", type=int, default=8)
     parser.add_argument("--skip-capacity-check", action="store_true")
     return parser.parse_args()
 
@@ -195,21 +203,34 @@ def _write_scalar_to_writers(
         full_writer.write_array(key, array)
 
 
+def _new_writer(
+    path: Path, attrs: dict[str, Any], args: argparse.Namespace
+) -> AtomicH5Shard | AsyncAtomicH5Shard:
+    if args.async_io:
+        return AsyncAtomicH5Shard(
+            path,
+            attrs=attrs,
+            queue_depth=args.io_queue_depth,
+        )
+    return AtomicH5Shard(path, attrs=attrs)
+
+
 def _new_full_writer(
     output_root: Path,
     phase: str,
     sample: dict[str, Any],
     attrs: dict[str, Any],
-    summary_only: bool,
-) -> Optional[AtomicH5Shard]:
-    if summary_only or not bool(sample["full_capture"]):
+    args: argparse.Namespace,
+) -> Optional[AtomicH5Shard | AsyncAtomicH5Shard]:
+    if args.summary_only or args.trajectory_only or not bool(sample["full_capture"]):
         return None
-    return AtomicH5Shard(
+    return _new_writer(
         output_root
         / "full"
         / phase
         / f"sample_{int(sample['global_index']):06d}.h5",
-        attrs={**attrs, **_sample_attrs(sample), "shard_kind": "full"},
+        {**attrs, **_sample_attrs(sample), "shard_kind": "full"},
+        args,
     )
 
 
@@ -218,6 +239,19 @@ def _close_full_writer(
 ) -> None:
     if writer is not None:
         shard_records.append(writer.close())
+
+
+def _write_trajectory_tensor(
+    writer: AtomicH5Shard | AsyncAtomicH5Shard,
+    sample_index: int,
+    step: int,
+    name: str,
+    value: torch.Tensor,
+) -> None:
+    writer.write_tensor(
+        f"samples/{sample_index:06d}/steps/{step:02d}/trajectory/{name}/full",
+        value,
+    )
 
 
 def _cache_student_conditioning(
@@ -274,12 +308,16 @@ def capture_student_phase(
 ) -> tuple[dict[int, dict[str, torch.Tensor]], list[dict[str, Any]]]:
     from flow_factory.diagnostics.activation_capture import Flux2ActivationCollector
 
-    collector = Flux2ActivationCollector(
-        adapter.pipeline.transformer,
-        summary_writer,
-        model_name="student_4b",
-        projection_dim=args.projection_dim,
-        internal_steps=parse_int_list(args.internal_steps, "internal_steps"),
+    collector = (
+        None
+        if args.trajectory_only
+        else Flux2ActivationCollector(
+            adapter.pipeline.transformer,
+            summary_writer,
+            model_name="student_4b",
+            projection_dim=args.projection_dim,
+            internal_steps=parse_int_list(args.internal_steps, "internal_steps"),
+        )
     )
     trajectories: dict[int, dict[str, torch.Tensor]] = {}
     shard_records: list[dict[str, Any]] = []
@@ -287,33 +325,36 @@ def capture_student_phase(
         for sample in local_samples:
             sample_index = int(sample["global_index"])
             full_writer = _new_full_writer(
-                output_root, "student_4b", sample, attrs, args.summary_only
+                output_root, "student_4b", sample, attrs, args
             )
-            collector.start_sample(
-                sample_index,
-                full_capture=full_writer is not None,
-                full_writer=full_writer,
-            )
+            if collector is not None:
+                collector.start_sample(
+                    sample_index,
+                    full_capture=full_writer is not None,
+                    full_writer=full_writer,
+                )
             sample_prefix = f"samples/{sample_index:06d}"
             summary_writer.set_group_attrs(sample_prefix, _sample_attrs(sample))
             if full_writer is not None:
                 full_writer.set_group_attrs(sample_prefix, _sample_attrs(sample))
             cond = conditioning[sample_index]
-            _write_conditioning(
-                summary_writer,
-                sample_index,
-                cond["prompt_embeds"],
-                cond["text_ids"],
-            )
-            if full_writer is not None:
+            if not args.trajectory_only:
                 _write_conditioning(
-                    full_writer,
+                    summary_writer,
                     sample_index,
                     cond["prompt_embeds"],
                     cond["text_ids"],
                 )
+                if full_writer is not None:
+                    _write_conditioning(
+                        full_writer,
+                        sample_index,
+                        cond["prompt_embeds"],
+                        cond["text_ids"],
+                    )
             generator = torch.Generator(device=adapter.device).manual_seed(int(sample["seed"]))
-            collector.start_auto_steps()
+            if collector is not None:
+                collector.start_auto_steps()
             with torch.autocast(
                 device_type=adapter.device.type,
                 dtype=adapter.pipeline.transformer.dtype,
@@ -336,7 +377,8 @@ def capture_student_phase(
                         "dt",
                     ],
                 )
-            collector.stop_auto_steps(expected_steps=args.num_steps)
+            if collector is not None:
+                collector.stop_auto_steps(expected_steps=args.num_steps)
             if len(generated) != 1:
                 raise ValueError(
                     f"expected one generated sample for global_index={sample_index}, "
@@ -355,18 +397,30 @@ def capture_student_phase(
                     f"student rollout global_index={sample_index} missing callbacks {missing}"
                 )
             for step in range(args.num_steps):
-                collector.set_step(step)
                 x_t = result.all_latents[step].unsqueeze(0)
                 x_next = result.all_latents[step + 1].unsqueeze(0)
-                collector.write_external("x_t", x_t)
-                collector.write_external("x_next", x_next)
-                collector.write_external(
-                    "model_output", callbacks["noise_pred"][step].unsqueeze(0)
-                )
-                collector.write_external(
-                    "transition_mean",
-                    callbacks["next_latents_mean"][step].unsqueeze(0),
-                )
+                if collector is None:
+                    _write_trajectory_tensor(
+                        summary_writer, sample_index, step, "x_t", x_t
+                    )
+                    _write_trajectory_tensor(
+                        summary_writer,
+                        sample_index,
+                        step,
+                        "model_output",
+                        callbacks["noise_pred"][step].unsqueeze(0),
+                    )
+                else:
+                    collector.set_step(step)
+                    collector.write_external("x_t", x_t)
+                    collector.write_external("x_next", x_next)
+                    collector.write_external(
+                        "model_output", callbacks["noise_pred"][step].unsqueeze(0)
+                    )
+                    collector.write_external(
+                        "transition_mean",
+                        callbacks["next_latents_mean"][step].unsqueeze(0),
+                    )
                 scalar_prefix = (
                     f"samples/{sample_index:06d}/steps/{step:02d}/trajectory"
                 )
@@ -397,7 +451,8 @@ def capture_student_phase(
             _close_full_writer(full_writer, shard_records)
             summary_writer.flush()
     finally:
-        collector.close()
+        if collector is not None:
+            collector.close()
     return trajectories, shard_records
 
 
@@ -418,12 +473,16 @@ def capture_teacher_phase(
         device=adapter.device,
         dtype=adapter.pipeline.transformer.dtype,
     )
-    collector = Flux2ActivationCollector(
-        teacher,
-        summary_writer,
-        model_name=phase,
-        projection_dim=args.projection_dim,
-        internal_steps=parse_int_list(args.internal_steps, "internal_steps"),
+    collector = (
+        None
+        if args.trajectory_only
+        else Flux2ActivationCollector(
+            teacher,
+            summary_writer,
+            model_name=phase,
+            projection_dim=args.projection_dim,
+            internal_steps=parse_int_list(args.internal_steps, "internal_steps"),
+        )
     )
     shard_records: list[dict[str, Any]] = []
     try:
@@ -438,37 +497,38 @@ def capture_teacher_phase(
             for sample in local_samples:
                 sample_index = int(sample["global_index"])
                 full_writer = _new_full_writer(
-                    output_root, phase, sample, attrs, args.summary_only
+                    output_root, phase, sample, attrs, args
                 )
-                collector.start_sample(
-                    sample_index,
-                    full_capture=full_writer is not None,
-                    full_writer=full_writer,
-                )
+                if collector is not None:
+                    collector.start_sample(
+                        sample_index,
+                        full_capture=full_writer is not None,
+                        full_writer=full_writer,
+                    )
                 sample_prefix = f"samples/{sample_index:06d}"
                 summary_writer.set_group_attrs(sample_prefix, _sample_attrs(sample))
                 if full_writer is not None:
                     full_writer.set_group_attrs(sample_prefix, _sample_attrs(sample))
                 cond = conditioning[sample_index]
-                _write_conditioning(
-                    summary_writer,
-                    sample_index,
-                    cond["prompt_embeds"],
-                    cond["text_ids"],
-                )
-                if full_writer is not None:
+                if not args.trajectory_only:
                     _write_conditioning(
-                        full_writer,
+                        summary_writer,
                         sample_index,
                         cond["prompt_embeds"],
                         cond["text_ids"],
                     )
+                    if full_writer is not None:
+                        _write_conditioning(
+                            full_writer,
+                            sample_index,
+                            cond["prompt_embeds"],
+                            cond["text_ids"],
+                        )
                 trajectory = trajectories[sample_index]
                 all_latents = trajectory["all_latents"]
                 timesteps = trajectory["timesteps"]
                 latent_ids = trajectory["latent_ids"].unsqueeze(0).to(adapter.device)
                 for step in range(args.num_steps):
-                    collector.set_step(step)
                     x_t = all_latents[step].unsqueeze(0).to(adapter.device)
                     t = timesteps[step].reshape(1).to(adapter.device)
                     t_next = (
@@ -497,15 +557,25 @@ def capture_teacher_phase(
                             f"{phase} query for sample={sample_index}, step={step} "
                             "did not return model_output and transition_mean"
                         )
-                    collector.write_external("x_t", x_t)
-                    collector.write_external(
-                        "x_next_student",
-                        all_latents[step + 1].unsqueeze(0),
-                    )
-                    collector.write_external("model_output", output.noise_pred)
-                    collector.write_external(
-                        "transition_mean", output.next_latents_mean
-                    )
+                    if collector is None:
+                        _write_trajectory_tensor(
+                            summary_writer,
+                            sample_index,
+                            step,
+                            "model_output",
+                            output.noise_pred,
+                        )
+                    else:
+                        collector.set_step(step)
+                        collector.write_external("x_t", x_t)
+                        collector.write_external(
+                            "x_next_student",
+                            all_latents[step + 1].unsqueeze(0),
+                        )
+                        collector.write_external("model_output", output.noise_pred)
+                        collector.write_external(
+                            "transition_mean", output.next_latents_mean
+                        )
                     scalar_prefix = (
                         f"samples/{sample_index:06d}/steps/{step:02d}/trajectory"
                     )
@@ -531,7 +601,8 @@ def capture_teacher_phase(
                 _close_full_writer(full_writer, shard_records)
                 summary_writer.flush()
     finally:
-        collector.close()
+        if collector is not None:
+            collector.close()
         adapter._teacher_transformer = None
         del teacher
         gc.collect()
@@ -540,6 +611,37 @@ def capture_teacher_phase(
 
 
 def _capacity_preflight(args: argparse.Namespace, samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if args.trajectory_only:
+        image_tokens = (args.height // 16) * (args.width // 16)
+        tensor_bytes = image_tokens * 128 * 2
+        trajectory_tensors = 1 + len(MODEL_SPECS)
+        estimated_total = (
+            len(samples) * args.num_steps * trajectory_tensors * tensor_bytes
+        )
+        usage = shutil.disk_usage(args.output_root.parent)
+        estimate = {
+            "estimated_total": estimated_total,
+            "full_block_outputs": 0,
+            "projections": 0,
+            "summaries": 0,
+            "trajectory_tensors": estimated_total,
+            "with_internal_and_hdf5_overhead": int(estimated_total * 1.15),
+            "filesystem_free_bytes": usage.free,
+        }
+        estimate["required_with_25pct_headroom"] = int(
+            estimate["with_internal_and_hdf5_overhead"] * 1.25
+        )
+        if (
+            not args.skip_capacity_check
+            and usage.free < estimate["required_with_25pct_headroom"]
+        ):
+            raise OSError(
+                "insufficient shared storage for trajectory-only capture: expected "
+                f"{estimate['required_with_25pct_headroom'] / 2**30:.2f} GiB, "
+                f"found {usage.free / 2**30:.2f} GiB at {args.output_root.parent}"
+            )
+        return estimate
+
     full_prompts = (
         0 if args.summary_only else sum(bool(sample["full_capture"]) for sample in samples)
     )
@@ -587,10 +689,22 @@ def _release_teacher(adapter: Any) -> None:
 
 def main() -> None:
     args = parse_args()
-    if min(args.num_steps, args.height, args.width, args.projection_dim) <= 0:
+    if args.summary_only and args.trajectory_only:
         raise ValueError(
-            "num_steps, height, width and projection_dim must be positive, got "
-            f"{(args.num_steps, args.height, args.width, args.projection_dim)}"
+            "expected at most one reduced capture mode, got both "
+            "summary_only=True and trajectory_only=True"
+        )
+    if min(
+        args.num_steps,
+        args.height,
+        args.width,
+        args.projection_dim,
+        args.io_queue_depth,
+    ) <= 0:
+        raise ValueError(
+            "num_steps, height, width, projection_dim and io_queue_depth must be "
+            "positive, got "
+            f"{(args.num_steps, args.height, args.width, args.projection_dim, args.io_queue_depth)}"
         )
     phases = tuple(item.strip() for item in args.phases.split(",") if item.strip())
     unknown = set(phases) - set(MODEL_PATHS)
@@ -678,9 +792,10 @@ def main() -> None:
                 world_size=world_size,
                 args=args,
             )
-            summary_writer = AtomicH5Shard(
+            summary_writer = _new_writer(
                 args.output_root / "summary" / phase / f"rank_{rank:03d}.h5",
-                attrs={**attrs, "shard_kind": "summary"},
+                {**attrs, "shard_kind": "summary"},
+                args,
             )
             phase_shards: list[dict[str, Any]] = []
             try:

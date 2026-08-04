@@ -2,9 +2,10 @@
 # Four-node x 8-GPU launcher for activation-capture diagnostics.
 set -euo pipefail
 
-MASTER_IP=${MASTER_IP:-28.7.193.116}
+MASTER_IP=${MASTER_IP:-28.7.186.81}
 MASTER_PORT=${MASTER_PORT:-29740}
-WORKERS=(28.7.185.215 28.7.185.156 28.7.195.15)
+read -r -a WORKERS <<< "${XOPD_WORKERS-28.7.193.116 28.7.193.87 28.7.187.4}"
+NUM_NODES=$((1 + ${#WORKERS[@]}))
 SCRIPT=scripts/xopd_analysis/capture_teacher_student_activations.py
 EXTRA=("$@")
 PATTERN='[c]apture_teacher_student_activations.py'
@@ -27,8 +28,11 @@ restart_keepalive() {
   for ip in "${WORKERS[@]}"; do
     ssh -o StrictHostKeyChecking=no -f "$ip" \
       "source /opt/conda/etc/profile.d/conda.sh && conda activate ff && \
-       setsid python /root/gpu_keepalive.py > /root/gpu_keepalive.log 2>&1 < /dev/null &" || true
+       pkill -9 -f '[g]pu_keepalive.py' 2>/dev/null || true; \
+       setsid python /root/Flow-Factory-Private/.scratch/gpu_keepalive.py \
+       > /root/gpu_keepalive.log 2>&1 < /dev/null &" || true
   done
+  pkill -9 -f '[g]pu_keepalive.py' 2>/dev/null || true
   setsid /opt/conda/envs/ff/bin/python .scratch/gpu_keepalive.py \
     > /root/gpu_keepalive.log 2>&1 < /dev/null &
 }
@@ -47,7 +51,7 @@ rank=1
 for ip in "${WORKERS[@]}"; do
   ssh -o StrictHostKeyChecking=no "$ip" \
     "$COMMON; nohup /opt/conda/envs/ff/bin/torchrun \
-      --nnodes=4 --nproc-per-node=8 --node-rank=$rank \
+      --nnodes=$NUM_NODES --nproc-per-node=8 --node-rank=$rank \
       --master-addr=$MASTER_IP --master-port=$MASTER_PORT \
       $SCRIPT ${EXTRA[*]} > /root/activation_capture_rank${rank}.log 2>&1 &"
   rank=$((rank + 1))
@@ -55,6 +59,6 @@ done
 
 eval "$COMMON"
 /opt/conda/envs/ff/bin/torchrun \
-  --nnodes=4 --nproc-per-node=8 --node-rank=0 \
+  --nnodes="$NUM_NODES" --nproc-per-node=8 --node-rank=0 \
   --master-addr="$MASTER_IP" --master-port="$MASTER_PORT" \
   "$SCRIPT" "${EXTRA[@]}" > /root/activation_capture_rank0.log 2>&1
