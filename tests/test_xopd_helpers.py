@@ -173,6 +173,15 @@ class TestForwardRiskVelocityLoss(unittest.TestCase):
             result.teacher_responsibility,
             torch.full((2,), 0.25),
         )
+        torch.testing.assert_close(
+            result.teacher_preferred_fraction,
+            torch.zeros(2),
+        )
+        torch.testing.assert_close(
+            result.student_preferred_fraction,
+            torch.ones(2),
+        )
+        torch.testing.assert_close(result.gate_tied_fraction, torch.zeros(2))
         torch.testing.assert_close(result.teacher_delta_rms, torch.zeros(2))
 
     def test_gate_prefers_predictor_with_lower_forward_risk(self) -> None:
@@ -186,6 +195,15 @@ class TestForwardRiskVelocityLoss(unittest.TestCase):
         )
         self.assertGreater(result.teacher_responsibility[0].item(), 0.5)
         self.assertLess(result.teacher_responsibility[1].item(), 0.5)
+        torch.testing.assert_close(
+            result.teacher_preferred_fraction,
+            torch.tensor([1.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            result.student_preferred_fraction,
+            torch.tensor([0.0, 1.0]),
+        )
+        torch.testing.assert_close(result.gate_tied_fraction, torch.zeros(2))
 
     def test_event_mean_gate_is_dimension_stable(self) -> None:
         kwargs = {

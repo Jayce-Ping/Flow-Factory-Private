@@ -251,6 +251,14 @@ class TestForwardRiskTrainer(unittest.TestCase):
         self.assertIn("train/forward_risk/advantage", logged_metrics)
         self.assertIn("train/forward_risk/advantage_p90", logged_metrics)
         self.assertIn("train/forward_risk/teacher_delta_rms_p90", logged_metrics)
+        self.assertIn(
+            "train/forward_risk/teacher_preferred_fraction",
+            logged_metrics,
+        )
+        self.assertIn(
+            "train/forward_risk/student_preferred_fraction",
+            logged_metrics,
+        )
         timestep_metrics = [
             key
             for key in logged_metrics

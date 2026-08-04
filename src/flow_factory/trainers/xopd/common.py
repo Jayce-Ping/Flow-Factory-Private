@@ -107,6 +107,9 @@ class ForwardRiskVelocityLoss:
     teacher_energy: torch.Tensor
     advantage: torch.Tensor
     teacher_responsibility: torch.Tensor
+    teacher_preferred_fraction: torch.Tensor
+    student_preferred_fraction: torch.Tensor
+    gate_tied_fraction: torch.Tensor
     gate_entropy: torch.Tensor
     gate_saturated_low: torch.Tensor
     gate_saturated_high: torch.Tensor
@@ -127,6 +130,9 @@ class ForwardRiskVelocityLoss:
             "advantage": self.advantage.detach(),
             "abs_advantage": self.advantage.detach().abs(),
             "teacher_responsibility": self.teacher_responsibility.detach(),
+            "teacher_preferred_fraction": self.teacher_preferred_fraction.detach(),
+            "student_preferred_fraction": self.student_preferred_fraction.detach(),
+            "gate_tied_fraction": self.gate_tied_fraction.detach(),
             "gate_entropy": self.gate_entropy.detach(),
             "gate_saturated_low": self.gate_saturated_low.detach(),
             "gate_saturated_high": self.gate_saturated_high.detach(),
@@ -267,6 +273,9 @@ def compute_forward_risk_velocity_loss(
         teacher_energy=teacher_energy.detach(),
         advantage=advantage.detach(),
         teacher_responsibility=teacher_responsibility,
+        teacher_preferred_fraction=(teacher_responsibility > 0.5).float(),
+        student_preferred_fraction=(teacher_responsibility < 0.5).float(),
+        gate_tied_fraction=(teacher_responsibility == 0.5).float(),
         gate_entropy=gate_entropy.detach(),
         gate_saturated_low=(teacher_responsibility <= 0.01).float(),
         gate_saturated_high=(teacher_responsibility >= 0.99).float(),

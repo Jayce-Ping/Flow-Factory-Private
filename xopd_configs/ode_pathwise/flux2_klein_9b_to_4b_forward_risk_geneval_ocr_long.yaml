@@ -35,7 +35,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "flux2klein_9b_to_4b_forward_risk_geneval_ocr_long_teacher_gs1"
+  run_name: "flux2klein_9b_to_4b_forward_risk_geneval_ocr_long_teacher_gs1_alpha02"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -69,7 +69,8 @@ train:
   kl_type: "x-based"
   kl_beta: 0.0
   xopd_target_mode: "forward_risk"
-  forward_risk_alpha: 0.5
+  # Require a positive advantage > tau * log(4) before teacher weight exceeds 0.5.
+  forward_risk_alpha: 0.2
   forward_risk_temperature: 0.00362676868369
   forward_risk_max_delta_rms: 0.153199896216
 

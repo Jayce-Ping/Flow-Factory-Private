@@ -153,6 +153,7 @@ class TestA2MatchedSmokeConfigs(unittest.TestCase):
         with patch.dict(os.environ, {"WORLD_SIZE": "32"}):
             args = Arguments.load_from_yaml(str(a2_path))
         self.assertEqual(args.training_args.xopd_target_mode, "forward_risk")
+        self.assertEqual(args.training_args.forward_risk_alpha, 0.2)
         self.assertIsNone(args.training_args.max_epochs)
         self.assertEqual(args.training_args.gradient_accumulation_steps, 40)
         self.assertAlmostEqual(
