@@ -155,6 +155,7 @@ class TestPOPDScheduleAlignment(unittest.TestCase):
         )
         trainer._is_popd = True
         trainer._is_marginal_cfm = False
+        trainer._is_forward_risk = False
         trainer._is_ode = False
         trainer._cross_vae = False
         trainer.log_args = SimpleNamespace(verbose=False)
@@ -169,6 +170,7 @@ class TestPOPDScheduleAlignment(unittest.TestCase):
 
         captured.clear()
         trainer._is_popd = False
+        trainer._is_forward_risk = False
         self.assertEqual(trainer.sample(), [])
         self.assertEqual(captured["trajectory_indices"], SCHEDULER_TRAIN_INDICES)
 

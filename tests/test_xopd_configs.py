@@ -93,5 +93,77 @@ class TestA4MatchedSmokeConfigs(unittest.TestCase):
         self.assertEqual(args.training_args.gradient_accumulation_steps, 28)
 
 
+class TestA2MatchedSmokeConfigs(unittest.TestCase):
+    def test_forward_risk_calibration_config_parses_with_long_run_geometry(self) -> None:
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "xopd_configs"
+            / "ode_pathwise"
+            / "_TEST_9b_4b_forward_risk_calibration.yaml"
+        )
+        with patch.dict(os.environ, {"WORLD_SIZE": "32"}):
+            args = Arguments.load_from_yaml(str(config_path))
+
+        self.assertIsInstance(args.training_args, XOPDTrainingArguments)
+        self.assertEqual(args.training_args.xopd_target_mode, "forward_risk")
+        self.assertEqual(args.training_args.forward_risk_alpha, 0.5)
+        self.assertAlmostEqual(
+            args.training_args.forward_risk_temperature,
+            0.00362676868369,
+        )
+        self.assertAlmostEqual(
+            args.training_args.forward_risk_max_delta_rms,
+            0.153199896216,
+        )
+        self.assertEqual(args.training_args.xopd_dk_space, "v")
+        self.assertFalse(args.training_args.normalize_d_k)
+        self.assertEqual(args.scheduler_args.dynamics_type, "ODE")
+        self.assertEqual(args.scheduler_args.noise_level, 0.0)
+        self.assertEqual(args.training_args.num_inference_steps, 20)
+        self.assertEqual(args.training_args.per_device_batch_size, 4)
+        self.assertEqual(args.training_args.unique_sample_num_per_epoch, 256)
+        self.assertEqual(args.training_args.num_batches_per_epoch, 2)
+        self.assertEqual(args.training_args.gradient_accumulation_steps, 40)
+        self.assertEqual(args.training_args.teacher_guidance_scale, 1.0)
+        self.assertEqual(args.training_args.student_guidance_scale, 1.0)
+
+    def test_forward_risk_long_run_only_changes_a4_loss_configuration(self) -> None:
+        config_dir = Path(__file__).resolve().parents[1] / "xopd_configs" / "ode_pathwise"
+        a4_path = config_dir / "flux2_klein_9b_to_4b_marginal_cfm_geneval_ocr_long.yaml"
+        a2_path = config_dir / "flux2_klein_9b_to_4b_forward_risk_geneval_ocr_long.yaml"
+        with open(a4_path, encoding="utf-8") as handle:
+            a4_raw = yaml.safe_load(handle)
+        with open(a2_path, encoding="utf-8") as handle:
+            a2_raw = yaml.safe_load(handle)
+
+        self.assertNotEqual(a4_raw["log"]["run_name"], a2_raw["log"]["run_name"])
+        a4_raw["log"].pop("run_name")
+        a2_raw["log"].pop("run_name")
+        for config in (a4_raw, a2_raw):
+            for key in (
+                "xopd_target_mode",
+                "marginal_cfm_alpha",
+                "forward_risk_alpha",
+                "forward_risk_temperature",
+                "forward_risk_max_delta_rms",
+            ):
+                config["train"].pop(key, None)
+        self.assertEqual(a2_raw, a4_raw)
+
+        with patch.dict(os.environ, {"WORLD_SIZE": "32"}):
+            args = Arguments.load_from_yaml(str(a2_path))
+        self.assertEqual(args.training_args.xopd_target_mode, "forward_risk")
+        self.assertIsNone(args.training_args.max_epochs)
+        self.assertEqual(args.training_args.gradient_accumulation_steps, 40)
+        self.assertAlmostEqual(
+            args.training_args.forward_risk_temperature,
+            0.00362676868369,
+        )
+        self.assertAlmostEqual(
+            args.training_args.forward_risk_max_delta_rms,
+            0.153199896216,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

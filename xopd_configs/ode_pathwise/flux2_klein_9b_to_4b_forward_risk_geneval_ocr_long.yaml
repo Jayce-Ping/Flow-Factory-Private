@@ -1,10 +1,10 @@
-# A4 marginal-mixture CFM: FLUX.2-klein-base-9B -> FLUX.2-klein-base-4B.
+# A2 forward-risk XOPD: FLUX.2-klein-base-9B -> FLUX.2-klein-base-4B.
 #
-# This is the long-run counterpart of _TEST_9b_4b_marginal_cfm_smoke.yaml.
-# Training uses the established 9B->4B XOPD geometry with a 1:1 mixture of
-# Geneval and OCR prompts. At 32 GPUs, batch size 4 and 256 unique prompts,
-# each epoch has two global micro-batches; 20 dense ODE targets therefore give
-# auto GAS=40 and exactly one optimizer update per epoch.
+# Matched to flux2_klein_9b_to_4b_marginal_cfm_geneval_ocr_long.yaml except
+# for the run name and A2 target/loss parameters calibrated by smoke run
+# c01we62m. At 32 GPUs, batch size 4 and 256 unique prompts, each epoch has
+# two global micro-batches; 20 dense ODE targets therefore give auto GAS=40
+# and exactly one optimizer update per epoch.
 
 launcher: "accelerate"
 config_file: config/deepspeed/deepspeed_zero2.yaml
@@ -35,7 +35,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "flux2klein_9b_to_4b_marginal_cfm_geneval_ocr_long_teacher_gs1"
+  run_name: "flux2klein_9b_to_4b_forward_risk_geneval_ocr_long_teacher_gs1"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
   save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
@@ -68,8 +68,10 @@ train:
   xopd_dk_space: "v"
   kl_type: "x-based"
   kl_beta: 0.0
-  xopd_target_mode: "marginal_cfm"
-  marginal_cfm_alpha: 0.5
+  xopd_target_mode: "forward_risk"
+  forward_risk_alpha: 0.5
+  forward_risk_temperature: 0.00362676868369
+  forward_risk_max_delta_rms: 0.153199896216
 
   source_ratio: {geneval: 1, ocr: 1}
 

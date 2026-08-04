@@ -1,10 +1,4 @@
-# A4 marginal-mixture CFM: FLUX.2-klein-base-9B -> FLUX.2-klein-base-4B.
-#
-# This is the long-run counterpart of _TEST_9b_4b_marginal_cfm_smoke.yaml.
-# Training uses the established 9B->4B XOPD geometry with a 1:1 mixture of
-# Geneval and OCR prompts. At 32 GPUs, batch size 4 and 256 unique prompts,
-# each epoch has two global micro-batches; 20 dense ODE targets therefore give
-# auto GAS=40 and exactly one optimizer update per epoch.
+# Arm-A2 calibration smoke: match the long 9B->4B Geneval+OCR geometry for one epoch.
 
 launcher: "accelerate"
 config_file: config/deepspeed/deepspeed_zero2.yaml
@@ -35,16 +29,16 @@ model:
   resume_type: null
 
 log:
-  run_name: "flux2klein_9b_to_4b_marginal_cfm_geneval_ocr_long_teacher_gs1"
+  run_name: "TEST_9b_4b_forward_risk_calibrated_smoke"
   project: "Flow-Factory-XOPD"
   logging_backend: "wandb"
-  save_dir: "/apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/checkpoints"
-  save_freq: 50
+  save_dir: "saves/"
+  save_freq: 0
   save_model_only: true
 
 train:
   trainer_type: "xopd"
-  max_epochs: null
+  max_epochs: 1
   fsdp_shard_teacher: false
 
   teacher_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
@@ -68,8 +62,12 @@ train:
   xopd_dk_space: "v"
   kl_type: "x-based"
   kl_beta: 0.0
-  xopd_target_mode: "marginal_cfm"
-  marginal_cfm_alpha: 0.5
+  xopd_target_mode: "forward_risk"
+  forward_risk_alpha: 0.5
+  # Fixed from the raw 4-node calibration run c01we62m:
+  # max(|A_p10|, |A_p90|) / log(9), and p90(RMS(f_T - f_old)).
+  forward_risk_temperature: 0.00362676868369
+  forward_risk_max_delta_rms: 0.153199896216
 
   source_ratio: {geneval: 1, ocr: 1}
 
@@ -107,30 +105,11 @@ eval:
   per_device_batch_size: 1
   num_inference_steps: 40
   guidance_scale: 1.0
-  eval_freq: 100
+  eval_freq: 0
   seed: 42
+  # Keep one real DataLoader so Accelerate can infer DeepSpeed's micro-batch
+  # size; eval_freq=0 prevents any calibration-time inference.
   test_sets:
-    - {name: geneval_gs1, dataset_dir: dataset/geneval, split: test, guidance_scale: 1.0, eval_reward_names: [geneval, pick_score]}
-    - {name: ocr_gs1, dataset_dir: dataset/ocr, split: test, guidance_scale: 1.0, eval_reward_names: [ocr, pick_score]}
-    - {name: pickscore_gs1, dataset_dir: dataset/pickscore, split: test, guidance_scale: 1.0, eval_reward_names: [pick_score]}
+    - {name: calibration_loader, dataset_dir: dataset/geneval, split: test, guidance_scale: 1.0, eval_reward_names: []}
 
-rewards:
-  - name: "geneval"
-    reward_model: "geneval"
-    weight: 1
-    batch_size: 64
-    device: "cuda"
-    dtype: float32
-    async_reward: false
-  - name: "pick_score"
-    reward_model: "PickScore"
-    batch_size: 64
-    device: "cuda"
-    dtype: bfloat16
-    async_reward: false
-  - name: "ocr"
-    reward_model: "ocr"
-    batch_size: 64
-    device: "cpu"
-    dtype: float32
-    async_reward: false
+rewards: []

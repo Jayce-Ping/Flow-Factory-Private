@@ -13,10 +13,28 @@ transport between different ones.
 
 ```
 xopd_configs/
-├── ode_pathwise/     # dynamics_type=ODE  (direct pathwise or marginal CFM)
+├── ode_pathwise/     # dynamics_type=ODE  (direct, A2 forward risk, or A4 marginal CFM)
 ├── sde_pathwise/     # stochastic Gaussian transitions (P-OPD)
 └── cross_vae/        # heterogeneous VAE spaces (FLUX.2 teacher -> SD3.5 student) via a latent transport
 ```
+
+### ode_pathwise/ — A2 forward risk
+
+`xopd_target_mode: forward_risk` implements Arm A2. It first completes the
+ordinary old-student ODE rollout, forward-re-noises that rollout's clean
+endpoint at each training timestep, and queries the frozen teacher and current
+student on the same probe state. The detached teacher gate is
+
+`sigmoid(logit(alpha) + (E_old - E_teacher) / temperature)`,
+
+where both energies are per-dimension flow-target MSEs. An optional
+`forward_risk_max_delta_rms` projects the teacher-minus-old velocity correction
+to a fixed RMS trust radius. A2 requires same-VAE identity transport, ODE,
+unnormalized velocity loss, composed CFG supervision, and `kl_beta: 0`.
+
+Use `_TEST_9b_4b_forward_risk_calibration.yaml` with a null radius to measure
+global advantage and teacher-gap quantiles before fixing the temperature and
+radius for a long run.
 
 ### ode_pathwise/ — A4 marginal-mixture CFM
 

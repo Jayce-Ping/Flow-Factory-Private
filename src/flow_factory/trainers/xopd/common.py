@@ -98,6 +98,197 @@ class PDMVelocityLoss:
         }
 
 
+@dataclass(frozen=True)
+class ForwardRiskVelocityLoss:
+    """Arm-A2 velocity loss and detached predictive-risk diagnostics."""
+
+    loss: torch.Tensor
+    old_energy: torch.Tensor
+    teacher_energy: torch.Tensor
+    advantage: torch.Tensor
+    teacher_responsibility: torch.Tensor
+    gate_entropy: torch.Tensor
+    gate_saturated_low: torch.Tensor
+    gate_saturated_high: torch.Tensor
+    teacher_delta_rms: torch.Tensor
+    teacher_delta_l2: torch.Tensor
+    correction_scale: torch.Tensor
+    projection_active: torch.Tensor
+    target_delta_rms: torch.Tensor
+    event_dim: int
+    alpha: float
+    temperature: float
+    max_delta_rms: Optional[float]
+
+    def detached_diagnostics(self) -> Dict[str, torch.Tensor]:
+        return {
+            "old_energy": self.old_energy.detach(),
+            "teacher_energy": self.teacher_energy.detach(),
+            "advantage": self.advantage.detach(),
+            "abs_advantage": self.advantage.detach().abs(),
+            "teacher_responsibility": self.teacher_responsibility.detach(),
+            "gate_entropy": self.gate_entropy.detach(),
+            "gate_saturated_low": self.gate_saturated_low.detach(),
+            "gate_saturated_high": self.gate_saturated_high.detach(),
+            "teacher_delta_rms": self.teacher_delta_rms.detach(),
+            "teacher_delta_l2": self.teacher_delta_l2.detach(),
+            "correction_scale": self.correction_scale.detach(),
+            "projection_active": self.projection_active.detach(),
+            "target_delta_rms": self.target_delta_rms.detach(),
+        }
+
+
+def compute_forward_risk_velocity_loss(
+    *,
+    student_prediction: torch.Tensor,
+    teacher_prediction: torch.Tensor,
+    flow_target: torch.Tensor,
+    alpha: float,
+    temperature: float,
+    max_delta_rms: Optional[float],
+) -> ForwardRiskVelocityLoss:
+    """Compute Arm A2 with per-dimension predictive risk and an RMS trust radius.
+
+    ``student_prediction.detach()`` is the frozen behavior prediction. This is
+    exact under XOPD's one-optimizer-step-per-epoch replay invariant: all
+    micro-batches are evaluated before the sole optimizer update.
+    """
+    tensors = {
+        "student_prediction": student_prediction,
+        "teacher_prediction": teacher_prediction,
+        "flow_target": flow_target,
+    }
+    for name, value in tensors.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"expected torch.Tensor for {name}, got {type(value).__name__}: {value!r}."
+            )
+        if value.ndim < 2:
+            raise ValueError(
+                f"expected {name} with shape (B,event...), got shape={tuple(value.shape)}."
+            )
+        if not value.is_floating_point():
+            raise TypeError(
+                f"expected floating-point {name}, got dtype={value.dtype}, "
+                f"shape={tuple(value.shape)}."
+            )
+        if not torch.isfinite(value.detach()).all():
+            raise ValueError(
+                f"expected finite {name}, got non-finite values with "
+                f"shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}."
+            )
+    reference = student_prediction
+    for name, value in tensors.items():
+        if value.shape != reference.shape:
+            raise ValueError(
+                "forward-risk predictions and target must share one shape, "
+                f"student_prediction.shape={tuple(reference.shape)}, "
+                f"{name}.shape={tuple(value.shape)}."
+            )
+        if value.device != reference.device:
+            raise ValueError(
+                "forward-risk predictions and target must share one device, "
+                f"student_prediction.device={reference.device}, {name}.device={value.device}."
+            )
+
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError(
+            "expected finite numeric alpha strictly between 0 and 1 for forward risk, "
+            f"got {type(alpha).__name__}: alpha={alpha!r}."
+        )
+    if not math.isfinite(float(alpha)) or not 0.0 < float(alpha) < 1.0:
+        raise ValueError(
+            f"expected finite alpha strictly between 0 and 1, got alpha={alpha!r}."
+        )
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError(
+            "expected finite numeric temperature > 0 for forward risk, "
+            f"got {type(temperature).__name__}: temperature={temperature!r}."
+        )
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError(
+            f"expected finite temperature > 0, got temperature={temperature!r}."
+        )
+    if max_delta_rms is not None:
+        if isinstance(max_delta_rms, bool) or not isinstance(max_delta_rms, (int, float)):
+            raise TypeError(
+                "expected max_delta_rms=None or a finite numeric value > 0, "
+                f"got {type(max_delta_rms).__name__}: max_delta_rms={max_delta_rms!r}."
+            )
+        if not math.isfinite(float(max_delta_rms)) or float(max_delta_rms) <= 0.0:
+            raise ValueError(
+                "expected max_delta_rms=None or a finite value > 0, "
+                f"got max_delta_rms={max_delta_rms!r}."
+            )
+
+    event_dim = math.prod(reference.shape[1:])
+    event_dims = tuple(range(1, reference.ndim))
+    student_f = student_prediction.float()
+    old_f = student_prediction.detach().float()
+    teacher_f = teacher_prediction.detach().float()
+    target_f = flow_target.detach().float()
+
+    old_energy = 0.5 * (target_f - old_f).square().mean(dim=event_dims)
+    teacher_energy = 0.5 * (target_f - teacher_f).square().mean(dim=event_dims)
+    advantage = old_energy - teacher_energy
+    prior_logit = math.log(float(alpha)) - math.log1p(-float(alpha))
+    gate_logit = prior_logit + advantage / float(temperature)
+    teacher_responsibility = torch.sigmoid(gate_logit).detach()
+
+    teacher_delta = teacher_f - old_f
+    teacher_delta_mse = teacher_delta.square().mean(dim=event_dims)
+    teacher_delta_rms = teacher_delta_mse.sqrt()
+    teacher_delta_l2 = teacher_delta_rms * math.sqrt(event_dim)
+    if max_delta_rms is None:
+        correction_scale = torch.ones_like(teacher_delta_rms)
+    else:
+        radius = teacher_delta_rms.new_tensor(float(max_delta_rms))
+        correction_scale = torch.minimum(
+            torch.ones_like(teacher_delta_rms),
+            radius / teacher_delta_rms.clamp_min(torch.finfo(torch.float32).eps),
+        )
+    correction_scale = correction_scale.detach()
+
+    broadcast_shape = (reference.shape[0],) + (1,) * (reference.ndim - 1)
+    target_delta = (
+        teacher_responsibility.view(broadcast_shape)
+        * correction_scale.view(broadcast_shape)
+        * teacher_delta
+    )
+    forward_risk_target = (old_f + target_delta).detach()
+    loss = 0.5 * (student_f - forward_risk_target).square().mean(dim=event_dims)
+
+    gate_eps = torch.finfo(torch.float32).eps
+    gate = teacher_responsibility.clamp(gate_eps, 1.0 - gate_eps)
+    gate_entropy = -(gate * gate.log() + (1.0 - gate) * (1.0 - gate).log())
+    result = ForwardRiskVelocityLoss(
+        loss=loss,
+        old_energy=old_energy.detach(),
+        teacher_energy=teacher_energy.detach(),
+        advantage=advantage.detach(),
+        teacher_responsibility=teacher_responsibility,
+        gate_entropy=gate_entropy.detach(),
+        gate_saturated_low=(teacher_responsibility <= 0.01).float(),
+        gate_saturated_high=(teacher_responsibility >= 0.99).float(),
+        teacher_delta_rms=teacher_delta_rms.detach(),
+        teacher_delta_l2=teacher_delta_l2.detach(),
+        correction_scale=correction_scale,
+        projection_active=(correction_scale < 1.0).float(),
+        target_delta_rms=target_delta.square().mean(dim=event_dims).sqrt().detach(),
+        event_dim=event_dim,
+        alpha=float(alpha),
+        temperature=float(temperature),
+        max_delta_rms=None if max_delta_rms is None else float(max_delta_rms),
+    )
+    for name, value in {"loss": result.loss, **result.detached_diagnostics()}.items():
+        if not torch.isfinite(value.detach()).all():
+            raise ValueError(
+                f"expected finite forward-risk {name}, got values={value.detach().cpu().tolist()}, "
+                f"student_shape={tuple(student_prediction.shape)}, event_dim={event_dim}."
+            )
+    return result
+
+
 def compute_xopd_pdm_loss(
     *,
     student_positive: torch.Tensor,
@@ -469,6 +660,46 @@ def validate_marginal_cfm_configuration(
         )
 
 
+def validate_forward_risk_configuration(
+    *,
+    dynamics_type: str,
+    noise_level: float,
+    xopd_dk_space: str,
+    normalize_d_k: bool,
+    is_cross_vae: bool,
+    pixel_loss: bool,
+    vae_transport: str,
+) -> None:
+    """Validate the same-VAE ODE velocity geometry used by Arm A2."""
+    if dynamics_type != "ODE":
+        raise ValueError(
+            "Forward-risk A2 requires dynamics_type='ODE', "
+            f"got dynamics_type={dynamics_type!r}."
+        )
+    if isinstance(noise_level, bool) or not isinstance(noise_level, (int, float)):
+        raise TypeError(
+            "Forward-risk A2 requires finite numeric noise_level == 0, "
+            f"got {type(noise_level).__name__}: noise_level={noise_level!r}."
+        )
+    if not math.isfinite(float(noise_level)) or float(noise_level) != 0.0:
+        raise ValueError(
+            "Forward-risk A2 requires finite noise_level == 0, "
+            f"got noise_level={noise_level!r}."
+        )
+    if xopd_dk_space != "v" or normalize_d_k is not False:
+        raise ValueError(
+            "Forward-risk A2 requires event-mean velocity loss: expected "
+            "xopd_dk_space='v' and normalize_d_k=False, got "
+            f"xopd_dk_space={xopd_dk_space!r}, normalize_d_k={normalize_d_k!r}."
+        )
+    if is_cross_vae or pixel_loss or vae_transport != "identity":
+        raise ValueError(
+            "Forward-risk A2 currently requires same-VAE identity transport and latent loss, got "
+            f"is_cross_vae={is_cross_vae!r}, pixel_loss={pixel_loss!r}, "
+            f"vae_transport={vae_transport!r}."
+        )
+
+
 def validate_xopd_target_configuration(
     *,
     target_mode: str,
@@ -516,8 +747,19 @@ def validate_xopd_target_configuration(
             vae_transport=vae_transport,
         )
         return
+    if target_mode == "forward_risk":
+        validate_forward_risk_configuration(
+            dynamics_type=dynamics_type,
+            noise_level=noise_level,
+            xopd_dk_space=xopd_dk_space,
+            normalize_d_k=normalize_d_k,
+            is_cross_vae=is_cross_vae,
+            pixel_loss=pixel_loss,
+            vae_transport=vae_transport,
+        )
+        return
     raise ValueError(
-        "XOPD target mode must be 'direct', 'p_opd', or 'marginal_cfm', "
+        "XOPD target mode must be 'direct', 'p_opd', 'marginal_cfm', or 'forward_risk', "
         f"got target_mode={target_mode!r}."
     )
 

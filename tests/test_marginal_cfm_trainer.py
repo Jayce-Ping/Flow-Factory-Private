@@ -307,6 +307,7 @@ class TestMarginalCFMSample(unittest.TestCase):
         trainer.teacher_gs = 3.0
         trainer._is_marginal_cfm = marginal
         trainer._is_popd = popd
+        trainer._is_forward_risk = False
         trainer._is_pdm = pdm
         trainer.pdm_lambda = 1.0
         trainer._is_ode = True
@@ -663,6 +664,7 @@ class TestMarginalCFMOptimization(unittest.TestCase):
         )
         trainer._is_marginal_cfm = marginal
         trainer._is_popd = popd
+        trainer._is_forward_risk = False
         trainer._is_pdm = pdm
         trainer._is_ode = True
         trainer._pixel_loss = False
@@ -1117,6 +1119,7 @@ class TestMarginalCFMEvaluation(unittest.TestCase):
 
                 trainer = XOPDTrainer.__new__(XOPDTrainer)
                 trainer._is_marginal_cfm = marginal
+                trainer._is_forward_risk = False
                 trainer.adapter = _EvalAdapter()
                 trainer.training_args = SimpleNamespace(num_inference_steps=3)
                 trainer.test_dataloaders = {"validation": [{"prompt": ["eval prompt"]}]}
@@ -1150,6 +1153,7 @@ class TestMarginalCFMEvaluation(unittest.TestCase):
             with self.subTest(marginal=marginal):
                 trainer = XOPDTrainer.__new__(XOPDTrainer)
                 trainer._is_marginal_cfm = marginal
+                trainer._is_forward_risk = False
                 trainer._teacher_baseline_scalars = {"eval/teacher/reward": 2.0}
                 trainer.accelerator = SimpleNamespace(is_main_process=True)
                 trainer.step = 3

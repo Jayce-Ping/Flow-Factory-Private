@@ -8,6 +8,8 @@
 \usepackage{geometry}
 \usepackage{xcolor}
 \usepackage{tcolorbox}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing,positioning}
 \usepackage[pdfencoding=auto,psdextra]{hyperref}
 
 \geometry{margin=2.5cm}
@@ -721,6 +723,102 @@ A_T=E_{\mathrm{old}}-E_T,
 Positive $A_T$ means that the teacher predicts the sampled forward target better than the old
 student.
 
+\subsection{How the prior and temperature change the target}
+
+The two gate hyperparameters have different roles.  Rewriting \eqref{eq:a2-gate} in odds form gives
+\begin{equation}
+\frac{\gamma_T}{1-\gamma_T}
+=
+\frac{\alpha}{1-\alpha}
+\exp\!\left(\frac{A_T}{\tau_s}\right).
+\label{eq:a2-gate-odds}
+\end{equation}
+Thus $\alpha$ supplies the teacher's prior odds, while $\tau_s$ converts one unit of measured risk
+advantage into log-odds evidence.  In particular,
+\begin{equation}
+\gamma_T(0)=\alpha,
+\qquad
+A_T(\gamma_T=q)
+=
+\tau_s\bigl(\logit q-\logit\alpha\bigr),
+\qquad q\in(0,1).
+\label{eq:a2-gate-threshold}
+\end{equation}
+The evidence needed merely to cross $\gamma_T=\tfrac12$ is
+\begin{equation}
+A_T^\star=-\tau_s\logit\alpha
+=
+\tau_s\log\frac{1-\alpha}{\alpha}.
+\label{eq:a2-indifference-threshold}
+\end{equation}
+Consequently, increasing $\alpha$ does not just multiply a fixed loss: it shifts every gate upward
+and lowers the teacher-evidence threshold.  As $\alpha\to1$, even weak or mildly negative evidence
+retains a teacher target; as $\alpha\to0$, strong positive evidence is required.  The neutral choice
+$\alpha=\tfrac12$ sets $A_T^\star=0$, so the sign of the measured risk difference decides which
+side of one half the gate occupies.
+
+Temperature determines selectivity.  Its exact sensitivity is
+\begin{equation}
+\frac{\partial\gamma_T}{\partial A_T}
+=
+\frac{\gamma_T(1-\gamma_T)}{\tau_s}
+\le \frac{1}{4\tau_s}.
+\label{eq:a2-gate-sensitivity}
+\end{equation}
+A small $\tau_s$ approaches a hard accept/reject rule around $A_T^\star$.  This sharply suppresses
+teacher-worse events, but amplifies the variance of the one-sample risk estimate and produces
+saturated gates with little resolution.  A large $\tau_s$ gives
+\begin{equation}
+\gamma_T
+=
+\alpha+\alpha(1-\alpha)\frac{A_T}{\tau_s}
++O\!\left(\frac{A_T^2}{\tau_s^2}\right),
+\label{eq:a2-large-temperature}
+\end{equation}
+so A2 approaches fixed-$\alpha$ teacher interpolation and the risk test becomes weak.
+
+These effects act directly on both the detached target and the local update.  For a single event,
+at exact replay $f_\theta=f_{\mathrm{old}}$,
+\begin{align}
+f_\gamma-f_{\mathrm{old}}
+&=\gamma_Tc\,d,\\
+\ell_{\mathrm{A2}}(\theta_{\mathrm{old}})
+&=\frac{\gamma_T^2c^2}{2c_D}\norm{d}_{G_s}^2,\\
+\left.\nabla_{f_\theta}\ell_{\mathrm{A2}}\right|_{f_{\mathrm{old}}}
+&=-\frac{\gamma_Tc}{c_D}G_s d.
+\label{eq:a2-hparam-local-effect}
+\end{align}
+Hence $\alpha$ and $\tau_s$ set the accepted fraction of the teacher direction and linearly scale
+the first output-space gradient; the numerical loss value scales quadratically with that fraction.
+
+\paragraph{Calibration used by the 9B-to-4B run.}
+Because the implementation uses event-mean risk, $\tau_s$ has the units and scale of per-coordinate
+half-MSE and is not transferable across arbitrary models or preprocessing.  A raw four-node pilot
+with no radius cap measured
+\[
+\widehat A_{0.10}=-0.00796882528812,
+\qquad
+\widehat A_{0.90}=0.00302977883257.
+\]
+Let
+\[
+S_A=\max\{|\widehat A_{0.10}|,|\widehat A_{0.90}|\}.
+\]
+The fixed temperature was chosen as
+\begin{equation}
+\widehat\tau
+=
+\frac{S_A}{\log 9}
+=0.00362676868369.
+\label{eq:a2-temperature-calibration}
+\end{equation}
+At $|A_T|=S_A$, the evidence term changes the prior odds by a factor of $9$ or $1/9$.
+With $\alpha=\tfrac12$, the calibration interval is therefore contained inside gates
+$[0.1,0.9]$ rather than being nearly binary.  Owing to the asymmetric empirical advantage
+distribution, its observed endpoints map to approximately $0.100$ and $0.697$, respectively.
+This is a robust operating-point heuristic, not a uniquely optimal or likelihood-derived
+temperature.
+
 \subsection{Exact auxiliary Gaussian interpretation}
 
 \begin{proposition}[When the forward-risk gate is a Bayes responsibility]
@@ -847,6 +945,57 @@ c(z)=
 \end{cases}
 \label{eq:a2-projection-coef}
 \end{equation}
+
+\paragraph{How the implemented RMS radius was obtained.}
+For the identity metric used by the current implementation, define each event's teacher correction
+RMS by
+\begin{equation}
+q(z)
+=
+\sqrt{\frac{1}{D}\norm{f_T(z)-f_{\mathrm{old}}(z)}_2^2}.
+\label{eq:a2-delta-rms}
+\end{equation}
+The code-level radius $r^{\mathrm{RMS}}$ and projection coefficient are therefore
+\begin{equation}
+c(z)
+=
+\min\!\left\{1,\frac{r^{\mathrm{RMS}}}{q(z)}\right\},
+\qquad
+r_s=\sqrt D\,r^{\mathrm{RMS}}.
+\label{eq:a2-rms-projection}
+\end{equation}
+In the uncapped calibration run, $q(z)$ was gathered globally over samples, timesteps, and all
+distributed ranks.  The production radius was set to its empirical 90th percentile:
+\begin{equation}
+\widehat r^{\mathrm{RMS}}
+=
+Q_{0.90}\!\left(q(z)\right)
+=
+0.153199896216.
+\label{eq:a2-radius-calibration}
+\end{equation}
+Thus approximately 90\% of calibration events retain $c=1$, while the largest 10\% of teacher
+corrections are clipped.  For the current event dimension $D=131072$, this corresponds to an
+event-$L^2$ radius $\sqrt D\,\widehat r^{\mathrm{RMS}}\approx55.46$; the RMS value is the
+dimension-stable quantity that should be compared across resolutions.  The realized target motion
+is even smaller:
+\begin{equation}
+\operatorname{RMS}(f_\gamma-f_{\mathrm{old}})
+=
+\gamma_T\min\{q(z),r^{\mathrm{RMS}}\}
+\le r^{\mathrm{RMS}}.
+\label{eq:a2-realized-rms}
+\end{equation}
+
+This percentile rule is an empirical trust-budget choice, not a consequence of $\alpha$ or
+$\tau_s$.  A smaller percentile or radius clips more events and can suppress useful teacher
+magnitude; a larger radius approaches ungated teacher displacement on accepted events and weakens
+the trust region.  The nominal 10\% clipping rate applies only to the calibration distribution:
+as training changes $f_{\mathrm{old}}$, one must monitor the projection-active fraction and
+correction-scale distribution.  Re-estimating the radius online would keep a clipping quantile
+fixed but would also move the trust budget with the model, so the current experiment deliberately
+uses a frozen pilot-derived radius.
+
 The detached target and loss are
 \begin{align}
 f_\gamma(z,u)
@@ -867,6 +1016,85 @@ Since $0\le\gamma_T,c\le1$,
 \norm{f_\gamma-f_{\mathrm{old}}}_{G_s}\le r_s.
 \label{eq:a2-target-trust}
 \end{equation}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  x=1cm,
+  y=1cm,
+  >=Latex,
+  point/.style={circle,inner sep=2.4pt},
+  callout/.style={font=\small,align=center,fill=white,inner sep=2pt},
+]
+  \coordinate (old) at (0,0);
+  \coordinate (target) at (1.30,0);
+  \coordinate (projected) at (2.40,0);
+  \coordinate (teacher) at (4.80,0);
+
+  \fill[blue!4] (old) circle[radius=2.40];
+  \draw[blue!65!black,line width=0.9pt] (old) circle[radius=2.40];
+  \node[
+    blue!65!black,
+    font=\small\bfseries,
+    align=left,
+    fill=white,
+    inner sep=2pt
+  ] at (-1.25,2.62)
+    {$G_s$ trust ball\\[-1pt]radius $r_s$};
+
+  % Horizontal decomposition of d avoids label/line intersections.
+  \draw[gray!55,line width=0.7pt,-{Latex[length=2.2mm]}] (old) -- (teacher);
+  \draw[green!55!black,line width=2.2pt,-{Latex[length=2.4mm]}]
+    (old) -- (target);
+  \draw[orange!85!black,line width=1.8pt] (target) -- (projected);
+  \draw[red!70!black,dashed,line width=1.2pt] (projected) -- (teacher);
+
+  \node[point,fill=blue!70!black] at (old) {};
+  \node[callout,below=5pt of old] {$f_{\mathrm{old}}$};
+
+  \node[point,fill=green!55!black] at (target) {};
+  \node[callout] (target-label) at (1.30,-1.18)
+    {$f_\gamma=f_{\mathrm{old}}+\gamma_T c\,d$\\
+     \textcolor{green!45!black}{detached A2 target}};
+  \draw[green!45!black,line width=0.7pt,-{Latex[length=1.8mm]}]
+    (target-label.north) -- (target);
+
+  \node[point,fill=orange!90!black] at (projected) {};
+  \node[callout] (projected-label) at (2.40,1.18)
+    {$f_{\mathrm{old}}+c\,d$\\
+     \textcolor{orange!85!black}{trust-ball projection}};
+  \draw[orange!80!black,line width=0.7pt,-{Latex[length=1.8mm]}]
+    (projected-label.south) -- (projected);
+
+  \node[point,fill=red!70!black] at (teacher) {};
+  \node[callout,above=5pt of teacher] {$f_T=f_{\mathrm{old}}+d$};
+
+  \node[
+    anchor=west,
+    align=left,
+    text width=5.5cm,
+    font=\small,
+    fill=gray!4,
+    draw=gray!30,
+    rounded corners=2pt,
+    inner sep=6pt
+  ] at (5.35,0.15) {
+    \textbf{Disjoint displacement segments}\\[3pt]
+    \textcolor{green!55!black}{\rule{8mm}{1.5pt}}\quad
+      used by the target: $\gamma_Tc\,d$\\[3pt]
+    \textcolor{orange!85!black}{\rule{8mm}{1.5pt}}\quad
+      allowed, then gated away: $(1-\gamma_T)c\,d$\\[3pt]
+    \textcolor{red!70!black}{\rule[0.4pt]{8mm}{1.2pt}}\quad
+      clipped by the trust radius: $(1-c)d$
+  };
+\end{tikzpicture}
+\caption{Arm A2 trust-ball geometry.  Projection acts first:
+$d\mapsto c\,d$ reaches at most the trust-ball boundary.  The predictive-risk gate acts second:
+$c\,d\mapsto\gamma_Tc\,d$.  Thus the detached regression target always remains inside the
+trust ball, and the two coefficients have distinct roles.}
+\label{fig:a2-trust-ball}
+\end{figure}
+
 At exact replay, $f_{\theta_{\mathrm{old}}}=f_{\mathrm{old}}$, and
 \begin{equation}
 \left.

@@ -2610,7 +2610,7 @@ class XOPDTrainingArguments(TrainingArguments):
         default=0.0,
         metadata={"help": "KL anchor coefficient against the base model; 0 disables."},
     )
-    xopd_target_mode: Literal["direct", "p_opd", "marginal_cfm"] = field(
+    xopd_target_mode: Literal["direct", "p_opd", "marginal_cfm", "forward_risk"] = field(
         default="direct",
         metadata={
             "help": (
@@ -2618,7 +2618,9 @@ class XOPDTrainingArguments(TrainingArguments):
                 "matching. 'p_opd' enables Proximal On-Policy Distillation: a detached "
                 "Gaussian-mixture teacher responsibility gates the covariance-normalized "
                 "transition-mean KL. 'marginal_cfm' enables deterministic marginal-mixture "
-                "conditional flow matching with one source branch per trajectory."
+                "conditional flow matching with one source branch per trajectory. "
+                "'forward_risk' enables Arm A2: a detached predictive-risk gate and RMS-capped "
+                "teacher correction on forward-re-noised old-student endpoints."
             )
         },
     )
@@ -2638,6 +2640,33 @@ class XOPDTrainingArguments(TrainingArguments):
                 "Marginal-CFM teacher-trajectory mixture probability alpha. Must be a finite "
                 "number in the inclusive interval [0, 1]. This parameter is independent of "
                 "popd_alpha and is ignored unless xopd_target_mode='marginal_cfm'."
+            )
+        },
+    )
+    forward_risk_alpha: float = field(
+        default=0.5,
+        metadata={
+            "help": (
+                "Arm-A2 teacher prior probability alpha in (0,1). Ignored unless "
+                "xopd_target_mode='forward_risk'."
+            )
+        },
+    )
+    forward_risk_temperature: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Positive fixed temperature for the per-dimension forward-risk advantage "
+                "inside the detached Arm-A2 teacher gate."
+            )
+        },
+    )
+    forward_risk_max_delta_rms: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional positive RMS trust radius for the Arm-A2 teacher-minus-old velocity "
+                "correction. null disables projection for calibration."
             )
         },
     )
@@ -2967,9 +2996,10 @@ class XOPDTrainingArguments(TrainingArguments):
                     "xopd_detail_mask_enabled=True currently requires same-VAE latent loss; "
                     f"got cross_vae={self._cross_vae}, xopd_pixel_loss={self.xopd_pixel_loss}."
                 )
-        if self.xopd_target_mode not in ("direct", "p_opd", "marginal_cfm"):
+        if self.xopd_target_mode not in ("direct", "p_opd", "marginal_cfm", "forward_risk"):
             raise ValueError(
-                "`xopd_target_mode` must be 'direct', 'p_opd', or 'marginal_cfm', "
+                "`xopd_target_mode` must be 'direct', 'p_opd', 'marginal_cfm', or "
+                "'forward_risk', "
                 f"got xopd_target_mode={self.xopd_target_mode!r}."
             )
         if self.xopd_cfg_objective not in ("composed", "pdm"):
@@ -2998,11 +3028,11 @@ class XOPDTrainingArguments(TrainingArguments):
                     "xopd_cfg_objective='pdm' is implemented only for trainer_type='xopd', "
                     f"got trainer_type={self.trainer_type!r}."
                 )
-            if self.xopd_target_mode == "p_opd":
+            if self.xopd_target_mode in ("p_opd", "forward_risk"):
                 raise ValueError(
-                    "xopd_cfg_objective='pdm' does not support xopd_target_mode='p_opd': "
-                    "gating PDM with the P-OPD responsibility would no longer be the exact "
-                    "local Gaussian mixture-KL surrogate."
+                    "xopd_cfg_objective='pdm' does not support gated target modes "
+                    "'p_opd' or 'forward_risk': expected xopd_cfg_objective='composed', "
+                    f"got xopd_target_mode={self.xopd_target_mode!r}."
                 )
             if self._cross_vae or self.vae_transport != "identity" or self.xopd_pixel_loss:
                 raise ValueError(
@@ -3069,6 +3099,60 @@ class XOPDTrainingArguments(TrainingArguments):
                 raise ValueError(
                     "xopd_target_mode='marginal_cfm' requires trainer_type='xopd', "
                     f"got trainer_type={self.trainer_type!r}."
+                )
+        if self.xopd_target_mode == "forward_risk":
+            if (
+                isinstance(self.forward_risk_alpha, bool)
+                or not isinstance(self.forward_risk_alpha, (int, float))
+                or not math.isfinite(float(self.forward_risk_alpha))
+                or not 0.0 < float(self.forward_risk_alpha) < 1.0
+            ):
+                raise ValueError(
+                    "`forward_risk_alpha` must be a finite number strictly between 0 and 1, "
+                    f"got forward_risk_alpha={self.forward_risk_alpha!r}."
+                )
+            if (
+                isinstance(self.forward_risk_temperature, bool)
+                or not isinstance(self.forward_risk_temperature, (int, float))
+                or not math.isfinite(float(self.forward_risk_temperature))
+                or float(self.forward_risk_temperature) <= 0.0
+            ):
+                raise ValueError(
+                    "`forward_risk_temperature` must be a finite number > 0, "
+                    f"got forward_risk_temperature={self.forward_risk_temperature!r}."
+                )
+            if self.forward_risk_max_delta_rms is not None:
+                if isinstance(self.forward_risk_max_delta_rms, bool) or not isinstance(
+                    self.forward_risk_max_delta_rms, (int, float)
+                ):
+                    raise TypeError(
+                        "`forward_risk_max_delta_rms` must be null or a finite number > 0, "
+                        f"got {type(self.forward_risk_max_delta_rms).__name__}: "
+                        f"forward_risk_max_delta_rms={self.forward_risk_max_delta_rms!r}."
+                    )
+                if (
+                    not math.isfinite(float(self.forward_risk_max_delta_rms))
+                    or float(self.forward_risk_max_delta_rms) <= 0.0
+                ):
+                    raise ValueError(
+                        "`forward_risk_max_delta_rms` must be null or a finite number > 0, "
+                        f"got forward_risk_max_delta_rms={self.forward_risk_max_delta_rms!r}."
+                    )
+            if str(self.trainer_type).lower() != "xopd":
+                raise ValueError(
+                    "xopd_target_mode='forward_risk' requires trainer_type='xopd', "
+                    f"got trainer_type={self.trainer_type!r}."
+                )
+            if self.xopd_cfg_objective != "composed":
+                raise ValueError(
+                    "xopd_target_mode='forward_risk' requires xopd_cfg_objective='composed', "
+                    f"got xopd_cfg_objective={self.xopd_cfg_objective!r}."
+                )
+            if float(self.kl_beta) != 0.0:
+                raise ValueError(
+                    "xopd_target_mode='forward_risk' currently requires kl_beta=0 because "
+                    "the A2 probe uses velocity-only forwards, got "
+                    f"kl_beta={self.kl_beta!r}."
                 )
         # XOPD dropped the REINFORCE trajectory term (L1 is pathwise D_k + optional KL anchor).
         # AbstractArguments.from_dict funnels unknown YAML keys into extra_kwargs with only a

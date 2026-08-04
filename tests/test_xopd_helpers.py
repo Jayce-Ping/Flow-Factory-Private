@@ -27,6 +27,7 @@ from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.xopd import common as xopd_common
 from flow_factory.trainers.xopd.common import (
     align_l0_inner_steps,
+    compute_forward_risk_velocity_loss,
     compute_per_step_kl,
     compute_xopd_detail_mask,
     compute_popd_diagnostics,
@@ -155,6 +156,101 @@ class TestXOPDPDMLoss(unittest.TestCase):
         result.loss.mean().backward()
         torch.testing.assert_close(student_positive.grad, torch.zeros_like(student_positive))
         torch.testing.assert_close(student_negative.grad, torch.zeros_like(student_negative))
+
+
+class TestForwardRiskVelocityLoss(unittest.TestCase):
+    def test_equal_predictive_risk_returns_prior_gate(self) -> None:
+        student = torch.zeros(2, 4, requires_grad=True)
+        result = compute_forward_risk_velocity_loss(
+            student_prediction=student,
+            teacher_prediction=torch.zeros(2, 4),
+            flow_target=torch.ones(2, 4),
+            alpha=0.25,
+            temperature=0.5,
+            max_delta_rms=None,
+        )
+        torch.testing.assert_close(
+            result.teacher_responsibility,
+            torch.full((2,), 0.25),
+        )
+        torch.testing.assert_close(result.teacher_delta_rms, torch.zeros(2))
+
+    def test_gate_prefers_predictor_with_lower_forward_risk(self) -> None:
+        result = compute_forward_risk_velocity_loss(
+            student_prediction=torch.zeros(2, 2, requires_grad=True),
+            teacher_prediction=torch.ones(2, 2),
+            flow_target=torch.tensor([[1.0, 1.0], [0.0, 0.0]]),
+            alpha=0.5,
+            temperature=0.1,
+            max_delta_rms=None,
+        )
+        self.assertGreater(result.teacher_responsibility[0].item(), 0.5)
+        self.assertLess(result.teacher_responsibility[1].item(), 0.5)
+
+    def test_event_mean_gate_is_dimension_stable(self) -> None:
+        kwargs = {
+            "alpha": 0.5,
+            "temperature": 0.25,
+            "max_delta_rms": None,
+        }
+        small = compute_forward_risk_velocity_loss(
+            student_prediction=torch.zeros(1, 2, requires_grad=True),
+            teacher_prediction=torch.ones(1, 2),
+            flow_target=torch.ones(1, 2),
+            **kwargs,
+        )
+        large = compute_forward_risk_velocity_loss(
+            student_prediction=torch.zeros(1, 20, requires_grad=True),
+            teacher_prediction=torch.ones(1, 20),
+            flow_target=torch.ones(1, 20),
+            **kwargs,
+        )
+        torch.testing.assert_close(
+            small.teacher_responsibility,
+            large.teacher_responsibility,
+        )
+
+    def test_radius_bounds_target_and_gradient_only_updates_student(self) -> None:
+        student = torch.zeros(1, 4, requires_grad=True)
+        teacher = torch.full((1, 4), 10.0, requires_grad=True)
+        target = torch.full((1, 4), 10.0, requires_grad=True)
+        result = compute_forward_risk_velocity_loss(
+            student_prediction=student,
+            teacher_prediction=teacher,
+            flow_target=target,
+            alpha=0.5,
+            temperature=0.1,
+            max_delta_rms=0.2,
+        )
+        self.assertLessEqual(result.target_delta_rms.item(), 0.2 + 1.0e-6)
+        self.assertEqual(result.projection_active.item(), 1.0)
+        result.loss.mean().backward()
+        self.assertIsNotNone(student.grad)
+        self.assertIsNone(teacher.grad)
+        self.assertIsNone(target.grad)
+        self.assertFalse(result.teacher_responsibility.requires_grad)
+
+    def test_rejects_invalid_shapes_and_hyperparameters(self) -> None:
+        base = {
+            "student_prediction": torch.zeros(1, 2),
+            "teacher_prediction": torch.ones(1, 2),
+            "flow_target": torch.ones(1, 2),
+            "alpha": 0.5,
+            "temperature": 1.0,
+            "max_delta_rms": None,
+        }
+        for overrides in (
+            {"teacher_prediction": torch.ones(1, 3)},
+            {"alpha": 0.0},
+            {"temperature": 0.0},
+            {"max_delta_rms": 0.0},
+        ):
+            kwargs = dict(base)
+            kwargs.update(overrides)
+            with self.subTest(overrides=overrides), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                compute_forward_risk_velocity_loss(**kwargs)
 
 
 class TestXOPDPerStepKL(unittest.TestCase):
@@ -368,6 +464,46 @@ class TestXOPDTrainingArguments(unittest.TestCase):
         self.assertEqual(args.marginal_cfm_alpha, 0.5)
         self.assertEqual(args.popd_alpha, 0.5)
         self.assertEqual(args.popd_temperature, 1.0)
+        self.assertEqual(args.forward_risk_alpha, 0.5)
+        self.assertEqual(args.forward_risk_temperature, 1.0)
+        self.assertIsNone(args.forward_risk_max_delta_rms)
+
+    def test_forward_risk_accepts_valid_same_vae_ode_configuration(self) -> None:
+        args = XOPDTrainingArguments(
+            trainer_type="xopd",
+            teacher_model_name_or_path="/tmp/teacher",
+            xopd_target_mode="forward_risk",
+            xopd_dk_space="v",
+            normalize_d_k=False,
+            forward_risk_alpha=0.4,
+            forward_risk_temperature=0.02,
+            forward_risk_max_delta_rms=0.1,
+        )
+        self.assertEqual(args.forward_risk_alpha, 0.4)
+        self.assertEqual(args.forward_risk_temperature, 0.02)
+        self.assertEqual(args.forward_risk_max_delta_rms, 0.1)
+
+    def test_forward_risk_rejects_invalid_gate_and_incompatible_objectives(self) -> None:
+        base = {
+            "trainer_type": "xopd",
+            "teacher_model_name_or_path": "/tmp/teacher",
+            "xopd_target_mode": "forward_risk",
+            "xopd_dk_space": "v",
+            "normalize_d_k": False,
+        }
+        for overrides in (
+            {"forward_risk_alpha": 0.0},
+            {"forward_risk_temperature": 0.0},
+            {"forward_risk_max_delta_rms": 0.0},
+            {"xopd_cfg_objective": "pdm"},
+            {"kl_beta": 0.1},
+        ):
+            kwargs = dict(base)
+            kwargs.update(overrides)
+            with self.subTest(overrides=overrides), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                XOPDTrainingArguments(**kwargs)
 
     def test_detail_mask_requires_x0_norm(self) -> None:
         with self.assertRaises(ValueError):
@@ -468,7 +604,7 @@ class TestXOPDTrainingArguments(unittest.TestCase):
                 xopd_target_mode="unsupported",
             )
         message = str(context.exception)
-        for mode in ("direct", "p_opd", "marginal_cfm"):
+        for mode in ("direct", "p_opd", "marginal_cfm", "forward_risk"):
             self.assertIn(mode, message)
 
     def test_popd_remains_independent_from_marginal_cfm_alpha(self) -> None:
@@ -558,6 +694,23 @@ class TestXOPDTargetConfiguration(unittest.TestCase):
 
     def test_accepts_marginal_cfm_same_vae_ode_configuration(self) -> None:
         self._validate()
+
+    def test_accepts_forward_risk_same_vae_ode_configuration(self) -> None:
+        self._validate(target_mode="forward_risk")
+
+    def test_forward_risk_rejects_incompatible_geometry(self) -> None:
+        invalid = (
+            {"dynamics_type": "Flow-SDE"},
+            {"noise_level": 0.1},
+            {"xopd_dk_space": "xt"},
+            {"normalize_d_k": True},
+            {"is_cross_vae": True},
+            {"pixel_loss": True},
+            {"vae_transport": "flow"},
+        )
+        for override in invalid:
+            with self.subTest(override=override), self.assertRaises((TypeError, ValueError)):
+                self._validate(target_mode="forward_risk", **override)
 
     def test_rejects_invalid_marginal_cfm_configuration_matrix(self) -> None:
         invalid = (

@@ -75,6 +75,7 @@ from .common import (
     align_l0_inner_steps,
     build_forward_kwargs,
     cache_forward_signature,
+    compute_forward_risk_velocity_loss,
     compute_marginal_cfm_diagnostics,
     compute_marginal_cfm_velocity_loss,
     compute_per_step_kl,
@@ -152,9 +153,21 @@ class XOPDTrainer(BaseTrainer):
         self.xopd_target_mode = ta.xopd_target_mode
         self._is_popd = self.xopd_target_mode == "p_opd"
         self._is_marginal_cfm = self.xopd_target_mode == "marginal_cfm"
+        self._is_forward_risk = self.xopd_target_mode == "forward_risk"
         self.popd_alpha = float(ta.popd_alpha) if self._is_popd else 0.5
         self.popd_temperature = float(ta.popd_temperature) if self._is_popd else 1.0
         self.popd_verbose_diagnostics = bool(ta.popd_verbose_diagnostics)
+        self.forward_risk_alpha = (
+            float(ta.forward_risk_alpha) if self._is_forward_risk else 0.5
+        )
+        self.forward_risk_temperature = (
+            float(ta.forward_risk_temperature) if self._is_forward_risk else 1.0
+        )
+        self.forward_risk_max_delta_rms = (
+            None
+            if not self._is_forward_risk or ta.forward_risk_max_delta_rms is None
+            else float(ta.forward_risk_max_delta_rms)
+        )
         if self._is_pdm and not hasattr(self.adapter, "predict_cfg_velocity"):
             raise TypeError(
                 "XOPD PDM requires an adapter exposing predict_cfg_velocity, "
@@ -1370,7 +1383,7 @@ class XOPDTrainer(BaseTrainer):
         super().evaluate()
         # Validation D_k on the gs=1.0 sets (held-out transition-matching loss),
         # written into the same sink so it shares the student/teacher eval step.
-        if not self._is_marginal_cfm:
+        if not (self._is_marginal_cfm or self._is_forward_risk):
             self._evaluate_validation_d_k()
         if self.accelerator.is_main_process:
             if self._teacher_baseline_scalars:
@@ -1402,7 +1415,10 @@ class XOPDTrainer(BaseTrainer):
         (identical to the reward path under ``offload_samples_to_cpu``).
         """
         gs = float(getattr(merged_eval, "guidance_scale", 1.0))
-        store_traj = not self._is_marginal_cfm and abs(gs - 1.0) <= 1e-6
+        store_traj = (
+            not (self._is_marginal_cfm or self._is_forward_risk)
+            and abs(gs - 1.0) <= 1e-6
+        )
         trajectory_indices = None
         if store_traj:
             eval_steps = int(
@@ -2725,6 +2741,118 @@ class XOPDTrainer(BaseTrainer):
                 out[k] = v.to(device) if torch.is_tensor(v) else v
         return out
 
+    def _build_forward_risk_probe(
+        self,
+        *,
+        batch: Dict[str, Any],
+        t: torch.Tensor,
+        batch_index: int,
+        timestep_index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Re-noise the old ODE endpoint with deterministic fresh Arm-A2 noise."""
+        all_latents = batch.get("all_latents")
+        if not isinstance(all_latents, torch.Tensor) or all_latents.ndim < 3:
+            raise ValueError(
+                "Forward-risk A2 expects batch['all_latents'] with shape (B,K,event...), "
+                f"got type={type(all_latents).__name__}, "
+                f"shape={getattr(all_latents, 'shape', None)}."
+            )
+        x_data = all_latents[:, -1]
+        if not x_data.is_floating_point() or not torch.isfinite(x_data).all():
+            raise ValueError(
+                "Forward-risk A2 expects a finite floating-point old-student endpoint, "
+                f"got dtype={x_data.dtype}, shape={tuple(x_data.shape)}."
+            )
+        if not isinstance(t, torch.Tensor) or t.ndim != 1 or t.shape[0] != x_data.shape[0]:
+            raise ValueError(
+                "Forward-risk A2 expects batched scheduler timesteps aligned with endpoints, "
+                f"got t.shape={getattr(t, 'shape', None)}, x_data.shape={tuple(x_data.shape)}."
+            )
+        process_index = int(getattr(self.accelerator, "process_index", 0))
+        modulus = 2**63 - 1
+        probe_seed = (
+            int(self.training_args.seed)
+            + int(self.epoch) * 1_000_003
+            + int(batch_index) * 10_007
+            + int(timestep_index) * 101
+            + process_index
+        ) % modulus
+        generator = torch.Generator(device=x_data.device)
+        generator.manual_seed(probe_seed)
+        epsilon = torch.randn(
+            x_data.shape,
+            generator=generator,
+            device=x_data.device,
+            dtype=x_data.dtype,
+        )
+        sigma = flow_match_sigma(t).to(device=x_data.device, dtype=x_data.dtype)
+        sigma_b = sigma.view(x_data.shape[0], *([1] * (x_data.ndim - 1)))
+        x_s = (1.0 - sigma_b) * x_data + sigma_b * epsilon
+        flow_target = epsilon - x_data
+        if not torch.isfinite(x_s).all() or not torch.isfinite(flow_target).all():
+            raise ValueError(
+                "Forward-risk A2 constructed non-finite probe tensors, "
+                f"epoch={self.epoch}, batch_index={batch_index}, "
+                f"timestep_index={timestep_index}, probe_seed={probe_seed}."
+            )
+        return x_s, flow_target
+
+    def _forward_risk_velocity_predictions(
+        self,
+        *,
+        batch: Dict[str, Any],
+        t: torch.Tensor,
+        x_s: torch.Tensor,
+        teacher_text_cond: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate trainable student and frozen teacher on the same A2 probe."""
+        device = x_s.device
+        prompt_embeds = batch.get("prompt_embeds")
+        if not isinstance(prompt_embeds, torch.Tensor):
+            raise TypeError(
+                "Forward-risk A2 requires tensor batch['prompt_embeds'], "
+                f"got {type(prompt_embeds).__name__}: {prompt_embeds!r}."
+            )
+        student_extra = self._student_cond_from_batch(batch, device)
+        student_kwargs = {
+            "t": t,
+            "latents": x_s,
+            "prompt_embeds": prompt_embeds.to(device),
+            "guidance_scale": self.student_gs,
+            **student_extra,
+        }
+        teacher_shared = {
+            key: value
+            for key, value in student_extra.items()
+            if key in ("latent_ids", "image_latents", "image_latent_ids")
+        }
+        teacher_kwargs = {
+            "t": t,
+            "latents": x_s,
+            "guidance_scale": self.teacher_gs,
+            **teacher_shared,
+            **teacher_text_cond,
+        }
+        with torch.no_grad(), self.adapter.use_teacher_transformer():
+            teacher_prediction = self.adapter.predict_velocity(**teacher_kwargs)
+        student_prediction = self.adapter.predict_velocity(**student_kwargs)
+        if (
+            not isinstance(student_prediction, torch.Tensor)
+            or not isinstance(teacher_prediction, torch.Tensor)
+        ):
+            raise TypeError(
+                "Forward-risk A2 predict_velocity must return tensors, got "
+                f"student={type(student_prediction).__name__}, "
+                f"teacher={type(teacher_prediction).__name__}."
+            )
+        if student_prediction.shape != teacher_prediction.shape:
+            raise ValueError(
+                "Forward-risk A2 student and teacher predictions must share one shape, "
+                f"student.shape={tuple(student_prediction.shape)}, "
+                f"teacher.shape={tuple(teacher_prediction.shape)}."
+            )
+        return student_prediction, teacher_prediction.detach()
+
     @staticmethod
     def _slice_marginal_cfm_batch_rows(
         batch: Dict[str, Any],
@@ -3137,7 +3265,7 @@ class XOPDTrainer(BaseTrainer):
             )
 
             step_indices = batch_steps if batch_steps is not None else self._train_timestep_indices
-            if self._is_marginal_cfm:
+            if self._is_marginal_cfm or self._is_forward_risk:
                 mu_teacher_list = None
                 pdm_teacher_list = None
                 popd_cache_list = None
@@ -3179,6 +3307,7 @@ class XOPDTrainer(BaseTrainer):
                 loss_info=loss_info,
                 timestep_indices=batch_steps,
                 callback_index_map=callback_index_map,
+                batch_index=batch_idx,
             )
 
     # =============================== L1 helpers ===============================
@@ -3724,6 +3853,32 @@ class XOPDTrainer(BaseTrainer):
             quantile_metrics[f"popd/gamma_{quantile_name}"] = value
         return quantile_metrics
 
+    def _gather_forward_risk_quantiles(
+        self,
+        loss_info: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        """Gather pooled A2 calibration values and compute true global quantiles."""
+        quantile_metrics: Dict[str, torch.Tensor] = {}
+        metric_names = (
+            "advantage",
+            "abs_advantage",
+            "teacher_delta_rms",
+            "teacher_responsibility",
+        )
+        for metric_name in metric_names:
+            key = f"forward_risk/{metric_name}"
+            values = loss_info.get(key)
+            if not values:
+                raise RuntimeError(
+                    "Forward-risk quantile collection is missing required diagnostics, "
+                    f"key={key!r}, available_keys={sorted(loss_info)!r}."
+                )
+            local = torch.cat(values).detach()
+            gathered = self.accelerator.gather(local)
+            for quantile_name, value in compute_popd_quantiles(gathered).items():
+                quantile_metrics[f"forward_risk/{metric_name}_{quantile_name}"] = value
+        return quantile_metrics
+
     @staticmethod
     def _append_marginal_cfm_diagnostics(
         loss_info: Dict[str, List[torch.Tensor]],
@@ -3924,20 +4079,23 @@ class XOPDTrainer(BaseTrainer):
         popd_cache_list: Optional[List[_POPDStepCache]] = None,
         timestep_indices: Optional[List[int]] = None,
         callback_index_map: Optional[torch.Tensor] = None,
+        batch_index: int = 0,
     ) -> Dict[str, List[torch.Tensor]]:
         """Gradient main pass: per-timestep student forward + loss + backward.
 
         Direct and P-OPD targets must align with ``timestep_indices``. Marginal CFM
-        instead resolves each rollout velocity callback through ``callback_index_map``.
+        resolves rollout velocity callbacks through ``callback_index_map``. Forward-risk
+        A2 constructs endpoint probes inline and receives no precomputed target list.
         """
         device = self.accelerator.device
         step_indices = (
             timestep_indices if timestep_indices is not None else self._train_timestep_indices
         )
-        if self._is_marginal_cfm and self._is_popd:
+        if sum((self._is_marginal_cfm, self._is_popd, self._is_forward_risk)) > 1:
             raise ValueError(
-                "XOPD target mode flags are mutually exclusive, but both "
-                "_is_marginal_cfm and _is_popd are True."
+                "XOPD target mode flags are mutually exclusive, got "
+                f"is_marginal_cfm={self._is_marginal_cfm}, is_popd={self._is_popd}, "
+                f"is_forward_risk={self._is_forward_risk}."
             )
 
         target_noise_pred_callbacks = None
@@ -4058,10 +4216,27 @@ class XOPDTrainer(BaseTrainer):
         else:
             if callback_index_map is not None:
                 raise ValueError(
-                    "Direct and P-OPD training must not receive the marginal-CFM callback map, "
+                    "Direct, P-OPD, and forward-risk training must not receive the "
+                    "marginal-CFM callback map, "
                     f"got callback_index_map shape={tuple(callback_index_map.shape)}."
                 )
-            if self._is_pdm:
+            if self._is_forward_risk:
+                unexpected = {
+                    "mu_teacher_list": mu_teacher_list,
+                    "pdm_teacher_list": pdm_teacher_list,
+                    "popd_cache_list": popd_cache_list,
+                }
+                received = {
+                    name: len(value)
+                    for name, value in unexpected.items()
+                    if value is not None
+                }
+                if received:
+                    raise ValueError(
+                        "Forward-risk A2 constructs targets inline and must not receive "
+                        f"precomputed target caches, got {received!r}."
+                    )
+            elif self._is_pdm:
                 if mu_teacher_list is not None:
                     raise ValueError(
                         "Direct XOPD PDM must not receive composed teacher means, "
@@ -4096,10 +4271,13 @@ class XOPDTrainer(BaseTrainer):
             )
         if not self._is_popd and popd_cache_list is not None:
             raise ValueError(
-                "Direct XOPD must not receive P-OPD behavior caches, "
+                "Non-P-OPD XOPD must not receive P-OPD behavior caches, "
                 f"got cache_count={len(popd_cache_list)}."
             )
 
+        forward_risk_teacher_cond = (
+            self._build_teacher_text_cond(batch) if self._is_forward_risk else None
+        )
         with self.autocast():
             for k_idx, timestep_index in enumerate(
                 tqdm(
@@ -4113,66 +4291,117 @@ class XOPDTrainer(BaseTrainer):
                 with self.accelerator.accumulate(*self.adapter.trainable_components):
                     ti = int(timestep_index)
                     t = batch["timesteps"][:, ti]
-                    # Final timestep -> t_next=0, kept BATCHED (shape [B], like t):
-                    # the I2I ragged fallback indexes t_next[idx] and a 0-dim
-                    # scalar raises IndexError.
-                    t_next = (
-                        batch["timesteps"][:, ti + 1]
-                        if ti + 1 < num_timesteps
-                        else torch.zeros_like(t)
-                    )
-                    if self._is_marginal_cfm:
-                        latent_count = int(batch["all_latents"].shape[1])
-                        current_latent_index = resolve_marginal_cfm_latent_index(
-                            latents_index_map,
+                    student_out = None
+                    forward_kwargs = None
+                    if self._is_forward_risk:
+                        x_s, flow_target = self._build_forward_risk_probe(
+                            batch=batch,
+                            t=t,
+                            batch_index=batch_index,
                             timestep_index=ti,
-                            latent_count=latent_count,
                         )
-                        next_latent_index = resolve_marginal_cfm_latent_index(
-                            latents_index_map,
-                            timestep_index=ti + 1,
-                            latent_count=latent_count,
+                        student_prediction, teacher_prediction = (
+                            self._forward_risk_velocity_predictions(
+                                batch=batch,
+                                t=t,
+                                x_s=x_s,
+                                teacher_text_cond=forward_risk_teacher_cond,
+                            )
                         )
-                        latents = batch["all_latents"][:, current_latent_index]
-                        next_latents = batch["all_latents"][:, next_latent_index]
+                        forward_risk = compute_forward_risk_velocity_loss(
+                            student_prediction=student_prediction,
+                            teacher_prediction=teacher_prediction,
+                            flow_target=flow_target,
+                            alpha=self.forward_risk_alpha,
+                            temperature=self.forward_risk_temperature,
+                            max_delta_rms=self.forward_risk_max_delta_rms,
+                        )
+                        d_k_grad = forward_risk.loss
+                        for name, values in forward_risk.detached_diagnostics().items():
+                            loss_info[f"forward_risk/{name}"].append(values)
+                        # A2 calibration and health checks use pooled diagnostics plus global
+                        # quantiles below. Expanding every diagnostic over every timestep adds
+                        # 13 * 20 * 4 W&B series and obscures the metrics that drive decisions.
+                        loss_info["forward_risk/event_dim"].append(
+                            d_k_grad.new_tensor(float(forward_risk.event_dim))
+                        )
+                        loss_info["forward_risk/alpha"].append(
+                            d_k_grad.new_tensor(forward_risk.alpha)
+                        )
+                        loss_info["forward_risk/temperature"].append(
+                            d_k_grad.new_tensor(forward_risk.temperature)
+                        )
+                        if forward_risk.max_delta_rms is not None:
+                            loss_info["forward_risk/max_delta_rms"].append(
+                                d_k_grad.new_tensor(forward_risk.max_delta_rms)
+                            )
                     else:
-                        latents = batch["all_latents"][:, latents_index_map[ti]]
-                        next_latents = batch["all_latents"][:, latents_index_map[ti + 1]]
-
-                    forward_kwargs = self._build_forward_kwargs(
-                        batch=batch,
-                        t=t,
-                        t_next=t_next,
-                        latents=latents,
-                        next_latents=next_latents,
-                        compute_log_prob=False,
-                        return_kwargs=self._student_return_kwargs_for_train(),
-                        guidance_scale=self.student_gs,
-                    )
-
-                    student_out = self.adapter.forward(**forward_kwargs)
-                    if self._is_marginal_cfm:
-                        if self._is_pdm and (
-                            student_out.positive_noise_pred is None
-                            or student_out.negative_noise_pred is None
-                        ):
-                            raise RuntimeError(
-                                "Marginal CFM PDM student forward must return both CFG branches, "
-                                f"positive_is_none={student_out.positive_noise_pred is None}, "
-                                f"negative_is_none={student_out.negative_noise_pred is None}, "
-                                f"timestep_index={int(timestep_index)}."
+                        # Final timestep -> t_next=0, kept BATCHED (shape [B], like t):
+                        # the I2I ragged fallback indexes t_next[idx] and a 0-dim
+                        # scalar raises IndexError.
+                        t_next = (
+                            batch["timesteps"][:, ti + 1]
+                            if ti + 1 < num_timesteps
+                            else torch.zeros_like(t)
+                        )
+                        if self._is_marginal_cfm:
+                            latent_count = int(batch["all_latents"].shape[1])
+                            current_latent_index = resolve_marginal_cfm_latent_index(
+                                latents_index_map,
+                                timestep_index=ti,
+                                latent_count=latent_count,
                             )
-                        if not self._is_pdm and student_out.noise_pred is None:
-                            raise RuntimeError(
-                                "Marginal CFM student forward must return `noise_pred`; "
-                                f"got None at timestep_index={int(timestep_index)}."
+                            next_latent_index = resolve_marginal_cfm_latent_index(
+                                latents_index_map,
+                                timestep_index=ti + 1,
+                                latent_count=latent_count,
                             )
-                    if not self._is_marginal_cfm and student_out.next_latents_mean is None:
-                        raise RuntimeError(
-                            "Student forward must return `next_latents_mean` for XOPD; got None."
+                            latents = batch["all_latents"][:, current_latent_index]
+                            next_latents = batch["all_latents"][:, next_latent_index]
+                        else:
+                            latents = batch["all_latents"][:, latents_index_map[ti]]
+                            next_latents = batch["all_latents"][:, latents_index_map[ti + 1]]
+
+                        forward_kwargs = self._build_forward_kwargs(
+                            batch=batch,
+                            t=t,
+                            t_next=t_next,
+                            latents=latents,
+                            next_latents=next_latents,
+                            compute_log_prob=False,
+                            return_kwargs=self._student_return_kwargs_for_train(),
+                            guidance_scale=self.student_gs,
                         )
 
-                    if self._is_marginal_cfm:
+                        student_out = self.adapter.forward(**forward_kwargs)
+                        if self._is_marginal_cfm:
+                            if self._is_pdm and (
+                                student_out.positive_noise_pred is None
+                                or student_out.negative_noise_pred is None
+                            ):
+                                raise RuntimeError(
+                                    "Marginal CFM PDM student forward must return both CFG "
+                                    "branches, "
+                                    f"positive_is_none="
+                                    f"{student_out.positive_noise_pred is None}, "
+                                    f"negative_is_none="
+                                    f"{student_out.negative_noise_pred is None}, "
+                                    f"timestep_index={int(timestep_index)}."
+                                )
+                            if not self._is_pdm and student_out.noise_pred is None:
+                                raise RuntimeError(
+                                    "Marginal CFM student forward must return `noise_pred`; "
+                                    f"got None at timestep_index={int(timestep_index)}."
+                                )
+                        if not self._is_marginal_cfm and student_out.next_latents_mean is None:
+                            raise RuntimeError(
+                                "Student forward must return `next_latents_mean` for XOPD; "
+                                "got None."
+                            )
+
+                    if self._is_forward_risk:
+                        pass
+                    elif self._is_marginal_cfm:
                         callback_index = resolve_marginal_cfm_callback_index(
                             callback_index_map,
                             timestep_index=ti,
@@ -4457,8 +4686,14 @@ class XOPDTrainer(BaseTrainer):
                         popd_quantiles = (
                             self._gather_popd_gamma_quantiles(loss_info) if self._is_popd else {}
                         )
+                        forward_risk_quantiles = (
+                            self._gather_forward_risk_quantiles(loss_info)
+                            if self._is_forward_risk
+                            else {}
+                        )
                         loss_info = reduce_loss_info(self.accelerator, loss_info)
                         loss_info.update(popd_quantiles)
+                        loss_info.update(forward_risk_quantiles)
                         loss_info["grad_norm"] = grad_norm
                         self.log_data(
                             {f"train/{k}": v for k, v in loss_info.items()},
