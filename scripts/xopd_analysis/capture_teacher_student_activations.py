@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture 4B rollout and 9B/32B queries on identical student-visited states."""
+"""Capture Flux2 student/teacher velocity fields and native trajectories."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import h5py
 import numpy as np
 import torch
 
@@ -87,6 +88,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--async-io", action="store_true")
     parser.add_argument("--io-queue-depth", type=int, default=8)
+    parser.add_argument(
+        "--native-teacher-rollouts",
+        action="store_true",
+        help="Run each selected teacher on its own trajectory instead of student states.",
+    )
+    parser.add_argument(
+        "--reference-student-capture",
+        type=Path,
+        help="Completed student capture used to validate identical step-0 noise.",
+    )
     parser.add_argument("--skip-capacity-check", action="store_true")
     return parser.parse_args()
 
@@ -252,6 +263,45 @@ def _write_trajectory_tensor(
         f"samples/{sample_index:06d}/steps/{step:02d}/trajectory/{name}/full",
         value,
     )
+
+
+def _read_reference_initial_latent(
+    capture_root: Path,
+    *,
+    sample_index: int,
+    world_size: int,
+) -> torch.Tensor:
+    path = (
+        capture_root
+        / "summary"
+        / "student_4b"
+        / f"rank_{sample_index % world_size:03d}.h5"
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"expected reference student shard for sample={sample_index} at {path}"
+        )
+    key = f"samples/{sample_index:06d}/steps/00/trajectory/x_t/full"
+    with h5py.File(path, mode="r") as handle:
+        if key not in handle:
+            raise KeyError(f"expected initial latent dataset {key!r} in {path}")
+        dataset = handle[key]
+        value = dataset[()]
+        if dataset.attrs.get("storage_encoding") == "bfloat16_uint16":
+            if value.dtype != np.uint16:
+                raise TypeError(
+                    f"dataset {dataset.name} declares bfloat16_uint16, "
+                    f"got dtype={value.dtype}"
+                )
+            tensor = torch.from_numpy(value).view(torch.bfloat16)
+        else:
+            tensor = torch.from_numpy(np.asarray(value))
+    if tensor.ndim != 3 or tensor.shape[0] != 1:
+        raise ValueError(
+            f"expected reference initial latent shape (1,L,C) for sample={sample_index}, "
+            f"got {tuple(tensor.shape)} from {path}"
+        )
+    return tensor
 
 
 def _cache_student_conditioning(
@@ -610,6 +660,197 @@ def capture_teacher_phase(
     return shard_records
 
 
+def capture_native_teacher_phase(
+    *,
+    adapter: Any,
+    phase: str,
+    local_samples: list[dict[str, Any]],
+    conditioning: dict[int, dict[str, torch.Tensor]],
+    summary_writer: AtomicH5Shard | AsyncAtomicH5Shard,
+    output_root: Path,
+    reference_student_capture: Path,
+    world_size: int,
+    args: argparse.Namespace,
+    attrs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    teacher = adapter.load_teacher_transformer(
+        MODEL_PATHS[phase],
+        device=adapter.device,
+        dtype=adapter.pipeline.transformer.dtype,
+    )
+    collector = (
+        None
+        if args.trajectory_only
+        else Flux2ActivationCollector(
+            teacher,
+            summary_writer,
+            model_name=phase,
+            projection_dim=args.projection_dim,
+            internal_steps=parse_int_list(args.internal_steps, "internal_steps"),
+        )
+    )
+    shard_records: list[dict[str, Any]] = []
+    try:
+        with (
+            adapter.use_teacher_transformer(),
+            torch.inference_mode(),
+            torch.autocast(
+                device_type=adapter.device.type,
+                dtype=adapter.pipeline.transformer.dtype,
+            ),
+        ):
+            for sample in local_samples:
+                sample_index = int(sample["global_index"])
+                full_writer = _new_full_writer(
+                    output_root, phase, sample, attrs, args
+                )
+                if collector is not None:
+                    collector.start_sample(
+                        sample_index,
+                        full_capture=full_writer is not None,
+                        full_writer=full_writer,
+                    )
+                sample_prefix = f"samples/{sample_index:06d}"
+                sample_attrs = {
+                    **_sample_attrs(sample),
+                    "trajectory_source": "model_native",
+                    "shared_init_noise": True,
+                }
+                summary_writer.set_group_attrs(sample_prefix, sample_attrs)
+                if full_writer is not None:
+                    full_writer.set_group_attrs(sample_prefix, sample_attrs)
+                cond = conditioning[sample_index]
+                if not args.trajectory_only:
+                    _write_conditioning(
+                        summary_writer,
+                        sample_index,
+                        cond["prompt_embeds"],
+                        cond["text_ids"],
+                    )
+                    if full_writer is not None:
+                        _write_conditioning(
+                            full_writer,
+                            sample_index,
+                            cond["prompt_embeds"],
+                            cond["text_ids"],
+                        )
+                generator = torch.Generator(device=adapter.device).manual_seed(
+                    int(sample["seed"])
+                )
+                if collector is not None:
+                    collector.start_auto_steps()
+                generated = adapter.inference(
+                    prompt=[sample["prompt"]],
+                    prompt_embeds=cond["prompt_embeds"].to(adapter.device),
+                    text_ids=cond["text_ids"].to(adapter.device),
+                    generator=[generator],
+                    height=args.height,
+                    width=args.width,
+                    num_inference_steps=args.num_steps,
+                    guidance_scale=1.0,
+                    compute_log_prob=False,
+                    trajectory_indices="all",
+                    extra_call_back_kwargs=[
+                        "noise_pred",
+                        "next_latents_mean",
+                        "std_dev_t",
+                        "dt",
+                    ],
+                )
+                if collector is not None:
+                    collector.stop_auto_steps(expected_steps=args.num_steps)
+                if len(generated) != 1:
+                    raise ValueError(
+                        f"expected one native rollout for phase={phase}, "
+                        f"sample={sample_index}, got {len(generated)}"
+                    )
+                result = generated[0]
+                if result.all_latents is None or result.timesteps is None:
+                    raise RuntimeError(
+                        f"native rollout phase={phase}, sample={sample_index} "
+                        "did not return latents and timesteps"
+                    )
+                callbacks = result.extra_kwargs
+                required_callbacks = ("noise_pred", "next_latents_mean", "dt")
+                missing = [
+                    name for name in required_callbacks if callbacks.get(name) is None
+                ]
+                if missing:
+                    raise KeyError(
+                        f"native rollout phase={phase}, sample={sample_index} "
+                        f"missing callbacks {missing}"
+                    )
+                initial = result.all_latents[0].unsqueeze(0).detach().cpu()
+                reference = _read_reference_initial_latent(
+                    reference_student_capture,
+                    sample_index=sample_index,
+                    world_size=world_size,
+                )
+                if not torch.equal(initial.float(), reference.float()):
+                    max_error = float((initial.float() - reference.float()).abs().max())
+                    raise ValueError(
+                        f"initial noise mismatch for phase={phase}, sample={sample_index}: "
+                        f"expected exact equality with {reference_student_capture}, "
+                        f"got max_abs_error={max_error}"
+                    )
+                for step in range(args.num_steps):
+                    x_t = result.all_latents[step].unsqueeze(0)
+                    x_next = result.all_latents[step + 1].unsqueeze(0)
+                    velocity = callbacks["noise_pred"][step].unsqueeze(0)
+                    if collector is None:
+                        _write_trajectory_tensor(
+                            summary_writer, sample_index, step, "x_t", x_t
+                        )
+                        _write_trajectory_tensor(
+                            summary_writer,
+                            sample_index,
+                            step,
+                            "model_output",
+                            velocity,
+                        )
+                    else:
+                        collector.set_step(step)
+                        collector.write_external("x_t", x_t)
+                        collector.write_external("x_next", x_next)
+                        collector.write_external("model_output", velocity)
+                        collector.write_external(
+                            "transition_mean",
+                            callbacks["next_latents_mean"][step].unsqueeze(0),
+                        )
+                    scalar_prefix = (
+                        f"samples/{sample_index:06d}/steps/{step:02d}/trajectory"
+                    )
+                    _write_scalar_to_writers(
+                        summary_writer,
+                        full_writer,
+                        f"{scalar_prefix}/timestep",
+                        result.timesteps[step],
+                    )
+                    _write_scalar_to_writers(
+                        summary_writer,
+                        full_writer,
+                        f"{scalar_prefix}/dt",
+                        callbacks["dt"][step],
+                    )
+                    if callbacks.get("std_dev_t") is not None:
+                        _write_scalar_to_writers(
+                            summary_writer,
+                            full_writer,
+                            f"{scalar_prefix}/std_dev_t",
+                            callbacks["std_dev_t"][step],
+                        )
+                _close_full_writer(full_writer, shard_records)
+                summary_writer.flush()
+    finally:
+        if collector is not None:
+            collector.close()
+        adapter._teacher_transformer = None
+        del teacher
+        gc.collect()
+        torch.cuda.empty_cache()
+    return shard_records
+
+
 def _capacity_preflight(args: argparse.Namespace, samples: list[dict[str, Any]]) -> dict[str, Any]:
     if args.trajectory_only:
         image_tokens = (args.height // 16) * (args.width // 16)
@@ -713,6 +954,23 @@ def main() -> None:
             f"expected non-empty phases subset of {tuple(MODEL_PATHS)}, got "
             f"{phases!r}; unknown={sorted(unknown)}"
         )
+    if args.native_teacher_rollouts:
+        selected_teachers = [phase for phase in phases if phase != "student_4b"]
+        if not selected_teachers:
+            raise ValueError(
+                "native teacher rollout mode requires at least one teacher phase, "
+                f"got phases={phases!r}"
+            )
+        if args.reference_student_capture is None:
+            raise ValueError(
+                "native teacher rollout mode requires --reference-student-capture "
+                "to validate identical initial noise"
+            )
+        reference_manifest = args.reference_student_capture / "run_manifest.json"
+        if not reference_manifest.is_file():
+            raise FileNotFoundError(
+                f"expected completed reference student capture at {reference_manifest}"
+            )
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     torch.set_grad_enabled(False)
@@ -777,9 +1035,14 @@ def main() -> None:
         adapter.load_checkpoint(str(args.student_checkpoint), resume_type="lora")
     adapter.eval()
 
-    student_conditioning = _cache_student_conditioning(
-        adapter, local_samples, accelerator.device
+    student_conditioning = (
+        _cache_student_conditioning(adapter, local_samples, accelerator.device)
+        if "student_4b" in phases
+        else {}
     )
+    if "student_4b" not in phases:
+        adapter.off_load_text_encoders()
+        torch.cuda.empty_cache()
     # Text/vae are no longer needed after prompt encoding and latent preparation in student
     # inference. VAE stays until student rollout decoding finishes, then both move to CPU.
     trajectories: dict[int, dict[str, torch.Tensor]] = {}
@@ -813,7 +1076,7 @@ def main() -> None:
                     adapter.off_load_vae()
                     torch.cuda.empty_cache()
                 else:
-                    if not trajectories:
+                    if not args.native_teacher_rollouts and not trajectories:
                         raise RuntimeError(
                             f"phase {phase!r} requires student_4b phase in the same run"
                         )
@@ -824,17 +1087,31 @@ def main() -> None:
                         accelerator.device,
                         adapter.pipeline.transformer.dtype,
                     )
-                    phase_shards = capture_teacher_phase(
-                        adapter=adapter,
-                        phase=phase,
-                        local_samples=local_samples,
-                        trajectories=trajectories,
-                        conditioning=teacher_conditioning,
-                        summary_writer=summary_writer,
-                        output_root=args.output_root,
-                        args=args,
-                        attrs=attrs,
-                    )
+                    if args.native_teacher_rollouts:
+                        phase_shards = capture_native_teacher_phase(
+                            adapter=adapter,
+                            phase=phase,
+                            local_samples=local_samples,
+                            conditioning=teacher_conditioning,
+                            summary_writer=summary_writer,
+                            output_root=args.output_root,
+                            reference_student_capture=args.reference_student_capture,
+                            world_size=world_size,
+                            args=args,
+                            attrs=attrs,
+                        )
+                    else:
+                        phase_shards = capture_teacher_phase(
+                            adapter=adapter,
+                            phase=phase,
+                            local_samples=local_samples,
+                            trajectories=trajectories,
+                            conditioning=teacher_conditioning,
+                            summary_writer=summary_writer,
+                            output_root=args.output_root,
+                            args=args,
+                            attrs=attrs,
+                        )
                     _release_teacher(adapter)
                 phase_shards.append(summary_writer.close())
                 all_shards.extend(phase_shards)

@@ -1338,12 +1338,27 @@ class Flux2KleinAdapter(BaseAdapter):
             latent_model_input = torch.cat([latents, image_latents], dim=1).to(torch.float32)
             latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
+        time_guidance_embed = getattr(cache_module, "time_guidance_embed", None)
+        uses_guidance_embedding = (
+            getattr(time_guidance_embed, "guidance_embedder", None) is not None
+        )
+        guidance = (
+            torch.full(
+                (batch_size,),
+                guidance_scale,
+                device=latents.device,
+                dtype=torch.float32,
+            )
+            if uses_guidance_embedding
+            else None
+        )
+
         # 2. Conditional forward pass
         with cache_module.cache_context("cond"):
             noise_pred = transformer(
                 hidden_states=latent_model_input,
                 timestep=t.expand(batch_size) / 1000,
-                guidance=None,
+                guidance=guidance,
                 encoder_hidden_states=prompt_embeds,
                 txt_ids=text_ids,
                 img_ids=latent_image_ids,
@@ -1361,7 +1376,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 neg_noise_pred = transformer(
                     hidden_states=latent_model_input,
                     timestep=t.expand(batch_size) / 1000,
-                    guidance=None,
+                    guidance=guidance,
                     encoder_hidden_states=negative_prompt_embeds,
                     txt_ids=negative_text_ids,
                     img_ids=latent_image_ids,
