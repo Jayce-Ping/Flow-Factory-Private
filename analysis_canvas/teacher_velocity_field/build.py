@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 import shutil
 from pathlib import Path
@@ -27,10 +28,17 @@ REFERENCE_SUMMARY = ANALYSIS / "teacher_velocity_x0_summary.json"
 HY_SUMMARY = ANALYSIS / "hy/hy_teacher_field_summary.json"
 THRESHOLDS = ANALYSIS / "mask_thresholds/teacher_mask_thresholds.json"
 DECISIONS = ANALYSIS / "mask_thresholds/teacher_mask_decisions.csv"
-TRAINING_GRID = (
-    REPO
-    / ".scratch/ode_teacher_gap_audit/canvas_images/"
-    "xopd_9b_32b_training_trajectories.jpg"
+WDB_AUDIT = REPO / ".scratch/ode_teacher_gap_audit"
+ARCHIVE = WDB_AUDIT / "archive"
+TEACHER_IMAGES = WDB_AUDIT / "canvas_images"
+TRAJECTORY_EPOCHS = (0, 20, 40, 60, 80)
+TRAJECTORY_PROMPTS = (
+    ("blue-cow", "Blue cow", "a photo of a blue cow"),
+    ("person-sink", "Person + sink", "a photo of a person and a sink"),
+)
+TRAJECTORY_RUNS = (
+    ("9B → 4B · ln5ureh6", "mask_9b_to_4b", "28-step teacher"),
+    ("32B → 4B · 4wvzbt8g", "32b_to_4b", "40-step teacher"),
 )
 
 COLORS = {"9B": "#e05a47", "HY": "#d99a2b", "32B": "#35a36f"}
@@ -52,6 +60,110 @@ def _nested(payload: dict[str, Any], *keys: str) -> Any:
             raise KeyError(f"missing key path {'.'.join(keys)!r}")
         value = value[key]
     return value
+
+
+def _prompt_from_caption(caption: object) -> str:
+    if not isinstance(caption, str):
+        raise TypeError(
+            f"expected image caption to be str, got "
+            f"{type(caption).__name__}: {caption!r}"
+        )
+    return caption.split("|", 1)[-1].strip()
+
+
+def _copy_trajectory_assets() -> str:
+    destination = ASSETS / "trajectories"
+    destination.mkdir(parents=True, exist_ok=True)
+    headers = "".join(
+        f'<div class="grid-head">E{epoch}</div>' for epoch in TRAJECTORY_EPOCHS
+    )
+    headers += '<div class="grid-head teacher-head">Teacher</div>'
+    run_rows = []
+    target_prompts = {entry[2] for entry in TRAJECTORY_PROMPTS}
+
+    for model_label, archive_name, teacher_note in TRAJECTORY_RUNS:
+        manifest_path = ARCHIVE / archive_name / "media_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"expected W&B media manifest at {manifest_path}")
+        panels = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(panels, list):
+            raise TypeError(
+                f"expected media manifest list at {manifest_path}, "
+                f"got {type(panels).__name__}"
+            )
+        selected: dict[tuple[int, str], Path] = {}
+        for panel in panels:
+            if (
+                panel.get("key") != "eval/geneval_gs1/eval_samples"
+                or panel.get("eval_epoch") not in TRAJECTORY_EPOCHS
+            ):
+                continue
+            epoch = int(panel["eval_epoch"])
+            for item in panel.get("items", []):
+                prompt = _prompt_from_caption(item.get("caption"))
+                if prompt not in target_prompts:
+                    continue
+                source = ARCHIVE / archive_name / str(item.get("local_path"))
+                if not source.is_file():
+                    raise FileNotFoundError(
+                        f"expected image for run={model_label!r}, epoch={epoch}, "
+                        f"prompt={prompt!r} at {source}"
+                    )
+                selected[(epoch, prompt)] = source
+        expected = {
+            (epoch, prompt)
+            for epoch in TRAJECTORY_EPOCHS
+            for _, _, prompt in TRAJECTORY_PROMPTS
+        }
+        if set(selected) != expected:
+            raise ValueError(
+                f"expected exact trajectory cells for run={model_label!r}, "
+                f"missing={sorted(expected - set(selected))}, "
+                f"unexpected={sorted(set(selected) - expected)}"
+            )
+
+        teacher_dir = TEACHER_IMAGES / archive_name / "teacher"
+        teacher_sources: dict[str, Path] = {}
+        for prompt_index, (_, _, prompt) in enumerate(TRAJECTORY_PROMPTS):
+            matches = sorted(teacher_dir.glob(f"{prompt_index}_*.jpg"))
+            if len(matches) != 1:
+                raise ValueError(
+                    f"expected one teacher image for run={model_label!r}, "
+                    f"prompt={prompt!r}, got {[str(path) for path in matches]}"
+                )
+            teacher_sources[prompt] = matches[0]
+
+        prompt_rows = []
+        for prompt_slug, prompt_label, prompt in TRAJECTORY_PROMPTS:
+            cells = []
+            for epoch in TRAJECTORY_EPOCHS:
+                output_name = f"{archive_name}_{prompt_slug}_e{epoch}.jpg"
+                shutil.copyfile(selected[(epoch, prompt)], destination / output_name)
+                cells.append(
+                    f'<img src="assets/trajectories/{output_name}" '
+                    f'alt="{html.escape(model_label)} '
+                    f'{html.escape(prompt_label)} epoch {epoch}">'
+                )
+            teacher_name = f"{archive_name}_{prompt_slug}_teacher.jpg"
+            shutil.copyfile(teacher_sources[prompt], destination / teacher_name)
+            cells.append(
+                f'<img class="teacher-cell" '
+                f'src="assets/trajectories/{teacher_name}" '
+                f'alt="{html.escape(model_label)} '
+                f'{html.escape(prompt_label)} teacher">'
+            )
+            prompt_rows.append(
+                f'<div class="prompt-label">{html.escape(prompt_label)}</div>'
+                + "".join(cells)
+            )
+        run_rows.append(
+            f'<div class="model-band"><strong>{html.escape(model_label)}</strong>'
+            f'<span>{html.escape(teacher_note)}</span></div>'
+            f'<div class="trajectory-grid"><div></div>{headers}'
+            + "".join(prompt_rows)
+            + "</div>"
+        )
+    return '<div class="trajectory-block">' + "".join(run_rows) + "</div>"
 
 
 def _by_step(payload: dict[str, Any], *, label: str) -> list[dict[str, Any]]:
@@ -278,6 +390,7 @@ def _build_html(
     reference_summary: dict[str, Any],
     hy_summary: dict[str, Any],
     threshold_report: dict[str, Any],
+    trajectory_grid: str,
 ) -> None:
     ref_global = _nested(reference_summary, "summary", "global_bootstrap_ci")
     hy_global = _nested(hy_summary, "summary", "global_cluster_bootstrap")
@@ -313,7 +426,21 @@ h3 {{ margin:0 0 8px; font-size:19px; }}
 .metric.thirtytwo strong {{ color:var(--thirtytwo); }}
 .metric small {{ color:var(--muted); }}
 .chart {{ width:100%; display:block; border-radius:12px; background:white; }}
-.grid-image {{ width:100%; display:block; border:1px solid var(--line); }}
+.trajectory-block {{ border:1px solid var(--line); overflow:hidden; background:white; }}
+.model-band {{ display:flex; align-items:center; gap:10px; padding:8px 10px;
+  background:#eef2f7; border-top:1px solid var(--line); }}
+.model-band:first-child {{ border-top:0; }}
+.model-band span {{ color:var(--muted); font-size:12px; }}
+.trajectory-grid {{ display:grid; grid-template-columns:76px repeat(6,minmax(0,1fr));
+  gap:0; align-items:stretch; }}
+.grid-head {{ padding:5px 2px; color:var(--muted); text-align:center;
+  font-size:11px; border-bottom:1px solid var(--line); }}
+.teacher-head {{ border-left:2px solid #c9d1dc; }}
+.prompt-label {{ display:flex; align-items:center; padding:6px 8px; color:var(--muted);
+  font-size:11px; border-top:1px solid var(--line); }}
+.trajectory-grid img {{ display:block; width:100%; aspect-ratio:1/1; object-fit:cover;
+  border:0; border-top:1px solid var(--line); }}
+.trajectory-grid .teacher-cell {{ border-left:2px solid #c9d1dc; }}
 .callouts {{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:20px; }}
 .callout {{ padding:17px 19px; border-left:4px solid var(--line); background:#f8fafb; }}
 .callout.nine {{ border-color:var(--nine); }} .callout.hy {{ border-color:var(--hy); }}
@@ -322,7 +449,10 @@ h3 {{ margin:0 0 8px; font-size:19px; }}
   border-radius:12px; background:#16232d; color:#e5f0f1; overflow:auto; }}
 .source {{ color:var(--muted); font-size:13px; overflow-wrap:anywhere; }}
 @media(max-width:850px) {{ .metrics,.callouts {{ grid-template-columns:1fr; }}
-  h1 {{ font-size:36px; }} .section,.hero {{ padding:26px; }} }}
+  h1 {{ font-size:36px; }} .section,.hero {{ padding:26px; }}
+  .trajectory-grid {{ grid-template-columns:58px repeat(6,minmax(100px,1fr));
+    min-width:680px; }}
+  .trajectory-block {{ overflow-x:auto; }} }}
 </style>
 </head>
 <body><main>
@@ -338,9 +468,8 @@ h3 {{ margin:0 0 8px; font-size:19px; }}
   <h2>Visual training trajectories</h2>
   <p class="subtitle">Matched GenEval gs=1 prompts. Student snapshots progress
   left-to-right; teacher output is the final column.</p>
-  <img class="grid-image" src="assets/training_trajectories.jpg"
-       alt="9B and 32B student image trajectories with teacher references">
-  <p class="source">Student runs: ta1qvnuz (9B→4B), 4wvzbt8g (32B→4B).
+  {trajectory_grid}
+  <p class="source">Student runs: ln5ureh6 (9B→4B), 4wvzbt8g (32B→4B).
   Student: 1024px, 28 steps, epochs 0/20/40/60/80. 9B teacher: 28 steps.
   32B teacher: same seed/gs=1/1024px, 40 steps from uilxegpn because the
   historical 28-step run did not log teacher media.</p>
@@ -433,9 +562,7 @@ mask when harmful_score &gt; max(global_32B_q99, per_step_32B_q99)</div>
 
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
-    if not TRAINING_GRID.is_file():
-        raise FileNotFoundError(f"expected training trajectory grid at {TRAINING_GRID}")
-    shutil.copy2(TRAINING_GRID, ASSETS / "training_trajectories.jpg")
+    trajectory_grid = _copy_trajectory_assets()
 
     reference_summary = _load_json(REFERENCE_SUMMARY)
     hy_summary = _load_json(HY_SUMMARY)
@@ -447,7 +574,7 @@ def main() -> None:
     _plot_field_geometry(reference_rows, hy_rows)
     _plot_blur_signature(reference_rows, hy_rows)
     _plot_thresholds(decisions, threshold_report)
-    _build_html(reference_summary, hy_summary, threshold_report)
+    _build_html(reference_summary, hy_summary, threshold_report, trajectory_grid)
     print((ROOT / "index.html").resolve())
 
 

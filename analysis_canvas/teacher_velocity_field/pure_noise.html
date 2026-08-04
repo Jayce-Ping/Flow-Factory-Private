@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pure-noise teacher gap</title>
+<style>
+:root { --ink:#1f252b; --muted:#69737d; --line:#d9dfe3; --paper:#f5f6f7;
+  --card:#fff; --nine:#d85b4a; --hy:#c58c25; --thirtytwo:#27845c; }
+* { box-sizing:border-box; }
+body { margin:0; color:var(--ink); background:var(--paper);
+  font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif; }
+main { width:min(1180px,96vw); margin:0 auto; padding:24px 0 40px; }
+header { display:grid; grid-template-columns:1fr auto; gap:20px; align-items:end;
+  padding:20px 22px; background:var(--card); border:1px solid var(--line); }
+h1 { margin:0 0 5px; font-size:25px; line-height:1.12; }
+h2 { margin:0 0 4px; font-size:17px; }
+p { margin:0; }
+.muted,.caption { color:var(--muted); }
+.scope { text-align:right; font-variant-numeric:tabular-nums; }
+.scope strong { display:block; font-size:20px; }
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }
+.panel { padding:16px 18px; background:var(--card); border:1px solid var(--line); }
+.wide { grid-column:1/-1; }
+.bar-row { display:grid; grid-template-columns:88px 1fr 168px; gap:9px;
+  align-items:center; min-height:34px; border-top:1px solid #eef1f3; }
+.bar-row:first-of-type { margin-top:10px; }
+.bar-label { font-weight:600; white-space:nowrap; }
+.bar-track { height:9px; background:#edf0f2; position:relative; }
+.bar-track span { display:block; height:100%; min-width:2px; }
+.bar-value { text-align:right; font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace; }
+.bar-value small { display:block; color:var(--muted); font-size:10px; font-weight:400; }
+.matrix { display:grid; grid-template-columns:42px repeat(4,1fr); gap:3px;
+  margin-top:11px; text-align:center; align-items:center; }
+.matrix b { font-size:12px; }
+.matrix-cell { padding:8px 4px; font-variant-numeric:tabular-nums; }
+.matrix-cell.diagonal { color:#9aa2a8; background:#f3f4f5; }
+.matrix-cell.near { background:#f3e6dd; }
+.matrix-cell.far { color:white; background:#4f6675; }
+.finding { margin-top:11px; padding:10px 12px; background:#f1f4f3;
+  border-left:3px solid var(--thirtytwo); }
+table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12px;
+  font-variant-numeric:tabular-nums; }
+th,td { padding:7px 8px; border-top:1px solid #e8ecee; text-align:right; }
+th:first-child { text-align:left; }
+thead th { color:var(--muted); font-weight:600; }
+.note { padding:14px 16px; background:#f8f5ed; border-left:3px solid var(--hy); }
+.formula-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:10px;
+  margin-top:10px; }
+.formula-item { padding:11px 12px; border:1px solid #e5e9eb; }
+.formula-item strong { display:block; margin-bottom:3px; }
+.equation,pre { font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
+.equation { margin:4px 0; color:#33434d; overflow-x:auto; }
+pre { margin:10px 0 0; padding:12px 14px; color:#e9eef1; background:#26343d;
+  overflow:auto; white-space:pre; }
+.footer { margin-top:12px; font-size:11px; color:var(--muted); overflow-wrap:anywhere; }
+@media(max-width:760px) {
+  header,.grid { grid-template-columns:1fr; } .scope { text-align:left; }
+  .wide { grid-column:auto; } .bar-row { grid-template-columns:74px 1fr; }
+  .bar-value { grid-column:2; } .source-wrap { overflow-x:auto; }
+  .formula-grid { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body><main>
+<header>
+  <div>
+    <h1>Pure-noise teacher gap</h1>
+    <p class="muted">Only step 0: the same freshly sampled noise and prompt are
+    queried by 4B, 9B, HY and 32B. No later student trajectory states enter.</p>
+  </div>
+  <div class="scope"><strong>t = σ = 1</strong>128 prompts × 1 state</div>
+</header>
+
+<div class="grid">
+  <section class="panel">
+    <h2>Teacher–student velocity gap</h2>
+    <p class="caption">Mean RMS with prompt-bootstrap 95% CI; shared scale.</p>
+    
+    <div class="bar-row">
+      <div class="bar-label">9B − 4B</div>
+      <div class="bar-track positive">
+        <span style="width:8.16%;background:var(--nine)"></span>
+      </div>
+      <div class="bar-value">+0.106
+        <small>[+0.102, +0.110]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">HY − 4B</div>
+      <div class="bar-track positive">
+        <span style="width:12.97%;background:var(--hy)"></span>
+      </div>
+      <div class="bar-value">+0.169
+        <small>[+0.162, +0.175]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">32B − 4B</div>
+      <div class="bar-track positive">
+        <span style="width:92.59%;background:var(--thirtytwo)"></span>
+      </div>
+      <div class="bar-value">+1.204
+        <small>[+1.157, +1.250]</small>
+      </div>
+    </div>
+    <div class="finding">32B is 11.4× farther from 4B than 9B, while HY is
+    1.6× farther than 9B. Raw distance does not rank teacher quality.</div>
+  </section>
+
+  <section class="panel">
+    <h2>All pairwise velocity gaps</h2>
+    <p class="caption">Mean RMS at the identical noise state.</p>
+    <div class="matrix"><div></div>
+<b>4B</b>
+<b>9B</b>
+<b>HY</b>
+<b>32B</b>
+<b>4B</b>
+<span class="matrix-cell diagonal">0</span>
+<span class="matrix-cell near" title="4B vs 9B">0.106</span>
+<span class="matrix-cell near" title="4B vs HY">0.169</span>
+<span class="matrix-cell far" title="4B vs 32B">1.204</span>
+<b>9B</b>
+<span class="matrix-cell near" title="9B vs 4B">0.106</span>
+<span class="matrix-cell diagonal">0</span>
+<span class="matrix-cell near" title="9B vs HY">0.165</span>
+<span class="matrix-cell far" title="9B vs 32B">1.203</span>
+<b>HY</b>
+<span class="matrix-cell near" title="HY vs 4B">0.169</span>
+<span class="matrix-cell near" title="HY vs 9B">0.165</span>
+<span class="matrix-cell diagonal">0</span>
+<span class="matrix-cell far" title="HY vs 32B">1.212</span>
+<b>32B</b>
+<span class="matrix-cell far" title="32B vs 4B">1.204</span>
+<span class="matrix-cell far" title="32B vs 9B">1.203</span>
+<span class="matrix-cell far" title="32B vs HY">1.212</span>
+<span class="matrix-cell diagonal">0</span></div>
+    <div class="finding">4B, 9B and HY form a local cluster. 32B is about
+    1.2 RMS away from every member of that cluster.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Teacher-correction direction</h2>
+    <p class="caption">ΔT = vT − v4; cosine between correction fields.</p>
+    
+    <div class="bar-row">
+      <div class="bar-label">ΔHY ↔ Δ9B</div>
+      <div class="bar-track positive">
+        <span style="width:68.35%;background:var(--hy)"></span>
+      </div>
+      <div class="bar-value">+0.342
+        <small>[+0.302, +0.380]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">Δ9B ↔ Δ32B</div>
+      <div class="bar-track positive">
+        <span style="width:6.74%;background:var(--nine)"></span>
+      </div>
+      <div class="bar-value">+0.034
+        <small>[-0.012, +0.079]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">ΔHY ↔ Δ32B</div>
+      <div class="bar-track positive">
+        <span style="width:5.41%;background:var(--thirtytwo)"></span>
+      </div>
+      <div class="bar-value">+0.027
+        <small>[-0.012, +0.066]</small>
+      </div>
+    </div>
+    <div class="finding">HY follows 9B, but neither correction aligns
+    reliably with 32B at pure noise.</div>
+  </section>
+
+  <section class="panel">
+    <h2>x0 detail direction</h2>
+    <p class="caption">cos(∇x0_4, ∇(x0_T − x0_4)).</p>
+    
+    <div class="bar-row">
+      <div class="bar-label">9B</div>
+      <div class="bar-track negative">
+        <span style="width:80.40%;background:var(--nine)"></span>
+      </div>
+      <div class="bar-value">-0.442
+        <small>[-0.467, -0.416]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">HY</div>
+      <div class="bar-track negative">
+        <span style="width:74.16%;background:var(--hy)"></span>
+      </div>
+      <div class="bar-value">-0.408
+        <small>[-0.431, -0.384]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">32B</div>
+      <div class="bar-track positive">
+        <span style="width:50.18%;background:var(--thirtytwo)"></span>
+      </div>
+      <div class="bar-value">+0.276
+        <small>[+0.241, +0.311]</small>
+      </div>
+    </div>
+    <div class="finding">9B is anti-detail for 127/128 prompts; HY for
+    128/128. 32B is detail-aligned for 115/128.</div>
+  </section>
+
+  <section class="panel">
+    <h2>One-step x0 total variation</h2>
+    <p class="caption">Teacher x0 TV RMS minus 4B x0 TV RMS.</p>
+    
+    <div class="bar-row">
+      <div class="bar-label">9B</div>
+      <div class="bar-track negative">
+        <span style="width:1.43%;background:var(--nine)"></span>
+      </div>
+      <div class="bar-value">-0.0030
+        <small>[-0.0041, -0.0018]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">HY</div>
+      <div class="bar-track positive">
+        <span style="width:4.10%;background:var(--hy)"></span>
+      </div>
+      <div class="bar-value">+0.0086
+        <small>[+0.0070, +0.0102]</small>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">32B</div>
+      <div class="bar-track positive">
+        <span style="width:92.20%;background:var(--thirtytwo)"></span>
+      </div>
+      <div class="bar-value">+0.1936
+        <small>[+0.1803, +0.2075]</small>
+      </div>
+    </div>
+    <div class="finding">9B reduces local variation. HY adds a little TV
+    despite negative gradient alignment; 32B adds much more.</div>
+  </section>
+
+  <section class="panel">
+    <h2>What changes at σ = 1</h2>
+    <p class="note">Because x0 = x1 − v at σ=1,
+    RMS(x0_T − x0_4) equals RMS(vT − v4) exactly. Transition-gap metrics are
+    omitted: they measure scheduler step size, not the model prediction gap.</p>
+    <p class="footer">Velocity cosines: 9B↔4B
+    0.995;
+    32B↔4B 0.730;
+    9B↔32B 0.731.</p>
+  </section>
+
+  <section class="panel wide">
+    <h2>Consistency across prompt sets</h2>
+    <p class="caption">Per-source means; each source has 32 prompts.</p>
+    <div class="source-wrap"><table>
+      <thead><tr><th>Source</th><th>|v9−v4|</th><th>|vHY−v4|</th>
+      <th>|v32−v4|</th><th>grad 9B</th><th>grad HY</th><th>grad 32B</th></tr></thead>
+      <tbody><tr>
+              <th>GenEval</th>
+              <td>0.102</td>
+              <td>0.160</td>
+              <td>0.890</td>
+              <td>-0.490</td>
+              <td>-0.502</td>
+              <td>+0.045</td>
+            </tr>
+<tr>
+              <th>OCR</th>
+              <td>0.101</td>
+              <td>0.174</td>
+              <td>1.273</td>
+              <td>-0.474</td>
+              <td>-0.353</td>
+              <td>+0.321</td>
+            </tr>
+<tr>
+              <th>PickScore</th>
+              <td>0.110</td>
+              <td>0.152</td>
+              <td>1.202</td>
+              <td>-0.416</td>
+              <td>-0.459</td>
+              <td>+0.282</td>
+            </tr>
+<tr>
+              <th>Hard-T2I</th>
+              <td>0.112</td>
+              <td>0.188</td>
+              <td>1.450</td>
+              <td>-0.388</td>
+              <td>-0.318</td>
+              <td>+0.457</td>
+            </tr></tbody>
+    </table></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Step-0 gate warning</h2>
+    <p class="note">The previous joint harmful score does not separate 9B/HY
+    at pure noise. A step-0 32B q99 threshold of 0.1373 masks
+    0.00% of 9B,
+    0.00% of HY, and
+    1.56% of 32B. The velocity magnitude
+    term lets rare anti-aligned 32B cases set too high a threshold.</p>
+  </section>
+
+  <section class="panel wide">
+    <h2>Metric definitions</h2>
+    <p class="caption">All spatial derivatives use first-order finite differences
+    on the unpacked 32×32 latent-token grid, over both H and W.</p>
+    <div class="formula-grid">
+      <div class="formula-item"><strong>Velocity correction and gap</strong>
+        <div class="equation">Δv_T = v_T(x₁, 1, c) − v₄(x₁, 1, c)</div>
+        <div class="equation">gap_T = sqrt(mean(Δv_T²))</div>
+        <span class="caption">How far the teacher prediction is from 4B on the
+        same noise and conditioning; it has no direction information.</span></div>
+      <div class="formula-item"><strong>One-step clean prediction</strong>
+        <div class="equation">x̂₀,m = x₁ − σv_m; at σ=1: Δx̂₀,T = −Δv_T</div>
+        <span class="caption">At pure noise, x0 gap and velocity gap have exactly
+        the same RMS, with opposite signed correction fields.</span></div>
+      <div class="formula-item"><strong>Teacher-correction agreement</strong>
+        <div class="equation">cos(Δv_A, Δv_B) =
+        ⟨Δv_A,Δv_B⟩ / (‖Δv_A‖‖Δv_B‖)</div>
+        <span class="caption">Whether two teachers ask 4B to move in the same
+        parameter-space target direction.</span></div>
+      <div class="formula-item"><strong>Gradient / ∇v relation</strong>
+        <div class="equation">x[i,j,c] = unpack(x)[i,j,c], shape = 32×32×C</div>
+        <div class="equation">Dₓx[i,j,c] = x[i,j+1,c] − x[i,j,c]</div>
+        <div class="equation">Dᵧx[i,j,c] = x[i+1,j,c] − x[i,j,c]</div>
+        <div class="equation">∇x = concat(vec(Dᵧx), vec(Dₓx))</div>
+        <div class="equation">a_T = cos(∇x̂₀,4, ∇(x̂₀,T−x̂₀,4))</div>
+        <div class="equation">at σ=1: a_T = cos(∇x̂₀,4, −∇Δv_T)</div>
+        <span class="caption">Negative values mean the teacher correction
+        cancels existing x0 spatial changes; positive values reinforce them.
+        This report does not use ‖∇v_T‖ alone.</span></div>
+      <div class="formula-item"><strong>x0 total-variation RMS</strong>
+        <div class="equation">TV(x) = sqrt(½(mean((Dₓx)²)+mean((Dᵧx)²)))</div>
+        <div class="equation">ΔTV_T = TV(x̂₀,T) − TV(x̂₀,4)</div>
+        <span class="caption">A magnitude measure of local latent variation;
+        unlike gradient alignment, it does not say whether structures match.</span></div>
+      <div class="formula-item"><strong>Joint harmful score</strong>
+        <div class="equation">s_T = gap_T × max(0, −a_T)</div>
+        <span class="caption">Combines anti-detail direction with correction
+        magnitude. The step-0 warning above shows its current calibration issue.</span></div>
+    </div>
+<pre>def spatial_gradient(packed):
+    # packed: [1, 1024, C] → latent-token grid: [32, 32, C]
+    grid = packed[0].reshape(32, 32, packed.shape[-1])
+    dy = np.diff(grid, axis=0)                 # x[i+1,j,c] - x[i,j,c]
+    dx = np.diff(grid, axis=1)                 # x[i,j+1,c] - x[i,j,c]
+    return np.concatenate([dy.reshape(-1), dx.reshape(-1)])
+
+def cosine(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+for prompt in prompts:
+    x1 = sampled_noise[prompt]                  # identical query state
+    v4, vT = student(x1, t=1), teacher(x1, t=1)
+    delta_v = vT - v4
+    x0_4, x0_T = x1 - v4, x1 - vT
+    velocity_gap = rms(delta_v)
+    grad_x0_4 = spatial_gradient(x0_4)
+    grad_teacher_correction = spatial_gradient(x0_T - x0_4)
+    gradient_alignment = cosine(grad_x0_4, grad_teacher_correction)
+    tv_shift = tv_rms(x0_T) - tv_rms(x0_4)
+    harmful_score = velocity_gap * max(0, -gradient_alignment)</pre>
+  </section>
+</div>
+
+<p class="footer">Source: /apdcephfs_fsgm3/share_305110755/hunyuan/bowenping/xopd/diagnostics/teacher_gap_v1/analysis · Offline capture on 128 fixed prompts
+from GenEval, OCR, PickScore and Hard-T2I · 20,000 prompt-bootstrap draws ·
+generated by build_pure_noise.py</p>
+</main></body></html>

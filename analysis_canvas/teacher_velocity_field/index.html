@@ -28,7 +28,21 @@ h3 { margin:0 0 8px; font-size:19px; }
 .metric.thirtytwo strong { color:var(--thirtytwo); }
 .metric small { color:var(--muted); }
 .chart { width:100%; display:block; border-radius:12px; background:white; }
-.grid-image { width:100%; display:block; border:1px solid var(--line); }
+.trajectory-block { border:1px solid var(--line); overflow:hidden; background:white; }
+.model-band { display:flex; align-items:center; gap:10px; padding:8px 10px;
+  background:#eef2f7; border-top:1px solid var(--line); }
+.model-band:first-child { border-top:0; }
+.model-band span { color:var(--muted); font-size:12px; }
+.trajectory-grid { display:grid; grid-template-columns:76px repeat(6,minmax(0,1fr));
+  gap:0; align-items:stretch; }
+.grid-head { padding:5px 2px; color:var(--muted); text-align:center;
+  font-size:11px; border-bottom:1px solid var(--line); }
+.teacher-head { border-left:2px solid #c9d1dc; }
+.prompt-label { display:flex; align-items:center; padding:6px 8px; color:var(--muted);
+  font-size:11px; border-top:1px solid var(--line); }
+.trajectory-grid img { display:block; width:100%; aspect-ratio:1/1; object-fit:cover;
+  border:0; border-top:1px solid var(--line); }
+.trajectory-grid .teacher-cell { border-left:2px solid #c9d1dc; }
 .callouts { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:20px; }
 .callout { padding:17px 19px; border-left:4px solid var(--line); background:#f8fafb; }
 .callout.nine { border-color:var(--nine); } .callout.hy { border-color:var(--hy); }
@@ -37,7 +51,10 @@ h3 { margin:0 0 8px; font-size:19px; }
   border-radius:12px; background:#16232d; color:#e5f0f1; overflow:auto; }
 .source { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
 @media(max-width:850px) { .metrics,.callouts { grid-template-columns:1fr; }
-  h1 { font-size:36px; } .section,.hero { padding:26px; } }
+  h1 { font-size:36px; } .section,.hero { padding:26px; }
+  .trajectory-grid { grid-template-columns:58px repeat(6,minmax(100px,1fr));
+    min-width:680px; }
+  .trajectory-block { overflow-x:auto; } }
 </style>
 </head>
 <body><main>
@@ -53,9 +70,8 @@ h3 { margin:0 0 8px; font-size:19px; }
   <h2>Visual training trajectories</h2>
   <p class="subtitle">Matched GenEval gs=1 prompts. Student snapshots progress
   left-to-right; teacher output is the final column.</p>
-  <img class="grid-image" src="assets/training_trajectories.jpg"
-       alt="9B and 32B student image trajectories with teacher references">
-  <p class="source">Student runs: ta1qvnuz (9B→4B), 4wvzbt8g (32B→4B).
+  <div class="trajectory-block"><div class="model-band"><strong>9B → 4B · ln5ureh6</strong><span>28-step teacher</span></div><div class="trajectory-grid"><div></div><div class="grid-head">E0</div><div class="grid-head">E20</div><div class="grid-head">E40</div><div class="grid-head">E60</div><div class="grid-head">E80</div><div class="grid-head teacher-head">Teacher</div><div class="prompt-label">Blue cow</div><img src="assets/trajectories/mask_9b_to_4b_blue-cow_e0.jpg" alt="9B → 4B · ln5ureh6 Blue cow epoch 0"><img src="assets/trajectories/mask_9b_to_4b_blue-cow_e20.jpg" alt="9B → 4B · ln5ureh6 Blue cow epoch 20"><img src="assets/trajectories/mask_9b_to_4b_blue-cow_e40.jpg" alt="9B → 4B · ln5ureh6 Blue cow epoch 40"><img src="assets/trajectories/mask_9b_to_4b_blue-cow_e60.jpg" alt="9B → 4B · ln5ureh6 Blue cow epoch 60"><img src="assets/trajectories/mask_9b_to_4b_blue-cow_e80.jpg" alt="9B → 4B · ln5ureh6 Blue cow epoch 80"><img class="teacher-cell" src="assets/trajectories/mask_9b_to_4b_blue-cow_teacher.jpg" alt="9B → 4B · ln5ureh6 Blue cow teacher"><div class="prompt-label">Person + sink</div><img src="assets/trajectories/mask_9b_to_4b_person-sink_e0.jpg" alt="9B → 4B · ln5ureh6 Person + sink epoch 0"><img src="assets/trajectories/mask_9b_to_4b_person-sink_e20.jpg" alt="9B → 4B · ln5ureh6 Person + sink epoch 20"><img src="assets/trajectories/mask_9b_to_4b_person-sink_e40.jpg" alt="9B → 4B · ln5ureh6 Person + sink epoch 40"><img src="assets/trajectories/mask_9b_to_4b_person-sink_e60.jpg" alt="9B → 4B · ln5ureh6 Person + sink epoch 60"><img src="assets/trajectories/mask_9b_to_4b_person-sink_e80.jpg" alt="9B → 4B · ln5ureh6 Person + sink epoch 80"><img class="teacher-cell" src="assets/trajectories/mask_9b_to_4b_person-sink_teacher.jpg" alt="9B → 4B · ln5ureh6 Person + sink teacher"></div><div class="model-band"><strong>32B → 4B · 4wvzbt8g</strong><span>40-step teacher</span></div><div class="trajectory-grid"><div></div><div class="grid-head">E0</div><div class="grid-head">E20</div><div class="grid-head">E40</div><div class="grid-head">E60</div><div class="grid-head">E80</div><div class="grid-head teacher-head">Teacher</div><div class="prompt-label">Blue cow</div><img src="assets/trajectories/32b_to_4b_blue-cow_e0.jpg" alt="32B → 4B · 4wvzbt8g Blue cow epoch 0"><img src="assets/trajectories/32b_to_4b_blue-cow_e20.jpg" alt="32B → 4B · 4wvzbt8g Blue cow epoch 20"><img src="assets/trajectories/32b_to_4b_blue-cow_e40.jpg" alt="32B → 4B · 4wvzbt8g Blue cow epoch 40"><img src="assets/trajectories/32b_to_4b_blue-cow_e60.jpg" alt="32B → 4B · 4wvzbt8g Blue cow epoch 60"><img src="assets/trajectories/32b_to_4b_blue-cow_e80.jpg" alt="32B → 4B · 4wvzbt8g Blue cow epoch 80"><img class="teacher-cell" src="assets/trajectories/32b_to_4b_blue-cow_teacher.jpg" alt="32B → 4B · 4wvzbt8g Blue cow teacher"><div class="prompt-label">Person + sink</div><img src="assets/trajectories/32b_to_4b_person-sink_e0.jpg" alt="32B → 4B · 4wvzbt8g Person + sink epoch 0"><img src="assets/trajectories/32b_to_4b_person-sink_e20.jpg" alt="32B → 4B · 4wvzbt8g Person + sink epoch 20"><img src="assets/trajectories/32b_to_4b_person-sink_e40.jpg" alt="32B → 4B · 4wvzbt8g Person + sink epoch 40"><img src="assets/trajectories/32b_to_4b_person-sink_e60.jpg" alt="32B → 4B · 4wvzbt8g Person + sink epoch 60"><img src="assets/trajectories/32b_to_4b_person-sink_e80.jpg" alt="32B → 4B · 4wvzbt8g Person + sink epoch 80"><img class="teacher-cell" src="assets/trajectories/32b_to_4b_person-sink_teacher.jpg" alt="32B → 4B · 4wvzbt8g Person + sink teacher"></div></div>
+  <p class="source">Student runs: ln5ureh6 (9B→4B), 4wvzbt8g (32B→4B).
   Student: 1024px, 28 steps, epochs 0/20/40/60/80. 9B teacher: 28 steps.
   32B teacher: same seed/gs=1/1024px, 40 steps from uilxegpn because the
   historical 28-step run did not log teacher media.</p>
