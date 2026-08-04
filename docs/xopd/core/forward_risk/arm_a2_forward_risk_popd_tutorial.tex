@@ -558,10 +558,11 @@ guarantee pointwise teacherward movement for every sampled output.
   point/.style={circle,inner sep=2.4pt},
   callout/.style={font=\small,align=center,fill=white,inner sep=2pt},
 ]
-  \coordinate (o) at (0,0);
-  \coordinate (g) at (1.30,0);
-  \coordinate (p) at (2.40,0);
-  \coordinate (t) at (4.80,0);
+  % Use a 4:3 up-right direction so the construction clears the legend.
+  \coordinate (o) at (0,-0.80);
+  \coordinate (g) at (1.06,0);
+  \coordinate (p) at (1.92,0.64);
+  \coordinate (t) at (4.40,2.50);
 
   \fill[oldblue!5] (o) circle[radius=2.40];
   \draw[oldblue,line width=0.9pt] (o) circle[radius=2.40];
@@ -571,10 +572,10 @@ guarantee pointwise teacherward movement for every sampled output.
     align=left,
     fill=white,
     inner sep=2pt
-  ] at (-1.25,2.62)
+  ] at (-1.25,1.82)
     {$G_s$ trust ball\\[-1pt]radius $r_s$};
 
-  % Decompose the displacement into non-overlapping horizontal segments.
+  % Decompose the displacement into non-overlapping collinear segments.
   \draw[black!45,line width=0.7pt,-{Latex[length=2.2mm]}] (o) -- (t);
   \draw[studentgreen,line width=2.2pt,-{Latex[length=2.4mm]}] (o) -- (g);
   \draw[riskorange,line width=1.8pt] (g) -- (p);
@@ -584,21 +585,22 @@ guarantee pointwise teacherward movement for every sampled output.
   \node[callout,below=5pt of o] {$f_{\old}$};
 
   \node[point,fill=studentgreen] at (g) {};
-  \node[callout] (target-label) at (1.30,-1.18)
+  \node[callout] (target-label) at (1.30,-1.35)
     {$f_\gamma=f_{\old}+\gamma_Tc\,d$\\
      \textcolor{studentgreen}{detached A2 target}};
   \draw[studentgreen,line width=0.7pt,-{Latex[length=1.8mm]}]
     (target-label.north) -- (g);
 
   \node[point,fill=riskorange] at (p) {};
-  \node[callout] (projection-label) at (2.40,1.18)
+  \node[callout] (projection-label) at (2.62,1.42)
     {$f_{\old}+c\,d$\\
      \textcolor{riskorange}{trust-ball projection}};
   \draw[riskorange,line width=0.7pt,-{Latex[length=1.8mm]}]
     (projection-label.south) -- (p);
 
   \node[point,fill=teacherred] at (t) {};
-  \node[callout,above=5pt of t] {$f_T=f_{\old}+d$};
+  \node[callout,anchor=south east] at ([xshift=-3pt,yshift=5pt]t)
+    {$f_T=f_{\old}+d$};
 
   \node[
     anchor=west,
