@@ -1322,14 +1322,6 @@ class Flux2KleinAdapter(BaseAdapter):
                 f"got None with guidance_scale={guidance_scale!r}, "
                 f"latents.shape={tuple(latents.shape)}."
             )
-        if guidance_scale > 1.0 and negative_prompt_embeds is None:
-            logger.warning(
-                "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` provided. Classifier-free guidance will be disabled."
-            )
-        do_classifier_free_guidance = require_negative or (
-            guidance_scale > 1.0 and negative_prompt_embeds is not None
-        )
-
         # 1. Prepare model input (concatenate condition latents for I2I)
         latent_model_input = latents.to(torch.float32)
         latent_image_ids = latent_ids
@@ -1341,6 +1333,25 @@ class Flux2KleinAdapter(BaseAdapter):
         time_guidance_embed = getattr(cache_module, "time_guidance_embed", None)
         uses_guidance_embedding = (
             getattr(time_guidance_embed, "guidance_embedder", None) is not None
+        )
+        if (
+            guidance_scale > 1.0
+            and negative_prompt_embeds is None
+            and not uses_guidance_embedding
+        ):
+            logger.warning(
+                "Passed `guidance_scale` > 1.0 to a model without a guidance "
+                "embedding, but no `negative_prompt_embeds` were provided; "
+                "classifier-free guidance will be disabled."
+            )
+        # Guidance-distilled models (FLUX.2-dev) consume the scale through their
+        # native guidance embedding. Applying an additional cond/uncond CFG
+        # composition would guide them twice. ``require_negative`` is reserved
+        # for explicit branch-level objectives that intentionally need both.
+        do_classifier_free_guidance = require_negative or (
+            not uses_guidance_embedding
+            and guidance_scale > 1.0
+            and negative_prompt_embeds is not None
         )
         guidance = (
             torch.full(

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import os
 import shutil
 import socket
@@ -72,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=28)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--projection-dim", type=int, default=64)
     parser.add_argument("--internal-steps", default="0,9,18,27")
     parser.add_argument(
@@ -163,7 +165,7 @@ def _model_attrs(
         "num_steps": args.num_steps,
         "height": args.height,
         "width": args.width,
-        "guidance_scale": 1.0,
+        "guidance_scale": args.guidance_scale,
         "projection_dim": args.projection_dim,
         "internal_steps": parse_int_list(args.internal_steps, "internal_steps"),
     }
@@ -305,18 +307,28 @@ def _read_reference_initial_latent(
 
 
 def _cache_student_conditioning(
-    adapter: Any, local_samples: list[dict[str, Any]], device: torch.device
+    adapter: Any,
+    local_samples: list[dict[str, Any]],
+    device: torch.device,
+    guidance_scale: float,
 ) -> dict[int, dict[str, torch.Tensor]]:
     conditioning = {}
     for sample in local_samples:
         encoded = adapter.encode_prompt(
             prompt=[sample["prompt"]],
-            guidance_scale=1.0,
+            guidance_scale=guidance_scale,
             device=device,
         )
         conditioning[int(sample["global_index"])] = {
-            "prompt_embeds": encoded["prompt_embeds"].detach().cpu(),
-            "text_ids": encoded["text_ids"].detach().cpu(),
+            key: value.detach().cpu()
+            for key, value in encoded.items()
+            if key
+            in (
+                "prompt_embeds",
+                "text_ids",
+                "negative_prompt_embeds",
+                "negative_text_ids",
+            )
         }
     return conditioning
 
@@ -327,6 +339,7 @@ def _cache_teacher_conditioning(
     local_samples: list[dict[str, Any]],
     device: torch.device,
     dtype: torch.dtype,
+    guidance_scale: float,
 ) -> dict[int, dict[str, torch.Tensor]]:
     adapter.load_teacher_text_encoder(teacher_path, device=device, dtype=dtype)
     conditioning = {}
@@ -334,12 +347,19 @@ def _cache_teacher_conditioning(
         for sample in local_samples:
             encoded = adapter.encode_teacher_prompt(
                 [sample["prompt"]],
-                guidance_scale=1.0,
+                guidance_scale=guidance_scale,
                 device=device,
             )
             conditioning[int(sample["global_index"])] = {
-                "prompt_embeds": encoded["prompt_embeds"].detach().cpu(),
-                "text_ids": encoded["text_ids"].detach().cpu(),
+                key: value.detach().cpu()
+                for key, value in encoded.items()
+                if key
+                in (
+                    "prompt_embeds",
+                    "text_ids",
+                    "negative_prompt_embeds",
+                    "negative_text_ids",
+                )
             }
     finally:
         adapter.unload_teacher_text_encoder()
@@ -413,11 +433,21 @@ def capture_student_phase(
                     prompt=[sample["prompt"]],
                     prompt_embeds=cond["prompt_embeds"].to(adapter.device),
                     text_ids=cond["text_ids"].to(adapter.device),
+                    negative_prompt_embeds=(
+                        cond["negative_prompt_embeds"].to(adapter.device)
+                        if "negative_prompt_embeds" in cond
+                        else None
+                    ),
+                    negative_text_ids=(
+                        cond["negative_text_ids"].to(adapter.device)
+                        if "negative_text_ids" in cond
+                        else None
+                    ),
                     generator=[generator],
                     height=args.height,
                     width=args.width,
                     num_inference_steps=args.num_steps,
-                    guidance_scale=1.0,
+                    guidance_scale=args.guidance_scale,
                     compute_log_prob=False,
                     trajectory_indices="all",
                     extra_call_back_kwargs=[
@@ -593,7 +623,17 @@ def capture_teacher_phase(
                         latent_ids=latent_ids,
                         prompt_embeds=cond["prompt_embeds"].to(adapter.device),
                         text_ids=cond["text_ids"].to(adapter.device),
-                        guidance_scale=1.0,
+                        negative_prompt_embeds=(
+                            cond["negative_prompt_embeds"].to(adapter.device)
+                            if "negative_prompt_embeds" in cond
+                            else None
+                        ),
+                        negative_text_ids=(
+                            cond["negative_text_ids"].to(adapter.device)
+                            if "negative_text_ids" in cond
+                            else None
+                        ),
+                        guidance_scale=args.guidance_scale,
                         compute_log_prob=False,
                         return_kwargs=[
                             "noise_pred",
@@ -743,11 +783,21 @@ def capture_native_teacher_phase(
                     prompt=[sample["prompt"]],
                     prompt_embeds=cond["prompt_embeds"].to(adapter.device),
                     text_ids=cond["text_ids"].to(adapter.device),
+                    negative_prompt_embeds=(
+                        cond["negative_prompt_embeds"].to(adapter.device)
+                        if "negative_prompt_embeds" in cond
+                        else None
+                    ),
+                    negative_text_ids=(
+                        cond["negative_text_ids"].to(adapter.device)
+                        if "negative_text_ids" in cond
+                        else None
+                    ),
                     generator=[generator],
                     height=args.height,
                     width=args.width,
                     num_inference_steps=args.num_steps,
-                    guidance_scale=1.0,
+                    guidance_scale=args.guidance_scale,
                     compute_log_prob=False,
                     trajectory_indices="all",
                     extra_call_back_kwargs=[
@@ -947,6 +997,10 @@ def main() -> None:
             "positive, got "
             f"{(args.num_steps, args.height, args.width, args.projection_dim, args.io_queue_depth)}"
         )
+    if not math.isfinite(args.guidance_scale) or args.guidance_scale <= 0.0:
+        raise ValueError(
+            f"guidance_scale must be positive and finite, got {args.guidance_scale!r}"
+        )
     phases = tuple(item.strip() for item in args.phases.split(",") if item.strip())
     unknown = set(phases) - set(MODEL_PATHS)
     if not phases or unknown:
@@ -1036,7 +1090,12 @@ def main() -> None:
     adapter.eval()
 
     student_conditioning = (
-        _cache_student_conditioning(adapter, local_samples, accelerator.device)
+        _cache_student_conditioning(
+            adapter,
+            local_samples,
+            accelerator.device,
+            args.guidance_scale,
+        )
         if "student_4b" in phases
         else {}
     )
@@ -1086,6 +1145,7 @@ def main() -> None:
                         local_samples,
                         accelerator.device,
                         adapter.pipeline.transformer.dtype,
+                        args.guidance_scale,
                     )
                     if args.native_teacher_rollouts:
                         phase_shards = capture_native_teacher_phase(
