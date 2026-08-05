@@ -1,0 +1,1166 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont[BoldFont=STHeiti,ItalicFont=STKaiti]{STSong}
+\setCJKsansfont{STHeiti}
+\setCJKmonofont{STSong}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,matrix,fit,backgrounds}
+\usepackage[pdfencoding=auto,psdextra]{hyperref}
+
+\geometry{margin=2.35cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\C}{\mathcal{C}}
+\newcommand{\G}{\mathcal{G}}
+\newcommand{\MoF}{\mathrm{MoF}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\score}{\bm{s}}
+\newcommand{\vfield}{\bm{v}}
+\newcommand{\diff}{\mathrm{d}}
+\newcommand{\ind}{\mathbb{I}}
+\newcommand{\base}{\mathrm{base}}
+\newcommand{\rl}{\mathrm{RL}}
+\newcommand{\student}{\mathrm{S}}
+\newcommand{\teacher}{\mathrm{T}}
+\newcommand{\pos}{+}
+\newcommand{\negbranch}{-}
+\DeclareMathOperator{\softmax}{softmax}
+
+\theoremstyle{definition}
+\newtheorem{definition}{定义}[section]
+\newtheorem{remark}[definition]{注}
+\newtheorem{example}[definition]{例}
+\theoremstyle{plain}
+\newtheorem{proposition}[definition]{命题}
+\newtheorem{theorem}[definition]{定理}
+\newtheorem{corollary}[definition]{推论}
+
+\definecolor{studentblue}{RGB}{52,101,164}
+\definecolor{teacherred}{RGB}{190,65,55}
+\definecolor{guidancegreen}{RGB}{45,130,90}
+\definecolor{neutralgray}{RGB}{90,90,90}
+\definecolor{softorange}{RGB}{205,120,35}
+
+\tikzset{
+  flowarrow/.style={-{Latex[length=2.2mm]},thick},
+  opbox/.style={
+    draw=black!55,
+    rounded corners=2pt,
+    fill=black!2,
+    align=center,
+    inner sep=6pt,
+    font=\small
+  },
+  formulabox/.style={
+    draw=black!45,
+    rounded corners=2pt,
+    fill=black!1,
+    align=left,
+    text width=0.38\textwidth,
+    minimum height=2.2cm,
+    inner sep=6pt,
+    font=\footnotesize
+  }
+}
+
+\title{\textbf{Reward-Residual CFG Guidance}\\[0.35em]
+\large 从单 Teacher 到 Mixture of Flows 的算子代数、交换律与适用边界}
+\author{Jayce-Ping}
+\date{2026 年 8 月 5 日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文形式化一种 inference-time reward-residual guidance：
+\[
+  \vfield_{\alpha}
+  =
+  \vfield_{\base}
+  +\alpha\bigl(\vfield_{\rl}-\vfield_{\base}\bigr).
+\]
+它与 classifier-free guidance（CFG）具有相同的仿射形式，但``形式同构''并不自动
+意味着``概率解释相同''。本文以 Flow-Factory 当前 Mixture of Flows（MoF）为背景，
+首先把 CFG 写成作用于 positive/negative 两个 branch 的线性算子，再完整推导
+\{student 无 CFG, student 有 CFG\}$\times$\{teacher 无 CFG, teacher 有 CFG\}
+四种 single-teacher 组合。随后比较``先 CFG、后 reward guidance''与
+``先 branch-wise reward guidance、后 CFG''，给出二者的精确交换子、等价条件和
+不可恢复情形。最后把结论推广到 multi-teacher MoF、多个独立 reward residual、
+softmax/affine/free 三类权重区域，并区分三种不同陈述：
+\emph{可积分的合成 ODE field}、\emph{精确 density-mixture velocity} 和
+\emph{指数倾斜下的 score guidance}。核心结果是：同一 CFG scale、branch-independent
+混合权重与同一 residual strength 下，CFG 和 reward residual 严格交换；一旦
+student/teacher scale 不同、positive/negative 路由不同，或 negative branch 从未计算，
+该交换律即失效。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{问题、角色与现有 MoF}
+
+\subsection{本文中的 student 与 teacher}
+
+本文固定以下角色，避免与二阶段 MoF 蒸馏中的``最终 student''混淆：
+\begin{itemize}[leftmargin=1.6em]
+  \item $\student$：pretrained base，亦即部署时希望保留其质量与多样性的
+  \emph{anchor model}；
+  \item $\teacher$：从同一 base 出发，经某个 reward objective 做 RL 微调得到的
+  specialist；
+  \item $\vfield_M^\pos,\vfield_M^\negbranch$：模型
+  $M\in\{\student,\teacher\}$ 在 positive 与 negative/unconditional conditioning
+  下的原始 velocity prediction；
+  \item $\alpha$：reward-residual strength；$\gamma$：CFG scale。
+\end{itemize}
+
+因此本文的基本目标是
+\begin{equation}
+  \vfield_{\mathrm{RRG}}
+  =
+  (1-\alpha)\vfield_\student+\alpha\vfield_\teacher
+  =
+  \vfield_\student+\alpha(\vfield_\teacher-\vfield_\student).
+  \label{eq:rrg-basic}
+\end{equation}
+RRG 是 reward-residual guidance 的缩写。它在推理时不再调用 reward model，
+但仍依赖由 RL checkpoint pair 编码的 implicit preference；更准确的描述是
+\emph{reward-model-free at inference}，而不是无 reward。
+
+\subsection{Flow-Factory 当前 MoF 的算子}
+
+Flow-Factory 中的 MoF 在每个 denoising step 查询 $K$ 个冻结 teacher，并在输出
+velocity 空间组合：
+\begin{equation}
+  \vfield_{\MoF}(x,t,c)
+  =
+  \sum_{k=1}^{K}\lambda_k(t,s(c),c)\,
+  \vfield_k(x,t,c).
+  \label{eq:existing-mof}
+\end{equation}
+当前 mixing module 支持：
+\begin{align}
+  \texttt{softmax}:&\quad
+  \lambda_k\geq 0,\qquad \sum_k\lambda_k=1,
+  \label{eq:softmax-region}\\
+  \texttt{affine}:&\quad
+  \lambda_k\in\R,\qquad \sum_k\lambda_k=1,
+  \label{eq:affine-region}\\
+  \texttt{none}:&\quad
+  \lambda_k\in\R,\qquad \sum_k\lambda_k\ \text{不受约束}.
+  \label{eq:free-region}
+\end{align}
+实现分别落在三个位置：
+\begin{itemize}[leftmargin=1.6em]
+  \item \path{trainers/mof/common.py}：patched inference forward 与
+  \path{_combine_velocities_per_sample} 执行 \eqref{eq:existing-mof}；
+  \item \path{trainers/mof/utils.py}：\path{apply_weight_normalization}
+  实现 \eqref{eq:softmax-region}--\eqref{eq:free-region}；
+  \item \path{trainers/mof/distill.py}：用 on-policy velocity MSE 将固定
+  MoF target 蒸馏到部署 student。
+\end{itemize}
+
+\begin{tcolorbox}[
+  colback=blue!3,
+  colframe=blue!45!black,
+  title=本文与现有 MoF 的关系]
+现有 MoF 主要研究 teacher 之间如何组合；本文额外保留 pretrained base
+$\student$ 作为显式 anchor，并研究
+$\student+\alpha(\teacher-\student)$ 型外推与 CFG 的组合。Single-teacher
+是 $K=1$；multi-teacher 则可以先形成 $\vfield_{\MoF}$，再把它视为一个
+composite RL teacher。
+\end{tcolorbox}
+
+\section{两个基本算子}
+
+\subsection{CFG 算子}
+
+\begin{definition}[CFG direction 与 CFG 算子]
+对具有显式 positive/negative 两个 branch、且以线性方式合成 CFG 的模型
+$M$，定义 conditional direction
+\begin{equation}
+  \bm d_M
+  :=
+  \vfield_M^\pos-\vfield_M^\negbranch.
+  \label{eq:cfg-direction}
+\end{equation}
+CFG 算子为
+\begin{equation}
+  \C_\gamma[M]
+  :=
+  \vfield_M^\negbranch
+  +\gamma\bigl(\vfield_M^\pos-\vfield_M^\negbranch\bigr)
+  =
+  \vfield_M^\pos+(\gamma-1)\bm d_M.
+  \label{eq:cfg-operator}
+\end{equation}
+\end{definition}
+
+本文主体采用 SD3.5/Wan 等显式双 branch adapter 的 scale convention：
+\begin{equation}
+  \gamma=1
+  \quad\Longrightarrow\quad
+  \C_1[M]=\vfield_M^\pos.
+  \label{eq:no-cfg}
+\end{equation}
+所以``无 CFG''指仅使用 positive conditional prediction，不是使用
+$\vfield_M^\negbranch$。当 $\gamma>1$ 时，模型从 positive branch 沿
+$\bm d_M$ 继续外推。
+
+\begin{tcolorbox}[
+  colback=yellow!5,
+  colframe=yellow!50!black,
+  title=Adapter 适用范围]
+式~\eqref{eq:cfg-operator} 不是 Flow-Factory 所有模型的统一实现接口。
+Z-Image 使用
+$\vfield^\pos+g(\vfield^\pos-\vfield^\negbranch)$，在关闭 CFG normalization
+且固定 truncation mask 时，可通过 $\gamma=1+g$ 换元为本文记号；其无 CFG
+对应 $g=0$。FLUX.1/FLUX.2 则把 guidance scalar 作为 transformer 输入，
+没有可直接观测的 positive/negative CFG branch，不能直接套用本文四组合与交换子。
+若存在 norm matching、rescale、动态 truncation 等非线性后处理，CFG 也不再是
+线性算子，后文交换律需逐项重新推导。
+\end{tcolorbox}
+
+\subsection{Reward-residual 算子}
+
+\begin{definition}[Base-anchored reward-residual 算子]
+对两个处在相同 latent coordinate、相同时间方向、相同 prediction
+parameterization 的 field $A,B$，定义
+\begin{equation}
+  \G_\alpha[A,B]
+  :=
+  A+\alpha(B-A)
+  =
+  (1-\alpha)A+\alpha B.
+  \label{eq:reward-operator}
+\end{equation}
+\end{definition}
+
+系数区间决定几何意义：
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}cll@{}}
+\toprule
+$\alpha$ & 几何位置 & 解释 \\
+\midrule
+$0$ & anchor $\student$ & 纯 pretrained base \\
+$(0,1)$ & $\student$ 与 $\teacher$ 之间 & 插值，通常更保守 \\
+$1$ & RL teacher $\teacher$ & 纯 specialist \\
+$>1$ & 越过 $\teacher$ & 放大 RL-induced residual \\
+$<0$ & 远离 $\teacher$ & 反向 preference / negative guidance \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=2.0cm,y=1cm]
+  \draw[->,thick,black!65] (-1.7,0) -- (3.0,0) node[right] {$\alpha$};
+  \foreach \x/\lab in {-1/{-1},0/{0},1/{1},2/{2}}
+    \draw (\x,0.09)--(\x,-0.09) node[below=4pt] {$\lab$};
+  \fill[studentblue] (0,0) circle (2.8pt)
+    node[above=7pt,text=studentblue] {$\vfield_\student$};
+  \fill[teacherred] (1,0) circle (2.8pt)
+    node[above=7pt,text=teacherred] {$\vfield_\teacher$};
+  \draw[flowarrow,studentblue] (0,0.34)--(0.92,0.34)
+    node[midway,above,font=\small] {$\vfield_\teacher-\vfield_\student$};
+  \draw[very thick,guidancegreen] (-1.25,-0.45)--(2.5,-0.45);
+  \node[font=\footnotesize,align=center] at (-0.7,-0.86) {反向\\residual};
+  \node[font=\footnotesize,align=center] at (0.5,-0.86) {convex\\interpolation};
+  \node[font=\footnotesize,align=center] at (1.85,-0.86) {CFG 式\\extrapolation};
+\end{tikzpicture}
+\caption{Reward residual 是以 pretrained base 为锚点的仿射直线。只有
+$\alpha\in[0,1]$ 是凸插值；$\alpha<0$ 或 $\alpha>1$ 是外推。}
+\label{fig:affine-line}
+\end{figure}
+
+\section{Single-teacher：四种 CFG 组合}
+
+\subsection{统一公式}
+
+令 $I_\student,I_\teacher\in\{0,1\}$ 分别表示 student/teacher 是否启用 CFG。
+若不启用，将对应 scale 视为 $1$。先分别合成 student 与 teacher，再做 reward
+guidance，可统一写成
+\begin{equation}
+\boxed{
+  \vfield_{I_\student I_\teacher}^{\mathrm{CFG}\to\mathrm{R}}
+  =
+  (1-\alpha)
+  \left[
+    \vfield_\student^\pos
+    +I_\student(\gamma_\student-1)\bm d_\student
+  \right]
+  +
+  \alpha
+  \left[
+    \vfield_\teacher^\pos
+    +I_\teacher(\gamma_\teacher-1)\bm d_\teacher
+  \right].
+}
+\label{eq:four-unified}
+\end{equation}
+上式把输出拆成两个互相可审计的部分：
+\begin{equation}
+  \vfield_{I_\student I_\teacher}^{\mathrm{CFG}\to\mathrm{R}}
+  =
+  \underbrace{
+    (1-\alpha)\vfield_\student^\pos+\alpha\vfield_\teacher^\pos
+  }_{\text{positive-branch reward residual}}
+  +
+  \underbrace{
+    (1-\alpha)I_\student(\gamma_\student-1)\bm d_\student
+    +\alpha I_\teacher(\gamma_\teacher-1)\bm d_\teacher
+  }_{\text{CFG contribution}}.
+  \label{eq:four-decomposition}
+\end{equation}
+
+\subsection{四个 case}
+
+\paragraph{Case 00：student 无 CFG，teacher 无 CFG。}
+\begin{equation}
+  \vfield_{00}
+  =
+  (1-\alpha)\vfield_\student^\pos+\alpha\vfield_\teacher^\pos
+  =
+  \vfield_\student^\pos
+  +\alpha(\vfield_\teacher^\pos-\vfield_\student^\pos).
+  \label{eq:case-00}
+\end{equation}
+这是最纯粹的 reward residual；只需两个 positive forward。
+
+\paragraph{Case 10：student 有 CFG，teacher 无 CFG。}
+\begin{equation}
+  \vfield_{10}
+  =
+  (1-\alpha)\C_{\gamma_\student}[\student]
+  +\alpha\vfield_\teacher^\pos
+  =
+  \vfield_{00}
+  +(1-\alpha)(\gamma_\student-1)\bm d_\student.
+  \label{eq:case-10}
+\end{equation}
+CFG 增量被 anchor coefficient $(1-\alpha)$ 缩放。当 $\alpha=1$ 时，
+student CFG 完全消失；这是先合成、后插值的直接结果。
+
+\paragraph{Case 01：student 无 CFG，teacher 有 CFG。}
+\begin{equation}
+  \vfield_{01}
+  =
+  (1-\alpha)\vfield_\student^\pos
+  +\alpha\C_{\gamma_\teacher}[\teacher]
+  =
+  \vfield_{00}
+  +\alpha(\gamma_\teacher-1)\bm d_\teacher.
+  \label{eq:case-01}
+\end{equation}
+teacher CFG 增量被 reward strength $\alpha$ 缩放。若同时增大
+$\alpha$ 与 $\gamma_\teacher$，两个外推强度会相乘，容易产生 double
+extrapolation。
+
+\paragraph{Case 11：student 有 CFG，teacher 有 CFG。}
+\begin{equation}
+\begin{split}
+  \vfield_{11}
+  &=
+  (1-\alpha)\C_{\gamma_\student}[\student]
+  +\alpha\C_{\gamma_\teacher}[\teacher]\\
+  &=
+  \vfield_{00}
+  +(1-\alpha)(\gamma_\student-1)\bm d_\student
+  +\alpha(\gamma_\teacher-1)\bm d_\teacher.
+\end{split}
+\label{eq:case-11}
+\end{equation}
+这是最一般的 single-teacher 先-CFG形式。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+  \matrix (m) [
+    matrix of nodes,
+    row sep=3mm,
+    column sep=3mm,
+    nodes={formulabox,anchor=north west},
+    column 1/.style={nodes={text width=0.40\textwidth}},
+    column 2/.style={nodes={text width=0.40\textwidth}}
+  ] {
+    \textbf{00：S 无 CFG，T 无 CFG}\par
+    $\vfield_{00}=(1-\alpha)\vfield_\student^\pos+
+    \alpha\vfield_\teacher^\pos$
+    &
+    \textbf{01：S 无 CFG，T 有 CFG}\par
+    $\vfield_{01}=\vfield_{00}+
+    \alpha(\gamma_\teacher-1)\bm d_\teacher$
+    \\
+    \textbf{10：S 有 CFG，T 无 CFG}\par
+    $\vfield_{10}=\vfield_{00}+
+    (1-\alpha)(\gamma_\student-1)\bm d_\student$
+    &
+    \textbf{11：S 有 CFG，T 有 CFG}\par
+    $\vfield_{11}=\vfield_{00}+
+    (1-\alpha)(\gamma_\student-1)\bm d_\student+
+    \alpha(\gamma_\teacher-1)\bm d_\teacher$
+    \\
+  };
+  \node[above=2mm of m-1-1,font=\small\bfseries,text=studentblue]
+    {Teacher 无 CFG};
+  \node[above=2mm of m-1-2,font=\small\bfseries,text=teacherred]
+    {Teacher 有 CFG};
+  \node[rotate=90,left=2mm of m-1-1,font=\small\bfseries,text=neutralgray]
+    {S 无 CFG};
+  \node[rotate=90,left=2mm of m-2-1,font=\small\bfseries,text=guidancegreen]
+    {S 有 CFG};
+\end{tikzpicture}
+\caption{Single-teacher 的 $2\times2$ CFG 组合。四式仅相差
+student/teacher conditional direction 的加权项。}
+\label{fig:four-cases}
+\end{figure}
+
+\subsection{四种组合的两个实践结论}
+
+\begin{proposition}[CFG 增量的有效系数]
+在先 CFG 后 reward guidance 的语义下，student 与 teacher CFG direction 的有效系数分别是
+\begin{equation}
+  a_\student^{\mathrm{cfg}}
+  =(1-\alpha)(\gamma_\student-1),
+  \qquad
+  a_\teacher^{\mathrm{cfg}}
+  =\alpha(\gamma_\teacher-1).
+  \label{eq:effective-cfg-coeff}
+\end{equation}
+\end{proposition}
+
+因此只报告 $(\alpha,\gamma_\student,\gamma_\teacher)$ 不如同时报告
+\eqref{eq:effective-cfg-coeff} 透明。特别地，$\alpha>1$ 时
+$1-\alpha<0$，student CFG direction 被\emph{反向}加入；此时 Case 10/11
+不能解释成``保留一点 base CFG''。
+
+\begin{remark}[相同数值 scale 不保证相同物理强度]
+即使 $\gamma_\student=\gamma_\teacher$，也通常有
+$\bm d_\student\neq\bm d_\teacher$。相同 CFG scale 只保证算子系数相同，
+不保证两个模型的 branch gap、RMS 或语义强度相同。
+\end{remark}
+
+\section{CFG 在 reward guidance 之前与之后}
+
+\subsection{两个顺序的严格定义}
+
+\paragraph{顺序 A：先 CFG，后 reward guidance。}
+\begin{equation}
+  \vfield_{\mathrm{A}}
+  :=
+  \G_\alpha\!\left[
+    \C_{\gamma_\student}[\student],
+    \C_{\gamma_\teacher}[\teacher]
+  \right].
+  \label{eq:order-a}
+\end{equation}
+它允许 student 与 teacher 使用不同 CFG scale。
+
+\paragraph{顺序 B：先 branch-wise reward guidance，后 CFG。}
+先构造一个拥有两个 branch 的 virtual guided model：
+\begin{equation}
+  \vfield_{\mathrm{R}}^\pos
+  :=
+  (1-\alpha)\vfield_\student^\pos+\alpha\vfield_\teacher^\pos,
+  \qquad
+  \vfield_{\mathrm{R}}^\negbranch
+  :=
+  (1-\alpha)\vfield_\student^\negbranch+\alpha\vfield_\teacher^\negbranch.
+  \label{eq:branchwise-rrg}
+\end{equation}
+再用单一 scale $\gamma_{\mathrm R}$ 做 CFG：
+\begin{equation}
+  \vfield_{\mathrm{B}}
+  :=
+  \C_{\gamma_{\mathrm R}}[\mathrm R]
+  =
+  (1-\alpha)\C_{\gamma_{\mathrm R}}[\student]
+  +\alpha\C_{\gamma_{\mathrm R}}[\teacher].
+  \label{eq:order-b}
+\end{equation}
+最后一个等号来自 CFG 对 branch pair 的线性性。
+
+\subsection{交换子与等价条件}
+
+\begin{theorem}[Single-teacher CFG--RRG 交换子]
+顺序 A 与 B 的差为
+\begin{equation}
+\boxed{
+  \vfield_{\mathrm A}-\vfield_{\mathrm B}
+  =
+  (1-\alpha)(\gamma_\student-\gamma_{\mathrm R})\bm d_\student
+  +
+  \alpha(\gamma_\teacher-\gamma_{\mathrm R})\bm d_\teacher.
+}
+\label{eq:single-commutator}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+将 \eqref{eq:cfg-operator} 分别代入 \eqref{eq:order-a} 和
+\eqref{eq:order-b}。两式的 positive-branch residual 相消，只剩 conditional
+direction 系数之差。
+\end{proof}
+
+\begin{corollary}[同 scale 时严格交换]
+若
+\begin{equation}
+  \gamma_\student=\gamma_\teacher=\gamma_{\mathrm R}=\gamma,
+  \label{eq:same-scale}
+\end{equation}
+则
+\begin{equation}
+  \G_\alpha[\C_\gamma[\student],\C_\gamma[\teacher]]
+  =
+  \C_\gamma[\mathrm R],
+  \qquad
+  \vfield_{\mathrm R}^{b}
+  =
+  \G_\alpha[\vfield_\student^{b},\vfield_\teacher^{b}],
+  \quad b\in\{\pos,\negbranch\}.
+  \label{eq:commute}
+\end{equation}
+即 CFG 与 branch-wise reward residual 严格交换。
+\end{corollary}
+
+\begin{corollary}[一般必要条件]
+当 $0<\alpha<1$ 且 $\bm d_\student,\bm d_\teacher$ 线性无关时，
+$\vfield_{\mathrm A}=\vfield_{\mathrm B}$ 当且仅当
+\begin{equation}
+  \gamma_\student=\gamma_\teacher=\gamma_{\mathrm R}.
+  \label{eq:generic-necessary}
+\end{equation}
+若两个 direction 共线，则不同 scale 可能偶然抵消；这种等价依赖当前
+$(x,t,c)$，不构成全局算子恒等式。
+\end{corollary}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=16mm and 25mm]
+  \node[opbox] (branches) {原始 branches\\
+    $(\vfield_\student^\pos,\vfield_\student^\negbranch)$，
+    $(\vfield_\teacher^\pos,\vfield_\teacher^\negbranch)$};
+  \node[opbox,above right=of branches] (cfgfirst) {分别做 CFG\\
+    $\C_{\gamma_\student}[\student]$，
+    $\C_{\gamma_\teacher}[\teacher]$};
+  \node[opbox,right=of cfgfirst] (afterreward) {再做 RRG\\$\vfield_{\mathrm A}$};
+  \node[opbox,below right=of branches] (rewardfirst) {branch-wise RRG\\
+    $(\vfield_{\mathrm R}^\pos,\vfield_{\mathrm R}^\negbranch)$};
+  \node[opbox,right=of rewardfirst] (aftercfg) {再做 CFG\\
+    $\vfield_{\mathrm B}=\C_{\gamma_{\mathrm R}}[\mathrm R]$};
+  \draw[flowarrow,studentblue] (branches)--(cfgfirst);
+  \draw[flowarrow,teacherred] (cfgfirst)--(afterreward);
+  \draw[flowarrow,teacherred] (branches)--(rewardfirst);
+  \draw[flowarrow,studentblue] (rewardfirst)--(aftercfg);
+  \draw[<->,thick,dashed,guidancegreen] (afterreward)--node[
+    right,align=left,font=\footnotesize
+  ] {$\Delta$ 见式~\eqref{eq:single-commutator}\\同 scale 时 $\Delta=0$} (aftercfg);
+\end{tikzpicture}
+\caption{CFG 与 reward residual 的两条路径。交换律要求比较 branch pair，
+而不是只比较两个已合成的 velocity。}
+\label{fig:commutative-diagram}
+\end{figure}
+
+\subsection{四种组合在``CFG 后置''语义下能否复现}
+
+顺序 B 只有一个 $\gamma_{\mathrm R}$。由 \eqref{eq:single-commutator}：
+\begin{itemize}[leftmargin=1.6em]
+  \item Case 00 可取 $\gamma_{\mathrm R}=1$ 精确复现；
+  \item Case 11 在 $\gamma_\student=\gamma_\teacher$ 时可精确复现；
+  \item Case 10/01 一般不能由单一后置 CFG 精确复现，因为它要求同一个
+  $\gamma_{\mathrm R}$ 同时对两个不同 direction 施加不同 scale；
+  \item 只有当 $\bm d_\student,\bm d_\teacher$ 共线并满足
+  \eqref{eq:single-commutator} 的抵消关系时，Case 10/01 才可能在某个状态偶然等价。
+\end{itemize}
+
+\subsection{数学上的 no-CFG 与工程上的 branch 缺失}
+
+\begin{tcolorbox}[
+  colback=red!3,
+  colframe=red!50!black,
+  title=不可恢复性]
+数学上``无 CFG''可写成 $\gamma=1$，但仍可把
+$(\vfield^\pos,\vfield^\negbranch)$ 视为潜在可查询的 branch pair。
+工程上，Flow-Factory adapter 在 \texttt{guidance\_scale <= 1} 时通常只执行
+positive forward；negative embeddings 甚至不会进入 preprocessing cache。
+如果只保存了 $\vfield^\pos$ 或某个 composed
+$\C_\gamma[M]$，就无法唯一恢复 $\vfield^\negbranch$ 与 $\bm d_M$。
+因此``先无 CFG forward，之后再补 CFG''不是代数重排，而是缺少一次模型查询。
+\end{tcolorbox}
+
+只保存 composed field 还有更一般的不可辨识性：对任意扰动 $\bm e$，
+\begin{equation}
+  \vfield^\pos\leftarrow
+  \vfield^\pos+\frac{\gamma-1}{\gamma}\bm e,
+  \qquad
+  \vfield^\negbranch\leftarrow\vfield^\negbranch+\bm e
+  \label{eq:branch-nullspace}
+\end{equation}
+保持 $\C_\gamma[M]$ 不变。此 null space 正是只监督一个 CFG-composed target
+无法保证其他 inference scale 的原因；Flow-Factory 的 branch-aware PDM 文档
+对此给出了 positive--direction matching 的处理方式。
+
+\section{Multi-teacher reward residual}
+
+\subsection{先形成 MoF teacher，再以 base 为锚}
+
+对每个 branch $b\in\{\pos,\negbranch\}$，定义
+\begin{equation}
+  \vfield_{\MoF}^{b}
+  :=
+  \sum_{k=1}^{K}\lambda_k\,\vfield_k^{b}.
+  \label{eq:mof-branches}
+\end{equation}
+若 positive/negative 两个 branch 共用同一组 $\lambda_k$，则 composite teacher
+的 conditional direction 为
+\begin{equation}
+  \bm d_{\MoF}
+  =
+  \vfield_{\MoF}^{\pos}-\vfield_{\MoF}^{\negbranch}
+  =
+  \sum_{k=1}^{K}\lambda_k\bm d_k.
+  \label{eq:mof-direction}
+\end{equation}
+Base-anchored MoF reward residual 为
+\begin{equation}
+\boxed{
+  \vfield_{\alpha,\lambda}
+  =
+  (1-\alpha)\vfield_\student
+  +\alpha\sum_{k=1}^{K}\lambda_k\vfield_k.
+}
+\label{eq:outer-mof-residual}
+\end{equation}
+在 $\sum_k\lambda_k=1$ 时，总系数恒满足
+\begin{equation}
+  (1-\alpha)+\sum_k\alpha\lambda_k=1.
+  \label{eq:outer-sum-one}
+\end{equation}
+
+\begin{proposition}[系数区域]
+对 \eqref{eq:outer-mof-residual}：
+\begin{enumerate}[leftmargin=1.6em]
+  \item 若 $\lambda\in\Delta^{K-1}$ 且 $\alpha\in[0,1]$，则
+  $(1-\alpha,\alpha\lambda_1,\ldots,\alpha\lambda_K)$ 位于
+  $\{\student,\teacher_1,\ldots,\teacher_K\}$ 的凸包；
+  \item 若 $\lambda\in\Delta^{K-1}$ 且 $\alpha\notin[0,1]$，则沿
+  $\student\leftrightarrow\vfield_{\MoF}$ 直线做外推；
+  \item 若 $\sum_k\lambda_k=1$ 但允许负权重，则整体仍是 affine combination，
+  可以沿多个 teacher residual 方向离开凸包；
+  \item 若 $\sum_k\lambda_k\neq1$，总系数为
+  $1+\alpha(\sum_k\lambda_k-1)$，不再保持 affine constraint；field magnitude
+  可整体漂移，同时失去 affine 几何解释与对共同 field offset 的平移等变性。
+  只有当合成 field 恰为某个参考 field 的纯时间标量倍数时，才可进一步解释为
+  time reparameterization。
+\end{enumerate}
+\end{proposition}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[scale=1.05]
+  \coordinate (S) at (0,0);
+  \coordinate (T1) at (5,0);
+  \coordinate (T2) at (1.5,3.7);
+  \fill[studentblue!9] (S)--(T1)--(T2)--cycle;
+  \draw[thick,black!55] (S)--(T1)--(T2)--cycle;
+  \fill[studentblue] (S) circle (3pt) node[below left] {$\vfield_\student$};
+  \fill[teacherred] (T1) circle (3pt) node[below right] {$\vfield_1$};
+  \fill[teacherred] (T2) circle (3pt) node[above] {$\vfield_2$};
+  \coordinate (M) at ($(T1)!0.42!(T2)$);
+  \fill[softorange] (M) circle (3pt)
+    node[right=3pt] {$\vfield_{\MoF}=\lambda_1\vfield_1+\lambda_2\vfield_2$};
+  \coordinate (A) at ($(S)!0.62!(M)$);
+  \fill[guidancegreen] (A) circle (3pt)
+    node[below right=2pt] {$0<\alpha<1$};
+  \draw[flowarrow,guidancegreen] (S)--($(S)!1.48!(M)$);
+  \node[align=center,font=\footnotesize] at (3.35,3.55)
+    {越过 MoF teacher：\\$\alpha>1$};
+  \draw[flowarrow,dashed,teacherred] (S)--(-1.25,-0.7)
+    node[left,font=\footnotesize] {$\alpha<0$};
+  \node[font=\small,align=center] at (2.0,1.15)
+    {convex region\\$\lambda\in\Delta,\ \alpha\in[0,1]$};
+  \draw[flowarrow,dashed,softorange] (M)--($(M)!1.55!(T1)$);
+  \draw[flowarrow,dashed,softorange] (M)--($(M)!1.45!(T2)$);
+  \node[font=\footnotesize,align=center] at (5.55,2.75)
+    {affine teacher\\weights 可离开边};
+\end{tikzpicture}
+\caption{两个 RL teacher 与 base anchor 的几何区域。Softmax MoF 位于 teacher
+边上；外层 $\alpha$ 决定从 base 朝该点插值或外推。Affine teacher 权重还能沿
+teacher 边方向继续外推。}
+\label{fig:multi-simplex}
+\end{figure}
+
+\subsection{多个独立 reward residual 直接叠加}
+
+若每个 teacher $k$ 都从同一 base $\student$ 独立 RL 得到，可以直接写
+\begin{equation}
+  \vfield_{\bm\beta}
+  =
+  \vfield_\student
+  +\sum_{k=1}^{K}\beta_k
+  (\vfield_k-\vfield_\student)
+  =
+  \left(1-\sum_k\beta_k\right)\vfield_\student
+  +\sum_k\beta_k\vfield_k.
+  \label{eq:direct-residual-sum}
+\end{equation}
+令 $a=\sum_k\beta_k$。当 $a\neq0$ 时，取
+\begin{equation}
+  \alpha=a,\qquad \lambda_k=\frac{\beta_k}{a},
+  \label{eq:beta-to-alpha-lambda}
+\end{equation}
+即可把 \eqref{eq:direct-residual-sum} 写成
+\eqref{eq:outer-mof-residual}。因此在 $\sum_k\beta_k\neq0$ 的区域，两种写法
+代数等价，但参数语义不同：
+\begin{itemize}[leftmargin=1.6em]
+  \item outer-MoF 写法把``teacher 内部 trade-off'' $\lambda$ 与``离 base 多远''
+  $\alpha$ 分离；
+  \item direct residual 写法让每个 reward direction 拥有独立 strength $\beta_k$；
+  \item 若 $\beta_k$ 有正有负，则归一化后的 $\lambda_k$ 一般不在概率单纯形内，
+  所以这属于 affine preference composition，而不是 convex MoF。
+\end{itemize}
+若 $\sum_k\beta_k=0$ 但 $\bm\beta\neq\bm0$，
+\eqref{eq:direct-residual-sum} 表示 teacher 之间的非零 zero-sum affine direction；
+outer-MoF 参数化要求 $\alpha=0$ 才能保持 student 系数为 $1$，继而无法保留这些
+teacher 项。因此这是 \eqref{eq:outer-mof-residual} 的退化盲区；当系数依赖
+$(x,t,c)$ 时，式~\eqref{eq:beta-to-alpha-lambda} 还会在 $a=0$ 的状态产生奇点。
+
+\subsection{Multi-teacher 的 CFG 顺序}
+
+先允许 student scale 为 $\gamma_\student$，第 $k$ 个 teacher scale 为
+$\gamma_k$。``先 CFG 后 RRG''为
+\begin{equation}
+  \vfield_{\mathrm A}^{(K)}
+  =
+  (1-\alpha)\C_{\gamma_\student}[\student]
+  +\alpha\sum_{k=1}^{K}\lambda_k\C_{\gamma_k}[\teacher_k].
+  \label{eq:multi-order-a}
+\end{equation}
+若所有 branch 共用同一 $\lambda$，先按 branch 做 \eqref{eq:mof-branches} 与
+\eqref{eq:outer-mof-residual}，再用单一 $\gamma_{\mathrm R}$ 做 CFG，得到
+\begin{equation}
+  \vfield_{\mathrm B}^{(K)}
+  =
+  (1-\alpha)\C_{\gamma_{\mathrm R}}[\student]
+  +\alpha\sum_{k=1}^{K}\lambda_k\C_{\gamma_{\mathrm R}}[\teacher_k].
+  \label{eq:multi-order-b}
+\end{equation}
+
+\begin{theorem}[Multi-teacher CFG--RRG 交换子]
+\begin{equation}
+\boxed{
+  \vfield_{\mathrm A}^{(K)}-\vfield_{\mathrm B}^{(K)}
+  =
+  (1-\alpha)(\gamma_\student-\gamma_{\mathrm R})\bm d_\student
+  +
+  \alpha\sum_{k=1}^{K}
+  \lambda_k(\gamma_k-\gamma_{\mathrm R})\bm d_k.
+}
+\label{eq:multi-commutator}
+\end{equation}
+\end{theorem}
+
+特别地，若 $\gamma_\student=\gamma_1=\cdots=\gamma_K=\gamma_{\mathrm R}$，
+则 CFG 与 MoF、外层 reward residual 都严格交换。这个结果不要求
+$\lambda_k\ge0$，甚至不要求 $\sum_k\lambda_k=1$；它只使用线性性。
+权重约束影响概率/几何解释，不影响该代数恒等式。
+
+\subsection{Positive/negative 使用不同 router}
+
+若两个 branch 使用不同权重 $\lambda_k^\pos,\lambda_k^\negbranch$，则
+\begin{align}
+  \vfield_{\MoF}^\pos
+  &=
+  \sum_k\lambda_k^\pos\vfield_k^\pos,
+  &
+  \vfield_{\MoF}^\negbranch
+  &=
+  \sum_k\lambda_k^\negbranch\vfield_k^\negbranch,
+  \label{eq:branch-dependent-router}\\
+  \bm d_{\MoF}
+  &=
+  \sum_k\lambda_k^\pos\bm d_k
+  +
+  \sum_k(\lambda_k^\pos-\lambda_k^\negbranch)
+  \vfield_k^\negbranch.
+  \label{eq:routing-shift}
+\end{align}
+第二项是\emph{routing shift}。此时后置 CFG 放大的不仅是每个 teacher 的
+conditional direction，还包括 positive/negative router 改变 teacher composition
+所产生的差异。把它误写成 $\sum_k\lambda_k\bm d_k$ 会漏项。
+
+\begin{proposition}[Branch-dependent router 的广义交换子]
+明确采用如下``先 CFG 后 route''约定：
+\begin{equation}
+  \widetilde{\vfield}_{\mathrm A}^{(K)}
+  :=
+  (1-\alpha)\C_{\gamma_\student}[\student]
+  +\alpha\sum_k\lambda_k^\pos\C_{\gamma_k}[\teacher_k],
+  \label{eq:branch-router-order-a}
+\end{equation}
+即 composed teacher 使用 positive router；而后置 CFG 路径先以
+\eqref{eq:branch-dependent-router} 构造两个 branch，再施加
+$\C_{\gamma_{\mathrm R}}$。两条路径之差为
+\begin{equation}
+\boxed{
+\begin{aligned}
+  \widetilde{\vfield}_{\mathrm A}^{(K)}
+  -\widetilde{\vfield}_{\mathrm B}^{(K)}
+  ={}&
+  (1-\alpha)(\gamma_\student-\gamma_{\mathrm R})\bm d_\student\\
+  &+\alpha\sum_k
+  \lambda_k^\pos(\gamma_k-\gamma_{\mathrm R})\bm d_k\\
+  &-\alpha(\gamma_{\mathrm R}-1)
+  \sum_k(\lambda_k^\pos-\lambda_k^\negbranch)\vfield_k^\negbranch.
+\end{aligned}
+}
+\label{eq:branch-router-commutator}
+\end{equation}
+\end{proposition}
+
+最后一行是 router commutator。即使所有 CFG scale 相同，只要
+$\lambda^\pos\neq\lambda^\negbranch$ 且 $\gamma_{\mathrm R}\neq1$，两种顺序通常仍
+不交换。令 $\lambda^\pos=\lambda^\negbranch$ 即恢复
+式~\eqref{eq:multi-commutator}。
+
+当前 Flow-Factory MoF router 由 timestep、source 与 prompt representation
+产生一组 shared teacher weights，然后组合 adapter 已经返回的 prediction；
+它不是显式的 dual-branch router。因此只要所有 teacher forward 使用相同
+guidance scale，当前路径落在交换律成立的 shared-$\lambda$ 情形。若未来暴露原始
+branches 并让 router 读取 negative conditioning，则必须明确采用 shared router
+还是 branch-dependent router。
+
+\section{理论解释的边界}
+
+\subsection{Score 层：指数倾斜下的严格结论}
+
+假设 endpoint RL distribution 真正满足 KL-regularized exponential tilt：
+\begin{equation}
+  p_\teacher(x)
+  =
+  \frac{1}{Z_\beta}
+  p_\student(x)e^{\beta R(x)},
+  \qquad
+  0<Z_\beta<\infty.
+  \label{eq:endpoint-tilt}
+\end{equation}
+则 endpoint score 严格满足
+\begin{equation}
+  \score_\teacher(x)-\score_\student(x)
+  =
+  \beta\nabla_x R(x).
+  \label{eq:endpoint-score-residual}
+\end{equation}
+因此 score residual
+\begin{equation}
+  \score_\alpha
+  =
+  (1-\alpha)\score_\student+\alpha\score_\teacher
+  \label{eq:score-interpolation}
+\end{equation}
+是密度
+\begin{equation}
+  p_\alpha(x)
+  \propto
+  p_\student(x)^{1-\alpha}p_\teacher(x)^\alpha
+  \propto
+  p_\student(x)e^{\alpha\beta R(x)}
+  \label{eq:score-geometric-density}
+\end{equation}
+的 score，前提是新的 normalizer 有限。这个结论是 reward residual 与 CFG
+概率类比最严格的部分。
+
+\subsection{Noisy marginal：不是直接的 \texorpdfstring{$\nabla R(x_t)$}{grad R}}
+
+若 base 与 RL endpoint 经相同 forward noising kernel $q_t(x_t\mid x_0)$，
+则
+\begin{equation}
+  p_{\teacher,t}(x_t)
+  =
+  \frac{p_{\student,t}(x_t)}{Z_\beta}
+  \E_{\student}\!\left[
+    e^{\beta R(X_0)}\mid X_t=x_t
+  \right].
+  \label{eq:noisy-tilt}
+\end{equation}
+记
+\begin{equation}
+  h_t(x_t)
+  :=
+  \E_{\student}\!\left[
+    e^{\beta R(X_0)}\mid X_t=x_t
+  \right],
+  \label{eq:soft-value}
+\end{equation}
+则
+\begin{equation}
+  \score_{\teacher,t}-\score_{\student,t}
+  =
+  \nabla_{x_t}\log h_t(x_t),
+  \label{eq:noisy-score-residual}
+\end{equation}
+而不是一般意义下的 $\beta\nabla_{x_t}R(x_t)$。小 $\beta$ 时，
+$\log h_t=\beta\E[R(X_0)\mid X_t]+\mathcal O(\beta^2)$，所以 residual
+更接近 denoising posterior 上的 soft reward-to-go gradient。
+
+\subsection{Velocity 层：形式同构不等于分布等价}
+
+一般 flow-matching velocity 只满足连续性方程
+\begin{equation}
+  \partial_t p_t+\nabla\cdot(p_t\vfield_t)=0.
+  \label{eq:continuity}
+\end{equation}
+局部的 $\vfield_t(x)$ 不是 $\nabla\log p_t(x)$；endpoint tilt 也不唯一决定
+整条 probability path。因此
+\begin{equation}
+  \vfield_\teacher-\vfield_\student
+  \stackrel{\text{一般情形}}{\neq}
+  \beta\nabla R.
+  \label{eq:not-general-reward-gradient}
+\end{equation}
+Velocity residual 可获得\emph{局部}严格概率解释的常见条件包括：
+\begin{enumerate}[leftmargin=1.6em]
+  \item student/teacher 共享 diffusion schedule，且 probability-flow velocity
+  是 score 的同一个 affine-linear map；此时 score residual 到 velocity residual
+  的映射在每个 $(x,t)$ 上严格成立；
+  \item 单步 stochastic transition 是共享协方差高斯，velocity 到 transition
+  mean 的映射相同，此时 mean residual 对应精确的单步 conditional
+  log-density-ratio tilt；
+  \item 明确把 \eqref{eq:rrg-basic} 仅定义为一个新的 ODE control field，
+  不宣称它精确实现 endpoint exponential tilt。
+\end{enumerate}
+前两项仍不足以自动保证
+$p_{\student,t}^{1-\alpha}p_{\teacher,t}^{\alpha}$ 在所有 $t$ 上构成同一条
+Fokker--Planck/continuity-equation path。完整 density-path 等价还要求额外的
+path-consistency 条件，或加入相应 dynamic/Doob corrector。
+
+\begin{tcolorbox}[
+  colback=yellow!5,
+  colframe=yellow!50!black,
+  title=推荐表述]
+``Reward residual 与线性双 branch CFG 在 velocity 输出空间具有相同的仿射算子
+结构；共享 score--velocity 映射或共享协方差 transition 可以给出严格的局部
+density-ratio 解释。完整 path-level KL tilt 还需独立的 path-consistency 条件；
+否则该算子仍定义了可测试的 inference-time control field，但不是 reward gradient
+或目标分布路径的严格恢复。''
+\end{tcolorbox}
+
+\subsection{精确 density mixture 需要 posterior responsibility}
+
+给定 teacher path densities $p_{k,t}$ 与其合法 velocities $\vfield_{k,t}$，
+若目标密度是
+\begin{equation}
+  p_{\mathrm mix,t}(x)
+  =
+  \sum_{k=1}^{K}\pi_k p_{k,t}(x),
+  \qquad
+  \pi_k\ge0,\quad\sum_k\pi_k=1,
+  \label{eq:density-mixture}
+\end{equation}
+则一个精确 mixture marginal velocity 是
+\begin{equation}
+\boxed{
+  \vfield_{\mathrm mix,t}(x)
+  =
+  \sum_{k=1}^{K}
+  r_k(x,t)\vfield_{k,t}(x),
+  \qquad
+  r_k(x,t)
+  =
+  \frac{\pi_kp_{k,t}(x)}
+       {\sum_j\pi_jp_{j,t}(x)}.
+}
+\label{eq:posterior-responsibility}
+\end{equation}
+这里 $r_k$ 是 state-dependent posterior responsibility，而不是固定 prior
+$\pi_k$。因此``连续性方程对 velocity 线性''不能单独证明任意常数
+$\lambda_k$ 的 teacher velocity 平均等于 density mixture flow；不同 teacher
+通常携带不同 $p_{k,t}$。
+
+另一方面，只要 $\sum_k\lambda_k\vfield_k$ 足够正则，它仍然定义一个可积分 ODE，
+并从共同初始噪声诱导\emph{某个}分布。正确区分是：
+\begin{align}
+  \text{regular field}
+  &\Longrightarrow \text{可采样的 ODE},\nonumber\\
+  \text{posterior-responsibility field}
+  &\Longrightarrow \text{指定 density mixture 的精确 marginal flow}.
+  \label{eq:validity-distinction}
+\end{align}
+Flow-Factory 当前 MoF 的 time/source/prompt router 一般不读取 latent state $x_t$，
+所以它应被描述为 learnable composite field；除非额外证明其权重等于
+\eqref{eq:posterior-responsibility}，不应自动称为 teacher density mixture。
+
+\section{实现映射与推理协议}
+
+\subsection{当前代码对应关系}
+
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}
+  >{\raggedright\arraybackslash}p{0.28\textwidth}
+  >{\raggedright\arraybackslash}p{0.29\textwidth}
+  >{\raggedright\arraybackslash}p{0.35\textwidth}
+@{}}
+\toprule
+理论对象 & 当前实现 & 含义/限制 \\
+\midrule
+$\sum_k\lambda_k\vfield_k$ &
+\path{trainers/mof/common.py} &
+逐 teacher weight swap、stack 后在 velocity 输出空间求和；teacher
+forward 共享传入的 CFG kwargs。\\
+\addlinespace
+softmax/affine/free 区域 &
+\path{trainers/mof/utils.py} &
+\path{apply_weight_normalization} 分别对应
+\eqref{eq:softmax-region}--\eqref{eq:free-region}。\\
+\addlinespace
+MoF target 蒸馏 &
+\path{trainers/mof/distill.py} &
+先缓存 teacher mixture，再以 student on-policy states 做 velocity MSE。\\
+\addlinespace
+$\C_\gamma[M]$ &
+\path{models/stable_diffusion/sd3_5.py} 与部分显式双 branch adapter &
+存在 negative embeddings 且 $\gamma>1$ 时运行两 branch，再返回 composed
+prediction；通常不暴露原始 branches。\\
+\addlinespace
+其他 guidance 语义 &
+\path{models/z_image/z_image.py}；\path{models/flux/} &
+Z-Image 需用 $\gamma=1+g$ 换元且关闭 nonlinear normalization；
+FLUX.1/2 guidance 是模型输入，无显式 CFG branch。\\
+\addlinespace
+branch 不可辨识性 &
+\path{docs/xopd/core/cfg/}\\
+\path{branch_aware_cfg_distillation.md} &
+PDM 用 positive prediction 与 conditional direction 分别监督；当前文档明确
+不自动改变 MoF。\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{最低成本的推理消融}
+
+对 single-teacher，建议使用 matched seed、相同 scheduler、相同 latent state，
+扫以下最小集合：
+\begin{equation}
+  \alpha\in\{0,0.5,1,1.5,2\},
+  \qquad
+  (\gamma_\student,\gamma_\teacher)
+  \in\{(1,1),(\gamma,1),(1,\gamma),(\gamma,\gamma)\}.
+  \label{eq:minimal-sweep}
+\end{equation}
+每个点同时记录：
+\begin{align}
+  &\mathrm{RMS}(\vfield_\teacher^\pos-\vfield_\student^\pos),\qquad
+  \mathrm{RMS}(\bm d_\student),\qquad
+  \mathrm{RMS}(\bm d_\teacher),\nonumber\\
+  &\mathrm{cos}(\vfield_\teacher^\pos-\vfield_\student^\pos,\bm d_\student),
+  \qquad
+  \mathrm{cos}(\vfield_\teacher^\pos-\vfield_\student^\pos,\bm d_\teacher).
+  \label{eq:diagnostics}
+\end{align}
+这些量可以区分 reward residual 与 CFG direction 是协同、正交还是冲突。
+
+对 multi-teacher，先固定 shared $\gamma$ 验证交换律，再逐项引入
+teacher-specific $\gamma_k$。否则 reward routing、CFG scale 与 outer
+$\alpha$ 三者同时变化，无法归因。
+
+\subsection{安全与数值约束}
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item 所有模型必须使用同一 latent coordinate、prediction parameterization、
+  scheduler time convention 与 tensor scaling 后才能直接相减；
+  \item teacher weight swap 循环必须遵守现有 autocast-cache disable 与
+  inference-mode DDP bypass 约束；
+  \item residual subtraction 建议以 fp32 完成，并监控 per-timestep RMS；
+  \item $\alpha>1$ 与 $\gamma>1$ 同时使用时，优先约束有效系数
+  \eqref{eq:effective-cfg-coeff}，而不是分别给两个看似温和的上界；
+  \item free teacher weights 的 $\sum_k\lambda_k$ 漂移与 outer $\alpha$
+  会相乘，应显式记录总 field coefficient
+  $1+\alpha(\sum_k\lambda_k-1)$；
+  \item 任何``严格 reward gradient''声明都应说明采用的是 score、shared-covariance
+  transition mean，还是仅作为 ODE field heuristic。
+\end{enumerate}
+
+\section{结论}
+
+Reward-residual guidance 与 CFG 的共同核心是
+\begin{equation}
+  \text{anchor}+\text{scale}\times\text{direction}.
+  \label{eq:shared-template}
+\end{equation}
+这个共同模板带来一组简单但有约束的结论：
+\begin{enumerate}[leftmargin=1.6em]
+  \item Single-teacher 四种 CFG 组合由
+  \eqref{eq:four-unified} 统一；差别仅是
+  $\bm d_\student,\bm d_\teacher$ 的有效系数；
+  \item 同一 scale、shared branches 与同一 residual strength 下，CFG 与
+  branch-wise reward residual 严格交换；
+  \item student/teacher scale 不同时，交换误差由
+  \eqref{eq:single-commutator} 精确给出；multi-teacher 情形由
+  \eqref{eq:multi-commutator} 给出；
+  \item 数学上的 $\gamma=1$ 不代表 negative branch 已被计算；后置 CFG
+  需要原始 branch pair，不能从单个 composed output 唯一恢复；
+  \item 当 $\sum_k\beta_k\neq0$ 时，Multi-teacher 的 outer-MoF 与 direct
+  residual sum 可以互换参数化；非零 zero-sum residual 是 outer-MoF 的退化盲区；
+  \item Score exponential tilt 提供严格概率解释；一般 flow velocity arithmetic
+  只提供一个新的 control field，除非额外满足 shared-path 条件；
+  \item 精确 teacher density mixture 需要 state-dependent posterior responsibility，
+  不能由任意固定凸权重的 velocity 平均自动推出。
+\end{enumerate}
+
+因此，最稳健的研究顺序是：先把 \eqref{eq:rrg-basic} 作为 zero-training
+inference oracle，使用 shared CFG scale 验证 residual 是否改善 reward--quality
+Pareto frontier；再测试不同 student/teacher CFG 组合；最后才引入
+multi-teacher routing 与 affine extrapolation。这样每一步都对应本文中的一个
+可验证算子，而不会把 CFG、reward residual 与 teacher routing 的效应混在一起。
+
+\begin{thebibliography}{9}
+
+\bibitem{cfg}
+Jonathan Ho and Tim Salimans.
+\newblock Classifier-Free Diffusion Guidance.
+\newblock \emph{NeurIPS 2021 Workshop on Deep Generative Models and Downstream
+Applications}, 2021.
+\newblock \url{https://arxiv.org/abs/2207.12598}.
+
+\bibitem{flowmatching}
+Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le.
+\newblock Flow Matching for Generative Modeling.
+\newblock \emph{International Conference on Learning Representations}, 2023.
+\newblock \url{https://arxiv.org/abs/2210.02747}.
+
+\bibitem{diffusionopd}
+Quanhao Li, Junqiu Yu, Kaixun Jiang, et al.
+\newblock DiffusionOPD: A Unified Perspective of On-Policy Distillation in
+Diffusion Models.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2605.15055}.
+
+\bibitem{pdm}
+Rethinking Classifier-Free Guidance in On-Policy Diffusion Distillation.
+\newblock 2026.
+\newblock \url{https://arxiv.org/abs/2607.24731}.
+
+\end{thebibliography}
+
+\end{document}
