@@ -1,0 +1,125 @@
+# One-pass continuous GenEval reward-residual control distillation.
+
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "dataset/geneval"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+model:
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  finetune_type: "lora"
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  lora_modules_to_save: ["control_embedder"]
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "reward_control_distill_sd35_geneval"
+  project: "Flow-Factory-Reward-Guidance"
+  logging_backend: "wandb"
+  save_dir: "saves/reward_control_distill_sd35_geneval"
+  save_freq: 10
+  save_model_only: false
+
+train:
+  trainer_type: "reward-guidance-distill"
+  teachers:
+    - name: "geneval"
+      path: "Jayce-Ping/GenEval-Teacher"
+      sources: null
+      reward_name: "geneval"
+      guidance_scale: 4.5
+  teacher_param_device: "cuda"
+  reward_control_names: ["geneval"]
+  control_ranges:
+    geneval: [-0.5, 2.0]
+  target_guidance_scale: 4.5
+  control_fourier_dim: 256
+  control_hidden_dim: 512
+  control_input_scale: 1000.0
+  control_sampling_probabilities:
+    anchor: 0.10
+    axis: 0.50
+    sparse_joint: 0.10
+    dense_joint: 0.30
+  distill_loss: "pseudo_huber"
+  pseudo_huber_delta: 0.01
+  timestep_weighting: "dt_squared"
+  eval_baselines_at_start: true
+  eval_control_vectors:
+    reverse: [-0.5]
+    teacher: [1.0]
+    extrapolate: [2.0]
+
+  learning_rate: 1.0e-4
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 200
+  seed: 42
+
+  ema_decay: 0.999
+  ema_update_interval: 1
+  ema_device: "cuda"
+  offload_samples_to_cpu: true
+
+  resolution: 1024
+  guidance_scale: 1.0
+  num_inference_steps: 50
+  enable_gradient_checkpointing: true
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  seed: 42
+
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  guidance_scale: 1.0
+  num_inference_steps: 50
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: "dataset/geneval"
+      split: "test"
+      eval_reward_names: ["geneval", "pick_score"]
+
+rewards: []
+
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: ["geneval"]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+

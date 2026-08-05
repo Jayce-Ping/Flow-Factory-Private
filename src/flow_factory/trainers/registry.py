@@ -37,6 +37,10 @@ _TRAINER_REGISTRY: Dict[str, str] = {
     "mof-dmin": "flow_factory.trainers.mof.dmin.MoFDMinTrainer",
     "mof-klmin": "flow_factory.trainers.mof.klmin.MoFKLMinTrainer",
     "mof-distill": "flow_factory.trainers.mof.distill.MoFDistillTrainer",
+    "reward-guidance-distill": (
+        "flow_factory.trainers.reward_guidance.distill."
+        "RewardGuidanceDistillTrainer"
+    ),
     "awm": "flow_factory.trainers.awm.AWMTrainer",
     "dgpo": "flow_factory.trainers.dgpo.DGPOTrainer",
     "dpo": "flow_factory.trainers.dpo.DPOTrainer",

@@ -74,6 +74,16 @@ class ModelArguments(ArgABC):
         default='all',
         metadata={"help": "Which layers to fine-tune. Options are like ['all',  'default', 'to_q', ['to_q', 'to_k', 'to_v']]"}
     )
+    lora_modules_to_save: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Additional full modules persisted inside a PEFT LoRA checkpoint. "
+                "Used by architecture extensions such as SD3.5 reward-control "
+                "conditioning. None keeps standard LoRA-only behavior."
+            )
+        },
+    )
 
     model_type: Literal["sd3", "sd3-5", "flux1", "flux1-kontext", 'flux2', 'flux2-klein', 'qwenimage', 'qwenimage-edit', 'z-image'] = field(
         default="flux1",
@@ -438,6 +448,25 @@ class ModelArguments(ArgABC):
         if isinstance(self.target_modules, str):
             if self.target_modules not in ['all', 'default']:
                 self.target_modules = [self.target_modules]
+
+        if self.lora_modules_to_save is not None:
+            if isinstance(self.lora_modules_to_save, str):
+                self.lora_modules_to_save = [self.lora_modules_to_save]
+            if not isinstance(self.lora_modules_to_save, list) or not all(
+                isinstance(name, str) and name
+                for name in self.lora_modules_to_save
+            ):
+                raise TypeError(
+                    "expected lora_modules_to_save to be null or a list of "
+                    f"non-empty strings, got {self.lora_modules_to_save!r}."
+                )
+            if len(set(self.lora_modules_to_save)) != len(
+                self.lora_modules_to_save
+            ):
+                raise ValueError(
+                    "expected unique lora_modules_to_save entries, got "
+                    f"{self.lora_modules_to_save!r}."
+                )
 
         if self.lora_alpha is None:
             self.lora_alpha = 2 * self.lora_rank

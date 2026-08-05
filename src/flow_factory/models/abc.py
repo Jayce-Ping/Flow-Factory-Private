@@ -940,6 +940,7 @@ class BaseAdapter(ABC):
                 lora_alpha=self.model_args.lora_alpha,
                 init_lora_weights="gaussian",
                 target_modules=modules,
+                modules_to_save=self.model_args.lora_modules_to_save,
             )
 
             model_component = self.get_component(comp)
@@ -980,6 +981,7 @@ class BaseAdapter(ABC):
                     lora_alpha=self.model_args.lora_alpha,
                     init_lora_weights="gaussian",
                     target_modules=modules,
+                    modules_to_save=self.model_args.lora_modules_to_save,
                 )
                 model_component = get_peft_model(model_component, lora_config)
                 # Set back to attribute

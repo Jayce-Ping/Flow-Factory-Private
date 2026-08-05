@@ -3972,6 +3972,311 @@ class MoFDistillTrainingArguments(TrainingArguments):
 
 
 @dataclass
+class RewardGuidanceDistillTrainingArguments(TrainingArguments):
+    r"""Continuous N-teacher reward-residual guidance distillation."""
+
+    teachers: Optional[List[Any]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Ordered LoRA teachers. Each entry requires a unique name and "
+                "path; order defines the reward-control axis."
+            )
+        },
+    )
+    teacher_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={"help": "Storage device for frozen teacher LoRA snapshots."},
+    )
+    reward_control_names: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Ordered control names. None derives them from teachers; an "
+                "explicit value must exactly match teacher order."
+            )
+        },
+    )
+    control_ranges: Dict[str, List[float]] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Per-control inclusive [minimum, maximum] sampling ranges."
+        },
+    )
+    target_guidance_scale: float = field(
+        default=4.5,
+        metadata={
+            "help": "Shared explicit CFG scale used by base and all teachers."
+        },
+    )
+    control_fourier_dim: int = field(
+        default=256,
+        metadata={"help": "Fourier feature dimension for each scalar control."},
+    )
+    control_hidden_dim: int = field(
+        default=512,
+        metadata={"help": "Hidden size of each control MLP."},
+    )
+    control_input_scale: float = field(
+        default=1000.0,
+        metadata={"help": "Scale applied before sinusoidal control encoding."},
+    )
+    control_sampling_probabilities: Dict[str, float] = field(
+        default_factory=lambda: {
+            "anchor": 0.1,
+            "axis": 0.35,
+            "sparse_joint": 0.25,
+            "dense_joint": 0.3,
+        },
+        metadata={
+            "help": (
+                "Probability mass for anchor/axis/sparse_joint/dense_joint "
+                "control strata."
+            )
+        },
+    )
+    distill_loss: Literal["pseudo_huber", "mse"] = field(
+        default="pseudo_huber",
+        metadata={"help": "Velocity regression loss."},
+    )
+    pseudo_huber_delta: float = field(
+        default=0.01,
+        metadata={"help": "Positive pseudo-Huber transition scale."},
+    )
+    timestep_weighting: Literal["none", "dt_squared"] = field(
+        default="dt_squared",
+        metadata={"help": "Optional local Euler transition-error weighting."},
+    )
+    eval_baselines_at_start: bool = field(
+        default=True,
+        metadata={"help": "Evaluate explicit oracle baselines before training."},
+    )
+    eval_velocity_diagnostics: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Evaluate pointwise student/oracle velocity error on the "
+                "student trajectory for every configured control probe."
+            )
+        },
+    )
+    source_ratio: Optional[Dict[str, float]] = field(
+        default=None,
+        metadata={"help": "Optional multi-source round-robin sampling ratio."},
+    )
+    eval_control_vectors: Dict[str, List[float]] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Named control vectors evaluated by the one-pass student."
+        },
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.teachers:
+            raise ValueError(
+                "reward-guidance-distill requires a non-empty `teachers` list."
+            )
+        parsed: List[TeacherConfig] = []
+        for index, teacher in enumerate(self.teachers):
+            if isinstance(teacher, TeacherConfig):
+                parsed_teacher = teacher
+            elif isinstance(teacher, dict):
+                parsed_teacher = TeacherConfig.from_dict(teacher)
+            else:
+                raise TypeError(
+                    f"expected teachers[{index}] to be dict or TeacherConfig, "
+                    f"got {type(teacher).__name__}: {teacher!r}."
+                )
+            if not parsed_teacher.name:
+                raise ValueError(
+                    f"expected non-empty teachers[{index}].name for stable "
+                    f"control semantics, got {parsed_teacher.name!r}."
+                )
+            parsed.append(parsed_teacher)
+        self.teachers = parsed
+
+        teacher_names = [teacher.name for teacher in parsed]
+        if len(set(teacher_names)) != len(teacher_names):
+            raise ValueError(
+                f"expected unique teacher names, got {teacher_names!r}."
+            )
+        if self.reward_control_names is None:
+            self.reward_control_names = list(teacher_names)
+        elif list(self.reward_control_names) != teacher_names:
+            raise ValueError(
+                "expected reward_control_names to exactly match teacher order, "
+                f"got controls={self.reward_control_names!r}, "
+                f"teachers={teacher_names!r}."
+            )
+
+        if set(self.control_ranges) != set(teacher_names):
+            raise ValueError(
+                "expected control_ranges keys to exactly match teacher names, "
+                f"got range_keys={sorted(self.control_ranges)!r}, "
+                f"teacher_names={teacher_names!r}."
+            )
+        normalized_ranges: Dict[str, List[float]] = {}
+        for name in teacher_names:
+            value = self.control_ranges[name]
+            if (
+                not isinstance(value, (list, tuple))
+                or len(value) != 2
+                or isinstance(value[0], bool)
+                or isinstance(value[1], bool)
+                or not isinstance(value[0], (int, float))
+                or not isinstance(value[1], (int, float))
+            ):
+                raise TypeError(
+                    f"expected control_ranges[{name!r}] as [finite_min, "
+                    f"finite_max], got {value!r}."
+                )
+            low, high = float(value[0]), float(value[1])
+            if not math.isfinite(low) or not math.isfinite(high):
+                raise ValueError(
+                    f"expected finite range for control={name!r}, got "
+                    f"[{low!r}, {high!r}]."
+                )
+            if low > 0.0 or high < 0.0 or low >= high:
+                raise ValueError(
+                    f"expected control range containing zero with low < high "
+                    f"for control={name!r}, got [{low}, {high}]."
+                )
+            normalized_ranges[name] = [low, high]
+        self.control_ranges = normalized_ranges
+
+        if (
+            isinstance(self.target_guidance_scale, bool)
+            or not isinstance(self.target_guidance_scale, (int, float))
+            or not math.isfinite(float(self.target_guidance_scale))
+            or float(self.target_guidance_scale) <= 1.0
+        ):
+            raise ValueError(
+                "expected finite target_guidance_scale > 1 for explicit CFG, "
+                f"got {self.target_guidance_scale!r}."
+            )
+        self.target_guidance_scale = float(self.target_guidance_scale)
+        for teacher in parsed:
+            if teacher.guidance_scale is not None and not math.isclose(
+                float(teacher.guidance_scale),
+                self.target_guidance_scale,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "reward-guidance-distill requires matched CFG for every "
+                    f"teacher; teacher={teacher.name!r} has guidance_scale="
+                    f"{teacher.guidance_scale!r}, expected "
+                    f"{self.target_guidance_scale!r}."
+                )
+        if not math.isclose(
+            float(self.guidance_scale), 1.0, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "expected train.guidance_scale=1.0 for one-pass student "
+                f"distillation, got {self.guidance_scale!r}."
+            )
+
+        expected_strata = {
+            "anchor",
+            "axis",
+            "sparse_joint",
+            "dense_joint",
+        }
+        if set(self.control_sampling_probabilities) != expected_strata:
+            raise ValueError(
+                "expected control_sampling_probabilities keys "
+                f"{sorted(expected_strata)!r}, got "
+                f"{sorted(self.control_sampling_probabilities)!r}."
+            )
+        probability_sum = 0.0
+        for name, probability in self.control_sampling_probabilities.items():
+            if (
+                isinstance(probability, bool)
+                or not isinstance(probability, (int, float))
+                or not math.isfinite(float(probability))
+                or float(probability) < 0.0
+            ):
+                raise ValueError(
+                    f"expected finite non-negative probability for stratum="
+                    f"{name!r}, got {probability!r}."
+                )
+            probability_sum += float(probability)
+        if not math.isclose(
+            probability_sum, 1.0, rel_tol=0.0, abs_tol=1e-6
+        ):
+            raise ValueError(
+                "expected control_sampling_probabilities to sum to 1, got "
+                f"sum={probability_sum}, values="
+                f"{self.control_sampling_probabilities!r}."
+            )
+
+        for field_name in ("control_fourier_dim", "control_hidden_dim"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"expected positive int for {field_name}, got "
+                    f"{type(value).__name__}: {value!r}."
+                )
+        if (
+            isinstance(self.control_input_scale, bool)
+            or not isinstance(self.control_input_scale, (int, float))
+            or not math.isfinite(float(self.control_input_scale))
+        ):
+            raise ValueError(
+                f"expected finite control_input_scale, got "
+                f"{self.control_input_scale!r}."
+            )
+        if (
+            isinstance(self.pseudo_huber_delta, bool)
+            or not isinstance(self.pseudo_huber_delta, (int, float))
+            or not math.isfinite(float(self.pseudo_huber_delta))
+            or float(self.pseudo_huber_delta) <= 0.0
+        ):
+            raise ValueError(
+                f"expected pseudo_huber_delta > 0, got "
+                f"{self.pseudo_huber_delta!r}."
+            )
+        for name, vector in self.eval_control_vectors.items():
+            if not isinstance(name, str) or not name:
+                raise TypeError(
+                    f"expected non-empty eval control vector name, got {name!r}."
+                )
+            if not isinstance(vector, (list, tuple)) or len(vector) != len(
+                teacher_names
+            ):
+                raise ValueError(
+                    f"expected eval_control_vectors[{name!r}] length="
+                    f"{len(teacher_names)}, got {vector!r}."
+                )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in vector
+            ):
+                raise ValueError(
+                    f"expected finite numeric eval vector for {name!r}, got "
+                    f"{vector!r}."
+                )
+            self.eval_control_vectors[name] = [
+                float(value) for value in vector
+            ]
+
+    def get_preprocess_guidance_scale(self) -> float:
+        """Cache negative prompt embeddings required by the oracle CFG."""
+        return self.target_guidance_scale
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        if args.scheduler_args.dynamics_type != "ODE":
+            raise ValueError(
+                "reward-guidance-distill v1 requires scheduler.dynamics_type="
+                f"'ODE', got {args.scheduler_args.dynamics_type!r}."
+            )
+        return self.num_inference_steps
+
+
+@dataclass
 class DiffusionOPDTrainingArguments(TrainingArguments):
     r"""Training arguments for multi-task DiffusionOPD (Algorithm 1).
 
@@ -4466,6 +4771,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "mof-dmin": MoFDMinTrainingArguments,
     "mof-klmin": MoFKLMinTrainingArguments,
     "mof-distill": MoFDistillTrainingArguments,
+    "reward-guidance-distill": RewardGuidanceDistillTrainingArguments,
     "awm": AWMTrainingArguments,
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,

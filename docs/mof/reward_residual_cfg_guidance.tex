@@ -1101,6 +1101,101 @@ $\alpha$ 三者同时变化，无法归因。
   transition mean，还是仅作为 ODE field heuristic。
 \end{enumerate}
 
+\section{Reward residual 控制强度蒸馏}
+\label{sec:reward-control-distillation}
+
+前述 zero-training oracle 还可以作为连续控制模型的监督信号。给定有序的
+$K$ 个 RL LoRA teacher 与控制向量
+$\bm\beta=(\beta_1,\ldots,\beta_K)$，定义 matched-CFG oracle
+\begin{equation}
+  \vfield^\star(x,t,c,\bm\beta)
+  =
+  \C_{\gamma}[\student](x,t,c)
+  +
+  \sum_{k=1}^{K}\beta_k
+  \left(
+    \C_{\gamma}[\teacher_k](x,t,c)
+    -
+    \C_{\gamma}[\student](x,t,c)
+  \right).
+  \label{eq:reward-control-oracle}
+\end{equation}
+式~\eqref{eq:reward-control-oracle} 对 base 与所有 teacher 强制使用同一
+$\gamma$。由定理~\ref{eq:multi-commutator}，这正是 CFG 与 direct residual
+composition 交换的 shared-branch 情形。首版实现固定 $\gamma=4.5$，而 student
+部署时使用外部 $\gamma_{\mathrm{student}}=1$；因此 student 的一次 forward
+直接预测已经完成 CFG 与 reward-residual composition 的场。
+
+\subsection{连续控制条件}
+
+令 $\Phi$ 为 Fourier feature map，并为每个有序 teacher 配置独立 MLP
+$E_k$。SD3.5 的 timestep--text embedding 扩展为
+\begin{equation}
+  \bm e_{\bm\beta}
+  =
+  \bm e_{t,c}
+  +
+  \sum_{k=1}^{K}
+  \left[
+    E_k(\Phi(\beta_k))-E_k(\Phi(0))
+  \right].
+  \label{eq:reward-control-temb}
+\end{equation}
+减去 $E_k(\Phi(0))$ 使每个控制支路在原点对任意参数都严格为零；
+输出投影再采用 zero initialization。这样新增控制路径在初始化时不改变 stock
+SD3.5 的 timestep/text conditioning，同时现有 AdaLN-Zero 层会自然消费
+$\bm e_{\bm\beta}$。训练时冻结 base，仅更新 control embedders 与 LoRA。
+
+\subsection{Guided-trajectory distillation}
+
+普通 forward noising 的状态分布与 guided reverse process 实际访问的状态分布
+不同。参考 guided distillation~\cite{guideddistill} 与
+Adapter Guidance Distillation (AGD)~\cite{agd}，训练轨迹直接由
+\eqref{eq:reward-control-oracle} 推进：
+\begin{equation}
+  x_{i+1}
+  =
+  \operatorname{Step}
+  \left(x_i,t_i,\vfield^\star(x_i,t_i,c,\bm\beta)\right).
+  \label{eq:reward-control-rollout}
+\end{equation}
+每个 visited state 缓存 oracle velocity，gradient pass 只运行一次
+control-conditioned student forward。Teacher collection 每步需要 $K+1$ 个
+顺序模型 forward，部署则只需要一个 student forward。
+
+为避免多个 residual 误差相互抵消，$\bm\beta$ 不只从 dense hypercube 均匀采样，
+而是分层覆盖 anchor、single-axis、sparse-joint 与 dense-joint。主损失在
+FP32 中使用 pseudo-Huber：
+\begin{equation}
+  \mathcal L_{\mathrm{RCD}}
+  =
+  \E\left[
+    w(t)
+    \operatorname{PHuber}_{\delta}
+    \left(
+      \vfield_{\theta}(x_t,t,c,\bm\beta)
+      -
+      \vfield^\star(x_t,t,c,\bm\beta)
+    \right)
+  \right],
+  \label{eq:reward-control-loss}
+\end{equation}
+其中可选 $w(t)=|\Delta t|^2$ 与 Euler transition error 对齐。
+由于首版部署目标就是固定 $\gamma$ 的单个 composed field，PDM branch loss
+不作为主目标；若未来把 CFG scale 本身也暴露为 student control，则应重新加入
+positive/direction 的 branch-aware supervision。
+
+\subsection{与其他 guidance-free 方法的边界}
+
+LCM~\cite{lcm} 与 guided distillation 的 Fourier scale embedding 直接支持
+连续强度；Plug-and-Play distillation~\cite{pnpdistill} 与 AGD 支持冻结 base、
+只训练轻量 residual capacity。DICE~\cite{dice} 主要改变 text representation，
+无法自然保留多个命名 reward residual 轴；Model Guidance/GFT
+\cite{modelguidance,gft} 从 data/noise objective 学习 guidance-free model，
+而这里有可直接查询的 LoRA teacher vector-field oracle。因此首版采用
+``continuous embedding + lightweight LoRA + guided trajectories''，而不把
+这些不同问题的目标机械拼接。
+
 \section{结论}
 
 Reward-residual guidance 与 CFG 的共同核心是
@@ -1134,7 +1229,7 @@ Pareto frontier；再测试不同 student/teacher CFG 组合；最后才引入
 multi-teacher routing 与 affine extrapolation。这样每一步都对应本文中的一个
 可验证算子，而不会把 CFG、reward residual 与 teacher routing 的效应混在一起。
 
-\begin{thebibliography}{9}
+\begin{thebibliography}{16}
 
 \bibitem{cfg}
 Jonathan Ho and Tim Salimans.
@@ -1160,6 +1255,45 @@ Diffusion Models.
 Rethinking Classifier-Free Guidance in On-Policy Diffusion Distillation.
 \newblock 2026.
 \newblock \url{https://arxiv.org/abs/2607.24731}.
+
+\bibitem{guideddistill}
+Chenlin Meng, Robin Rombach, Ruiqi Gao, et al.
+\newblock On Distillation of Guided Diffusion Models.
+\newblock \emph{CVPR}, 2023.
+
+\bibitem{lcm}
+Simian Luo, Yiqin Tan, Longbo Huang, Jian Li, and Hang Zhao.
+\newblock Latent Consistency Models: Synthesizing High-Resolution Images with
+Few-Step Inference.
+\newblock 2023.
+\newblock \url{https://arxiv.org/abs/2310.04378}.
+
+\bibitem{pnpdistill}
+Jui-Ting Hsiao, Yu-Chiang Frank Wang, and Ming-Hsuan Yang.
+\newblock Plug-and-Play Diffusion Distillation.
+\newblock \emph{CVPR}, 2024.
+
+\bibitem{agd}
+Cristian Perez Jensen and Seyedmorteza Sadat.
+\newblock Efficient Distillation of Classifier-Free Guidance using Adapters.
+\newblock 2025.
+\newblock \url{https://arxiv.org/abs/2503.07274}.
+
+\bibitem{dice}
+Zhenyu Zhou, Defang Chen, Can Wang, Chun Chen, and Siwei Lyu.
+\newblock DICE: Distilling Classifier-Free Guidance into Text Embeddings.
+\newblock \emph{AAAI}, 2026.
+\newblock \url{https://arxiv.org/abs/2502.03726}.
+
+\bibitem{modelguidance}
+Diffusion Models without Classifier-Free Guidance.
+\newblock 2025.
+\newblock \url{https://arxiv.org/abs/2502.12154}.
+
+\bibitem{gft}
+Visual Generation Without Guidance.
+\newblock 2025.
+\newblock \url{https://arxiv.org/abs/2501.15420}.
 
 \end{thebibliography}
 

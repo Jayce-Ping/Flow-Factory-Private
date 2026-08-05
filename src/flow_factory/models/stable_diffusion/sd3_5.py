@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar, Literal
 from dataclasses import dataclass
 from collections import defaultdict
@@ -46,6 +47,10 @@ from ...utils.trajectory_collector import (
 )
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
+from .reward_control import (
+    CombinedTimestepRewardControlTextProjEmbeddings,
+    install_reward_control_embedding,
+)
 
 logger = setup_logger(__name__)
 
@@ -70,10 +75,84 @@ class SD3_5Adapter(BaseAdapter):
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
 
     def load_pipeline(self) -> StableDiffusion3Pipeline:
-        return StableDiffusion3Pipeline.from_pretrained(
+        pipeline = StableDiffusion3Pipeline.from_pretrained(
             self.model_args.model_name_or_path,
             low_cpu_mem_usage=False,
         )
+        control_names = getattr(
+            self.training_args, "reward_control_names", None
+        )
+        if control_names:
+            modules_to_save = self.model_args.lora_modules_to_save or []
+            if (
+                self.model_args.finetune_type == "lora"
+                and "control_embedder" not in modules_to_save
+            ):
+                raise ValueError(
+                    "reward-control LoRA training requires "
+                    "model.lora_modules_to_save to include 'control_embedder'; "
+                    f"got {modules_to_save!r}."
+                )
+            install_reward_control_embedding(
+                pipeline.transformer,
+                control_names=control_names,
+                fourier_dim=self.training_args.control_fourier_dim,
+                hidden_dim=self.training_args.control_hidden_dim,
+                input_scale=self.training_args.control_input_scale,
+            )
+        return pipeline
+
+    def _reward_control_embedder(
+        self,
+    ) -> Optional[CombinedTimestepRewardControlTextProjEmbeddings]:
+        root = self.accelerator.unwrap_model(self.transformer)
+        matches = [
+            module
+            for module in root.modules()
+            if isinstance(
+                module, CombinedTimestepRewardControlTextProjEmbeddings
+            )
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "expected at most one SD3.5 reward-control time embedder, "
+                f"found {len(matches)} instances."
+            )
+        return matches[0] if matches else None
+
+    def _reward_control_context(
+        self,
+        reward_control: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        do_classifier_free_guidance: bool,
+        device: torch.device,
+    ):
+        embedder = self._reward_control_embedder()
+        if embedder is None:
+            if reward_control is not None:
+                raise RuntimeError(
+                    "received reward_control but SD3.5 has no installed control "
+                    "embedder; use trainer_type='reward-guidance-distill' or "
+                    "load a compatible reward-control checkpoint."
+                )
+            return nullcontext()
+        if reward_control is None:
+            return embedder.use_reward_control(None)
+        if not isinstance(reward_control, torch.Tensor):
+            raise TypeError(
+                "expected torch.Tensor for reward_control, got "
+                f"{type(reward_control).__name__}: {reward_control!r}."
+            )
+        if reward_control.ndim != 2 or reward_control.shape[0] != batch_size:
+            raise ValueError(
+                "expected reward_control shape (batch, num_controls) with "
+                f"batch={batch_size}, got shape={tuple(reward_control.shape)}."
+            )
+        controls = reward_control.to(device=device)
+        if do_classifier_free_guidance:
+            controls = torch.cat([controls, controls], dim=0)
+        return embedder.use_reward_control(controls)
 
     # ============================ Modules & Components ============================
     @property
@@ -303,6 +382,7 @@ class SD3_5Adapter(BaseAdapter):
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+        reward_control: Optional[torch.Tensor] = None,
         # Other args
         compute_log_prob: bool = True,
         extra_call_back_kwargs: List[str] = [],
@@ -345,6 +425,18 @@ class SD3_5Adapter(BaseAdapter):
                 negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device)
 
         batch_size = len(prompt_embeds)
+        if reward_control is not None:
+            if not isinstance(reward_control, torch.Tensor):
+                raise TypeError(
+                    "expected torch.Tensor for reward_control, got "
+                    f"{type(reward_control).__name__}: {reward_control!r}."
+                )
+            if reward_control.ndim != 2 or reward_control.shape[0] != batch_size:
+                raise ValueError(
+                    "expected reward_control shape (batch, num_controls) with "
+                    f"batch={batch_size}, got shape={tuple(reward_control.shape)}."
+                )
+            reward_control = reward_control.to(device=device)
         num_channels_latents = self.pipeline.transformer.config.in_channels
 
         # 3. Prepare latent variables
@@ -396,6 +488,7 @@ class SD3_5Adapter(BaseAdapter):
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                reward_control=reward_control,
                 guidance_scale=guidance_scale,
                 joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=current_compute_log_prob,
@@ -474,6 +567,11 @@ class SD3_5Adapter(BaseAdapter):
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
                     "callback_index_map": callback_index_map,
+                    **(
+                        {"reward_control": reward_control[b]}
+                        if reward_control is not None
+                        else {}
+                    ),
                 },
             )
             for b in range(batch_size)
@@ -492,6 +590,7 @@ class SD3_5Adapter(BaseAdapter):
         pooled_prompt_embeds: torch.Tensor,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+        reward_control: Optional[torch.Tensor] = None,
         guidance_scale: float = 7.5,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
@@ -523,14 +622,20 @@ class SD3_5Adapter(BaseAdapter):
             latents_input = latents
             timestep_input = timestep
 
-        noise_pred = self.transformer(
-            hidden_states=latents_input,
-            timestep=timestep_input,
-            encoder_hidden_states=prompt_embeds_input,
-            pooled_projections=pooled_input,
-            joint_attention_kwargs=joint_attention_kwargs,
-            return_dict=False,
-        )[0]
+        with self._reward_control_context(
+            reward_control,
+            batch_size=batch_size,
+            do_classifier_free_guidance=do_cfg,
+            device=latents.device,
+        ):
+            noise_pred = self.transformer(
+                hidden_states=latents_input,
+                timestep=timestep_input,
+                encoder_hidden_states=prompt_embeds_input,
+                pooled_projections=pooled_input,
+                joint_attention_kwargs=joint_attention_kwargs,
+                return_dict=False,
+            )[0]
 
         if do_cfg:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -548,6 +653,7 @@ class SD3_5Adapter(BaseAdapter):
         # Optional for CFG
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+        reward_control: Optional[torch.Tensor] = None,
         guidance_scale: float = 7.5,
         # Next timestep info
         t_next: Optional[torch.Tensor] = None,
@@ -620,14 +726,20 @@ class SD3_5Adapter(BaseAdapter):
             timestep_input = timestep
 
         # 3. Transformer forward pass
-        noise_pred = self.transformer(
-            hidden_states=latents_input,
-            timestep=timestep_input,
-            encoder_hidden_states=prompt_embeds_input,
-            pooled_projections=pooled_prompt_embeds_input,
-            joint_attention_kwargs=joint_attention_kwargs,
-            return_dict=False,
-        )[0]
+        with self._reward_control_context(
+            reward_control,
+            batch_size=batch_size,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            device=latents.device,
+        ):
+            noise_pred = self.transformer(
+                hidden_states=latents_input,
+                timestep=timestep_input,
+                encoder_hidden_states=prompt_embeds_input,
+                pooled_projections=pooled_prompt_embeds_input,
+                joint_attention_kwargs=joint_attention_kwargs,
+                return_dict=False,
+            )[0]
 
         # 4. Apply CFG
         if do_classifier_free_guidance:

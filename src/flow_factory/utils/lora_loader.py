@@ -26,9 +26,15 @@ out of the same student model (e.g., OPD multi-task distillation).
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, List, Sequence, Union
 
 import torch
+from peft import PeftModel
+from peft.utils.save_and_load import (
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+)
+from safetensors.torch import load_file
 
 from .logger_utils import setup_logger
 
@@ -38,11 +44,143 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__, rank_zero_only=True)
 
 
+def set_peft_state_allowing_missing_modules_to_save(
+    model: PeftModel,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    adapter_name: str,
+    allowed_modules_to_save: Sequence[str],
+) -> None:
+    """Load a teacher LoRA while retaining named student-only full modules."""
+
+    current_state = get_peft_model_state_dict(
+        model, adapter_name=adapter_name
+    )
+    allowed_names = tuple(allowed_modules_to_save)
+
+    def is_allowed(key: str) -> bool:
+        return any(
+            key == name
+            or key.startswith(f"{name}.")
+            or f".{name}." in key
+            for name in allowed_names
+        )
+
+    unexpected = sorted(set(state_dict) - set(current_state))
+    if unexpected:
+        raise ValueError(
+            "teacher LoRA contains parameters absent from the student adapter; "
+            f"unexpected_keys={unexpected[:12]!r}, adapter={adapter_name!r}."
+        )
+    missing = sorted(set(current_state) - set(state_dict))
+    disallowed_missing = [key for key in missing if not is_allowed(key)]
+    if disallowed_missing:
+        raise ValueError(
+            "teacher LoRA is missing non-control adapter parameters; expected "
+            "all LoRA targets/ranks to match the student, got "
+            f"missing_keys={disallowed_missing[:12]!r}, "
+            f"allowed_modules_to_save={allowed_names!r}."
+        )
+
+    padded_state = dict(state_dict)
+    for key in missing:
+        padded_state[key] = current_state[key].detach().clone()
+    try:
+        result = set_peft_model_state_dict(
+            model,
+            padded_state,
+            adapter_name=adapter_name,
+        )
+    except RuntimeError as error:
+        raise ValueError(
+            "teacher LoRA tensor shapes do not match the student adapter; "
+            f"adapter={adapter_name!r}, allowed_modules_to_save="
+            f"{allowed_names!r}."
+        ) from error
+    remaining_missing = [
+        key
+        for key in result.missing_keys
+        if "lora_" in key and not is_allowed(key)
+    ]
+    remaining_unexpected = [
+        key for key in result.unexpected_keys if "lora_" in key
+    ]
+    if remaining_missing or remaining_unexpected:
+        raise ValueError(
+            "teacher LoRA load produced incompatible parameters; "
+            f"missing_keys={remaining_missing[:12]!r}, "
+            f"unexpected_keys={remaining_unexpected[:12]!r}."
+        )
+
+
+def _load_lora_with_student_only_modules(
+    adapter: "BaseAdapter",
+    lora_path: str,
+    target_components: Sequence[str],
+) -> None:
+    allowed = adapter.model_args.lora_modules_to_save or []
+    if not allowed:
+        adapter._load_lora(lora_path)
+        return
+    for component_name in target_components:
+        component_path = (
+            os.path.join(lora_path, component_name)
+            if len(target_components) > 1
+            else lora_path
+        )
+        config_path = os.path.join(component_path, "adapter_config.json")
+        if not os.path.isfile(config_path):
+            # The legacy manual state-dict loader already uses strict=False,
+            # so student-only full modules remain untouched.
+            adapter._load_lora(lora_path)
+            return
+        weights_path = os.path.join(
+            component_path, "adapter_model.safetensors"
+        )
+        if os.path.isfile(weights_path):
+            teacher_state = load_file(weights_path)
+        else:
+            weights_path = os.path.join(
+                component_path, "adapter_model.bin"
+            )
+            if not os.path.isfile(weights_path):
+                raise FileNotFoundError(
+                    "expected standard PEFT teacher weights at "
+                    f"{component_path!r}, checked adapter_model.safetensors "
+                    "and adapter_model.bin."
+                )
+            teacher_state = torch.load(
+                weights_path, map_location="cpu", weights_only=True
+            )
+        unwrapped = adapter.accelerator.unwrap_model(
+            adapter.get_component(component_name)
+        )
+        if not isinstance(unwrapped, PeftModel):
+            raise TypeError(
+                "expected an existing PeftModel before loading a teacher with "
+                f"student-only modules, got {type(unwrapped).__name__} for "
+                f"component={component_name!r}."
+            )
+        active_adapter = unwrapped.active_adapter
+        if not isinstance(active_adapter, str):
+            raise TypeError(
+                "expected one active PEFT adapter name, got "
+                f"{active_adapter!r} for component={component_name!r}."
+            )
+        set_peft_state_allowing_missing_modules_to_save(
+            unwrapped,
+            teacher_state,
+            adapter_name=active_adapter,
+            allowed_modules_to_save=allowed,
+        )
+
+
 def load_lora_as_named_parameters(
     adapter: "BaseAdapter",
     name: str,
     lora_path: str,
     device: Union[torch.device, str] = "cpu",
+    allow_missing_modules_to_save: bool = False,
 ) -> None:
     """Load a LoRA checkpoint into the adapter as a named-parameter snapshot.
 
@@ -72,6 +210,10 @@ def load_lora_as_named_parameters(
             VRAM at the cost of an H2D copy on every swap; ``"cuda"`` keeps
             the snapshot on-device and is faster but uses LoRA-sized VRAM
             per loaded teacher.
+        allow_missing_modules_to_save: Keep the active student's named
+            ``modules_to_save`` values when an otherwise-compatible teacher
+            checkpoint predates those student-only modules. LoRA target and
+            tensor-shape mismatches still raise.
 
     Raises:
         ValueError: The adapter is not in LoRA mode, or no trainable LoRA
@@ -123,7 +265,12 @@ def load_lora_as_named_parameters(
     saved_data = [p.detach().clone() for p in live_params]
 
     try:
-        adapter._load_lora(lora_path)
+        if allow_missing_modules_to_save:
+            _load_lora_with_student_only_modules(
+                adapter, lora_path, target_components
+            )
+        else:
+            adapter._load_lora(lora_path)
 
         adapter.add_named_parameters(
             name=name,

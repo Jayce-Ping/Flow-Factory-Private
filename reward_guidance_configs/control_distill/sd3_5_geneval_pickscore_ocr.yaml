@@ -1,0 +1,161 @@
+# Joint three-axis reward-residual control distillation. Every teacher is
+# broadcast on every prompt; source labels only route evaluation rewards.
+
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "dataset/geneval"
+  dataset_dirs:
+    - "dataset/geneval"
+    - "dataset/pickscore"
+    - "dataset/ocr"
+  preprocessing_batch_size: 32
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null
+  sampler_type: "auto"
+
+model:
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  finetune_type: "lora"
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  lora_modules_to_save: ["control_embedder"]
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "reward_control_distill_sd35_geneval_pickscore_ocr"
+  project: "Flow-Factory-Reward-Guidance"
+  logging_backend: "wandb"
+  save_dir: "saves/reward_control_distill_sd35_geneval_pickscore_ocr"
+  save_freq: 10
+  save_model_only: false
+
+train:
+  trainer_type: "reward-guidance-distill"
+  teachers:
+    - name: "geneval"
+      path: "Jayce-Ping/GenEval-Teacher"
+      sources: null
+      reward_name: "geneval"
+      guidance_scale: 4.5
+    - name: "pickscore"
+      path: "Jayce-Ping/Pickscore-Teacher"
+      sources: null
+      reward_name: "pick_score"
+      guidance_scale: 4.5
+    - name: "ocr"
+      path: "Jayce-Ping/OCR-Teacher"
+      sources: null
+      reward_name: "ocr"
+      guidance_scale: 4.5
+  teacher_param_device: "cuda"
+  reward_control_names: ["geneval", "pickscore", "ocr"]
+  control_ranges:
+    geneval: [-0.5, 2.0]
+    pickscore: [-0.5, 2.0]
+    ocr: [-0.5, 2.0]
+  target_guidance_scale: 4.5
+  control_fourier_dim: 256
+  control_hidden_dim: 512
+  control_input_scale: 1000.0
+  control_sampling_probabilities:
+    anchor: 0.10
+    axis: 0.35
+    sparse_joint: 0.25
+    dense_joint: 0.30
+  distill_loss: "pseudo_huber"
+  pseudo_huber_delta: 0.01
+  timestep_weighting: "dt_squared"
+  eval_baselines_at_start: true
+  eval_control_vectors:
+    geneval: [1.0, 0.0, 0.0]
+    pickscore: [0.0, 1.0, 0.0]
+    ocr: [0.0, 0.0, 1.0]
+    equal_average: [0.3333333333, 0.3333333333, 0.3333333333]
+    reverse_equal: [-0.5, -0.5, -0.5]
+    extrapolate_equal: [2.0, 2.0, 2.0]
+
+  learning_rate: 1.0e-4
+  per_device_batch_size: 1
+  group_size: 1
+  # Divisible by 64 so the same YAML scales to the canonical 64-GPU launch.
+  unique_sample_num_per_epoch: 128
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  max_grad_norm: 1.0
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  ddp_find_unused_parameters: false
+  max_epochs: 200
+  seed: 42
+
+  ema_decay: 0.999
+  ema_update_interval: 1
+  ema_device: "cuda"
+  offload_samples_to_cpu: true
+
+  resolution: 1024
+  guidance_scale: 1.0
+  num_inference_steps: 50
+  enable_gradient_checkpointing: true
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.0
+  seed: 42
+
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  guidance_scale: 1.0
+  num_inference_steps: 50
+  eval_freq: 10
+  seed: 42
+  test_sets:
+    - name: geneval
+      dataset_dir: "dataset/geneval"
+      split: "test"
+      eval_reward_names: ["geneval", "pick_score"]
+    - name: pickscore
+      dataset_dir: "dataset/pickscore"
+      split: "test"
+      eval_reward_names: ["pick_score"]
+    - name: ocr
+      dataset_dir: "dataset/ocr"
+      split: "test"
+      eval_reward_names: ["ocr", "pick_score"]
+
+rewards: []
+
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 64
+    device: "cuda"
+    dtype: float32
+    async_reward: false
+    applicable_sources: ["geneval"]
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+  - name: "ocr"
+    reward_model: "ocr"
+    batch_size: 64
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: false
+    applicable_sources: ["ocr"]
+
