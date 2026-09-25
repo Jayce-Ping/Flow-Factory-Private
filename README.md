@@ -139,6 +139,7 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 | DGPO           | dgpo           | [DGPO](https://arxiv.org/abs/2510.08425) |
 | GRPO-Guard     | grpo-guard     | [GRPO-Guard](https://arxiv.org/abs/2510.22319) |
 | DPPO           | dppo           | [Flow-DPPO](https://arxiv.org/abs/2606.11025) |
+| SC-GRPO        | sc-grpo        | [Score Centering](https://arxiv.org/abs/2609.20807) on Flow-GRPO SDE transitions |
 | CRD            | crd            | [Centered Reward Distillation](https://arxiv.org/abs/2603.14128) ([Blog (Chinese)](https://mp.weixin.qq.com/s/fpTi7PPi3APSNJQ2kXN3Dw))|
 | DiffusionOPD   | diffusion-opd  | [DiffusionOPD](https://arxiv.org/abs/2605.15055) |
 | DMD2           | dmd2           | [DMD2](https://arxiv.org/abs/2405.14867) |

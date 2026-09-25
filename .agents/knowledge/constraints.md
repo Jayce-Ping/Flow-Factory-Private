@@ -50,7 +50,7 @@ the finite loader through `optimize_batch()` and must not call rollout/reward st
 either axis from batch fields or make it user-configurable independently of `trainer_type`.
 
 ### 7. Coupled vs Decoupled Paradigm
-- **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
+- **Coupled** (GRPO, GRPO-Guard, DPPO, SC-GRPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
 - **Decoupled** (SFT, offline DPO, online DPO, NFT, AWM, DGPO, CRD, TDM-R1): Training timesteps are decoupled from sampling. They may use ODE subject to algorithm-specific rules; TDM-R1 requires ODE.
 - **Distillation** (`diffusion-opd`, DMD2, TDM): Generated acquisition with no runtime reward/advantage stage. DiffusionOPD supports ODE or SDE; DMD2 and TDM require ODE.
 

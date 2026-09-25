@@ -4,7 +4,7 @@
 
 Flow-Factory is a unified **online and offline fine-tuning framework** for diffusion/flow-matching models. It provides a modular architecture where trainers, model adapters, data acquisition, and reward models are independently extensible through typed contracts and registries.
 
-- **Algorithms**: SFT, offline DPO, online DPO, GRPO, GRPO-Guard, DPPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1
+- **Algorithms**: SFT, offline DPO, online DPO, GRPO, GRPO-Guard, DPPO, SC-GRPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1
 - **Models**: FLUX.1 (+Kontext), FLUX.2 (+Klein), SD3.5, Qwen-Image (+Edit-Plus), Z-Image, Wan2 (T2V/I2V), LTX2 (T2AV/I2AV), MiniMax H3 (T2VA/FL2VA/Ref2VA), Bagel, SenseNova-U1 (1.0/1.5; T2I + ordered multi-reference I2I)
 - **Rewards**: PickScore (+Rank), CLIP, CLAP, ImageBind, OCR, GenEval/GenEval2, HPSv2, VLM-Evaluate, rational-rewards, and custom rewards
 - **Python**: >=3.10 | **PyTorch**: >=2.10.0 | **License**: Apache-2.0
@@ -60,7 +60,7 @@ See `.agents/knowledge/architecture.md` "Module Dependency Graph" for full detai
 | Document | Purpose |
 |----------|---------|
 | `guidance/workflow.md` | Unified generation/dataset acquisition contracts plus the online 6-stage pipeline |
-| `guidance/algorithms.md` | All algorithms (SFT, offline DPO, GRPO, GRPO-Guard, DPPO, online DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) deep dive |
+| `guidance/algorithms.md` | All algorithms (SFT, offline DPO, GRPO, GRPO-Guard, DPPO, SC-GRPO, online DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) deep dive |
 | `guidance/rewards.md` | Reward system design, custom model creation |
 | `guidance/new_model.md` | Step-by-step model adapter integration |
 | `guidance/acceleration.md` | Acceleration plugin layer (compile, attention backend, feature caching) |

@@ -48,7 +48,7 @@ reduction, and losses.
 
 | Trainer | Structured consumption |
 |---|---|
-| GRPO / GRPO-Guard / DPPO | Coupled replay; transition statistics and joint/component log probabilities |
+| GRPO / GRPO-Guard / DPPO / SC-GRPO | Coupled replay; transition statistics and joint/component log probabilities |
 | DiffusionNFT / AWM / DPO | Terminal state plus ordered forward-process noise |
 | DGPO | Deterministic per-UID component noise in `component_order` |
 | CRD | Global two-pass order; pass two rebuilds state from stored component noise |

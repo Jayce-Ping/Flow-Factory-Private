@@ -15,6 +15,8 @@
 
 - [DPPO](#dppo)
 
+- [SC-GRPO: Score-Centered GRPO](#sc-grpo-score-centered-grpo)
+
 - [SFT](#sft)
 
 - [Offline DPO](#offline-dpo)
@@ -207,6 +209,32 @@ train:
 ```
 
 Like GRPO, DPPO is **coupled** and must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`). `DPPOTrainingArguments` does not inherit `GRPOTrainingArguments` (no `clip_range`) — its field set is intentionally minimal. When `kl_beta > 0`, the KL-vs-reference term is evaluated at `kl_guidance_scale`; this is reflected in `DPPOTrainingArguments.get_preprocess_guidance_scale()` so negative prompts are encoded at preprocessing whenever `kl_guidance_scale > 1.0`. Example configs: `examples/dppo/lora/{flux2_klein_base,sd3_5}/geneval2_{single,multi}.yaml`.
+
+## SC-GRPO: Score-Centered GRPO
+
+Score centering [[16]](#ref16) targets the training-inference mismatch between the rollout sampler $q$ and the trainer $p_\theta$ (numerical differences between rollout and training forwards, or staleness when one rollout batch feeds several optimizer steps). Under mismatch the policy-gradient update splits into a *drift* term $\mathbb{E}_q[A]\,\mathbb{E}_q[\nabla_\theta \log p_\theta]$ and the reward *signal* $\mathrm{Cov}_q(A, \nabla_\theta \log p_\theta)$. The drift is nonzero whenever $q \neq p_\theta$ and distills the trainer toward the sampler, compounding across syncs. Score centering subtracts the rollout-expected score, which cancels the drift exactly.
+
+For LLMs the expectation needs a top-$k$ approximation over the vocabulary. For flow models it is exact: each SDE step is Gaussian with a policy-independent variance, $q = \mathcal{N}(\mu_q, s^2 I)$ and $p_\theta = \mathcal{N}(\mu_\theta, s^2 I)$, so $\mathbb{E}_q[\log p_\theta] = -\mathrm{KL}(q \,\|\, p_\theta) + \text{const}$ and the per-step loss is
+
+$$
+\mathcal{L}_{\text{SC}} = -A\,\big[\log p_\theta(x') + \mathrm{KL}(q \,\|\, p_\theta)\big],
+$$
+
+where $x'$ is the stored next latent and $\mu_q$ the stored rollout transition mean. Its gradient is $-A\,(x' - \mu_q)\,\nabla_\theta \mu_\theta / s^2$ (per latent element): only the rollout noise remains, while the uncentered drift term $(\mu_q - \mu_\theta)/s^2$ — largest at low-noise steps — is removed. There is no importance ratio and no clipping.
+
+```yaml
+train:
+    trainer_type: 'sc-grpo'
+    score_centering: true      # false = plain REINFORCE on the same code path (ablation)
+    adv_clip_range: 5.0
+    kl_type: 'x-based'         # Optional KL(current||reference) penalty space
+    kl_beta: 0                 # 0 disables the reference term
+    kl_guidance_scale: null    # CFG for the KL-vs-reference forward (null = training guidance_scale)
+scheduler:
+    dynamics_type: 'Flow-SDE'  # Flow-SDE, Dance-SDE, or CPS
+```
+
+SC-GRPO is **coupled** and must use SDE dynamics. The KL term follows each scheduler's `log_prob` convention: $c\,(\mu_q - \mu_\theta)^2$ with $c = 1/(2s^2)$ for Flow-SDE / Dance-SDE and $c = 1$ for CPS (whose `log_prob` is unnormalized), reduced with the same element weighting as the joint `log_prob`. Rollouts store `next_latents_mean` (same memory as GRPO-Guard / DPPO). Logged diagnostics: `sampler_kl` (mismatch size), `plain_log_ratio` (mean ≈ −`sampler_kl` under mismatch), and `centered_log_ratio` (mean ≈ 0). `SCGRPOTrainingArguments` does not inherit `GRPOTrainingArguments` (no `clip_range`). Example config: `examples/sc_grpo/lora/sd3_5/default.yaml`.
 
 ## SFT
 
@@ -825,3 +853,4 @@ Each teacher's `applicable_datasets` must reference declared `data.datasets[*].n
 * <a name="ref13"></a>[13] [**CRD**: Diffusion Reinforcement Learning via Centered Reward Distillation](https://arxiv.org/abs/2603.14128)
 * <a name="ref14"></a>[14] [**DiffusionOPD**: A Unified Perspective of On-Policy Distillation in Diffusion Models](https://arxiv.org/abs/2605.15055)
 * <a name="ref15"></a>[15] [**Flow-DPPO**: Divergence Proximal Policy Optimization for Flow Matching Models](https://arxiv.org/abs/2606.11025) ([Code](https://github.com/Tencent-Hunyuan/UniRL/tree/main/FlowDPPO#readme))
+* <a name="ref16"></a>[16] [**Score Centering** Stabilizes Off-policy Reinforcement Learning](https://arxiv.org/abs/2609.20807) ([Code](https://github.com/martin-marek/score-centering))

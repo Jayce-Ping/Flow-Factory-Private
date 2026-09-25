@@ -20,7 +20,8 @@ enforces them against the trainer's `paradigm` before training starts (fail-fast
 
 The single restriction: a **`lossy` rollout** accelerator is allowed **only on
 `decoupled` / `distillation`** trainers. Why: for **coupled** algorithms (GRPO,
-GRPO-Guard, DPPO) the rollout's per-step log-prob becomes the PPO "old log-prob";
+GRPO-Guard, DPPO, SC-GRPO) the rollout's per-step log-prob becomes the PPO "old log-prob"
+(SC-GRPO: the rollout transition mean enters the loss);
 changing the rollout while the training forward stays exact biases the importance ratio
 and silently corrupts gradients (`.agents/knowledge/constraints.md` #7). For
 **decoupled** (NFT, AWM, DGPO, DPO, CRD) and **distillation** (diffusion-opd), the rollout
@@ -184,7 +185,7 @@ FirstBlockCache is lossy and its threshold is workload-dependent, tune `threshol
 reward/quality on the target prompt distribution and hardware.
 
 As a lossy rollout accelerator, H3 caching remains restricted to decoupled or distillation
-trainers such as TDM. Coupled GRPO/GRPO-Guard/DPPO configurations are rejected by the paradigm
+trainers such as TDM. Coupled GRPO/GRPO-Guard/DPPO/SC-GRPO configurations are rejected by the paradigm
 validator.
 
 `torch_compile` is model-agnostic and applies to every adapter.

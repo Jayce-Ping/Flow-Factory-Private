@@ -84,6 +84,7 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `grpo` | `GRPOTrainer` | Coupled | `BaseTrainer` |
 | `grpo-guard` | `GRPOGuardTrainer` | Coupled | `GRPOTrainer` |
 | `dppo` | `DPPOTrainer` | Coupled | `GRPOTrainer` |
+| `sc-grpo` | `SCGRPOTrainer` | Coupled | `BaseTrainer` |
 | `dpo` | `DPOTrainer` | Decoupled | `BaseTrainer` |
 | `dgpo` | `DGPOTrainer` | Decoupled | `BaseTrainer` |
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
